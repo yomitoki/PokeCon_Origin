@@ -32,6 +32,10 @@ SerialController/Commands/PythonCommands/*
 SerialController/Commands/PythonCommands/ImageProcessingOnly/*
 !SerialController/Commands/PythonCommands/ImageProcessingOnly/Samples/
 
+# ADD LOCAL ORIGIN
+SerialController/Recordings/
+SerialController/Recordings/*
+SerialController/Recordings/**
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
