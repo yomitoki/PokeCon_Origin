@@ -44,6 +44,9 @@ class Command:
     app_name = ""
     cur_command_name = ""
     profilename = None
+    # Assigned by Window at startup.  Python commands can call show_output()
+    # without importing or depending on Tkinter widgets.
+    output = None
 
     def __init__(self):
         self.isRunning = False
@@ -66,6 +69,16 @@ class Command:
     ############### print functions ###############
     def print_s(self, *objects: object, sep: str = " ", end: str = "\n"):
         print(*objects, sep=sep, end=end)
+
+    def show_output(self, panel: str, text: str = None, image=None, html_path: str = None):
+        """Send a result to a configured panel.
+
+        ``panel`` is one of ``Output#1``, ``Output#2``, ``Analysis`` or a
+        physical slot name: ``left_top``, ``left_bottom``, ``right_top``,
+        ``right_bottom``.  ``image`` is an OpenCV BGR image.
+        """
+        if Command.output is not None:
+            Command.output(panel, text=text, image=image, html_path=html_path)
 
     def print_t1(self, *objects: object, sep: str = " ", end: str = "\n"):
         """

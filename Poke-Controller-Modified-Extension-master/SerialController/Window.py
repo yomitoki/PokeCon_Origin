@@ -3,14 +3,18 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import os
 import re
+import shutil
 from os.path import dirname, abspath
 import cv2
 import platform
 import subprocess
 import threading
+import webbrowser
+from pathlib import Path
 import tkinter.ttk as ttk
 import tkinter.messagebox as tkmsg
 import Constant
@@ -27,6 +31,10 @@ from Camera import Camera
 import Settings
 from CommandLoader import CommandLoader
 from GuiAssets import CaptureArea, ControllerGUI
+from VisionAutomation import VisionAutomation
+from AudioMonitor import AudioMonitor
+from Recording import CaptureRecorder
+from PIL import Image, ImageTk
 from KeyConfig import PokeKeycon
 from Keyboard import SwitchKeyboardController
 from LineNotify import Line_Notify
@@ -63,6 +71,15 @@ class PokeControllerApp:
         self.keyboard = None
 
         self.camera_dic = None
+        self.vision = VisionAutomation(os.path.join("Commands", "PythonCommands", "Samples", "vision_rules.json"))
+        self.audio_monitor = AudioMonitor()
+        self.recorder = CaptureRecorder()
+        self.record_trigger_rules = []
+        self.record_cleanup_rules = []
+        # Template mode is an armed detector.  It must not create a file
+        # until the configured image is actually found.
+        self.record_armed = False
+        self._last_vision_text = ""
         self.Line = None
         self.Discord = None
 
@@ -111,13 +128,16 @@ class PokeControllerApp:
         self.discord_button.configure(text="Discord")
         self.discord_button.grid(column="5", padx="5", pady="5", row="0", sticky="ew")
         self.discord_button.configure(command=self.sendDiscordImage)
+        self.html_button = ttk.Button(self.top_command_f, text="Open HTML")
+        self.html_button.grid(column="6", padx="5", pady="5", row="0", sticky="ew")
+        self.html_button.configure(command=self.open_html_output)
         self.top_command_f.grid(column="0", row="0", sticky="w")
         self.top_command_f.grid_anchor("center")
         self.canvas_frame = ttk.Frame(self.camera_lf)
         self.canvas_frame.configure(height="360", relief="groove", width="640")
         self.canvas_frame.grid(column="0", columnspan="7", row="1")
         self.camera_lf.configure(text="Main Panel")  # modfied
-        self.camera_lf.grid(column="0", columnspan="3", padx="5", pady="5", row="0", sticky="ew")
+        self.camera_lf.grid(column="1", padx="5", pady="5", row="0", sticky="ew")
         self.camera_lf.rowconfigure("0", uniform="0")
         self.controller_nb = ttk.Notebook(self.main_frame)
         self.camera_f = ttk.Frame(self.controller_nb)
@@ -169,7 +189,7 @@ class PokeControllerApp:
         self.camera_name_cb.grid(column="1", columnspan="9", padx="5", pady="5", row="0", sticky="ew")
         self.camera_name_cb.bind("<<ComboboxSelected>>", self.set_cameraid, add="")
         self.camera_settings_lf.configure(text="Settings", width="420")
-        self.camera_settings_lf.grid(column="0", padx="5", row="0", sticky="ew")
+        self.camera_settings_lf.grid(column="0", padx="5", row="0", sticky="nw")
         self.display_settings_lf = ttk.Labelframe(self.camera_f)
         self.show_realtime_checkbox = ttk.Checkbutton(self.display_settings_lf)
         self.is_show_realtime = tk.BooleanVar()  # modified
@@ -185,11 +205,109 @@ class PokeControllerApp:
         self.show_guide_checkbox.configure(text="Show Guide", variable=self.is_show_guide)
         self.show_guide_checkbox.grid(column="2", padx="5", pady="5", row="0", sticky="ew")
         self.show_guide_checkbox.configure(command=self.mode_change_show_guide)
+        # Audio is intentionally separate from camera/display settings.
+        self.audio_f = ttk.Frame(self.controller_nb)
+        self.audio_lf = ttk.Labelframe(self.audio_f, text="Capture Audio")
+        self.audio_filter_camera = tk.BooleanVar(value=False)
+        self.audio_filter_checkbox = ttk.Checkbutton(
+            self.audio_lf, text="カメラ名に類似する音声のみ", variable=self.audio_filter_camera,
+            command=self.update_audio_input_list,
+        )
+        self.audio_filter_checkbox.grid(column=0, row=0, columnspan=2, padx=5, pady=(3, 0), sticky="w")
+        self.audio_auto_start = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self.audio_lf, text="Start audio on launch", variable=self.audio_auto_start).grid(
+            column=3, row=0, padx=5, pady=(3, 0), sticky="w"
+        )
+        ttk.Button(self.audio_lf, text="Refresh", command=self.refresh_audio_devices).grid(column=2, row=0, padx=5, pady=(3, 0))
+        ttk.Label(self.audio_lf, text="Audio In:").grid(column=0, row=1, padx=(5, 2), pady=5, sticky="e")
+        self.audio_input = tk.StringVar()
+        self.audio_input_cb = ttk.Combobox(self.audio_lf, textvariable=self.audio_input, width=100, state="readonly")
+        self.audio_input_cb.grid(column=1, columnspan=4, row=1, padx=2, pady=5, sticky="ew")
+        self.audio_lf.columnconfigure(1, weight=1)
+        self.audio_device_full_name = tk.StringVar(value="")
+        ttk.Label(self.audio_lf, textvariable=self.audio_device_full_name, anchor="w", foreground="#404040").grid(
+            column=1, columnspan=4, row=2, padx=2, pady=(0, 3), sticky="ew"
+        )
+        self.audio_input.trace_add("write", self._show_full_audio_device_name)
+        self.audio_gain = tk.IntVar(value=100)
+        ttk.Label(self.audio_lf, text="Gain:").grid(column=0, row=3, padx=(5, 2), pady=(0, 5), sticky="e")
+        ttk.Spinbox(self.audio_lf, from_=0, to=400, increment=10, textvariable=self.audio_gain, width=5).grid(column=1, row=3, padx=(2, 2), pady=(0, 5), sticky="w")
+        ttk.Label(self.audio_lf, text="%").grid(column=1, row=3, padx=(58, 0), pady=(0, 5), sticky="w")
+        self.audio_start_button = ttk.Button(self.audio_lf, text="Start audio", command=self.start_audio_monitor)
+        self.audio_start_button.grid(column=1, row=3, padx=(86, 2), pady=(0, 5), sticky="w")
+        ttk.Button(self.audio_lf, text="Stop", command=self.stop_audio_monitor).grid(column=1, row=3, padx=(180, 0), pady=(0, 5), sticky="w")
+        self.refresh_audio_devices()
         self.display_settings_lf.configure(height="200", text="Display Settings", width="200")
-        self.display_settings_lf.grid(column="0", padx="5", pady="0", row="1", sticky="ew")
+        self.display_settings_lf.grid(column="1", padx="5", pady="0", row="0", sticky="nw")
+        self.camera_f.columnconfigure(0, weight=0)
+        self.camera_f.columnconfigure(1, weight=1)
+        self.analysis_f = ttk.Frame(self.controller_nb)
+        self.vision_lf = ttk.Labelframe(self.analysis_f, text="Screen analysis / mode")
+        self.vision_mode = tk.StringVar(value="default")
+        self.vision_mode_cb = ttk.Combobox(self.vision_lf, state="readonly", width="15", textvariable=self.vision_mode,
+                                           values=list(self.vision.modes.keys()))
+        self.vision_mode_cb.grid(column=0, row=0, padx=5, pady=5)
+        self.vision_mode_cb.bind("<<ComboboxSelected>>", self.change_vision_mode)
+        ttk.Button(self.vision_lf, text="Reload rules", command=self.reload_vision_rules).grid(column=1, row=0, padx=5, pady=5)
+        ttk.Label(self.vision_lf, text="Template detection / HP bar → Output#2 (no key input)").grid(column=2, row=0, padx=5, pady=5)
+        self.vision_lf.grid(column=0, padx=5, pady=5, sticky="ew")
         # self.camera_f.configure(height='200', width='200')    # removed
         self.camera_f.pack(side="top")
         self.controller_nb.add(self.camera_f, padding="5", sticky="nsew", text="Camera")
+        self.audio_lf.pack(fill="x", padx=5, pady=5)
+        self.audio_f.pack(side="top", fill="both", expand=True)
+        self.controller_nb.add(self.audio_f, padding="5", sticky="nsew", text="Audio")
+        self.analysis_f.pack(side="top", fill="both", expand=True)
+        self.controller_nb.add(self.analysis_f, padding="5", sticky="nsew", text="Analysis")
+        self.presets_f = ttk.Frame(self.controller_nb)
+        self.presets_lf = ttk.Labelframe(self.presets_f, text="Saved setting sets")
+        ttk.Label(self.presets_lf, text="Set name:").grid(column=0, row=0, padx=5, pady=5)
+        self.preset_name = tk.StringVar()
+        self.preset_cb = ttk.Combobox(self.presets_lf, textvariable=self.preset_name, width=32)
+        self.preset_cb.grid(column=1, row=0, padx=5, pady=5)
+        ttk.Button(self.presets_lf, text="Save all tabs", command=self.save_preset).grid(column=2, row=0, padx=5, pady=5)
+        ttk.Button(self.presets_lf, text="Load", command=self.load_preset).grid(column=3, row=0, padx=5, pady=5)
+        ttk.Button(self.presets_lf, text="Delete", command=self.delete_preset).grid(column=4, row=0, padx=5, pady=5)
+        ttk.Button(self.presets_lf, text="Refresh", command=self.refresh_presets).grid(column=5, row=0, padx=5, pady=5)
+        ttk.Label(self.presets_lf, text="Load applies the entire linked set after restarting PokeCon.").grid(column=0, columnspan=6, row=1, padx=5, pady=(0, 5), sticky="w")
+        self.presets_lf.pack(fill="x", padx=5, pady=5)
+        self.presets_f.pack(side="top", fill="both", expand=True)
+        self.controller_nb.add(self.presets_f, padding="5", sticky="nsew", text="Presets")
+        self.recording_f = ttk.Frame(self.controller_nb)
+        self.recording_lf = ttk.Labelframe(self.recording_f, text="Video + audio recording")
+        self.record_mode = tk.StringVar(value="Manual")
+        ttk.Radiobutton(self.recording_lf, text="Manual", value="Manual", variable=self.record_mode).grid(column=0, row=0, padx=5, pady=5)
+        ttk.Radiobutton(self.recording_lf, text="Template segments", value="Template", variable=self.record_mode).grid(column=1, row=0, padx=5, pady=5)
+        self.record_button = ttk.Button(self.recording_lf, text="Start recording", command=self.toggle_recording)
+        self.record_button.grid(column=2, row=0, padx=5, pady=5)
+        ttk.Label(self.recording_lf, text="Template:").grid(column=0, row=1, padx=5, pady=5)
+        self.record_template_path = tk.StringVar()
+        ttk.Entry(self.recording_lf, textvariable=self.record_template_path, width=34).grid(column=1, columnspan=5, row=1, sticky="ew")
+        ttk.Button(self.recording_lf, text="Browse", command=self.choose_record_template).grid(column=6, row=1, padx=3)
+        ttk.Button(self.recording_lf, text="Rules...", command=self.open_recording_rules).grid(column=7, row=1, padx=3)
+        self.record_threshold = tk.DoubleVar(value=0.9)
+        self.record_interval = tk.DoubleVar(value=0.5)
+        self.record_release = tk.DoubleVar(value=1.0)
+        ttk.Label(self.recording_lf, text="Threshold").grid(column=0, row=2, padx=(5, 2))
+        ttk.Spinbox(self.recording_lf, from_=0.1, to=1.0, increment=0.05, textvariable=self.record_threshold, width=5).grid(column=1, row=2, sticky="w")
+        ttk.Label(self.recording_lf, text="Interval(s)").grid(column=2, row=2, padx=(8, 2))
+        ttk.Spinbox(self.recording_lf, from_=0.1, to=5.0, increment=0.1, textvariable=self.record_interval, width=5).grid(column=3, row=2, sticky="w")
+        ttk.Label(self.recording_lf, text="Absent(s)").grid(column=4, row=2, padx=(8, 2))
+        ttk.Spinbox(self.recording_lf, from_=0.1, to=30.0, increment=0.5, textvariable=self.record_release, width=5).grid(column=5, row=2, sticky="w")
+        ttk.Label(self.recording_lf, text="ROI x,y,w,h").grid(column=6, row=2, padx=(8, 2))
+        self.record_roi = tk.StringVar(value="0,0,0,0")
+        self.record_minimum_duration = tk.DoubleVar(value=0.0)
+        ttk.Entry(self.recording_lf, textvariable=self.record_roi, width=13).grid(column=7, row=2, sticky="w")
+        self.record_debug = tk.BooleanVar(value=False)
+        ttk.Checkbutton(self.recording_lf, text="Show detection debug", variable=self.record_debug,
+                        command=self.toggle_record_debug).grid(column=3, columnspan=2, row=0, padx=5, pady=3, sticky="w")
+        self.record_debug_status = tk.StringVar(value="Debug: disabled")
+        ttk.Label(self.recording_lf, textvariable=self.record_debug_status).grid(
+            column=5, columnspan=3, row=0, padx=5, pady=3, sticky="w"
+        )
+        self.recording_lf.pack(fill="x", padx=5, pady=5)
+        self.recording_f.pack(side="top", fill="both", expand=True)
+        self.controller_nb.add(self.recording_f, padding="5", sticky="nsew", text="Recording")
         self.serial_f = ttk.Frame(self.controller_nb)
         self.settings_lf = ttk.Labelframe(self.serial_f)
         self.com_port_label = ttk.Label(self.settings_lf)
@@ -544,6 +662,36 @@ class PokeControllerApp:
         self.outputs_text_area_2_clear_button.configure(command=self.clearTextArea2)
         self.outputs_clear_lf.configure(text="Clear Outputs")
         self.outputs_clear_lf.grid(column="2", padx="5", pady="5", row="0", sticky="ew")
+        self.panel_assignment_lf = ttk.Labelframe(self.othres_outputs_lf, text="Side panel layout / content")
+        self.panel_layout = tk.StringVar(value="Four panels (left/right, top/bottom)")
+        self.panel_layout_cb = ttk.Combobox(
+            self.panel_assignment_lf, state="readonly", textvariable=self.panel_layout, width=34,
+            values=("Four panels (left/right, top/bottom)", "Two vertical panels", "Output panels hidden"),
+        )
+        self.panel_layout_cb.grid(column=0, columnspan=2, row=0, padx=5, pady=3, sticky="ew")
+        self.panel_layout_cb.bind("<<ComboboxSelected>>", self.apply_panel_assignment)
+        self.show_software_controller = tk.BooleanVar(value=True)
+        self.show_software_controller_cb = ttk.Checkbutton(
+            self.panel_assignment_lf, text="Show software controller", variable=self.show_software_controller,
+            command=self.apply_panel_assignment,
+        )
+        self.show_software_controller_cb.grid(column=2, row=0, padx=5, pady=3, sticky="w")
+        self.panel_slots = {}
+        panel_values = ["Disabled", "Log: Output#1", "Log: Output#2", "Image", "HTML", "Analysis"]
+        for row, (slot, label) in enumerate((("left_top", "Left / Top"), ("left_bottom", "Left / Bottom"),
+                                             ("right_top", "Right / Top"), ("right_bottom", "Right / Bottom")), start=1):
+            ttk.Label(self.panel_assignment_lf, text=label).grid(column=0, row=row, padx=5, pady=2, sticky="w")
+            value = tk.StringVar(value="Disabled")
+            combo = ttk.Combobox(self.panel_assignment_lf, state="readonly", values=panel_values,
+                                 textvariable=value, width=14)
+            combo.grid(column=1, row=row, padx=5, pady=2)
+            combo.bind("<<ComboboxSelected>>", self.apply_panel_assignment)
+            self.panel_slots[slot] = value
+        self.panel_ratio = tk.IntVar(value=50)
+        ttk.Label(self.panel_assignment_lf, text="Top / bottom ratio").grid(column=2, row=1, padx=5)
+        ttk.Scale(self.panel_assignment_lf, from_=10, to=90, variable=self.panel_ratio,
+                  command=self.apply_panel_assignment).grid(column=2, row=1, rowspan=3, padx=5, sticky="ns")
+        self.panel_assignment_lf.grid(column=0, columnspan=3, padx=5, pady=5, row=2, sticky="ew")
         self.othres_outputs_lf.configure(height="200", text="Outputs/Dialogue Settings", width="200")
         self.othres_outputs_lf.grid(column="0", padx="5", row="0", sticky="ew")
         # self.othres_right_frame_lf = ttk.Labelframe(self.others_f)
@@ -609,10 +757,12 @@ class PokeControllerApp:
             self.controller_nb.configure(height="150")
         else:
             self.controller_nb.configure(height="180")
-        self.controller_nb.grid(column="0", padx="5", pady="5", row="1", sticky="ew")
+        self.controller_nb.grid(column="1", padx="5", pady="5", row="1", sticky="ew")
         self.output_area_f = ttk.Frame(self.main_frame)
         self.text_scroll_1 = ttk.LabelFrame(self.output_area_f, relief=tk.GROOVE)
         self.text_scroll_1.configure(text="Output#1")
+        self.output_image_1 = ttk.Label(self.text_scroll_1, text="Shift + drag on video: send crop here", anchor="center")
+        self.output_image_1.pack(fill="x", padx=5, pady=(5, 0))
         self.text_area_1 = tk.Text(self.text_scroll_1)
         self.text_area_1.config(blockcursor="true", height="3", insertunfocussed="none", maxundo="0")
         self.text_area_1.config(relief="flat", state="disabled", undo="false", width="50")
@@ -623,6 +773,8 @@ class PokeControllerApp:
         self.text_scroll_1.pack(expand="true", fill="both", padx="0", pady="0", side="top")
         self.text_scroll_2 = ttk.LabelFrame(self.output_area_f, relief=tk.GROOVE)
         self.text_scroll_2.configure(text="Output#2")
+        self.output_image_2 = ttk.Label(self.text_scroll_2, text="Analysis result / HTML source", anchor="center")
+        self.output_image_2.pack(fill="x", padx=5, pady=(5, 0))
         self.text_area_2 = tk.Text(self.text_scroll_2)
         self.text_area_2.config(blockcursor="true", height="3", insertunfocussed="none", maxundo="0")
         self.text_area_2.config(relief="flat", state="disabled", undo="false", width="50")
@@ -631,7 +783,28 @@ class PokeControllerApp:
         self.text_area_2["yscrollcommand"] = self.yscroll_2.set
         self.text_area_2.pack(expand="true", fill="both", padx=(5, 0), pady="5")
         self.text_scroll_2.pack(expand="true", fill="both", padx="0", pady="0", side="top")
-        self.output_area_f.grid(column="3", padx="5", pady="5", row="0", rowspan="2", sticky="nsew")
+        self.left_output_area_f = ttk.Frame(self.main_frame)
+        self.left_top_panel = ttk.LabelFrame(self.left_output_area_f, text="Left / Top")
+        self.left_bottom_panel = ttk.LabelFrame(self.left_output_area_f, text="Left / Bottom")
+        self.left_top_image = ttk.Label(self.left_top_panel, text="Left / Top", anchor="center")
+        self.left_top_image.pack(fill="x", padx=5, pady=(5, 0))
+        self.left_top_text = tk.Text(self.left_top_panel, height=5, width=28, state="disabled", relief="flat")
+        self.left_top_text.pack(expand=True, fill="both", padx=5, pady=5)
+        self.left_bottom_image = ttk.Label(self.left_bottom_panel, text="Left / Bottom", anchor="center")
+        self.left_bottom_image.pack(fill="x", padx=5, pady=(5, 0))
+        self.left_bottom_text = tk.Text(self.left_bottom_panel, height=5, width=28, state="disabled", relief="flat")
+        self.left_bottom_text.pack(expand=True, fill="both", padx=5, pady=5)
+        self.left_top_panel.pack(expand=True, fill="both", side="top")
+        self.left_bottom_panel.pack(expand=True, fill="both", side="top")
+        self.left_output_area_f.grid(column="0", padx="5", pady="5", row="0", rowspan="2", sticky="nsew")
+        self.output_area_f.grid(column="2", padx="5", pady="5", row="0", rowspan="2", sticky="nsew")
+        self.panel_widgets = {
+            "left_top": (self.left_top_panel, self.left_top_image, self.left_top_text),
+            "left_bottom": (self.left_bottom_panel, self.left_bottom_image, self.left_bottom_text),
+            "right_top": (self.text_scroll_1, self.output_image_1, self.text_area_1),
+            "right_bottom": (self.text_scroll_2, self.output_image_2, self.text_area_2),
+        }
+        self.base_text_areas = (self.text_area_1, self.text_area_2)
         self.softcon_frame = ttk.LabelFrame(self.output_area_f, relief=tk.GROOVE)
         self.softcon_frame.configure(text="Software-Controller")
         self.softcon_left_frame = tk.Frame(self.softcon_frame, bg="#56CCF2")
@@ -700,7 +873,9 @@ class PokeControllerApp:
         self.softcon_frame.grid_anchor("center")
         self.main_frame.config(height="720", padding="5", relief="flat", width="1280")
         self.main_frame.pack(expand="true", fill="both", side="top")
-        self.main_frame.columnconfigure("3", weight="1")
+        self.main_frame.columnconfigure("0", weight="1")
+        self.main_frame.columnconfigure("1", weight="3")
+        self.main_frame.columnconfigure("2", weight="1")
         """
         ここまで
         """
@@ -961,6 +1136,36 @@ class PokeControllerApp:
         self.right_frame_widget_mode.set(self.settings.right_frame_widget_mode)
         self.pos_software_controller.set(self.settings.pos_software_controller)
         self.pos_dialogue_buttons.set(self.settings.pos_dialogue_buttons)
+        self.panel_slots["left_top"].set(self.settings.panel_left_top)
+        self.panel_slots["left_bottom"].set(self.settings.panel_left_bottom)
+        self.panel_slots["right_top"].set(self.settings.panel_right_top)
+        self.panel_slots["right_bottom"].set(self.settings.panel_right_bottom)
+        self.panel_ratio.set(self.settings.panel_ratio)
+        self.panel_layout.set(self.settings.panel_layout)
+        self.show_software_controller.set(self.settings.show_software_controller)
+        self.audio_input.set(self.settings.audio_input)
+        self.audio_gain.set(self.settings.audio_gain)
+        self.audio_filter_camera.set(self.settings.audio_filter_camera)
+        self.audio_auto_start.set(self.settings.audio_auto_start)
+        self.vision_mode.set(self.settings.vision_mode)
+        self.record_mode.set(self.settings.record_mode)
+        self.record_template_path.set(self.settings.record_template_path)
+        self.record_threshold.set(self.settings.record_threshold)
+        self.record_interval.set(self.settings.record_interval)
+        self.record_release.set(self.settings.record_release)
+        self.record_roi.set(self.settings.record_roi)
+        self.record_debug.set(self.settings.record_debug)
+        self.record_minimum_duration.set(self.settings.record_minimum_duration)
+        try:
+            self.record_trigger_rules = json.loads(self.settings.record_trigger_rules)
+            self.record_cleanup_rules = json.loads(self.settings.record_cleanup_rules)
+        except (TypeError, ValueError):
+            self.record_trigger_rules, self.record_cleanup_rules = [], []
+        self.configure_recording_rules()
+        if self.record_template_path.get():
+            self.recorder.configure_template(self.record_template_path.get())
+        self.apply_panel_assignment()
+        self.refresh_presets()
 
         # Shortcutボタンに名称とtooltipを設定する
         self.shortcut_1.set(self.shortcut_command_name[1][:8])
@@ -1067,10 +1272,17 @@ class PokeControllerApp:
         self.preview.setTouchscreenArea(
             self.touchscreen_start_x, self.touchscreen_start_y, self.touchscreen_end_x, self.touchscreen_end_y
         )
+        self.preview.set_region_listener(self.receive_output_region)
+        self.preview.set_frame_listener(self.analyse_live_frame)
+        self.preview.set_record_listener(self.process_recording_frame)
+        # Audio devices have now been enumerated and the GUI is ready.  Use
+        # an idle callback so an unavailable device never delays startup.
+        self.root.after(700, self.start_audio_on_launch)
         self.loadCommands()
 
         # キャンバスに自動化スクリプトからアクセスできるようにする。
         Command.canvas = self.preview
+        Command.output = self.show_output
 
         self.show_size_tmp = self.show_size_cb["values"].index(self.show_size_cb.get())
         self.root.bind("<Key-F5>", self.ReloadCommandWithF5)
@@ -1308,6 +1520,8 @@ class PokeControllerApp:
         else:
             ret = None
         self.camera_id.set(ret)
+        if hasattr(self, "audio_filter_camera") and self.audio_filter_camera.get():
+            self.update_audio_input_list()
 
     def set_device(self, event=None):
         self.com_port.set(int(re.search(r"COM(\d+)", self.serial_device_name.get()).groups()[0]))
@@ -1910,9 +2124,33 @@ class PokeControllerApp:
             self.settings.right_frame_widget_mode = self.right_frame_widget_mode.get()
             self.settings.pos_software_controller = self.pos_software_controller.get()
             self.settings.pos_dialogue_buttons = self.pos_dialogue_buttons.get()
+            self.settings.panel_left_top = self.panel_slots["left_top"].get()
+            self.settings.panel_left_bottom = self.panel_slots["left_bottom"].get()
+            self.settings.panel_right_top = self.panel_slots["right_top"].get()
+            self.settings.panel_right_bottom = self.panel_slots["right_bottom"].get()
+            self.settings.panel_ratio = self.panel_ratio.get()
+            self.settings.panel_layout = self.panel_layout.get()
+            self.settings.show_software_controller = self.show_software_controller.get()
+            self.settings.audio_input = self.audio_input.get()
+            self.settings.audio_gain = self.audio_gain.get()
+            self.settings.audio_filter_camera = self.audio_filter_camera.get()
+            self.settings.audio_auto_start = self.audio_auto_start.get()
+            self.settings.vision_mode = self.vision_mode.get()
+            self.settings.record_mode = self.record_mode.get()
+            self.settings.record_template_path = self.record_template_path.get()
+            self.settings.record_threshold = self.record_threshold.get()
+            self.settings.record_interval = self.record_interval.get()
+            self.settings.record_release = self.record_release.get()
+            self.settings.record_roi = self.record_roi.get()
+            self.settings.record_debug = self.record_debug.get()
+            self.settings.record_trigger_rules = json.dumps(self.record_trigger_rules)
+            self.settings.record_cleanup_rules = json.dumps(self.record_cleanup_rules)
+            self.settings.record_minimum_duration = self.record_minimum_duration.get()
 
             self.settings.save()
 
+            self.stop_audio_monitor()
+            self.recorder.stop()
             self.camera.destroy()
             cv2.destroyAllWindows()
             self._logger.debug("Stop Poke Controller")
@@ -1958,6 +2196,459 @@ class PokeControllerApp:
         self.clearTextArea1()
         self.clearTextArea2()
 
+    def receive_output_region(self, image_bgr, rect):
+        """Display the persistent red selection in the currently selected output."""
+        target = self.output_image_1 if self.stdout_destination.get() == "1" else self.output_image_2
+        self.display_output_image(target, image_bgr)
+        print(f"Output crop: x={rect[0]}, y={rect[1]}, w={rect[2]}, h={rect[3]}")
+
+    def apply_panel_assignment(self, *event):
+        """Reflect assignment in titles and expose it to command scripts.
+
+        Output#1 and Output#2 remain the two existing result areas; the slot
+        settings describe where each result belongs in the four-panel layout.
+        """
+        slots = {name: value.get() for name, value in self.panel_slots.items()}
+        output_1_slot = next((name for name, value in slots.items() if value == "Log: Output#1"), "unassigned")
+        output_2_slot = next((name for name, value in slots.items() if value == "Log: Output#2"), "unassigned")
+        self.text_scroll_1.configure(text=f"Output#1 ({output_1_slot})")
+        self.text_scroll_2.configure(text=f"Output#2 ({output_2_slot})")
+        if output_1_slot != "unassigned":
+            self.text_area_1 = self.panel_widgets[output_1_slot][2]
+        else:
+            self.text_area_1 = self.base_text_areas[0]
+        if output_2_slot != "unassigned":
+            self.text_area_2 = self.panel_widgets[output_2_slot][2]
+        else:
+            self.text_area_2 = self.base_text_areas[1]
+        if self.show_software_controller.get():
+            self.softcon_frame.pack(expand="true", fill="both", padx="0", pady="0", side="top")
+        else:
+            self.softcon_frame.pack_forget()
+
+        is_two = self.panel_layout.get() == "Two vertical panels"
+        is_hidden = self.panel_layout.get() == "Output panels hidden"
+        for panel, _, _ in self.panel_widgets.values():
+            panel.pack_forget()
+        if not is_hidden:
+            visible_slots = ("right_top", "right_bottom") if is_two else self.panel_widgets.keys()
+            for slot in visible_slots:
+                self.panel_widgets[slot][0].pack(expand=True, fill="both", side="top")
+        # Rebind the stdout proxy after a log destination is moved.
+        if hasattr(self, "stdout_destination"):
+            self.switchStdoutDestination(silent=True)
+        for slot, (_, image_label, text_widget) in self.panel_widgets.items():
+            content = slots[slot]
+            if content == "Disabled":
+                image_label.configure(text="Disabled", image="")
+            elif content in ("Image", "HTML", "Analysis"):
+                image_label.configure(text=content, image="")
+
+    def show_output(self, panel, text=None, image=None, html_path=None):
+        """Public UI API used by Command.show_output()."""
+        if panel in self.panel_slots:
+            _, image_label, text_area = self.panel_widgets[panel]
+            if image is not None:
+                self.display_output_image(image_label, image)
+            if text is not None:
+                text_area.configure(state="normal")
+                text_area.delete("1.0", "end")
+                text_area.insert("end", str(text))
+                text_area.configure(state="disabled")
+            if html_path:
+                webbrowser.open(Path(html_path).resolve().as_uri())
+            return
+        if panel == "Analysis":
+            panel = "Output#2"
+        if panel == "Log: Output#1":
+            panel = "Output#1"
+        if panel == "Log: Output#2":
+            panel = "Output#2"
+        if panel == "Disabled":
+            return
+        image_label = self.output_image_1 if panel == "Output#1" else self.output_image_2
+        text_area = self.text_area_1 if panel == "Output#1" else self.text_area_2
+        if image is not None:
+            self.display_output_image(image_label, image)
+        if text is not None:
+            text_area.configure(state="normal")
+            text_area.delete("1.0", "end")
+            text_area.insert("end", str(text))
+            text_area.configure(state="disabled")
+        if html_path:
+            webbrowser.open(Path(html_path).resolve().as_uri())
+
+    def display_output_image(self, target, image_bgr):
+        if image_bgr is None or image_bgr.size == 0:
+            return
+        h, w = image_bgr.shape[:2]
+        scale = min(300 / max(w, 1), 180 / max(h, 1), 1.0)
+        image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(image_rgb).resize((max(1, int(w * scale)), max(1, int(h * scale))))
+        tk_image = ImageTk.PhotoImage(image)
+        target.configure(image=tk_image, text="")
+        target.image = tk_image  # prevent Tk from garbage-collecting the image
+
+    def change_vision_mode(self, event=None):
+        self.vision.set_mode(self.vision_mode.get())
+        print(f"Vision mode: {self.vision_mode.get()}")
+
+    def reload_vision_rules(self):
+        self.vision.reload_rules()
+        self.vision_mode_cb.configure(values=list(self.vision.modes.keys()))
+        if self.vision_mode.get() not in self.vision.modes:
+            self.vision_mode.set("default")
+        self.change_vision_mode()
+
+    def analyse_live_frame(self, frame):
+        try:
+            result = self.vision.analyse(frame)
+            text = result.to_json()
+            if text != self._last_vision_text:
+                self._last_vision_text = text
+                self.text_area_2.configure(state="normal")
+                self.text_area_2.delete("1.0", "end")
+                self.text_area_2.insert("end", text)
+                self.text_area_2.configure(state="disabled")
+        except Exception as error:
+            self._logger.warning(f"Live analysis error: {error}")
+
+    def refresh_audio_devices(self):
+        self.all_audio_inputs = AudioMonitor.devices("input")
+        self.update_audio_input_list()
+
+    def _show_full_audio_device_name(self, *_):
+        self.audio_device_full_name.set(self.audio_input.get())
+
+    def update_audio_input_list(self):
+        """Optionally limit Audio In to devices similar to the selected camera."""
+        import re
+
+        camera_name = self.camera_name_cb.get().lower()
+        tokens = [word for word in re.split(r"[^a-z0-9]+", camera_name) if len(word) >= 3]
+        inputs = getattr(self, "all_audio_inputs", [])
+        if self.audio_filter_camera.get() and tokens:
+            inputs = [name for name in inputs if any(token in name.lower() for token in tokens)]
+        self.audio_input_cb.configure(values=inputs)
+        if inputs and self.audio_input.get() not in inputs:
+            self.audio_input.set(inputs[0])
+        elif not inputs:
+            self.audio_input.set("")
+
+    def match_camera_audio(self):
+        """Select the audio device whose name best matches the camera name."""
+        import re
+
+        camera_name = self.camera_name_cb.get().lower()
+        # USB model words are more useful than generic words such as 'video'.
+        tokens = [word for word in re.split(r"[^a-z0-9]+", camera_name) if len(word) >= 3]
+        candidates = list(self.audio_input_cb.cget("values"))
+        best = max(candidates, key=lambda name: sum(token in name.lower() for token in tokens), default=None)
+        if best and any(token in best.lower() for token in tokens):
+            self.audio_input.set(best)
+        else:
+            tkmsg.showinfo("Capture audio", "カメラ名に一致する音声デバイスを見つけられませんでした。Audio Inから選択してください。")
+
+    def start_audio_monitor(self):
+        try:
+            self.audio_monitor.start(self.audio_input.get(), gain_percent=self.audio_gain.get())
+            self.audio_start_button.configure(text="Audio running")
+        except Exception as error:
+            tkmsg.showerror("Capture audio", "音声デバイスを開始できません。sounddevice をインストールし、キャプチャーデバイスを選択してください。\n\n" + str(error))
+
+    def start_audio_on_launch(self):
+        """Automatic start should never show a modal error during launch."""
+        if not self.audio_auto_start.get() or not self.audio_input.get():
+            return
+        try:
+            self.audio_monitor.start(self.audio_input.get(), gain_percent=self.audio_gain.get())
+            self.audio_start_button.configure(text="Audio running")
+        except Exception as error:
+            print("[AUDIO] Automatic start failed: " + str(error))
+
+    def stop_audio_monitor(self):
+        self.audio_monitor.stop()
+        self.audio_start_button.configure(text="Start audio")
+
+    def choose_record_template(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(title="Recording trigger template", filetypes=[("Image", "*.png;*.jpg;*.jpeg;*.bmp")])
+        if path:
+            self.record_template_path.set(path)
+            self.recorder.configure_template(path)
+
+    def configure_recording_rules(self):
+        """Apply saved multi-image AND rules and post-recording discard rules."""
+        valid_trigger = [rule for rule in self.record_trigger_rules if rule.get("path")]
+        self.recorder.configure_trigger_rules(valid_trigger)
+        self.recorder.configure_cleanup_rules(self.record_cleanup_rules, self.record_minimum_duration.get())
+
+    def open_recording_rules(self):
+        """Edit multi-image start (AND) and discard rules in a small popup."""
+        from tkinter import filedialog
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Recording image rules")
+        dialog.transient(self.root)
+        trigger_rows = [
+            {"path": tk.StringVar(value=item.get("path", "")), "threshold": tk.DoubleVar(value=item.get("threshold", 0.9))}
+            for item in self.record_trigger_rules
+        ] or [{"path": tk.StringVar(value=self.record_template_path.get()), "threshold": tk.DoubleVar(value=self.record_threshold.get())}]
+        cleanup_rows = [
+            {"path": tk.StringVar(value=item.get("path", "")), "threshold": tk.DoubleVar(value=item.get("threshold", 0.9)),
+             "minimum_percent": tk.DoubleVar(value=item.get("minimum_percent", 100.0))}
+            for item in self.record_cleanup_rules
+        ]
+        trigger_frame = ttk.Labelframe(dialog, text="Start images — ALL images must match (AND)")
+        cleanup_frame = ttk.Labelframe(dialog, text="Discard a completed recording when an image is present")
+        trigger_frame.grid(column=0, row=0, padx=8, pady=6, sticky="ew")
+        cleanup_frame.grid(column=0, row=1, padx=8, pady=6, sticky="ew")
+
+        def pick(target):
+            path = filedialog.askopenfilename(title="Choose image", filetypes=[("Image", "*.png;*.jpg;*.jpeg;*.bmp")])
+            if path:
+                target.set(path)
+
+        def render_trigger():
+            for child in trigger_frame.winfo_children():
+                child.destroy()
+            ttk.Label(trigger_frame, text="Image").grid(column=0, row=0, padx=3)
+            ttk.Label(trigger_frame, text="Threshold").grid(column=3, row=0, padx=3)
+            for row, item in enumerate(trigger_rows, 1):
+                ttk.Entry(trigger_frame, textvariable=item["path"], width=52).grid(column=0, row=row, padx=3, pady=2)
+                ttk.Button(trigger_frame, text="...", width=3, command=lambda value=item["path"]: pick(value)).grid(column=1, row=row)
+                ttk.Spinbox(trigger_frame, from_=0.1, to=1.0, increment=0.05, textvariable=item["threshold"], width=6).grid(column=3, row=row)
+                ttk.Button(trigger_frame, text="-", width=3, command=lambda index=row - 1: (trigger_rows.pop(index), render_trigger())).grid(column=4, row=row)
+            ttk.Button(trigger_frame, text="+ Add start image", command=lambda: (trigger_rows.append({"path": tk.StringVar(), "threshold": tk.DoubleVar(value=0.9)}), render_trigger())).grid(column=0, row=len(trigger_rows) + 1, padx=3, pady=3, sticky="w")
+
+        def render_cleanup():
+            for child in cleanup_frame.winfo_children():
+                child.destroy()
+            ttk.Label(cleanup_frame, text="Image").grid(column=0, row=0, padx=3)
+            ttk.Label(cleanup_frame, text="Match threshold").grid(column=3, row=0, padx=3)
+            ttk.Label(cleanup_frame, text="Discard if present >= %").grid(column=4, row=0, padx=3)
+            for row, item in enumerate(cleanup_rows, 1):
+                ttk.Entry(cleanup_frame, textvariable=item["path"], width=52).grid(column=0, row=row, padx=3, pady=2)
+                ttk.Button(cleanup_frame, text="...", width=3, command=lambda value=item["path"]: pick(value)).grid(column=1, row=row)
+                ttk.Spinbox(cleanup_frame, from_=0.1, to=1.0, increment=0.05, textvariable=item["threshold"], width=6).grid(column=3, row=row)
+                ttk.Spinbox(cleanup_frame, from_=0, to=100, increment=1, textvariable=item["minimum_percent"], width=6).grid(column=4, row=row)
+                ttk.Button(cleanup_frame, text="-", width=3, command=lambda index=row - 1: (cleanup_rows.pop(index), render_cleanup())).grid(column=5, row=row)
+            ttk.Button(cleanup_frame, text="+ Add discard image", command=lambda: (cleanup_rows.append({"path": tk.StringVar(), "threshold": tk.DoubleVar(value=0.9), "minimum_percent": tk.DoubleVar(value=100.0)}), render_cleanup())).grid(column=0, row=len(cleanup_rows) + 1, padx=3, pady=3, sticky="w")
+
+        def save_rules():
+            self.record_trigger_rules = [{"path": item["path"].get(), "threshold": item["threshold"].get()} for item in trigger_rows if item["path"].get()]
+            self.record_cleanup_rules = [
+                {"path": item["path"].get(), "threshold": item["threshold"].get(), "minimum_percent": item["minimum_percent"].get()}
+                for item in cleanup_rows if item["path"].get()
+            ]
+            self.configure_recording_rules()
+            dialog.destroy()
+
+        render_trigger()
+        render_cleanup()
+        ttk.Label(dialog, text="Discard recordings shorter than (s):").grid(column=0, row=2, padx=8, pady=(4, 0), sticky="w")
+        ttk.Spinbox(dialog, from_=0, to=3600, increment=1, textvariable=self.record_minimum_duration, width=8).grid(column=0, row=3, padx=8, sticky="w")
+        ttk.Button(dialog, text="Save rules", command=save_rules).grid(column=0, row=4, padx=8, pady=8, sticky="e")
+
+    def _recording_roi(self):
+        try:
+            values = tuple(map(int, self.record_roi.get().split(",")))
+            return values if len(values) == 4 else (0, 0, 0, 0)
+        except ValueError:
+            return 0, 0, 0, 0
+
+    def toggle_record_debug(self):
+        if self.record_debug.get():
+            self.record_debug_status.set("Debug: checking template in the ROI...")
+            return
+        self.record_debug_status.set("Debug: disabled")
+        if hasattr(self, "preview"):
+            self.preview.deleteImageRect("RecordingDebugROI")
+            self.preview.deleteImageText("RecordingDebugText")
+
+    def update_recording_debug(self, frame):
+        """Show the template search area and the most recent match result."""
+        if not self.record_debug.get():
+            return
+        x, y, width, height = self.recorder.last_roi
+        if width <= 0 or height <= 0:
+            height, width = frame.shape[:2]
+            x, y = 0, 0
+        score = self.recorder.last_score
+        threshold = self.record_threshold.get()
+        if score is None:
+            text = "ROI: {}  score: n/a (template is larger than ROI or unavailable)".format((x, y, width, height))
+            color = "orange"
+        else:
+            matched = score >= threshold
+            text = "ROI: {}  score: {:.3f} / threshold: {:.3f}  {}".format(
+                (x, y, width, height), score, threshold, "MATCH" if matched else "NO MATCH"
+            )
+            color = "lime" if matched else "red"
+        self.record_debug_status.set("Debug: " + text)
+        self.preview.deleteImageRect("RecordingDebugROI")
+        self.preview.deleteImageText("RecordingDebugText")
+        self.preview.ImgRect(x, y, x + width, y + height, color, "RecordingDebugROI", 0, flag=False)
+        self.preview.ImgText(x, max(18, y + 20), text, "RecordingDebugText", 0, color=color, flag=False)
+
+    def toggle_recording(self):
+        self.configure_recording_rules()
+        if self.record_mode.get() == "Template":
+            if self.record_armed:
+                self.record_armed = False
+                if self.recorder.active:
+                    self.recorder.stop()
+                self.record_button.configure(text="Start recording")
+                return
+            if not self.record_trigger_rules and not self.record_template_path.get():
+                tkmsg.showwarning("Recording", "Choose a template image before arming template recording.")
+                return
+            if not self.record_trigger_rules:
+                self.recorder.configure_template(self.record_template_path.get())
+            expected_rules = len(self.record_trigger_rules) if self.record_trigger_rules else 1
+            configured_rules = len(self.recorder.trigger_rules) if self.record_trigger_rules else (1 if self.recorder.template is not None else 0)
+            if configured_rules != expected_rules:
+                tkmsg.showwarning("Recording", "The template image could not be read.")
+                return
+            self.record_armed = True
+            self.recorder.last_check = 0.0
+            self.record_button.configure(text="Stop monitoring")
+            self.show_output("Analysis", text="Template recording armed: waiting for score >= threshold.")
+            return
+        if self.recorder.active:
+            self.recorder.stop()
+            self.record_button.configure(text="Start recording")
+            self.show_output("Analysis", text="録画を停止しました。MP4はバックグラウンドで結合中です。")
+            return
+        frame = getattr(self.camera, "image_bgr", None)
+        if frame is None:
+            tkmsg.showwarning("Recording", "カメラ映像を開始してから録画してください。")
+            return
+        self.recorder.start(frame, self.fps.get(), self.audio_input.get(), self.audio_gain.get())
+        self.record_button.configure(text="Stop recording")
+
+    def process_recording_frame(self, frame):
+        if self.record_mode.get() == "Manual":
+            self.recorder.add_frame(frame)
+            return
+        if not self.record_armed and not self.record_debug.get():
+            return
+        if not self.record_trigger_rules and self.recorder.template_path != self.record_template_path.get():
+            self.recorder.configure_template(self.record_template_path.get())
+        result = self.recorder.process_detection(
+            frame, self.fps.get(), self.audio_input.get(), self.audio_gain.get(), self.record_threshold.get(), self._recording_roi(),
+            self.record_interval.get(), self.record_release.get(), allow_start=self.record_armed,
+        )
+        self.update_recording_debug(frame)
+        # A detected segment must receive every camera frame, not merely the
+        # low-frequency frames that are used for template matching.
+        if self.recorder.active:
+            self.recorder.add_frame(frame)
+        if result is not None:
+            # Stay armed after one segment finishes so the next matching
+            # appearance becomes the next timestamped recording.
+            self.root.after(0, lambda: self.record_button.configure(text="Stop monitoring"))
+        elif self.recorder.active:
+            self.root.after(0, lambda: self.record_button.configure(text="Stop recording"))
+
+    def _sync_settings_for_preset(self):
+        """Copy every UI setting owned by the added tabs into GuiSettings."""
+        self.settings.camera_id.set(self.camera_id.get())
+        self.settings.com_port.set(self.com_port.get())
+        self.settings.com_port_name.set(self.com_port_name.get())
+        self.settings.baud_rate.set(self.baud_rate.get())
+        self.settings.fps.set(self.fps.get())
+        self.settings.show_size.set(self.show_size.get())
+        self.settings.is_show_realtime.set(self.is_show_realtime.get())
+        self.settings.is_show_value.set(self.is_show_value.get())
+        self.settings.is_show_guide.set(self.is_show_guide.get())
+        self.settings.is_show_serial.set(self.is_show_serial.get())
+        self.settings.is_use_keyboard.set(self.is_use_keyboard.get())
+        self.settings.serial_data_format_name.set(self.serial_data_format_name.get())
+        self.settings.area_size = self.area_size.get()
+        self.settings.stdout_destination = self.stdout_destination.get()
+        self.settings.right_frame_widget_mode = self.right_frame_widget_mode.get()
+        self.settings.pos_software_controller = self.pos_software_controller.get()
+        self.settings.pos_dialogue_buttons = self.pos_dialogue_buttons.get()
+        self.settings.panel_left_top = self.panel_slots["left_top"].get()
+        self.settings.panel_left_bottom = self.panel_slots["left_bottom"].get()
+        self.settings.panel_right_top = self.panel_slots["right_top"].get()
+        self.settings.panel_right_bottom = self.panel_slots["right_bottom"].get()
+        self.settings.panel_ratio = self.panel_ratio.get()
+        self.settings.panel_layout = self.panel_layout.get()
+        self.settings.show_software_controller = self.show_software_controller.get()
+        self.settings.audio_input = self.audio_input.get()
+        self.settings.audio_gain = self.audio_gain.get()
+        self.settings.audio_filter_camera = self.audio_filter_camera.get()
+        self.settings.audio_auto_start = self.audio_auto_start.get()
+        self.settings.vision_mode = self.vision_mode.get()
+        self.settings.record_mode = self.record_mode.get()
+        self.settings.record_template_path = self.record_template_path.get()
+        self.settings.record_threshold = self.record_threshold.get()
+        self.settings.record_interval = self.record_interval.get()
+        self.settings.record_release = self.record_release.get()
+        self.settings.record_roi = self.record_roi.get()
+        self.settings.record_debug = self.record_debug.get()
+        self.settings.record_trigger_rules = json.dumps(self.record_trigger_rules)
+        self.settings.record_cleanup_rules = json.dumps(self.record_cleanup_rules)
+        self.settings.record_minimum_duration = self.record_minimum_duration.get()
+
+    def _preset_dir(self):
+        return os.path.join(os.path.dirname(Settings.GuiSettings.SETTING_PATH), "presets")
+
+    def _preset_path(self, name):
+        safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", name.strip())
+        return os.path.join(self._preset_dir(), safe_name + ".ini") if safe_name else None
+
+    def refresh_presets(self):
+        os.makedirs(self._preset_dir(), exist_ok=True)
+        names = [os.path.splitext(entry)[0] for entry in os.listdir(self._preset_dir()) if entry.endswith(".ini")]
+        self.preset_cb.configure(values=sorted(names))
+
+    def save_preset(self):
+        path = self._preset_path(self.preset_name.get())
+        if path is None:
+            tkmsg.showwarning("Presets", "保存セット名を入力してください。")
+            return
+        self._sync_settings_for_preset()
+        self.settings.save(path)
+        self.refresh_presets()
+        tkmsg.showinfo("Presets", "全タブの設定を保存しました。")
+
+    def load_preset(self):
+        path = self._preset_path(self.preset_name.get())
+        if path is None or not os.path.isfile(path):
+            tkmsg.showwarning("Presets", "読み出す保存セットを選択してください。")
+            return
+        if tkmsg.askyesno("Presets", "現在の設定をこの保存セットで置き換え、PokeConを再起動しますか？"):
+            shutil.copyfile(path, Settings.GuiSettings.SETTING_PATH)
+            tkmsg.showinfo("Presets", "読み出しました。PokeConを再起動してください。")
+
+    def delete_preset(self):
+        path = self._preset_path(self.preset_name.get())
+        if path is None or not os.path.isfile(path):
+            tkmsg.showwarning("Presets", "削除する保存セットを選択してください。")
+            return
+        if tkmsg.askyesno("Presets", f"保存セット '{self.preset_name.get()}' を削除しますか？"):
+            os.remove(path)
+            self.preset_name.set("")
+            self.refresh_presets()
+
+    def open_html_output(self):
+        from tkinter import filedialog
+        path = filedialog.askopenfilename(title="Open HTML for Output#2", filetypes=[("HTML", "*.html;*.htm")])
+        if not path:
+            return
+        with open(path, encoding="utf-8", errors="replace") as html_file:
+            source = html_file.read()
+        self.text_area_2.configure(state="normal")
+        self.text_area_2.delete("1.0", "end")
+        self.text_area_2.insert("end", source)
+        self.text_area_2.configure(state="disabled")
+        # Tk itself has no secure HTML renderer.  The system browser gives full
+        # HTML/CSS/JS rendering while Output#2 keeps the source/result visible.
+        webbrowser.open(Path(path).resolve().as_uri())
+
     def changeAreaSize(self, *event):
         _, height = map(int, self.show_size.get().split("x"))
         max_size = 0.075 * height
@@ -1982,17 +2673,19 @@ class PokeControllerApp:
         self.text_area_1.config(height=text_area_1_size)
         self.text_area_2.config(height=text_area_2_size)
 
-    def switchStdoutDestination(self):
+    def switchStdoutDestination(self, silent=False):
         val = self.stdout_destination.get()
         if val == "1":
             sys.stdout = StdoutRedirector(self.text_area_1)
-            print("standard output destination is switched.")
+            if not silent:
+                print("standard output destination is switched.")
             Command.stdout_destination = val
             self.text_scroll_1.configure(text="Output#1 (Stdout)")
             self.text_scroll_2.configure(text="Output#2")
         elif val == "2":
             sys.stdout = StdoutRedirector(self.text_area_2)
-            print("standard output destination is switched.")
+            if not silent:
+                print("standard output destination is switched.")
             Command.stdout_destination = val
             self.text_scroll_1.configure(text="Output#1")
             self.text_scroll_2.configure(text="Output#2 (Stdout)")

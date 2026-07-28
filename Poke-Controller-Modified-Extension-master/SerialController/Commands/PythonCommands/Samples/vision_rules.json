@@ -1,0 +1,17 @@
+{
+  "modes": {
+    "default": {},
+    "custom_in": {
+      "template": "custom_in_marker.png",
+      "template_threshold": 0.9
+    },
+    "battle": {
+      "hp_regions": [
+        {"name": "enemy_hp_bar", "rect": [900, 72, 280, 12]}
+      ],
+      "ocr_regions": [
+        {"name": "enemy_hp_number", "rect": [1030, 87, 110, 32], "whitelist": "0123456789/", "psm": 7}
+      ]
+    }
+  }
+}

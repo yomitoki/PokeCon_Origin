@@ -126,6 +126,28 @@ class GuiSettings:
             self.pos_dialogue_buttons = self.setting["Output"]["dialogue_buttons_position"]
         except Exception:
             self.pos_dialogue_buttons = "2"
+        self.panel_left_top = self.setting["Output"].get("panel_left_top", "Disabled")
+        self.panel_left_bottom = self.setting["Output"].get("panel_left_bottom", "Disabled")
+        self.panel_right_top = self.setting["Output"].get("panel_right_top", "Log: Output#1")
+        self.panel_right_bottom = self.setting["Output"].get("panel_right_bottom", "Log: Output#2")
+        self.panel_ratio = self.setting["Output"].get("panel_ratio", "50")
+        self.panel_layout = self.setting["Output"].get("panel_layout", "Four panels (left/right, top/bottom)")
+        self.show_software_controller = self.setting["Output"].getboolean("show_software_controller", True)
+        self.audio_input = self.setting.get("Audio", "input_device", fallback="")
+        self.audio_gain = self.setting.get("Audio", "gain", fallback="100")
+        self.audio_filter_camera = self.setting.getboolean("Audio", "filter_camera", fallback=False)
+        self.audio_auto_start = self.setting.getboolean("Audio", "auto_start", fallback=False)
+        self.vision_mode = self.setting.get("Analysis", "vision_mode", fallback="default")
+        self.record_mode = self.setting.get("Recording", "mode", fallback="Manual")
+        self.record_template_path = self.setting.get("Recording", "template_path", fallback="")
+        self.record_threshold = self.setting.get("Recording", "threshold", fallback="0.9")
+        self.record_interval = self.setting.get("Recording", "interval", fallback="0.5")
+        self.record_release = self.setting.get("Recording", "release_seconds", fallback="1.0")
+        self.record_roi = self.setting.get("Recording", "roi", fallback="0,0,0,0")
+        self.record_debug = self.setting.getboolean("Recording", "debug", fallback=False)
+        self.record_trigger_rules = self.setting.get("Recording", "trigger_rules", fallback="[]")
+        self.record_cleanup_rules = self.setting.get("Recording", "cleanup_rules", fallback="[]")
+        self.record_minimum_duration = self.setting.get("Recording", "minimum_duration", fallback="0")
 
     def load(self):
         if os.path.isfile(self.SETTING_PATH):
@@ -231,6 +253,20 @@ class GuiSettings:
             "widget_mode": "ALL (default)",
             "software_controller_position": "2",
             "dialogue_buttons_position": "2",
+            "panel_left_top": "Disabled",
+            "panel_left_bottom": "Disabled",
+            "panel_right_top": "Log: Output#1",
+            "panel_right_bottom": "Log: Output#2",
+            "panel_ratio": "50",
+            "panel_layout": "Four panels (left/right, top/bottom)",
+            "show_software_controller": True,
+        }
+        self.setting["Audio"] = {"input_device": "", "gain": "100", "filter_camera": False, "auto_start": False}
+        self.setting["Analysis"] = {"vision_mode": "default"}
+        self.setting["Recording"] = {
+            "mode": "Manual", "template_path": "", "threshold": "0.9",
+            "interval": "0.5", "release_seconds": "1.0", "roi": "0,0,0,0", "debug": False,
+            "trigger_rules": "[]", "cleanup_rules": "[]", "minimum_duration": "0",
         }
         with open(self.SETTING_PATH, "w", encoding="utf-8") as file:
             self.setting.write(file)
@@ -302,9 +338,37 @@ class GuiSettings:
             "widget_mode": self.right_frame_widget_mode,
             "software_controller_position": self.pos_software_controller,
             "dialogue_buttons_position": self.pos_dialogue_buttons,
+            "panel_left_top": self.panel_left_top,
+            "panel_left_bottom": self.panel_left_bottom,
+            "panel_right_top": self.panel_right_top,
+            "panel_right_bottom": self.panel_right_bottom,
+            "panel_ratio": self.panel_ratio,
+            "panel_layout": self.panel_layout,
+            "show_software_controller": self.show_software_controller,
+        }
+        self.setting["Audio"] = {
+            "input_device": self.audio_input,
+            "gain": self.audio_gain,
+            "filter_camera": self.audio_filter_camera,
+            "auto_start": self.audio_auto_start,
+        }
+        self.setting["Analysis"] = {"vision_mode": self.vision_mode}
+        self.setting["Recording"] = {
+            "mode": self.record_mode,
+            "template_path": self.record_template_path,
+            "threshold": self.record_threshold,
+            "interval": self.record_interval,
+            "release_seconds": self.record_release,
+            "roi": self.record_roi,
+            "debug": self.record_debug,
+            "trigger_rules": self.record_trigger_rules,
+            "cleanup_rules": self.record_cleanup_rules,
+            "minimum_duration": self.record_minimum_duration,
         }
 
-        with open(self.SETTING_PATH, "w", encoding="utf-8") as file:
+        target_path = path or self.SETTING_PATH
+        os.makedirs(os.path.dirname(target_path), exist_ok=True)
+        with open(target_path, "w", encoding="utf-8") as file:
             self.setting.write(file)
-        os.chmod(path=self.SETTING_PATH, mode=0o777)
+        os.chmod(path=target_path, mode=0o777)
         self._logger.debug("Settings file has been saved.")

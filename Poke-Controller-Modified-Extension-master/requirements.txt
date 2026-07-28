@@ -24,6 +24,9 @@ paho-mqtt
 windows-capture-device-list
 gitpython
 plyer
+pytesseract
+sounddevice
+imageio-ffmpeg
 
 #
 # requirements not mentioned in the documents above:

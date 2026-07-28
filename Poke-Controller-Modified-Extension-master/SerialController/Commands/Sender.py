@@ -119,6 +119,7 @@ class Sender:
         if self.is_show_serial.get():
             print(row)
 
+
     def writeList(self, values: list, is_show: bool = False):
         try:
             self.time_bef = time.perf_counter()

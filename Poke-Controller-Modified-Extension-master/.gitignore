@@ -10,6 +10,7 @@
 *.eep
 *.exe
 *.json
+!SerialController/Commands/PythonCommands/Samples/vision_rules.json
 *.bat
 !ExecutePokeConModified-Extension.bat
 !UpdatePokeConModified-Extension.bat
@@ -25,6 +26,8 @@ SerialController/Commands/PythonCommands/*
 !SerialController/Commands/PythonCommands/bridge_functions/
 !SerialController/Commands/PythonCommands/bridge_functions/*
 !SerialController/Commands/PythonCommands/Samples/
+!SerialController/Commands/PythonCommands/LocalSamples/
+!SerialController/Commands/PythonCommands/LocalSamples/*
 !SerialController/Commands/PythonCommands/ImageProcessingOnly/
 SerialController/Commands/PythonCommands/ImageProcessingOnly/*
 !SerialController/Commands/PythonCommands/ImageProcessingOnly/Samples/

@@ -1,0 +1,9 @@
+# シリアルコントローラー関連のログ・生成物
+SerialController/Controller_Log/
+SerialController/Captures/
+SerialController/log/
+SerialController/Recordings/
+SerialController/profiles/default/
+
+# Python キャッシュ
+__pycache__/

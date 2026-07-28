@@ -100,6 +100,12 @@ class CaptureArea(tk.Canvas):
         self.touchscreen_start_y = 1
         self.touchscreen_end_x = 320
         self.touchscreen_end_y = 240
+        # Called with a BGR crop and its source coordinates.  Keeping this in
+        # the preview makes the feature available to every Python command too.
+        self.region_listener = None
+        self.frame_listener = None
+        self.record_listener = None
+        self._last_listener_time = 0.0
 
         self.stick_handler = StreamHandler()
         self.stick_logging_level = DEBUG
@@ -134,6 +140,12 @@ class CaptureArea(tk.Canvas):
         self.bind("<Control-Alt-ButtonPress-1>", self.StartRangeSS)
         self.bind("<Control-Alt-Button1-Motion>", self.MotionRangeSS)
         self.bind("<Control-Alt-ButtonRelease-1>", self.ReleaseRangeSS_asksaveasfilename)
+
+        # Shift-drag is a persistent "send to output" selection.  Ctrl+Shift
+        # retains the existing behaviour (save a cropped capture).
+        self.bind("<Shift-ButtonPress-1>", self.StartOutputRegion)
+        self.bind("<Shift-Button1-Motion>", self.MotionRangeSS)
+        self.bind("<Shift-ButtonRelease-1>", self.ReleaseOutputRegion)
 
         self.bind("<Control-ButtonPress-3>", self.StartRangeTouchscreen)
         self.bind("<Control-Button3-Motion>", self.MotionRangeTouchscreen)
@@ -189,6 +201,40 @@ class CaptureArea(tk.Canvas):
             self.BindLeftClick()
         if self.master.is_use_right_stick_mouse.get():
             self.BindRightClick()
+
+    def set_region_listener(self, listener):
+        """Set ``listener(image_bgr, (x, y, width, height))`` for Shift-drag."""
+        self.region_listener = listener
+
+    def set_frame_listener(self, listener):
+        """Set a low-rate callback for live BGR frames (max. 4 calls/sec)."""
+        self.frame_listener = listener
+
+    def set_record_listener(self, listener):
+        """Set a callback invoked for every displayed capture frame."""
+        self.record_listener = listener
+
+    def StartOutputRegion(self, event):
+        self.min_x, self.min_y = event.x, event.y
+        self.delete("OutputRegion")
+        self.create_rectangle(event.x, event.y, event.x + 1, event.y + 1,
+                              width=3, outline="red", tag="OutputRegion")
+
+    def ReleaseOutputRegion(self, event):
+        self.max_x = min(max(event.x, 0), self.show_width)
+        self.max_y = min(max(event.y, 0), self.show_height)
+        x1, x2 = sorted((self.min_x, self.max_x))
+        y1, y2 = sorted((self.min_y, self.max_y))
+        self.coords("OutputRegion", x1, y1, x2, y2)
+        if not self.region_listener or not hasattr(self.camera, "image_bgr"):
+            return
+        ratio_x = self.camera.capture_size[0] / self.show_width
+        ratio_y = self.camera.capture_size[1] / self.show_height
+        sx, sy = int(x1 * ratio_x), int(y1 * ratio_y)
+        ex, ey = int(x2 * ratio_x), int(y2 * ratio_y)
+        image = self.camera.image_bgr[sy:ey, sx:ex].copy()
+        if image.size:
+            self.region_listener(image, (sx, sy, ex - sx, ey - sy))
 
     def MotionRangeSS(self, event):
         if event.x < 0:
@@ -644,6 +690,11 @@ class CaptureArea(tk.Canvas):
             return
 
         if image_bgr is not None:
+            if self.record_listener is not None:
+                self.record_listener(image_bgr)
+            if self.frame_listener is not None and time.monotonic() - self._last_listener_time >= 0.25:
+                self._last_listener_time = time.monotonic()
+                self.frame_listener(image_bgr.copy())
             image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
             image_pil = Image.fromarray(image_rgb).resize(self.show_size)
             image_tk = ImageTk.PhotoImage(image_pil)
