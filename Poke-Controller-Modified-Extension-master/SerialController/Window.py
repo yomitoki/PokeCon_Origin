@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import datetime
 import sys
 import os
 import re
@@ -254,6 +255,37 @@ class PokeControllerApp:
         # self.camera_f.configure(height='200', width='200')    # removed
         self.camera_f.pack(side="top")
         self.controller_nb.add(self.camera_f, padding="5", sticky="nsew", text="Camera")
+        self.area_capture_f = ttk.Frame(self.controller_nb)
+        self.area_capture_lf = ttk.Labelframe(self.area_capture_f, text="Capture selected camera area")
+        ttk.Label(self.area_capture_lf, text="ROI x,y,w,h:").grid(column=0, row=0, padx=5, pady=5, sticky="w")
+        self.area_capture_roi = tk.StringVar(value="0,0,0,0")
+        self.area_capture_roi.trace_add("write", self.area_capture_roi_changed)
+        self.area_capture_active = tk.BooleanVar(value=True)
+        ttk.Checkbutton(self.area_capture_lf, text="Active live preview", variable=self.area_capture_active,
+                        command=self.toggle_area_capture_active).grid(column=4, row=1, padx=5, pady=2, sticky="w")
+        ttk.Entry(self.area_capture_lf, textvariable=self.area_capture_roi, width=20).grid(column=1, row=0, padx=5, pady=5, sticky="w")
+        ttk.Button(self.area_capture_lf, text="Capture area", command=self.save_area_capture).grid(column=2, row=0, padx=5, pady=5)
+        ttk.Button(self.area_capture_lf, text="Open folder", command=self.open_area_capture_dir).grid(column=3, row=0, padx=5, pady=5)
+        ttk.Label(self.area_capture_lf, text="Preview panel:").grid(column=0, row=1, padx=5, pady=2, sticky="w")
+        self.area_capture_output_target = tk.StringVar(value="Output#1")
+        self.area_capture_output_cb = ttk.Combobox(self.area_capture_lf, state="readonly", width=24,
+                                                    textvariable=self.area_capture_output_target)
+        self.area_capture_output_cb.grid(column=1, row=1, padx=5, pady=2, sticky="w")
+        self.area_capture_output_cb.bind("<<ComboboxSelected>>", self.select_area_capture_preview)
+        ttk.Label(self.area_capture_lf, text="Arrow move(px):").grid(column=2, row=1, padx=5, pady=2, sticky="e")
+        self.area_capture_step = tk.IntVar(value=5)
+        ttk.Spinbox(self.area_capture_lf, from_=1, to=200, textvariable=self.area_capture_step, width=5).grid(column=3, row=1, padx=5, pady=2, sticky="w")
+        ttk.Button(self.area_capture_lf, text="Preview / edit...", command=self.open_area_capture_editor).grid(column=0, row=2, padx=5, pady=2, sticky="w")
+        ttk.Label(self.area_capture_lf, text="Preview background:").grid(column=1, row=2, padx=5, pady=2, sticky="e")
+        self.area_capture_background = tk.StringVar(value="#ffffff")
+        self.area_capture_background.trace_add("write", self.apply_area_capture_background)
+        ttk.Entry(self.area_capture_lf, textvariable=self.area_capture_background, width=10).grid(column=2, row=2, padx=2, pady=2, sticky="w")
+        ttk.Button(self.area_capture_lf, text="Color...", command=self.choose_area_capture_background).grid(column=3, row=2, padx=5, pady=2, sticky="w")
+        self.area_capture_status = tk.StringVar(value="")
+        ttk.Label(self.area_capture_lf, textvariable=self.area_capture_status).grid(column=0, columnspan=5, row=3, padx=5, pady=(0, 5), sticky="w")
+        self.area_capture_lf.pack(fill="x", padx=5, pady=5)
+        self.area_capture_f.pack(side="top", fill="both", expand=True)
+        self.controller_nb.add(self.area_capture_f, padding="5", sticky="nsew", text="Area Capture")
         self.audio_lf.pack(fill="x", padx=5, pady=5)
         self.audio_f.pack(side="top", fill="both", expand=True)
         self.controller_nb.add(self.audio_f, padding="5", sticky="nsew", text="Audio")
@@ -305,6 +337,13 @@ class PokeControllerApp:
         ttk.Label(self.recording_lf, textvariable=self.record_debug_status).grid(
             column=5, columnspan=3, row=0, padx=5, pady=3, sticky="w"
         )
+        ttk.Label(self.recording_lf, text="Recording set:").grid(column=0, row=3, padx=(5, 2), pady=(3, 5), sticky="w")
+        self.recording_preset_name = tk.StringVar()
+        self.recording_preset_cb = ttk.Combobox(self.recording_lf, textvariable=self.recording_preset_name, width=18)
+        self.recording_preset_cb.grid(column=1, columnspan=2, row=3, padx=2, pady=(3, 5), sticky="w")
+        ttk.Button(self.recording_lf, text="Save", command=self.save_recording_preset).grid(column=3, row=3, padx=2, pady=(3, 5))
+        ttk.Button(self.recording_lf, text="Load", command=self.load_recording_preset).grid(column=4, row=3, padx=2, pady=(3, 5))
+        ttk.Button(self.recording_lf, text="Delete", command=self.delete_recording_preset).grid(column=5, row=3, padx=2, pady=(3, 5))
         self.recording_lf.pack(fill="x", padx=5, pady=5)
         self.recording_f.pack(side="top", fill="both", expand=True)
         self.controller_nb.add(self.recording_f, padding="5", sticky="nsew", text="Recording")
@@ -629,16 +668,45 @@ class PokeControllerApp:
         self.notification_f.pack()
         self.controller_nb.add(self.notification_f, sticky="nsew", text="Notification")
         self.others_f = ttk.Frame(self.controller_nb)
+        self.others_preset_lf = ttk.Labelframe(self.others_f, text="Others setting set")
+        ttk.Label(self.others_preset_lf, text="Set:").grid(column=0, row=0, padx=(5, 2), pady=4)
+        self.others_preset_name = tk.StringVar()
+        self.others_preset_cb = ttk.Combobox(self.others_preset_lf, textvariable=self.others_preset_name, width=20)
+        self.others_preset_cb.grid(column=1, row=0, padx=2, pady=4)
+        self.others_preset_cb.bind("<<ComboboxSelected>>", lambda *_: self.load_others_preset())
+        ttk.Button(self.others_preset_lf, text="Save", command=self.save_others_preset).grid(column=2, row=0, padx=2, pady=4)
+        ttk.Button(self.others_preset_lf, text="Apply", command=self.load_others_preset).grid(column=3, row=0, padx=2, pady=4)
+        ttk.Button(self.others_preset_lf, text="Delete", command=self.delete_others_preset).grid(column=4, row=0, padx=(2, 5), pady=4)
+        self.others_preset_lf.grid(column=0, row=0, padx=5, pady=(3, 0), sticky="ew")
         self.othres_outputs_lf = ttk.Labelframe(self.others_f)
         self.outputs_size_adjuster_lf = ttk.Labelframe(self.othres_outputs_lf)
+        self.panel_split_adjuster_lf = ttk.Labelframe(self.othres_outputs_lf, text="Panel split")
         self.area_size_scale = ttk.Scale(self.outputs_size_adjuster_lf)
         self.area_size = tk.IntVar(value=20)
         self.area_size_scale.configure(from_="0", length="200", orient="horizontal", to="100")
         self.area_size_scale.configure(value="50", variable=self.area_size)
         self.area_size_scale.grid(column="0", padx="5", pady="5", row="0", sticky="ew")
         self.area_size_scale.configure(command=self.changeAreaSize)
+        # Legacy text-area size control is superseded by layout-aware sizing.
+        self.area_size_scale.grid_forget()
+        self.side_width_balance = tk.IntVar(value=50)
+        self.panel_ratio = tk.IntVar(value=50)
+        self.right_panel_ratio = tk.IntVar(value=50)
+        self.size_adjuster_label = ttk.Label(self.outputs_size_adjuster_lf, text="Left / right width")
+        self.size_adjuster_scale = ttk.Scale(self.outputs_size_adjuster_lf, from_=20, to=80,
+                                              orient="horizontal", variable=self.side_width_balance,
+                                              command=lambda *_: self.apply_panel_assignment())
+        self.panel_split_label = ttk.Label(self.panel_split_adjuster_lf, text="Left: top / bottom")
+        self.panel_split_scale = ttk.Scale(self.panel_split_adjuster_lf, from_=10, to=90,
+                                            orient="horizontal", variable=self.panel_ratio,
+                                            command=lambda *_: self.apply_panel_assignment())
+        self.right_panel_split_label = ttk.Label(self.panel_split_adjuster_lf, text="Right: top / bottom")
+        self.right_panel_split_scale = ttk.Scale(self.panel_split_adjuster_lf, from_=10, to=90,
+                                                  orient="horizontal", variable=self.right_panel_ratio,
+                                                  command=lambda *_: self.apply_panel_assignment())
         self.outputs_size_adjuster_lf.configure(text="Size Adjuster")
         self.outputs_size_adjuster_lf.grid(column="0", padx="5", pady="5", row="0", sticky="ew")
+        self.panel_split_adjuster_lf.grid(column="1", padx="5", pady="5", row="0", sticky="ew")
         self.outputs_stdout_dest_lf = ttk.Labelframe(self.othres_outputs_lf)
         self.stdout_destination_1_rb = ttk.Radiobutton(self.outputs_stdout_dest_lf)
         self.stdout_destination = tk.StringVar(value="1")
@@ -650,7 +718,14 @@ class PokeControllerApp:
         self.stdout_destination_2_rb.grid(column="1", padx="5", pady="5", row="0", sticky="ew")
         self.stdout_destination_2_rb.configure(command=self.switchStdoutDestination)
         self.outputs_stdout_dest_lf.configure(text="Standard Output Destination")
-        self.outputs_stdout_dest_lf.grid(column="1", padx="5", pady="5", row="0", sticky="ew")
+        self.stdout_log_target = tk.StringVar()
+        self.stdout_log_target_cb = ttk.Combobox(self.outputs_stdout_dest_lf, state="readonly", width=16,
+                                                 textvariable=self.stdout_log_target)
+        self.stdout_log_target_cb.grid(column=0, columnspan=2, row=1, padx=5, pady=3, sticky="ew")
+        self.stdout_log_target_cb.bind("<<ComboboxSelected>>", self.select_stdout_log_target)
+        self.stdout_destination_1_rb.grid_forget()
+        self.stdout_destination_2_rb.grid_forget()
+        self.outputs_stdout_dest_lf.grid(column="2", padx="5", pady="5", row="0", sticky="ew")
         self.outputs_clear_lf = ttk.Labelframe(self.othres_outputs_lf)
         self.outputs_text_area_1_clear_button = ttk.Button(self.outputs_clear_lf)
         self.outputs_text_area_1_clear_button.configure(text="Clear(#1)")
@@ -661,15 +736,39 @@ class PokeControllerApp:
         self.outputs_text_area_2_clear_button.grid(column="1", padx="10", pady="5", row="0", sticky="ew")
         self.outputs_text_area_2_clear_button.configure(command=self.clearTextArea2)
         self.outputs_clear_lf.configure(text="Clear Outputs")
-        self.outputs_clear_lf.grid(column="2", padx="5", pady="5", row="0", sticky="ew")
+        self.clear_log_target = tk.StringVar()
+        self.clear_log_target_cb = ttk.Combobox(self.outputs_clear_lf, state="readonly", width=16,
+                                                textvariable=self.clear_log_target)
+        self.clear_log_target_cb.grid(column=0, columnspan=2, row=1, padx=5, pady=3, sticky="ew")
+        ttk.Button(self.outputs_clear_lf, text="Clear selected", command=self.clear_selected_log).grid(
+            column=0, columnspan=2, row=2, padx=5, pady=3
+        )
+        self.outputs_text_area_1_clear_button.grid_forget()
+        self.outputs_text_area_2_clear_button.grid_forget()
+        self.outputs_clear_lf.grid(column="3", padx="5", pady="5", row="0", sticky="ew")
+        ttk.Button(self.othres_outputs_lf, text="Side panels...", command=self.open_side_panel_settings).grid(
+            column=4, row=0, padx=5, pady=5, sticky="ew"
+        )
         self.panel_assignment_lf = ttk.Labelframe(self.othres_outputs_lf, text="Side panel layout / content")
-        self.panel_layout = tk.StringVar(value="Four panels (left/right, top/bottom)")
+        self.panel_layout = tk.StringVar(value="Four panels (left/right, top/bottom)")  # legacy setting
+        self.panel_sides = tk.StringVar(value="Both sides")
         self.panel_layout_cb = ttk.Combobox(
-            self.panel_assignment_lf, state="readonly", textvariable=self.panel_layout, width=34,
-            values=("Four panels (left/right, top/bottom)", "Two vertical panels", "Output panels hidden"),
+            self.panel_assignment_lf, state="readonly", textvariable=self.panel_sides, width=18,
+            values=("Both sides", "Left side only", "Right side only", "Both sides hidden"),
         )
         self.panel_layout_cb.grid(column=0, columnspan=2, row=0, padx=5, pady=3, sticky="ew")
         self.panel_layout_cb.bind("<<ComboboxSelected>>", self.apply_panel_assignment)
+        ttk.Label(self.panel_assignment_lf, text="Left panels").grid(column=0, row=5, padx=5, pady=2, sticky="w")
+        self.left_panel_count = tk.StringVar(value="2")
+        ttk.Combobox(self.panel_assignment_lf, state="readonly", values=("1", "2"), width=4,
+                     textvariable=self.left_panel_count).grid(column=1, row=5, padx=5, pady=2, sticky="w")
+        ttk.Label(self.panel_assignment_lf, text="Right panels").grid(column=2, row=5, padx=5, pady=2, sticky="w")
+        self.right_panel_count = tk.StringVar(value="2")
+        right_count_cb = ttk.Combobox(self.panel_assignment_lf, state="readonly", values=("1", "2"), width=4,
+                                      textvariable=self.right_panel_count)
+        right_count_cb.grid(column=2, row=6, padx=5, pady=2, sticky="w")
+        for variable in (self.left_panel_count, self.right_panel_count):
+            variable.trace_add("write", lambda *_: self.apply_panel_assignment())
         self.show_software_controller = tk.BooleanVar(value=True)
         self.show_software_controller_cb = ttk.Checkbutton(
             self.panel_assignment_lf, text="Show software controller", variable=self.show_software_controller,
@@ -687,13 +786,12 @@ class PokeControllerApp:
             combo.grid(column=1, row=row, padx=5, pady=2)
             combo.bind("<<ComboboxSelected>>", self.apply_panel_assignment)
             self.panel_slots[slot] = value
-        self.panel_ratio = tk.IntVar(value=50)
         ttk.Label(self.panel_assignment_lf, text="Top / bottom ratio").grid(column=2, row=1, padx=5)
         ttk.Scale(self.panel_assignment_lf, from_=10, to=90, variable=self.panel_ratio,
                   command=self.apply_panel_assignment).grid(column=2, row=1, rowspan=3, padx=5, sticky="ns")
         self.panel_assignment_lf.grid(column=0, columnspan=3, padx=5, pady=5, row=2, sticky="ew")
         self.othres_outputs_lf.configure(height="200", text="Outputs/Dialogue Settings", width="200")
-        self.othres_outputs_lf.grid(column="0", padx="5", row="0", sticky="ew")
+        self.othres_outputs_lf.grid(column="0", padx="5", row="1", sticky="ew")
         # self.othres_right_frame_lf = ttk.Labelframe(self.others_f)
         self.select_right_frame_widget = ttk.Labelframe(self.othres_outputs_lf)
         self.select_right_frame_widget_cb = ttk.Combobox(self.select_right_frame_widget)
@@ -717,7 +815,7 @@ class PokeControllerApp:
         self.select_right_frame_widget_cb.grid(column="1", padx="5", pady="5", row="0", sticky="ew")
         self.select_right_frame_widget_cb.bind("<<ComboboxSelected>>", self.replace_right_frame_widget)
         self.select_right_frame_widget.configure(text="Widget Mode")
-        self.select_right_frame_widget.grid(column="0", padx="5", pady="5", row="1", sticky="ew")
+        # Widget Mode is retained only for old profiles.  Side-panel settings above supersede it.
         self.pos_software_controller_lf = ttk.Labelframe(self.othres_outputs_lf)
         self.pos_software_controller = tk.StringVar(value="2")
         self.pos_top_rb = ttk.Radiobutton(self.pos_software_controller_lf)
@@ -804,6 +902,9 @@ class PokeControllerApp:
             "right_top": (self.text_scroll_1, self.output_image_1, self.text_area_1),
             "right_bottom": (self.text_scroll_2, self.output_image_2, self.text_area_2),
         }
+        self.area_capture_inline = {}
+        self.area_capture_inline_zoom = {}
+        self.area_capture_drag = {}
         self.base_text_areas = (self.text_area_1, self.text_area_2)
         self.softcon_frame = ttk.LabelFrame(self.output_area_f, relief=tk.GROOVE)
         self.softcon_frame.configure(text="Software-Controller")
@@ -1141,7 +1242,20 @@ class PokeControllerApp:
         self.panel_slots["right_top"].set(self.settings.panel_right_top)
         self.panel_slots["right_bottom"].set(self.settings.panel_right_bottom)
         self.panel_ratio.set(self.settings.panel_ratio)
+        self.right_panel_ratio.set(self.settings.right_panel_ratio)
         self.panel_layout.set(self.settings.panel_layout)
+        # Migrate the former layout choices once, while allowing new profiles
+        # to persist the explicit left/right visibility setting.
+        legacy_layout = self.settings.panel_layout
+        if self.settings.panel_sides == "Both sides" and legacy_layout == "Two vertical panels":
+            self.panel_sides.set("Right side only")
+        elif self.settings.panel_sides == "Both sides" and legacy_layout == "Output panels hidden":
+            self.panel_sides.set("Both sides hidden")
+        else:
+            self.panel_sides.set(self.settings.panel_sides)
+        self.left_panel_count.set(self.settings.left_panel_count)
+        self.right_panel_count.set(self.settings.right_panel_count)
+        self.side_width_balance.set(self.settings.side_width_balance)
         self.show_software_controller.set(self.settings.show_software_controller)
         self.audio_input.set(self.settings.audio_input)
         self.audio_gain.set(self.settings.audio_gain)
@@ -1156,16 +1270,22 @@ class PokeControllerApp:
         self.record_roi.set(self.settings.record_roi)
         self.record_debug.set(self.settings.record_debug)
         self.record_minimum_duration.set(self.settings.record_minimum_duration)
+        self.area_capture_roi.set(self.settings.area_capture_roi)
+        self.area_capture_output_target.set(self.settings.area_capture_output_target)
+        self.area_capture_background.set(self.settings.area_capture_background)
+        self.area_capture_active.set(self.settings.area_capture_active)
         try:
             self.record_trigger_rules = json.loads(self.settings.record_trigger_rules)
             self.record_cleanup_rules = json.loads(self.settings.record_cleanup_rules)
         except (TypeError, ValueError):
             self.record_trigger_rules, self.record_cleanup_rules = [], []
         self.configure_recording_rules()
+        self.refresh_recording_presets()
         if self.record_template_path.get():
             self.recorder.configure_template(self.record_template_path.get())
         self.apply_panel_assignment()
         self.refresh_presets()
+        self.refresh_others_presets()
 
         # Shortcutボタンに名称とtooltipを設定する
         self.shortcut_1.set(self.shortcut_command_name[1][:8])
@@ -1275,6 +1395,7 @@ class PokeControllerApp:
         self.preview.set_region_listener(self.receive_output_region)
         self.preview.set_frame_listener(self.analyse_live_frame)
         self.preview.set_record_listener(self.process_recording_frame)
+        self.root.after(1000, self.preview_area_capture)
         # Audio devices have now been enumerated and the GUI is ready.  Use
         # an idle callback so an unavailable device never delays startup.
         self.root.after(700, self.start_audio_on_launch)
@@ -1456,6 +1577,271 @@ class PokeControllerApp:
 
     def saveCapture(self):
         self.camera.saveCapture()
+
+    def _area_capture_rect(self, image):
+        try:
+            x, y, width, height = map(int, self.area_capture_roi.get().split(","))
+        except ValueError:
+            raise ValueError("ROI must be x,y,width,height")
+        frame_height, frame_width = image.shape[:2]
+        if width <= 0 or height <= 0:
+            return 0, 0, frame_width, frame_height
+        x, y = max(0, x), max(0, y)
+        width, height = min(width, frame_width - x), min(height, frame_height - y)
+        if width <= 0 or height <= 0:
+            raise ValueError("ROI is outside the camera image")
+        return x, y, width, height
+
+    def area_capture_roi_changed(self, *_):
+        """Typed ROI edits behave the same as a Shift-drag selection."""
+        if self.area_capture_active.get() and hasattr(self, "camera") and getattr(self.camera, "image_bgr", None) is not None:
+            self.root.after_idle(self.preview_area_capture)
+
+    def toggle_area_capture_active(self):
+        if self.area_capture_active.get():
+            self.area_capture_status.set("Area Capture preview: active")
+            self.preview_area_capture()
+            return
+        if hasattr(self, "preview"):
+            self.preview.deleteImageRect("AreaCaptureROI")
+        slot = self._area_capture_preview_slot()
+        if slot in self.area_capture_inline:
+            self.area_capture_inline[slot][0].pack_forget()
+        self.area_capture_status.set("Area Capture preview: inactive")
+
+    def save_area_capture(self):
+        image = getattr(self.camera, "image_bgr", None)
+        if image is None:
+            tkmsg.showwarning("Area Capture", "Start the camera before capturing an area.")
+            return
+        try:
+            x, y, width, height = self._area_capture_rect(image)
+        except ValueError as error:
+            tkmsg.showwarning("Area Capture", str(error))
+            return
+        directory = "Captures_Area"
+        os.makedirs(directory, exist_ok=True)
+        filename = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S_%f") + ".png"
+        path = os.path.join(directory, filename)
+        if cv2.imwrite(path, image[y:y + height, x:x + width]):
+            self.area_capture_status.set("Saved: " + path)
+            print("Area capture succeeded: " + path)
+        else:
+            self.area_capture_status.set("Capture failed")
+
+    def open_area_capture_dir(self):
+        directory = "Captures_Area"
+        os.makedirs(directory, exist_ok=True)
+        if platform.system() == "Windows":
+            subprocess.Popen(["explorer", os.path.abspath(directory)])
+        elif platform.system() == "Darwin":
+            subprocess.Popen(["open", directory])
+
+    def choose_area_capture_background(self):
+        from tkinter import colorchooser
+        _, color = colorchooser.askcolor(color=self.area_capture_background.get(), parent=self.root)
+        if color:
+            self.area_capture_background.set(color)
+
+    def apply_area_capture_background(self, *_):
+        color = self.area_capture_background.get()
+        for _, canvas in self.area_capture_inline.values():
+            try:
+                canvas.configure(background=color)
+            except tk.TclError:
+                pass
+
+    def select_area_capture_preview(self, *event):
+        """An Area Capture preview owns its panel, so its text log is disabled."""
+        slot = self.area_capture_output_target.get().split(" ", 1)[0]
+        if slot not in self.panel_slots:
+            return
+        if self.panel_slots[slot].get().startswith("Log:"):
+            if not tkmsg.askyesno("Area Capture preview", "Assign this panel to Area Capture?\nText log output for this panel will be disabled."):
+                self.area_capture_output_target.set("")
+                return
+            self.panel_slots[slot].set("Image")
+            self.apply_panel_assignment()
+        elif self.panel_slots[slot].get() != "Image":
+            self.panel_slots[slot].set("Image")
+            self.apply_panel_assignment()
+        self.preview_area_capture()
+
+    def preview_area_capture(self):
+        if not self.area_capture_active.get():
+            return None
+        self.area_capture_status.set("Area Capture preview: active")
+        image = getattr(self.camera, "image_bgr", None)
+        if image is None:
+            return None
+        try:
+            x, y, width, height = self._area_capture_rect(image)
+        except ValueError:
+            return None
+        if hasattr(self, "preview"):
+            self.preview.deleteImageRect("AreaCaptureROI")
+            self.preview.ImgRect(x, y, x + width, y + height, "red", "AreaCaptureROI", 0, flag=False)
+        crop = image[y:y + height, x:x + width].copy()
+        slot = self.area_capture_output_target.get().split(" ", 1)[0]
+        if slot in self.panel_widgets:
+            self.display_area_capture_inline(slot, crop)
+        return crop
+
+    def _ensure_area_capture_inline(self, slot):
+        if slot in self.area_capture_inline:
+            return self.area_capture_inline[slot]
+        panel, _, _ = self.panel_widgets[slot]
+        holder = ttk.Frame(panel)
+        canvas = tk.Canvas(holder, background=self.area_capture_background.get(), highlightthickness=0)
+        y_scroll = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
+        x_scroll = ttk.Scrollbar(holder, orient="horizontal", command=canvas.xview)
+        canvas.configure(xscrollcommand=x_scroll.set, yscrollcommand=y_scroll.set)
+        canvas.grid(column=0, row=0, sticky="nsew")
+        y_scroll.grid(column=1, row=0, sticky="ns")
+        x_scroll.grid(column=0, row=1, sticky="ew")
+        controls = ttk.Frame(holder)
+        controls.grid(column=0, columnspan=2, row=2, pady=(3, 0), sticky="ew")
+        holder.columnconfigure(0, weight=1)
+        holder.rowconfigure(0, weight=1)
+
+        def scroll(event):
+            canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+        def zoom(event):
+            current = self.area_capture_inline_zoom.get(slot, 1.0)
+            self.area_capture_inline_zoom[slot] = max(0.25, min(8.0, current * (1.25 if event.delta > 0 else 0.8)))
+            self.preview_area_capture()
+
+        def button_zoom(factor):
+            current = self.area_capture_inline_zoom.get(slot, 1.0)
+            self.area_capture_inline_zoom[slot] = max(0.25, min(8.0, current * factor))
+            self.preview_area_capture()
+
+        def button_resize(edge, direction):
+            self.resize_area_capture(edge, direction)
+
+        canvas.bind("<MouseWheel>", scroll)
+        canvas.bind("<Control-MouseWheel>", zoom)
+        ttk.Button(controls, text="−", width=3, command=lambda: button_zoom(0.8)).pack(side="left", padx=2)
+        ttk.Button(controls, text="+", width=3, command=lambda: button_zoom(1.25)).pack(side="left", padx=2)
+        ttk.Label(controls, text="Left edge").pack(side="left", padx=(10, 2))
+        ttk.Button(controls, text="<", width=3, command=lambda: button_resize("left", -1)).pack(side="left", padx=1)
+        ttk.Button(controls, text=">", width=3, command=lambda: button_resize("left", 1)).pack(side="left", padx=1)
+        ttk.Label(controls, text="Right edge").pack(side="left", padx=(6, 2))
+        ttk.Button(controls, text="<", width=3, command=lambda: button_resize("right", -1)).pack(side="left", padx=1)
+        ttk.Button(controls, text=">", width=3, command=lambda: button_resize("right", 1)).pack(side="left", padx=1)
+        ttk.Label(controls, text="Top edge").pack(side="left", padx=(6, 2))
+        ttk.Button(controls, text="^", width=3, command=lambda: button_resize("top", -1)).pack(side="left", padx=1)
+        ttk.Button(controls, text="v", width=3, command=lambda: button_resize("top", 1)).pack(side="left", padx=1)
+        ttk.Label(controls, text="Bottom edge").pack(side="left", padx=(6, 2))
+        ttk.Button(controls, text="^", width=3, command=lambda: button_resize("bottom", -1)).pack(side="left", padx=1)
+        ttk.Button(controls, text="v", width=3, command=lambda: button_resize("bottom", 1)).pack(side="left", padx=1)
+        self.area_capture_inline[slot] = (holder, canvas)
+        self.area_capture_inline_zoom[slot] = 1.0
+        return holder, canvas
+
+    def display_area_capture_inline(self, slot, image_bgr):
+        holder, canvas = self._ensure_area_capture_inline(slot)
+        zoom = self.area_capture_inline_zoom.get(slot, 1.0)
+        h, w = image_bgr.shape[:2]
+        rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+        image = Image.fromarray(rgb).resize((max(1, int(w * zoom)), max(1, int(h * zoom))))
+        tk_image = ImageTk.PhotoImage(image)
+        canvas.delete("area_capture")
+        canvas.create_image(0, 0, anchor="nw", image=tk_image, tags="area_capture")
+        canvas.image = tk_image
+        canvas.configure(scrollregion=(0, 0, image.width, image.height))
+        holder.pack(expand=True, fill="both", padx=5, pady=5)
+
+    def move_area_capture(self, dx, dy):
+        image = getattr(self.camera, "image_bgr", None)
+        if image is None:
+            return
+        try:
+            x, y, width, height = self._area_capture_rect(image)
+        except ValueError:
+            return
+        x = max(0, min(x + dx, image.shape[1] - width))
+        y = max(0, min(y + dy, image.shape[0] - height))
+        self.area_capture_roi.set("{},{},{},{}".format(x, y, width, height))
+        self.preview_area_capture()
+
+    def resize_area_capture(self, edge, direction):
+        """Move one ROI edge; the opposite edge stays fixed."""
+        image = getattr(self.camera, "image_bgr", None)
+        if image is None:
+            return
+        try:
+            x, y, width, height = self._area_capture_rect(image)
+        except ValueError:
+            return
+        amount = self.area_capture_step.get() * direction
+        if edge == "left":
+            new_x = max(0, min(x + amount, x + width - 1))
+            width += x - new_x
+            x = new_x
+        elif edge == "right":
+            width = max(1, min(image.shape[1] - x, width + amount))
+        elif edge == "top":
+            new_y = max(0, min(y + amount, y + height - 1))
+            height += y - new_y
+            y = new_y
+        elif edge == "bottom":
+            height = max(1, min(image.shape[0] - y, height + amount))
+        self.area_capture_roi.set("{},{},{},{}".format(x, y, width, height))
+        self.preview_area_capture()
+
+    def open_area_capture_editor(self):
+        if getattr(self.camera, "image_bgr", None) is None:
+            tkmsg.showwarning("Area Capture", "Start the camera before opening the preview.")
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Area Capture preview / edit")
+        slot = self._area_capture_preview_slot()
+        zoom = tk.DoubleVar(value=self.area_capture_inline_zoom.get(slot, 1.0))
+        canvas = tk.Canvas(dialog, width=640, height=420, background="#303030")
+        y_scroll = ttk.Scrollbar(dialog, orient="vertical", command=canvas.yview)
+        x_scroll = ttk.Scrollbar(dialog, orient="horizontal", command=canvas.xview)
+        canvas.configure(xscrollcommand=x_scroll.set, yscrollcommand=y_scroll.set)
+        canvas.grid(column=0, row=1, columnspan=5, sticky="nsew")
+        y_scroll.grid(column=5, row=1, sticky="ns")
+        x_scroll.grid(column=0, columnspan=5, row=2, sticky="ew")
+        dialog.columnconfigure(0, weight=1)
+        dialog.rowconfigure(1, weight=1)
+
+        def refresh():
+            crop = self.preview_area_capture()
+            if crop is None:
+                return
+            h, w = crop.shape[:2]
+            scale = zoom.get()
+            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+            picture = Image.fromarray(rgb).resize((max(1, int(w * scale)), max(1, int(h * scale))))
+            tk_picture = ImageTk.PhotoImage(picture)
+            canvas.delete("preview")
+            canvas.create_image(0, 0, anchor="nw", image=tk_picture, tags="preview")
+            canvas.image = tk_picture
+            canvas.configure(scrollregion=(0, 0, picture.width, picture.height))
+
+        def adjust(dx, dy):
+            self.move_area_capture(dx * self.area_capture_step.get(), dy * self.area_capture_step.get())
+            refresh()
+
+        def change_zoom(factor):
+            zoom.set(max(0.25, min(8.0, zoom.get() * factor)))
+            if slot:
+                self.area_capture_inline_zoom[slot] = zoom.get()
+            self.preview_area_capture()
+            refresh()
+
+        ttk.Button(dialog, text="−", command=lambda: change_zoom(0.8)).grid(column=0, row=0, padx=3, pady=4)
+        ttk.Label(dialog, textvariable=zoom).grid(column=1, row=0, padx=3)
+        ttk.Button(dialog, text="+", command=lambda: change_zoom(1.25)).grid(column=2, row=0, padx=3, pady=4)
+        ttk.Button(dialog, text="←", command=lambda: adjust(-1, 0)).grid(column=3, row=0, padx=3)
+        ttk.Button(dialog, text="↑", command=lambda: adjust(0, -1)).grid(column=4, row=0, padx=3)
+        ttk.Button(dialog, text="↓", command=lambda: adjust(0, 1)).grid(column=3, row=3, padx=3, pady=4)
+        ttk.Button(dialog, text="→", command=lambda: adjust(1, 0)).grid(column=4, row=3, padx=3, pady=4)
+        refresh()
 
     def OpenCaptureDir(self):
         directory = "Captures"
@@ -2060,6 +2446,45 @@ class PokeControllerApp:
         self.mainwindow.mainloop()
 
     def exit(self):
+        """Avoid destroying the window while the background MP4 encoder runs."""
+        if getattr(self, "_exit_waiting", False):
+            return
+
+        # In Template mode the Start button arms monitoring.  Disarm it before
+        # closing so that a camera callback cannot begin another segment.
+        if getattr(self, "record_armed", False):
+            self.record_armed = False
+            if hasattr(self, "record_button"):
+                self.record_button.configure(text="Start recording")
+            self.show_output("Analysis", text="Template recording monitoring stopped before closing.")
+
+        # This starts final encoding in a background thread when there is an
+        # active clip; it intentionally does not wait for ffmpeg here.
+        if getattr(self.recorder, "active", False):
+            self.recorder.stop()
+            if hasattr(self, "record_button"):
+                self.record_button.configure(text="Start recording")
+
+        if getattr(self.recorder, "is_finalizing", False):
+            if tkmsg.askyesno(
+                "MP4 conversion in progress",
+                "MP4ファイルを作成中です。\n変換終了後にPoke Controllerを閉じますか？\n\n"
+                "「いいえ」を選ぶと、ツールは開いたままになります。",
+            ):
+                self._exit_waiting = True
+                self.show_output("Analysis", text="MP4 conversion in progress. The tool will close when it finishes.")
+                self._wait_for_recording_finalization()
+            return
+        self._exit_now()
+
+    def _wait_for_recording_finalization(self):
+        if getattr(self.recorder, "is_finalizing", False):
+            self.root.after(250, self._wait_for_recording_finalization)
+            return
+        self._exit_waiting = False
+        self._exit_now()
+
+    def _exit_now(self):
         # 一度proconのスレッドを落とす
         self.flag_procon = False
         self.record_pro_controller_checkbox["state"] = "normal"
@@ -2129,7 +2554,12 @@ class PokeControllerApp:
             self.settings.panel_right_top = self.panel_slots["right_top"].get()
             self.settings.panel_right_bottom = self.panel_slots["right_bottom"].get()
             self.settings.panel_ratio = self.panel_ratio.get()
+            self.settings.right_panel_ratio = self.right_panel_ratio.get()
             self.settings.panel_layout = self.panel_layout.get()
+            self.settings.panel_sides = self.panel_sides.get()
+            self.settings.left_panel_count = self.left_panel_count.get()
+            self.settings.right_panel_count = self.right_panel_count.get()
+            self.settings.side_width_balance = self.side_width_balance.get()
             self.settings.show_software_controller = self.show_software_controller.get()
             self.settings.audio_input = self.audio_input.get()
             self.settings.audio_gain = self.audio_gain.get()
@@ -2146,6 +2576,10 @@ class PokeControllerApp:
             self.settings.record_trigger_rules = json.dumps(self.record_trigger_rules)
             self.settings.record_cleanup_rules = json.dumps(self.record_cleanup_rules)
             self.settings.record_minimum_duration = self.record_minimum_duration.get()
+            self.settings.area_capture_roi = self.area_capture_roi.get()
+            self.settings.area_capture_output_target = self.area_capture_output_target.get()
+            self.settings.area_capture_background = self.area_capture_background.get()
+            self.settings.area_capture_active = self.area_capture_active.get()
 
             self.settings.save()
 
@@ -2196,10 +2630,131 @@ class PokeControllerApp:
         self.clearTextArea1()
         self.clearTextArea2()
 
+    def _configured_log_choices(self):
+        slots = {name: value.get() for name, value in self.panel_slots.items()}
+        choices = []
+        for output, number in (("Log: Output#1", "1"), ("Log: Output#2", "2")):
+            slot = next((name for name, value in slots.items() if value == output), None)
+            if slot:
+                choices.append((number, "Output#{} ({})".format(number, slot.replace("_", " "))))
+        return choices
+
+    def refresh_log_controls(self):
+        if not hasattr(self, "stdout_log_target_cb"):
+            return
+        choices = self._configured_log_choices()
+        labels = [label for _, label in choices]
+        self.stdout_log_target_cb.configure(values=labels)
+        self.clear_log_target_cb.configure(values=labels)
+        if hasattr(self, "area_capture_output_cb"):
+            area_choices = ["{} ({})".format(slot, value.get()) for slot, value in self.panel_slots.items()]
+            self.area_capture_output_cb.configure(values=area_choices)
+            if self.area_capture_output_target.get() not in area_choices:
+                legacy_target = self.area_capture_output_target.get()
+                logical = "Log: " + legacy_target if legacy_target.startswith("Output#") else ""
+                migrated = next(("{} ({})".format(slot, value.get()) for slot, value in self.panel_slots.items()
+                                 if value.get() == logical), "")
+                self.area_capture_output_target.set(migrated)
+        selected = next((label for number, label in choices if number == self.stdout_destination.get()), labels[0] if labels else "")
+        if choices and not any(number == self.stdout_destination.get() for number, _ in choices):
+            self.stdout_destination.set(choices[0][0])
+        self.stdout_log_target.set(selected)
+        if not self.clear_log_target.get() or self.clear_log_target.get() not in labels:
+            self.clear_log_target.set(selected)
+
+    def select_stdout_log_target(self, *event):
+        chosen = self.stdout_log_target.get()
+        if chosen.startswith("Output#1"):
+            self.stdout_destination.set("1")
+        elif chosen.startswith("Output#2"):
+            self.stdout_destination.set("2")
+        self.switchStdoutDestination()
+
+    def clear_selected_log(self):
+        chosen = self.clear_log_target.get()
+        if chosen.startswith("Output#1"):
+            self.clearTextArea1()
+        elif chosen.startswith("Output#2"):
+            self.clearTextArea2()
+
+    def _area_capture_preview_slot(self):
+        if not hasattr(self, "area_capture_output_target"):
+            return ""
+        return self.area_capture_output_target.get().split(" ", 1)[0]
+
+    def open_side_panel_settings(self):
+        """Keep the detailed side settings reachable on compact windows."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Side panel settings")
+        dialog.transient(self.root)
+        layout = ttk.Labelframe(dialog, text="Visible sides and panel count")
+        layout.grid(column=0, row=0, padx=8, pady=6, sticky="ew")
+        ttk.Label(layout, text="Display").grid(column=0, row=0, padx=5, pady=4, sticky="w")
+        side_cb = ttk.Combobox(layout, state="readonly", width=20, textvariable=self.panel_sides,
+                               values=("Both sides", "Left side only", "Right side only", "Both sides hidden"))
+        side_cb.grid(column=1, row=0, padx=5, pady=4)
+        side_cb.bind("<<ComboboxSelected>>", self.apply_panel_assignment)
+        ttk.Label(layout, text="Left panels").grid(column=0, row=1, padx=5, pady=4, sticky="w")
+        left_count_cb = ttk.Combobox(layout, state="readonly", width=5, textvariable=self.left_panel_count, values=("1", "2"))
+        left_count_cb.grid(column=1, row=1, padx=5, pady=4, sticky="w")
+        left_count_cb.bind("<<ComboboxSelected>>", self.apply_panel_assignment)
+        ttk.Label(layout, text="Right panels").grid(column=2, row=1, padx=5, pady=4, sticky="w")
+        right_count_cb = ttk.Combobox(layout, state="readonly", width=5, textvariable=self.right_panel_count, values=("1", "2"))
+        right_count_cb.grid(column=3, row=1, padx=5, pady=4, sticky="w")
+        right_count_cb.bind("<<ComboboxSelected>>", self.apply_panel_assignment)
+        ttk.Checkbutton(layout, text="Show software controller", variable=self.show_software_controller,
+                        command=self.apply_panel_assignment).grid(column=0, columnspan=2, row=2, padx=5, pady=4, sticky="w")
+        ttk.Radiobutton(layout, text="Controller TOP", variable=self.pos_software_controller, value="1",
+                        command=self.apply_panel_assignment).grid(column=2, row=2, padx=5, pady=4)
+        ttk.Radiobutton(layout, text="BOTTOM", variable=self.pos_software_controller, value="2",
+                        command=self.apply_panel_assignment).grid(column=3, row=2, padx=5, pady=4)
+
+        assignments = ttk.Labelframe(dialog, text="Content assigned to each panel")
+        assignments.grid(column=0, row=1, padx=8, pady=6, sticky="ew")
+        panel_values = ("Disabled", "Log: Output#1", "Log: Output#2", "Image", "HTML", "Analysis")
+        for row, (slot, label) in enumerate((("left_top", "Left / Top"), ("left_bottom", "Left / Bottom"),
+                                             ("right_top", "Right / Top"), ("right_bottom", "Right / Bottom"))):
+            ttk.Label(assignments, text=label).grid(column=0, row=row, padx=5, pady=3, sticky="w")
+            combo = ttk.Combobox(assignments, state="readonly", width=18, values=panel_values,
+                                 textvariable=self.panel_slots[slot])
+            combo.grid(column=1, row=row, padx=5, pady=3)
+            combo.bind("<<ComboboxSelected>>", self.apply_panel_assignment)
+        ttk.Button(dialog, text="Close", command=dialog.destroy).grid(column=0, row=2, padx=8, pady=(0, 8), sticky="e")
+
+    def update_size_adjuster_controls(self, show_left, show_right):
+        self.size_adjuster_label.grid_forget()
+        self.size_adjuster_scale.grid_forget()
+        self.panel_split_label.grid_forget()
+        self.panel_split_scale.grid_forget()
+        self.right_panel_split_label.grid_forget()
+        self.right_panel_split_scale.grid_forget()
+        row = 0
+        split_row = 0
+        if show_left and show_right:
+            self.size_adjuster_label.configure(text="Left / right width")
+            self.size_adjuster_label.grid(column=0, row=row, padx=5, pady=(2, 0), sticky="w")
+            self.size_adjuster_scale.grid(column=0, row=row + 1, padx=5, pady=(0, 2), sticky="ew")
+            row += 2
+        if show_left and self.left_panel_count.get() == "2":
+            self.panel_split_label.configure(text="Left: top / bottom split")
+            self.panel_split_label.grid(column=0, row=split_row, padx=5, pady=(2, 0), sticky="w")
+            self.panel_split_scale.grid(column=0, row=split_row + 1, padx=5, pady=(0, 2), sticky="ew")
+            split_row += 2
+        if show_right and self.right_panel_count.get() == "2":
+            self.right_panel_split_label.grid(column=0, row=split_row, padx=5, pady=(2, 0), sticky="w")
+            self.right_panel_split_scale.grid(column=0, row=split_row + 1, padx=5, pady=(0, 4), sticky="ew")
+            split_row += 2
+        if split_row:
+            self.panel_split_adjuster_lf.grid()
+        else:
+            self.panel_split_adjuster_lf.grid_remove()
+
     def receive_output_region(self, image_bgr, rect):
         """Display the persistent red selection in the currently selected output."""
-        target = self.output_image_1 if self.stdout_destination.get() == "1" else self.output_image_2
-        self.display_output_image(target, image_bgr)
+        if hasattr(self, "area_capture_roi"):
+            self.area_capture_roi.set("{},{},{},{}".format(*rect))
+            self.area_capture_status.set("Selected ROI: {},{},{},{}".format(*rect))
+        self.preview_area_capture()
         print(f"Output crop: x={rect[0]}, y={rect[1]}, w={rect[2]}, h={rect[3]}")
 
     def apply_panel_assignment(self, *event):
@@ -2221,35 +2776,100 @@ class PokeControllerApp:
             self.text_area_2 = self.panel_widgets[output_2_slot][2]
         else:
             self.text_area_2 = self.base_text_areas[1]
-        if self.show_software_controller.get():
-            self.softcon_frame.pack(expand="true", fill="both", padx="0", pady="0", side="top")
+        self.softcon_frame.pack_forget()
+        sides = self.panel_sides.get()
+        show_left = sides in ("Both sides", "Left side only")
+        show_right = sides in ("Both sides", "Right side only")
+        # The controller lives inside the right output container, but it is a
+        # separate option from the side log panels.  Keep that container
+        # visible as a host whenever the controller itself is enabled.
+        show_controller = self.show_software_controller.get()
+        show_right_host = show_right or show_controller
+        self.update_size_adjuster_controls(show_left, show_right)
+        self.left_output_area_f.grid_forget()
+        self.output_area_f.grid_forget()
+        if show_left:
+            self.left_output_area_f.grid(column=0, padx="5", pady="5", row=0, rowspan=2, sticky="nsew")
+        if show_right_host:
+            self.output_area_f.grid(column=2, padx="5", pady="5", row=0, rowspan=2, sticky="nsew")
+        # A single visible side is allowed to consume the freed space.
+        if show_left and show_right:
+            self.main_frame.columnconfigure(0, weight=max(1, self.side_width_balance.get()))
+            self.main_frame.columnconfigure(2, weight=max(1, 100 - self.side_width_balance.get()))
         else:
-            self.softcon_frame.pack_forget()
-
-        is_two = self.panel_layout.get() == "Two vertical panels"
-        is_hidden = self.panel_layout.get() == "Output panels hidden"
+            self.main_frame.columnconfigure(0, weight=2 if show_left else 0)
+            self.main_frame.columnconfigure(2, weight=2 if show_right_host else 0)
         for panel, _, _ in self.panel_widgets.values():
             panel.pack_forget()
-        if not is_hidden:
-            visible_slots = ("right_top", "right_bottom") if is_two else self.panel_widgets.keys()
-            for slot in visible_slots:
-                self.panel_widgets[slot][0].pack(expand=True, fill="both", side="top")
+            panel.pack_propagate(True)
+        def pack_side(slot_names, split_ratio):
+            if len(slot_names) == 1:
+                self.panel_widgets[slot_names[0]][0].pack(expand=True, fill="both", side="top")
+                return
+            total_height = max(240, int(getattr(getattr(self, "preview", None), "show_height", 360)))
+            top_height = int(total_height * split_ratio.get() / 100)
+            for name, height in zip(slot_names, (top_height, total_height - top_height)):
+                panel = self.panel_widgets[name][0]
+                panel.configure(height=max(40, height))
+                panel.pack_propagate(False)
+                panel.pack(expand=False, fill="both", side="top")
+        if show_left:
+            pack_side(("left_top",) if self.left_panel_count.get() == "1" else ("left_top", "left_bottom"),
+                      self.panel_ratio)
+        if show_controller and self.pos_software_controller.get() == "1":
+            self.softcon_frame.pack(expand=False, fill="x", padx=0, pady=0, side="top")
+        if show_right:
+            pack_side(("right_top",) if self.right_panel_count.get() == "1" else ("right_top", "right_bottom"),
+                      self.right_panel_ratio)
+        if show_controller and self.pos_software_controller.get() == "2":
+            self.softcon_frame.pack(expand=False, fill="x", padx=0, pady=0, side="bottom")
         # Rebind the stdout proxy after a log destination is moved.
         if hasattr(self, "stdout_destination"):
+            self.refresh_log_controls()
             self.switchStdoutDestination(silent=True)
         for slot, (_, image_label, text_widget) in self.panel_widgets.items():
             content = slots[slot]
+            # Rebuild panel contents so an Area Capture destination contains
+            # only the image, never the old text log below it.
+            text_widget.pack_forget()
+            if slot in self.area_capture_inline:
+                self.area_capture_inline[slot][0].pack_forget()
+            for scrollbar in (getattr(self, "yscroll_1", None), getattr(self, "yscroll_2", None)):
+                if scrollbar is not None and scrollbar.master == image_label.master:
+                    scrollbar.pack_forget()
+            image_label.pack_forget()
+            is_area_preview = slot == self._area_capture_preview_slot()
+            if content.startswith("Log:"):
+                image_label.pack(fill="x", padx=5, pady=(5, 0))
+                if image_label.master == self.text_scroll_1:
+                    self.yscroll_1.pack(side="right", fill="y", padx=(0, 5), pady=5)
+                elif image_label.master == self.text_scroll_2:
+                    self.yscroll_2.pack(side="right", fill="y", padx=(0, 5), pady=5)
+                text_widget.pack(expand=True, fill="both", padx=(5, 0), pady=5)
+            else:
+                if is_area_preview:
+                    self._ensure_area_capture_inline(slot)[0].pack(expand=True, fill="both", padx=5, pady=5)
+                else:
+                    image_label.pack(expand=True, fill="both", padx=5, pady=5)
             if content == "Disabled":
                 image_label.configure(text="Disabled", image="")
             elif content in ("Image", "HTML", "Analysis"):
-                image_label.configure(text=content, image="")
+                if is_area_preview:
+                    image_label.configure(text="")
+                    image_label.unbind("<Button-1>")
+                else:
+                    image_label.configure(text=content, image="")
+                    image_label.unbind("<Button-1>")
 
     def show_output(self, panel, text=None, image=None, html_path=None):
         """Public UI API used by Command.show_output()."""
         if panel in self.panel_slots:
             _, image_label, text_area = self.panel_widgets[panel]
             if image is not None:
-                self.display_output_image(image_label, image)
+                if panel == self._area_capture_preview_slot():
+                    self.display_area_capture_inline(panel, image)
+                else:
+                    self.display_output_image(image_label, image)
             if text is not None:
                 text_area.configure(state="normal")
                 text_area.delete("1.0", "end")
@@ -2266,8 +2886,13 @@ class PokeControllerApp:
             panel = "Output#2"
         if panel == "Disabled":
             return
-        image_label = self.output_image_1 if panel == "Output#1" else self.output_image_2
-        text_area = self.text_area_1 if panel == "Output#1" else self.text_area_2
+        logical_value = "Log: " + panel
+        assigned_slot = next((name for name, value in self.panel_slots.items() if value.get() == logical_value), None)
+        if assigned_slot:
+            _, image_label, text_area = self.panel_widgets[assigned_slot]
+        else:
+            image_label = self.output_image_1 if panel == "Output#1" else self.output_image_2
+            text_area = self.text_area_1 if panel == "Output#1" else self.text_area_2
         if image is not None:
             self.display_output_image(image_label, image)
         if text is not None:
@@ -2382,6 +3007,85 @@ class PokeControllerApp:
         valid_trigger = [rule for rule in self.record_trigger_rules if rule.get("path")]
         self.recorder.configure_trigger_rules(valid_trigger)
         self.recorder.configure_cleanup_rules(self.record_cleanup_rules, self.record_minimum_duration.get())
+
+    def _recording_presets_path(self):
+        return os.path.join(os.path.dirname(Settings.GuiSettings.SETTING_PATH), "recording_presets.json")
+
+    def _read_recording_presets(self):
+        path = self._recording_presets_path()
+        try:
+            with open(path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _write_recording_presets(self, data):
+        path = self._recording_presets_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+
+    def refresh_recording_presets(self):
+        if hasattr(self, "recording_preset_cb"):
+            self.recording_preset_cb.configure(values=sorted(self._read_recording_presets().keys()))
+
+    def _recording_preset_data(self):
+        return {
+            "mode": self.record_mode.get(),
+            "template_path": self.record_template_path.get(),
+            "threshold": self.record_threshold.get(),
+            "interval": self.record_interval.get(),
+            "release_seconds": self.record_release.get(),
+            "roi": self.record_roi.get(),
+            "debug": self.record_debug.get(),
+            "trigger_rules": self.record_trigger_rules,
+            "cleanup_rules": self.record_cleanup_rules,
+            "minimum_duration": self.record_minimum_duration.get(),
+        }
+
+    def save_recording_preset(self):
+        name = self.recording_preset_name.get().strip()
+        if not name:
+            tkmsg.showwarning("Recording set", "Enter a set name.")
+            return
+        data = self._read_recording_presets()
+        data[name] = self._recording_preset_data()
+        self._write_recording_presets(data)
+        self.refresh_recording_presets()
+
+    def load_recording_preset(self):
+        name = self.recording_preset_name.get().strip()
+        data = self._read_recording_presets().get(name)
+        if not data:
+            tkmsg.showwarning("Recording set", "Select a saved recording set.")
+            return
+        self.record_mode.set(data.get("mode", "Manual"))
+        self.record_template_path.set(data.get("template_path", ""))
+        self.record_threshold.set(data.get("threshold", 0.9))
+        self.record_interval.set(data.get("interval", 0.5))
+        self.record_release.set(data.get("release_seconds", 1.0))
+        self.record_roi.set(data.get("roi", "0,0,0,0"))
+        self.record_debug.set(data.get("debug", False))
+        self.record_trigger_rules = data.get("trigger_rules", [])
+        self.record_cleanup_rules = data.get("cleanup_rules", [])
+        self.record_minimum_duration.set(data.get("minimum_duration", 0))
+        self.configure_recording_rules()
+        if not self.record_trigger_rules:
+            self.recorder.configure_template(self.record_template_path.get())
+        self.toggle_record_debug()
+
+    def delete_recording_preset(self):
+        name = self.recording_preset_name.get().strip()
+        data = self._read_recording_presets()
+        if name not in data:
+            tkmsg.showwarning("Recording set", "Select a saved recording set.")
+            return
+        if tkmsg.askyesno("Recording set", "Delete recording set '" + name + "'?"):
+            del data[name]
+            self._write_recording_presets(data)
+            self.recording_preset_name.set("")
+            self.refresh_recording_presets()
 
     def open_recording_rules(self):
         """Edit multi-image start (AND) and discard rules in a small popup."""
@@ -2575,7 +3279,12 @@ class PokeControllerApp:
         self.settings.panel_right_top = self.panel_slots["right_top"].get()
         self.settings.panel_right_bottom = self.panel_slots["right_bottom"].get()
         self.settings.panel_ratio = self.panel_ratio.get()
+        self.settings.right_panel_ratio = self.right_panel_ratio.get()
         self.settings.panel_layout = self.panel_layout.get()
+        self.settings.panel_sides = self.panel_sides.get()
+        self.settings.left_panel_count = self.left_panel_count.get()
+        self.settings.right_panel_count = self.right_panel_count.get()
+        self.settings.side_width_balance = self.side_width_balance.get()
         self.settings.show_software_controller = self.show_software_controller.get()
         self.settings.audio_input = self.audio_input.get()
         self.settings.audio_gain = self.audio_gain.get()
@@ -2592,9 +3301,97 @@ class PokeControllerApp:
         self.settings.record_trigger_rules = json.dumps(self.record_trigger_rules)
         self.settings.record_cleanup_rules = json.dumps(self.record_cleanup_rules)
         self.settings.record_minimum_duration = self.record_minimum_duration.get()
+        self.settings.area_capture_roi = self.area_capture_roi.get()
+        self.settings.area_capture_output_target = self.area_capture_output_target.get()
+        self.settings.area_capture_background = self.area_capture_background.get()
+        self.settings.area_capture_active = self.area_capture_active.get()
 
     def _preset_dir(self):
         return os.path.join(os.path.dirname(Settings.GuiSettings.SETTING_PATH), "presets")
+
+    def _others_presets_path(self):
+        return os.path.join(os.path.dirname(Settings.GuiSettings.SETTING_PATH), "others_presets.json")
+
+    def _read_others_presets(self):
+        try:
+            with open(self._others_presets_path(), "r", encoding="utf-8") as file:
+                data = json.load(file)
+                return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _write_others_presets(self, data):
+        os.makedirs(os.path.dirname(self._others_presets_path()), exist_ok=True)
+        with open(self._others_presets_path(), "w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+
+    def refresh_others_presets(self):
+        if hasattr(self, "others_preset_cb"):
+            self.others_preset_cb.configure(values=sorted(self._read_others_presets().keys()))
+
+    def _others_preset_data(self):
+        return {
+            "stdout_destination": self.stdout_destination.get(),
+            "clear_log_target": self.clear_log_target.get(),
+            "pos_software_controller": self.pos_software_controller.get(),
+            "pos_dialogue_buttons": self.pos_dialogue_buttons.get(),
+            "left_top": self.panel_slots["left_top"].get(),
+            "left_bottom": self.panel_slots["left_bottom"].get(),
+            "right_top": self.panel_slots["right_top"].get(),
+            "right_bottom": self.panel_slots["right_bottom"].get(),
+            "panel_sides": self.panel_sides.get(),
+            "left_panel_count": self.left_panel_count.get(),
+            "right_panel_count": self.right_panel_count.get(),
+            "side_width_balance": self.side_width_balance.get(),
+            "left_panel_ratio": self.panel_ratio.get(),
+            "right_panel_ratio": self.right_panel_ratio.get(),
+            "show_software_controller": self.show_software_controller.get(),
+        }
+
+    def save_others_preset(self):
+        name = self.others_preset_name.get().strip()
+        if not name:
+            tkmsg.showwarning("Others setting set", "保存セット名を入力してください。")
+            return
+        presets = self._read_others_presets()
+        presets[name] = self._others_preset_data()
+        self._write_others_presets(presets)
+        self.refresh_others_presets()
+
+    def load_others_preset(self):
+        name = self.others_preset_name.get().strip()
+        data = self._read_others_presets().get(name)
+        if not data:
+            tkmsg.showwarning("Others setting set", "読み出す保存セットを選択してください。")
+            return
+        self.stdout_destination.set(str(data.get("stdout_destination", self.stdout_destination.get())))
+        self.pos_software_controller.set(str(data.get("pos_software_controller", self.pos_software_controller.get())))
+        self.pos_dialogue_buttons.set(str(data.get("pos_dialogue_buttons", self.pos_dialogue_buttons.get())))
+        for key, slot in (("left_top", "left_top"), ("left_bottom", "left_bottom"),
+                          ("right_top", "right_top"), ("right_bottom", "right_bottom")):
+            self.panel_slots[slot].set(data.get(key, self.panel_slots[slot].get()))
+        self.panel_sides.set(data.get("panel_sides", self.panel_sides.get()))
+        self.left_panel_count.set(str(data.get("left_panel_count", self.left_panel_count.get())))
+        self.right_panel_count.set(str(data.get("right_panel_count", self.right_panel_count.get())))
+        self.side_width_balance.set(int(data.get("side_width_balance", self.side_width_balance.get())))
+        self.panel_ratio.set(int(data.get("left_panel_ratio", self.panel_ratio.get())))
+        self.right_panel_ratio.set(int(data.get("right_panel_ratio", self.right_panel_ratio.get())))
+        self.show_software_controller.set(bool(data.get("show_software_controller", self.show_software_controller.get())))
+        self.clear_log_target.set(data.get("clear_log_target", self.clear_log_target.get()))
+        self.apply_panel_assignment()
+        self.refresh_log_controls()
+
+    def delete_others_preset(self):
+        name = self.others_preset_name.get().strip()
+        presets = self._read_others_presets()
+        if name not in presets:
+            tkmsg.showwarning("Others setting set", "削除する保存セットを選択してください。")
+            return
+        if tkmsg.askyesno("Others setting set", "保存セット '" + name + "' を削除しますか？"):
+            del presets[name]
+            self._write_others_presets(presets)
+            self.others_preset_name.set("")
+            self.refresh_others_presets()
 
     def _preset_path(self, name):
         safe_name = re.sub(r"[^A-Za-z0-9_-]", "_", name.strip())
@@ -2691,6 +3488,10 @@ class PokeControllerApp:
             self.text_scroll_2.configure(text="Output#2 (Stdout)")
 
     def replace_right_frame_widget(self, *event):
+        # Replaced by the explicit side-panel assignment in Others.
+        if hasattr(self, "panel_sides"):
+            self.apply_panel_assignment()
+            return
         try:
             self.text_scroll_1.pack_forget()
         except Exception:

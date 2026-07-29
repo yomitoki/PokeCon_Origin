@@ -32,6 +32,10 @@ class CaptureRecorder:
         self.last_found = False
         self.last_roi = (0, 0, 0, 0)
         self.lock = threading.Lock()
+        # Final MP4 encoding runs after capture has stopped.  Keep an explicit
+        # count so the window can avoid being destroyed while ffmpeg still has
+        # the recording files open.
+        self._finalizing_count = 0
 
     def start(self, frame, fps, audio_device="", audio_gain_percent=100, cleanup_rules=None, minimum_duration=0):
         if self.active or frame is None:
@@ -118,9 +122,24 @@ class CaptureRecorder:
         actual_fps = max(1.0, self.frames_written / elapsed)
         # Re-encoding can take seconds.  Never wait for it in the Tk/capture
         # thread: recording is already stopped and the UI may continue.
-        threading.Thread(target=self._finalize, args=(video_path, wav_path, mp4_path, actual_fps, elapsed), daemon=True).start()
+        with self.lock:
+            self._finalizing_count += 1
+        threading.Thread(target=self._finalize_worker,
+                         args=(video_path, wav_path, mp4_path, actual_fps, elapsed), daemon=True).start()
         print("[RECORDING] Finalizing MP4 in background ({:.2f} captured FPS): {}".format(actual_fps, mp4_path))
         return mp4_path
+
+    @property
+    def is_finalizing(self):
+        with self.lock:
+            return self._finalizing_count > 0
+
+    def _finalize_worker(self, video_path, wav_path, mp4_path, actual_fps, elapsed):
+        try:
+            self._finalize(video_path, wav_path, mp4_path, actual_fps, elapsed)
+        finally:
+            with self.lock:
+                self._finalizing_count = max(0, self._finalizing_count - 1)
 
     def _finalize(self, video_path, wav_path, mp4_path, actual_fps, elapsed):
         reason = self._discard_reason(video_path, elapsed)

@@ -131,7 +131,14 @@ class GuiSettings:
         self.panel_right_top = self.setting["Output"].get("panel_right_top", "Log: Output#1")
         self.panel_right_bottom = self.setting["Output"].get("panel_right_bottom", "Log: Output#2")
         self.panel_ratio = self.setting["Output"].get("panel_ratio", "50")
+        # Keep the old ratio as the left-side value for backward-compatible
+        # profiles.  Each side can now have its own top/bottom split.
+        self.right_panel_ratio = self.setting["Output"].get("right_panel_ratio", self.panel_ratio)
         self.panel_layout = self.setting["Output"].get("panel_layout", "Four panels (left/right, top/bottom)")
+        self.panel_sides = self.setting["Output"].get("panel_sides", "Both sides")
+        self.left_panel_count = self.setting["Output"].get("left_panel_count", "2")
+        self.right_panel_count = self.setting["Output"].get("right_panel_count", "2")
+        self.side_width_balance = self.setting["Output"].get("side_width_balance", "50")
         self.show_software_controller = self.setting["Output"].getboolean("show_software_controller", True)
         self.audio_input = self.setting.get("Audio", "input_device", fallback="")
         self.audio_gain = self.setting.get("Audio", "gain", fallback="100")
@@ -148,6 +155,10 @@ class GuiSettings:
         self.record_trigger_rules = self.setting.get("Recording", "trigger_rules", fallback="[]")
         self.record_cleanup_rules = self.setting.get("Recording", "cleanup_rules", fallback="[]")
         self.record_minimum_duration = self.setting.get("Recording", "minimum_duration", fallback="0")
+        self.area_capture_roi = self.setting.get("Area Capture", "roi", fallback="0,0,0,0")
+        self.area_capture_output_target = self.setting.get("Area Capture", "output_target", fallback="Output#1")
+        self.area_capture_background = self.setting.get("Area Capture", "background", fallback="#ffffff")
+        self.area_capture_active = self.setting.getboolean("Area Capture", "active", fallback=True)
 
     def load(self):
         if os.path.isfile(self.SETTING_PATH):
@@ -258,7 +269,12 @@ class GuiSettings:
             "panel_right_top": "Log: Output#1",
             "panel_right_bottom": "Log: Output#2",
             "panel_ratio": "50",
+            "right_panel_ratio": "50",
             "panel_layout": "Four panels (left/right, top/bottom)",
+            "panel_sides": "Both sides",
+            "left_panel_count": "2",
+            "right_panel_count": "2",
+            "side_width_balance": "50",
             "show_software_controller": True,
         }
         self.setting["Audio"] = {"input_device": "", "gain": "100", "filter_camera": False, "auto_start": False}
@@ -268,6 +284,7 @@ class GuiSettings:
             "interval": "0.5", "release_seconds": "1.0", "roi": "0,0,0,0", "debug": False,
             "trigger_rules": "[]", "cleanup_rules": "[]", "minimum_duration": "0",
         }
+        self.setting["Area Capture"] = {"roi": "0,0,0,0", "output_target": "Output#1", "background": "#ffffff", "active": True}
         with open(self.SETTING_PATH, "w", encoding="utf-8") as file:
             self.setting.write(file)
         os.chmod(path=self.SETTING_PATH, mode=0o777)
@@ -343,7 +360,12 @@ class GuiSettings:
             "panel_right_top": self.panel_right_top,
             "panel_right_bottom": self.panel_right_bottom,
             "panel_ratio": self.panel_ratio,
+            "right_panel_ratio": self.right_panel_ratio,
             "panel_layout": self.panel_layout,
+            "panel_sides": self.panel_sides,
+            "left_panel_count": self.left_panel_count,
+            "right_panel_count": self.right_panel_count,
+            "side_width_balance": self.side_width_balance,
             "show_software_controller": self.show_software_controller,
         }
         self.setting["Audio"] = {
@@ -365,6 +387,7 @@ class GuiSettings:
             "cleanup_rules": self.record_cleanup_rules,
             "minimum_duration": self.record_minimum_duration,
         }
+        self.setting["Area Capture"] = {"roi": self.area_capture_roi, "output_target": self.area_capture_output_target, "background": self.area_capture_background, "active": self.area_capture_active}
 
         target_path = path or self.SETTING_PATH
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
