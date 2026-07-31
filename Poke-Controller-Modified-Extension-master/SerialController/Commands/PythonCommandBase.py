@@ -76,6 +76,18 @@ class PythonCommand(CommandBase.Command):
 
         return inner
 
+    @classmethod
+    def get_detection_targets(cls):
+        """Return image-match definitions for Commands > Image match debug.
+
+        Override in a command without constructing/running the command:
+        ``[{"name": "target", "path": "...png", "threshold": 0.8,
+        "roi": (x, y, width, height)}]``.  ``roi`` is optional; all-zero
+        means the whole camera frame.  The base default keeps older commands
+        compatible and simply exposes no targets.
+        """
+        return []
+
     def show_var(self):
         """
         一時停止時に内部変数の一覧を表示します。

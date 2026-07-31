@@ -11,6 +11,7 @@ import re
 import shutil
 from os.path import dirname, abspath
 import cv2
+import numpy as np
 import platform
 import subprocess
 import threading
@@ -35,7 +36,7 @@ from GuiAssets import CaptureArea, ControllerGUI
 from VisionAutomation import VisionAutomation
 from AudioMonitor import AudioMonitor
 from Recording import CaptureRecorder
-from PIL import Image, ImageTk
+from PIL import Image, ImageTk, ImageDraw
 from KeyConfig import PokeKeycon
 from Keyboard import SwitchKeyboardController
 from LineNotify import Line_Notify
@@ -310,8 +311,14 @@ class PokeControllerApp:
         self.record_mode = tk.StringVar(value="Manual")
         ttk.Radiobutton(self.recording_lf, text="Manual", value="Manual", variable=self.record_mode).grid(column=0, row=0, padx=5, pady=5)
         ttk.Radiobutton(self.recording_lf, text="Template segments", value="Template", variable=self.record_mode).grid(column=1, row=0, padx=5, pady=5)
+        ttk.Radiobutton(self.recording_lf, text="Command variable segments", value="Variable", variable=self.record_mode).grid(column=2, row=0, padx=5, pady=5)
         self.record_button = ttk.Button(self.recording_lf, text="Start recording", command=self.toggle_recording)
-        self.record_button.grid(column=2, row=0, padx=5, pady=5)
+        self.record_button.grid(column=3, row=0, padx=5, pady=5)
+        ttk.Button(self.recording_lf, text="Output layout...", command=self.open_recording_output_layout).grid(column=4, row=0, padx=5, pady=5)
+        self.record_output_mode = tk.StringVar(value="Video only")
+        self.record_output_logs = tk.StringVar(value="Output#1")
+        self.record_output_guide = tk.BooleanVar(value=False)
+        self.record_output_value = tk.BooleanVar(value=False)
         ttk.Label(self.recording_lf, text="Template:").grid(column=0, row=1, padx=5, pady=5)
         self.record_template_path = tk.StringVar()
         ttk.Entry(self.recording_lf, textvariable=self.record_template_path, width=34).grid(column=1, columnspan=5, row=1, sticky="ew")
@@ -332,11 +339,27 @@ class PokeControllerApp:
         ttk.Entry(self.recording_lf, textvariable=self.record_roi, width=13).grid(column=7, row=2, sticky="w")
         self.record_debug = tk.BooleanVar(value=False)
         ttk.Checkbutton(self.recording_lf, text="Show detection debug", variable=self.record_debug,
-                        command=self.toggle_record_debug).grid(column=3, columnspan=2, row=0, padx=5, pady=3, sticky="w")
+                        command=self.toggle_record_debug).grid(column=5, row=0, padx=5, pady=3, sticky="w")
         self.record_debug_status = tk.StringVar(value="Debug: disabled")
         ttk.Label(self.recording_lf, textvariable=self.record_debug_status).grid(
-            column=5, columnspan=3, row=0, padx=5, pady=3, sticky="w"
+            column=6, columnspan=2, row=0, padx=5, pady=3, sticky="w"
         )
+        self.record_variable_command = tk.StringVar()
+        self.record_variable_name = tk.StringVar(value="current_step")
+        self.record_variable_start = tk.StringVar()
+        self.record_variable_stop = tk.StringVar()
+        self.record_variable_status = tk.StringVar(value="Variable segments: inactive")
+        ttk.Label(self.recording_lf, text="Variable command:").grid(column=0, row=4, padx=(5, 2), pady=3, sticky="w")
+        self.record_variable_command_cb = ttk.Combobox(self.recording_lf, state="readonly", width=28, textvariable=self.record_variable_command)
+        self.record_variable_command_cb.grid(column=1, columnspan=2, row=4, padx=2, pady=3, sticky="w")
+        ttk.Label(self.recording_lf, text="Variable:").grid(column=3, row=4, padx=(5, 2), pady=3, sticky="w")
+        ttk.Entry(self.recording_lf, textvariable=self.record_variable_name, width=16).grid(column=4, row=4, padx=2, pady=3, sticky="w")
+        ttk.Label(self.recording_lf, text="Start value:").grid(column=5, row=4, padx=(5, 2), pady=3, sticky="w")
+        ttk.Entry(self.recording_lf, textvariable=self.record_variable_start, width=16).grid(column=6, row=4, padx=2, pady=3, sticky="w")
+        ttk.Label(self.recording_lf, text="Stop value:").grid(column=0, row=5, padx=(5, 2), pady=3, sticky="w")
+        ttk.Entry(self.recording_lf, textvariable=self.record_variable_stop, width=16).grid(column=1, row=5, padx=2, pady=3, sticky="w")
+        ttk.Label(self.recording_lf, text="Exact values; e.g. 1_1 → 2").grid(column=2, columnspan=3, row=5, padx=4, pady=3, sticky="w")
+        ttk.Label(self.recording_lf, textvariable=self.record_variable_status).grid(column=5, columnspan=3, row=5, padx=4, pady=3, sticky="w")
         ttk.Label(self.recording_lf, text="Recording set:").grid(column=0, row=3, padx=(5, 2), pady=(3, 5), sticky="w")
         self.recording_preset_name = tk.StringVar()
         self.recording_preset_cb = ttk.Combobox(self.recording_lf, textvariable=self.recording_preset_name, width=18)
@@ -604,9 +627,15 @@ class PokeControllerApp:
         self.start_button.configure(text="Start")
         self.start_button.grid(column="5", padx="10", pady="5", row="0", sticky="ew")
         self.start_button.configure(command=self.startPlay)
+        self.force_stop_button = ttk.Button(self.action_commands_f)
+        self.force_stop_button.configure(text="Force stop", state="disabled", command=self.force_stop_play)
+        self.force_stop_button.grid(column="6", padx=(0, 5), pady="5", row="0", sticky="ew")
+        self.image_match_debug_button = ttk.Button(self.action_commands_f, text="Image match debug",
+                                                   command=self.open_image_match_debug)
+        self.image_match_debug_button.grid(column="7", padx=(0, 5), pady="5", row="0", sticky="ew")
         self.pause_button = ttk.Button(self.action_commands_f)
         self.pause_button.configure(text="Pause")
-        self.pause_button.grid(column="6", padx="10", pady="5", row="0", sticky="ew")
+        self.pause_button.grid(column="8", padx="10", pady="5", row="0", sticky="ew")
         self.pause_button.configure(command=self.pausePlay)
         self.action_commands_f.configure(height="200", width="200")
         self.action_commands_f.grid(column="0", row="1", sticky="e")
@@ -677,6 +706,7 @@ class PokeControllerApp:
         ttk.Button(self.others_preset_lf, text="Save", command=self.save_others_preset).grid(column=2, row=0, padx=2, pady=4)
         ttk.Button(self.others_preset_lf, text="Apply", command=self.load_others_preset).grid(column=3, row=0, padx=2, pady=4)
         ttk.Button(self.others_preset_lf, text="Delete", command=self.delete_others_preset).grid(column=4, row=0, padx=(2, 5), pady=4)
+        ttk.Button(self.others_preset_lf, text="Open Dev Studio", command=self.open_dev_studio).grid(column=5, row=0, padx=(2, 5), pady=4)
         self.others_preset_lf.grid(column=0, row=0, padx=5, pady=(3, 0), sticky="ew")
         self.othres_outputs_lf = ttk.Labelframe(self.others_f)
         self.outputs_size_adjuster_lf = ttk.Labelframe(self.othres_outputs_lf)
@@ -851,6 +881,34 @@ class PokeControllerApp:
         self.others_f.configure(height="200", width="200")
         self.others_f.pack()
         self.controller_nb.add(self.others_f, sticky="nsew", text="Others")
+        self.command_watch_f = ttk.Frame(self.controller_nb)
+        self.command_watch_lf = ttk.Labelframe(self.command_watch_f, text="Watch variables from the active Python Command")
+        self.command_watch_enabled = tk.BooleanVar(value=False)
+        self.command_watch_command = tk.StringVar()
+        self.command_watch_target = tk.StringVar(value="Output#1")
+        self.command_watch_variable = tk.StringVar()
+        ttk.Checkbutton(self.command_watch_lf, text="Enable watch", variable=self.command_watch_enabled,
+                        command=self.reset_command_watch).grid(column=0, row=0, padx=5, pady=4, sticky="w")
+        ttk.Label(self.command_watch_lf, text="Command:").grid(column=0, row=1, padx=5, pady=4, sticky="w")
+        self.command_watch_command_cb = ttk.Combobox(self.command_watch_lf, state="readonly", width=42,
+                                                     textvariable=self.command_watch_command)
+        self.command_watch_command_cb.grid(column=1, columnspan=3, row=1, padx=5, pady=4, sticky="ew")
+        ttk.Label(self.command_watch_lf, text="Log output:").grid(column=0, row=2, padx=5, pady=4, sticky="w")
+        ttk.Combobox(self.command_watch_lf, state="readonly", width=14, textvariable=self.command_watch_target,
+                     values=("Output#1", "Output#2")).grid(column=1, row=2, padx=5, pady=4, sticky="w")
+        ttk.Label(self.command_watch_lf, text="Variable:").grid(column=0, row=3, padx=5, pady=4, sticky="w")
+        ttk.Entry(self.command_watch_lf, textvariable=self.command_watch_variable, width=28).grid(column=1, row=3, padx=5, pady=4, sticky="ew")
+        ttk.Button(self.command_watch_lf, text="Add", command=self.add_command_watch_variable).grid(column=2, row=3, padx=3, pady=4)
+        ttk.Button(self.command_watch_lf, text="Remove", command=self.remove_command_watch_variable).grid(column=3, row=3, padx=3, pady=4)
+        self.command_watch_list = tk.Listbox(self.command_watch_lf, height=4, exportselection=False)
+        self.command_watch_list.grid(column=0, columnspan=4, row=4, padx=5, pady=4, sticky="ew")
+        self.command_watch_status = tk.StringVar(value="Select a command and variable names (for example: step, loop_count).")
+        self.command_watch_variables = []
+        self.command_watch_last_values = {}
+        ttk.Label(self.command_watch_lf, textvariable=self.command_watch_status).grid(column=0, columnspan=4, row=5, padx=5, pady=(0, 4), sticky="w")
+        self.command_watch_lf.pack(fill="x", padx=5, pady=5)
+        self.command_watch_f.pack(fill="both", expand=True)
+        self.controller_nb.add(self.command_watch_f, padding="5", sticky="nsew", text="Command Watch")
         if platform.system() == "Windows" or platform.system() == "Darwin":
             self.controller_nb.configure(height="150")
         else:
@@ -1270,10 +1328,21 @@ class PokeControllerApp:
         self.record_roi.set(self.settings.record_roi)
         self.record_debug.set(self.settings.record_debug)
         self.record_minimum_duration.set(self.settings.record_minimum_duration)
+        self.record_variable_command.set(self.settings.record_variable_command)
+        self.record_variable_name.set(self.settings.record_variable_name)
+        self.record_variable_start.set(self.settings.record_variable_start)
+        self.record_variable_stop.set(self.settings.record_variable_stop)
         self.area_capture_roi.set(self.settings.area_capture_roi)
         self.area_capture_output_target.set(self.settings.area_capture_output_target)
         self.area_capture_background.set(self.settings.area_capture_background)
         self.area_capture_active.set(self.settings.area_capture_active)
+        self.command_watch_enabled.set(self.settings.command_watch_enabled)
+        self.command_watch_command.set(self.settings.command_watch_command)
+        self.command_watch_target.set(self.settings.command_watch_target)
+        self.command_watch_variables = [name for name in self.settings.command_watch_variables.split(",") if name]
+        self.command_watch_list.delete(0, "end")
+        for name in self.command_watch_variables:
+            self.command_watch_list.insert("end", name)
         try:
             self.record_trigger_rules = json.loads(self.settings.record_trigger_rules)
             self.record_cleanup_rules = json.loads(self.settings.record_cleanup_rules)
@@ -1502,6 +1571,7 @@ class PokeControllerApp:
 
         self.root.protocol("WM_DELETE_WINDOW", self.exit)
         self.preview.startCapture()
+        self.root.after(500, self.poll_command_watch)
         self.set_serial_data_format()
 
         # Output画面/Software-Controllerを再配置する
@@ -1893,6 +1963,189 @@ class PokeControllerApp:
             command = f'open "{directory}"'
             subprocess.run(command, shell=True)
 
+    def refresh_command_watch_commands(self):
+        if not hasattr(self, "command_watch_command_cb"):
+            return
+        values = list(getattr(self, "py_cb_all", []))
+        self.command_watch_command_cb.configure(values=values)
+        if values and self.command_watch_command.get() not in values:
+            self.command_watch_command.set(values[0])
+        if hasattr(self, "record_variable_command_cb"):
+            self.record_variable_command_cb.configure(values=values)
+            if values and self.record_variable_command.get() not in values:
+                self.record_variable_command.set(values[0])
+
+    def open_image_match_debug(self):
+        """Inspect a command's declared images without starting the command."""
+        existing = getattr(self, "image_match_debug_dialog", None)
+        if existing is not None and existing.winfo_exists():
+            existing.focus_force()
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Image match debug")
+        dialog.transient(self.root)
+        self.image_match_debug_dialog = dialog
+        self.image_match_debug_active = False
+        self.image_match_debug_templates = {}
+        self.image_match_debug_command = tk.StringVar(value=self.py_cb.get() if hasattr(self, "py_cb") else "")
+        self.image_match_debug_output = tk.StringVar(value="Output#2")
+        self.image_match_debug_status = tk.StringVar(value="Select a command that implements get_detection_targets().")
+        ttk.Label(dialog, text="Command:").grid(column=0, row=0, padx=6, pady=5, sticky="w")
+        ttk.Combobox(dialog, state="readonly", width=48, textvariable=self.image_match_debug_command,
+                     values=getattr(self, "py_cb_all", [])).grid(column=1, columnspan=2, row=0, padx=6, pady=5, sticky="ew")
+        ttk.Label(dialog, text="Log output:").grid(column=0, row=1, padx=6, pady=5, sticky="w")
+        ttk.Combobox(dialog, state="readonly", width=14, textvariable=self.image_match_debug_output,
+                     values=("Output#1", "Output#2")).grid(column=1, row=1, padx=6, pady=5, sticky="w")
+        self.image_match_debug_button_popup = ttk.Button(dialog, text="Start monitoring", command=self.toggle_image_match_debug)
+        self.image_match_debug_button_popup.grid(column=2, row=1, padx=6, pady=5)
+        ttk.Label(dialog, textvariable=self.image_match_debug_status).grid(column=0, columnspan=3, row=2, padx=6, pady=(0, 6), sticky="w")
+        dialog.protocol("WM_DELETE_WINDOW", self.close_image_match_debug)
+
+    def close_image_match_debug(self):
+        self.image_match_debug_active = False
+        dialog = getattr(self, "image_match_debug_dialog", None)
+        if dialog is not None and dialog.winfo_exists():
+            dialog.destroy()
+
+    def toggle_image_match_debug(self):
+        self.image_match_debug_active = not self.image_match_debug_active
+        if self.image_match_debug_active:
+            self.image_match_debug_button_popup.configure(text="Stop monitoring")
+            self.poll_image_match_debug()
+        else:
+            self.image_match_debug_button_popup.configure(text="Start monitoring")
+
+    def poll_image_match_debug(self):
+        dialog = getattr(self, "image_match_debug_dialog", None)
+        if not getattr(self, "image_match_debug_active", False) or dialog is None or not dialog.winfo_exists():
+            return
+        try:
+            selected = self.image_match_debug_command.get()
+            command_class = next((item for item in getattr(self, "py_classes", []) if item.NAME == selected), None)
+            if command_class is None:
+                self.image_match_debug_status.set("Command was not found. Reload Commands and select it again.")
+            else:
+                targets = command_class.get_detection_targets()
+                frame = getattr(self.camera, "image_bgr", None)
+                if frame is None:
+                    self.image_match_debug_status.set("Waiting for a camera frame.")
+                elif not targets:
+                    self.image_match_debug_status.set("This command has no declared image targets.")
+                else:
+                    rows = ["[Image match debug] " + selected]
+                    for target in targets:
+                        name = str(target.get("name", os.path.basename(target.get("path", "target"))))
+                        path = target.get("path", "")
+                        image = self.image_match_debug_templates.get(path)
+                        if image is None and path:
+                            image = cv2.imread(path, cv2.IMREAD_COLOR)
+                            self.image_match_debug_templates[path] = image
+                        if image is None:
+                            rows.append("{}: template missing ({})".format(name, path))
+                            continue
+                        x, y, width, height = target.get("roi", (0, 0, 0, 0))
+                        height_frame, width_frame = frame.shape[:2]
+                        reference_width, reference_height = target.get("reference_resolution", (0, 0))
+                        reference_width, reference_height = int(reference_width or 0), int(reference_height or 0)
+                        scale_x = float(width_frame) / reference_width if reference_width else 1.0
+                        scale_y = float(height_frame) / reference_height if reference_height else 1.0
+                        x, y = max(0, int(round(int(x) * scale_x))), max(0, int(round(int(y) * scale_y)))
+                        width = int(round(int(width) * scale_x)) if int(width) else (width_frame - x)
+                        height = int(round(int(height) * scale_y)) if int(height) else (height_frame - y)
+                        region = frame[y:min(height_frame, y + height), x:min(width_frame, x + width)]
+                        if region.size == 0:
+                            rows.append("{}: ROI is outside the camera frame".format(name))
+                            continue
+                        scaled_image = image
+                        if reference_width or reference_height:
+                            scaled_image = cv2.resize(image, (max(1, int(round(image.shape[1] * scale_x))),
+                                                              max(1, int(round(image.shape[0] * scale_y)))))
+                        if target.get("grayscale", False):
+                            region = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+                            scaled_image = cv2.cvtColor(scaled_image, cv2.COLOR_BGR2GRAY)
+                        if region.shape[0] < scaled_image.shape[0] or region.shape[1] < scaled_image.shape[1]:
+                            rows.append("{}: ROI is smaller than template".format(name))
+                            continue
+                        _, score, _, _ = cv2.minMaxLoc(cv2.matchTemplate(region, scaled_image, cv2.TM_CCOEFF_NORMED))
+                        threshold = float(target.get("threshold", 0.8))
+                        rows.append("{}: {:.1f}% / {:.1f}% {}".format(
+                            name, score * 100, threshold * 100, "MATCH" if score >= threshold else "NO MATCH"))
+                    self.show_output(self.image_match_debug_output.get(), text="\n".join(rows))
+                    self.image_match_debug_status.set("Monitoring {} target(s) every 0.5 s.".format(len(targets)))
+        except Exception as error:
+            self.image_match_debug_status.set("Image debug error: " + str(error))
+        self.root.after(500, self.poll_image_match_debug)
+
+    def add_command_watch_variable(self):
+        name = self.command_watch_variable.get().strip()
+        if name and name not in self.command_watch_variables:
+            self.command_watch_variables.append(name)
+            self.command_watch_list.insert("end", name)
+            self.command_watch_variable.set("")
+            self.reset_command_watch()
+
+    def remove_command_watch_variable(self):
+        selected = self.command_watch_list.curselection()
+        if selected:
+            index = selected[0]
+            del self.command_watch_variables[index]
+            self.command_watch_list.delete(index)
+            self.reset_command_watch()
+
+    def reset_command_watch(self):
+        if hasattr(self, "command_watch_last_values"):
+            self.command_watch_last_values = {}
+
+    def poll_command_watch(self):
+        """Publish only changed public variables; never block the UI/command thread."""
+        try:
+            if self.command_watch_enabled.get() and self.command_watch_variables:
+                command = getattr(self, "cur_command", None)
+                expected = self.command_watch_command.get()
+                if command is None or getattr(command, "NAME", "") != expected:
+                    self.command_watch_status.set("Waiting for selected command to run.")
+                else:
+                    values = {}
+                    for name in self.command_watch_variables:
+                        if hasattr(command, name):
+                            try:
+                                values[name] = repr(getattr(command, name))
+                            except Exception:
+                                values[name] = "<unreadable>"
+                        else:
+                            values[name] = "<not set>"
+                    if values != self.command_watch_last_values:
+                        self.command_watch_last_values = values
+                        message = "[Command Watch] " + expected + "\n" + "\n".join(
+                            "{} = {}".format(name, value) for name, value in values.items()) + "\n"
+                        self.show_output(self.command_watch_target.get(), text=message)
+                    self.command_watch_status.set("Watching {} variable(s).".format(len(values)))
+        finally:
+            try:
+                self.root.after(500, self.poll_command_watch)
+            except tk.TclError:
+                pass
+
+    def open_dev_studio(self):
+        """Launch the dependency-free PokeCon code search/merge helper."""
+        project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        studio = os.path.join(project_dir, "DevStudio", "PokeConDevStudio.py")
+        if not os.path.isfile(studio):
+            tkmsg.showwarning("PokeCon Dev Studio", "DevStudio/PokeConDevStudio.py が見つかりません。")
+            return
+        try:
+            # Do not let Dev Studio's initial code indexing share PokeCon's
+            # process/console.  On Windows it is a detached child process, so
+            # the main capture/controller UI returns immediately.
+            options = {"cwd": os.path.dirname(studio), "close_fds": True}
+            if platform.system() == "Windows":
+                options["creationflags"] = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) |
+                                             getattr(subprocess, "DETACHED_PROCESS", 0x00000008))
+            subprocess.Popen([sys.executable, studio, project_dir], **options)
+            self.show_output("Analysis", text="PokeCon Dev Studio started in the background.")
+        except OSError as error:
+            tkmsg.showerror("PokeCon Dev Studio", "起動できませんでした。\n" + str(error))
+
     def set_init_device_name(self):
         for d in self.serial_devices:
             if int(self.com_port.get()) == int(re.search(r"COM(\d+)", d).groups()[0]):
@@ -2120,6 +2373,7 @@ class PokeControllerApp:
 
         self.setCommandItems()
         self.assignCommand()
+        self.refresh_command_watch_commands()
 
     def setCommandItems(self):
         # PythonCommands
@@ -2368,6 +2622,7 @@ class PokeControllerApp:
         self.shortcut_button_9["state"] = "disabled"
         self.shortcut_button_10["state"] = "disabled"
         self.pause_button["state"] = "normal"
+        self.force_stop_button["state"] = "normal"
 
     def startShortcutPlay(self, *event, num=0):
         if self.cur_command is None:
@@ -2402,8 +2657,39 @@ class PokeControllerApp:
             self.shortcut_button_9["state"] = "disabled"
             self.shortcut_button_10["state"] = "disabled"
             self.pause_button["state"] = "normal"
+            self.force_stop_button["state"] = "normal"
         else:
             pass
+
+    def force_stop_play(self):
+        """Immediately request cancellation for a misbehaving Python command.
+
+        Python cannot safely kill an arbitrary worker thread.  Generated Dev
+        Studio commands call ``checkIfAlive`` in their loops, so setting
+        ``alive`` false ends them at the next safe checkpoint while keys and
+        communications are also released here.
+        """
+        command = self.cur_command
+        if command is None:
+            return
+        if not tkmsg.askyesno("Force stop", "実行中コマンドへ強制停止要求を送りますか？"):
+            return
+        Command.isPause = False
+        try:
+            command.alive = False
+            if hasattr(command, "socket0"):
+                command.socket0.alive = False
+            if hasattr(command, "mqtt0"):
+                command.mqtt0.alive = False
+            keys = getattr(command, "keys", None)
+            if keys is not None:
+                keys.end()
+            command.end(self.ser)
+        except Exception as error:
+            self._logger.warning("Force stop request failed: %s", error)
+        self.force_stop_button["state"] = "disabled"
+        self.pause_button["state"] = "disabled"
+        self.show_output("Analysis", text="Force-stop requested. The command exits at its next checkIfAlive() checkpoint.")
 
     def stopPlay(self):
         print(self.start_button["text"] + " " + self.cur_command.NAME)
@@ -2415,11 +2701,13 @@ class PokeControllerApp:
         self.pause_button["text"] = "Pause"
         self.pause_button["command"] = self.pausePlay
         self.pause_button["state"] = "disable"
+        self.force_stop_button["state"] = "disabled"
 
         self.cur_command.end(self.ser)
 
     def stopPlayPost(self):
         self.start_button["text"] = "Start"
+        self.force_stop_button["state"] = "disabled"
         self.start_top_button["text"] = "Start"
         self.start_button["command"] = self.startPlay
         self.start_top_button["command"] = self.startPlay
@@ -2576,10 +2864,18 @@ class PokeControllerApp:
             self.settings.record_trigger_rules = json.dumps(self.record_trigger_rules)
             self.settings.record_cleanup_rules = json.dumps(self.record_cleanup_rules)
             self.settings.record_minimum_duration = self.record_minimum_duration.get()
+            self.settings.record_variable_command = self.record_variable_command.get()
+            self.settings.record_variable_name = self.record_variable_name.get()
+            self.settings.record_variable_start = self.record_variable_start.get()
+            self.settings.record_variable_stop = self.record_variable_stop.get()
             self.settings.area_capture_roi = self.area_capture_roi.get()
             self.settings.area_capture_output_target = self.area_capture_output_target.get()
             self.settings.area_capture_background = self.area_capture_background.get()
             self.settings.area_capture_active = self.area_capture_active.get()
+            self.settings.command_watch_enabled = self.command_watch_enabled.get()
+            self.settings.command_watch_command = self.command_watch_command.get()
+            self.settings.command_watch_target = self.command_watch_target.get()
+            self.settings.command_watch_variables = ",".join(self.command_watch_variables)
 
             self.settings.save()
 
@@ -3042,6 +3338,14 @@ class PokeControllerApp:
             "trigger_rules": self.record_trigger_rules,
             "cleanup_rules": self.record_cleanup_rules,
             "minimum_duration": self.record_minimum_duration.get(),
+            "variable_command": self.record_variable_command.get(),
+            "variable_name": self.record_variable_name.get(),
+            "variable_start": self.record_variable_start.get(),
+            "variable_stop": self.record_variable_stop.get(),
+            "output_mode": self.record_output_mode.get(),
+            "output_logs": self.record_output_logs.get(),
+            "output_guide": self.record_output_guide.get(),
+            "output_value": self.record_output_value.get(),
         }
 
     def save_recording_preset(self):
@@ -3070,6 +3374,14 @@ class PokeControllerApp:
         self.record_trigger_rules = data.get("trigger_rules", [])
         self.record_cleanup_rules = data.get("cleanup_rules", [])
         self.record_minimum_duration.set(data.get("minimum_duration", 0))
+        self.record_variable_command.set(data.get("variable_command", ""))
+        self.record_variable_name.set(data.get("variable_name", "current_step"))
+        self.record_variable_start.set(data.get("variable_start", ""))
+        self.record_variable_stop.set(data.get("variable_stop", ""))
+        self.record_output_mode.set(data.get("output_mode", "Video only"))
+        self.record_output_logs.set(data.get("output_logs", "Output#1"))
+        self.record_output_guide.set(data.get("output_guide", False))
+        self.record_output_value.set(data.get("output_value", False))
         self.configure_recording_rules()
         if not self.record_trigger_rules:
             self.recorder.configure_template(self.record_template_path.get())
@@ -3197,6 +3509,21 @@ class PokeControllerApp:
 
     def toggle_recording(self):
         self.configure_recording_rules()
+        if self.record_mode.get() == "Variable":
+            if self.record_armed:
+                self.record_armed = False
+                if self.recorder.active:
+                    self.recorder.stop()
+                self.record_button.configure(text="Start recording")
+                self.record_variable_status.set("Variable segments: stopped")
+                return
+            if not self.record_variable_command.get() or not self.record_variable_name.get().strip() or not self.record_variable_start.get().strip() or not self.record_variable_stop.get().strip():
+                tkmsg.showwarning("Recording", "Select a command and enter variable, start value, and stop value.")
+                return
+            self.record_armed = True
+            self.record_button.configure(text="Stop monitoring")
+            self.record_variable_status.set("Armed: waiting for {} == {}".format(self.record_variable_name.get(), self.record_variable_start.get()))
+            return
         if self.record_mode.get() == "Template":
             if self.record_armed:
                 self.record_armed = False
@@ -3231,9 +3558,72 @@ class PokeControllerApp:
         self.recorder.start(frame, self.fps.get(), self.audio_input.get(), self.audio_gain.get())
         self.record_button.configure(text="Stop recording")
 
+    def open_recording_output_layout(self):
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Recording output layout")
+        dialog.transient(self.root)
+        ttk.Radiobutton(dialog, text="Video only (existing recording sets)", value="Video only", variable=self.record_output_mode).grid(column=0, columnspan=2, row=0, padx=8, pady=5, sticky="w")
+        ttk.Radiobutton(dialog, text="Video + log panel", value="Video + logs", variable=self.record_output_mode).grid(column=0, columnspan=2, row=1, padx=8, pady=3, sticky="w")
+        ttk.Label(dialog, text="Log panel:").grid(column=0, row=2, padx=8, pady=4, sticky="w")
+        ttk.Combobox(dialog, state="readonly", width=18, textvariable=self.record_output_logs, values=("Output#1", "Output#2", "Output#1 + Output#2")).grid(column=1, row=2, padx=8, pady=4, sticky="w")
+        ttk.Checkbutton(dialog, text="Include Show Guide overlay", variable=self.record_output_guide).grid(column=0, columnspan=2, row=3, padx=8, pady=3, sticky="w")
+        ttk.Checkbutton(dialog, text="Include Show Value overlay", variable=self.record_output_value).grid(column=0, columnspan=2, row=4, padx=8, pady=3, sticky="w")
+        ttk.Button(dialog, text="Close", command=dialog.destroy).grid(column=1, row=5, padx=8, pady=8, sticky="e")
+
+    def recording_output_frame(self, frame):
+        if self.record_output_mode.get() == "Video only":
+            return frame
+        lines = []
+        selected = self.record_output_logs.get()
+        if "Output#1" in selected:
+            lines.append("[Output#1]")
+            lines.extend(self.text_area_1.get("1.0", "end-1c").splitlines()[-18:])
+        if "Output#2" in selected:
+            lines.append("[Output#2]")
+            lines.extend(self.text_area_2.get("1.0", "end-1c").splitlines()[-18:])
+        if self.record_output_guide.get() and self.is_show_guide.get():
+            lines.insert(0, "[Show Guide enabled]")
+        if self.record_output_value.get() and self.is_show_value.get():
+            lines.insert(0, "[Show Value enabled]")
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        height, width = rgb.shape[:2]
+        panel_width = min(420, max(180, width // 3))
+        # Keep the original frame size so template-triggered recording may
+        # start before the next composed frame arrives.
+        canvas = Image.new("RGB", (width, height), "#202020")
+        video_width = max(1, width - panel_width)
+        canvas.paste(Image.fromarray(rgb).resize((video_width, height)), (0, 0))
+        draw = ImageDraw.Draw(canvas)
+        y = 10
+        for line in lines:
+            draw.text((video_width + 10, y), str(line)[:max(12, panel_width // 7)], fill="white")
+            y += 18
+            if y >= height - 18:
+                break
+        return cv2.cvtColor(np.asarray(canvas), cv2.COLOR_RGB2BGR)
+
     def process_recording_frame(self, frame):
+        record_frame = self.recording_output_frame(frame)
         if self.record_mode.get() == "Manual":
-            self.recorder.add_frame(frame)
+            self.recorder.add_frame(record_frame)
+            return
+        if self.record_mode.get() == "Variable":
+            if not self.record_armed:
+                return
+            command = getattr(self, "cur_command", None)
+            if command is None or getattr(command, "NAME", "") != self.record_variable_command.get():
+                self.record_variable_status.set("Waiting for selected command to run.")
+                return
+            name = self.record_variable_name.get().strip()
+            value = str(getattr(command, name, "<not set>"))
+            if not self.recorder.active and value == self.record_variable_start.get():
+                self.recorder.start(record_frame, self.fps.get(), self.audio_input.get(), self.audio_gain.get())
+                self.record_variable_status.set("Recording: {} == {}".format(name, value))
+            if self.recorder.active:
+                self.recorder.add_frame(record_frame)
+                if value == self.record_variable_stop.get():
+                    self.recorder.stop()
+                    self.record_variable_status.set("Segment completed: {} == {}. Waiting for next start.".format(name, value))
             return
         if not self.record_armed and not self.record_debug.get():
             return
@@ -3247,7 +3637,7 @@ class PokeControllerApp:
         # A detected segment must receive every camera frame, not merely the
         # low-frequency frames that are used for template matching.
         if self.recorder.active:
-            self.recorder.add_frame(frame)
+            self.recorder.add_frame(record_frame)
         if result is not None:
             # Stay armed after one segment finishes so the next matching
             # appearance becomes the next timestamped recording.
@@ -3301,10 +3691,18 @@ class PokeControllerApp:
         self.settings.record_trigger_rules = json.dumps(self.record_trigger_rules)
         self.settings.record_cleanup_rules = json.dumps(self.record_cleanup_rules)
         self.settings.record_minimum_duration = self.record_minimum_duration.get()
+        self.settings.record_variable_command = self.record_variable_command.get()
+        self.settings.record_variable_name = self.record_variable_name.get()
+        self.settings.record_variable_start = self.record_variable_start.get()
+        self.settings.record_variable_stop = self.record_variable_stop.get()
         self.settings.area_capture_roi = self.area_capture_roi.get()
         self.settings.area_capture_output_target = self.area_capture_output_target.get()
         self.settings.area_capture_background = self.area_capture_background.get()
         self.settings.area_capture_active = self.area_capture_active.get()
+        self.settings.command_watch_enabled = self.command_watch_enabled.get()
+        self.settings.command_watch_command = self.command_watch_command.get()
+        self.settings.command_watch_target = self.command_watch_target.get()
+        self.settings.command_watch_variables = ",".join(self.command_watch_variables)
 
     def _preset_dir(self):
         return os.path.join(os.path.dirname(Settings.GuiSettings.SETTING_PATH), "presets")

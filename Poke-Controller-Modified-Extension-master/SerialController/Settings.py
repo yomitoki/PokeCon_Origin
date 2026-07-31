@@ -155,10 +155,18 @@ class GuiSettings:
         self.record_trigger_rules = self.setting.get("Recording", "trigger_rules", fallback="[]")
         self.record_cleanup_rules = self.setting.get("Recording", "cleanup_rules", fallback="[]")
         self.record_minimum_duration = self.setting.get("Recording", "minimum_duration", fallback="0")
+        self.record_variable_command = self.setting.get("Recording", "variable_command", fallback="")
+        self.record_variable_name = self.setting.get("Recording", "variable_name", fallback="current_step")
+        self.record_variable_start = self.setting.get("Recording", "variable_start", fallback="")
+        self.record_variable_stop = self.setting.get("Recording", "variable_stop", fallback="")
         self.area_capture_roi = self.setting.get("Area Capture", "roi", fallback="0,0,0,0")
         self.area_capture_output_target = self.setting.get("Area Capture", "output_target", fallback="Output#1")
         self.area_capture_background = self.setting.get("Area Capture", "background", fallback="#ffffff")
         self.area_capture_active = self.setting.getboolean("Area Capture", "active", fallback=True)
+        self.command_watch_enabled = self.setting.getboolean("Command Watch", "enabled", fallback=False)
+        self.command_watch_command = self.setting.get("Command Watch", "command", fallback="")
+        self.command_watch_target = self.setting.get("Command Watch", "target", fallback="Output#1")
+        self.command_watch_variables = self.setting.get("Command Watch", "variables", fallback="")
 
     def load(self):
         if os.path.isfile(self.SETTING_PATH):
@@ -285,6 +293,7 @@ class GuiSettings:
             "trigger_rules": "[]", "cleanup_rules": "[]", "minimum_duration": "0",
         }
         self.setting["Area Capture"] = {"roi": "0,0,0,0", "output_target": "Output#1", "background": "#ffffff", "active": True}
+        self.setting["Command Watch"] = {"enabled": False, "command": "", "target": "Output#1", "variables": ""}
         with open(self.SETTING_PATH, "w", encoding="utf-8") as file:
             self.setting.write(file)
         os.chmod(path=self.SETTING_PATH, mode=0o777)
@@ -386,8 +395,14 @@ class GuiSettings:
             "trigger_rules": self.record_trigger_rules,
             "cleanup_rules": self.record_cleanup_rules,
             "minimum_duration": self.record_minimum_duration,
+            "variable_command": self.record_variable_command,
+            "variable_name": self.record_variable_name,
+            "variable_start": self.record_variable_start,
+            "variable_stop": self.record_variable_stop,
         }
         self.setting["Area Capture"] = {"roi": self.area_capture_roi, "output_target": self.area_capture_output_target, "background": self.area_capture_background, "active": self.area_capture_active}
+        self.setting["Command Watch"] = {"enabled": self.command_watch_enabled, "command": self.command_watch_command,
+                                         "target": self.command_watch_target, "variables": self.command_watch_variables}
 
         target_path = path or self.SETTING_PATH
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
