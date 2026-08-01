@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib
+import importlib.util
+import os
 import sys
 
 import Utility as util
@@ -83,3 +85,45 @@ class CommandLoader:
                 classes.append(c)
 
         return classes
+
+
+class FileCommandLoader(CommandLoader):
+    """Load command modules recursively from an absolute directory."""
+    def __init__(self, base_path, base_class, module_prefix="DevStudio.SampleCommands"):
+        super().__init__(os.path.abspath(base_path), base_class)
+        self.module_prefix = module_prefix
+
+    def _load_files(self):
+        modules = []
+        if not os.path.isdir(self.path):
+            return modules
+        for directory, dirs, names in os.walk(self.path):
+            dirs[:] = sorted(item for item in dirs if item != "__pycache__")
+            for filename in sorted(names):
+                if not filename.endswith(".py") or filename.startswith("__"):
+                    continue
+                path = os.path.join(directory, filename)
+                relative = os.path.relpath(path[:-3], self.path).replace(os.sep, ".")
+                module_name = self.module_prefix + "." + relative
+                spec = importlib.util.spec_from_file_location(module_name, path)
+                if spec is None or spec.loader is None:
+                    continue
+                try:
+                    module = importlib.util.module_from_spec(spec)
+                    sys.modules[module_name] = module
+                    spec.loader.exec_module(module)
+                    modules.append(module)
+                except Exception:
+                    sys.modules.pop(module_name, None)
+                    logger.exception("Could not load PythonSampleCommand: %s", path)
+        return modules
+
+    def load(self):
+        self.modules = self._load_files()
+        return self.getCommandClasses()
+
+    def reload(self):
+        for module in self.modules:
+            sys.modules.pop(module.__name__, None)
+        self.modules = self._load_files()
+        return self.getCommandClasses()

@@ -14,6 +14,7 @@ import os
 import os.path
 import datetime
 import string
+import sys
 
 try:
     from plyer import notification
@@ -175,6 +176,11 @@ class PythonCommand(CommandBase.Command):
             import traceback
 
             traceback.print_exc()
+            # Window.py may redirect sys.stderr into an Output panel.  Keep
+            # the same traceback visible in the original black console too.
+            if sys.__stderr__ is not None and sys.stderr is not sys.__stderr__:
+                print("Interrupt: コマンド実行中に例外が発生しました。", file=sys.__stderr__)
+                traceback.print_exc(file=sys.__stderr__)
             self.keys.end()
             self.alive = False
 

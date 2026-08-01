@@ -31,7 +31,7 @@ except Exception:
     flag_import_plyer = False
 from Camera import Camera
 import Settings
-from CommandLoader import CommandLoader
+from CommandLoader import CommandLoader, FileCommandLoader
 from GuiAssets import CaptureArea, ControllerGUI
 from VisionAutomation import VisionAutomation
 from AudioMonitor import AudioMonitor
@@ -45,7 +45,7 @@ from ExternalTools import SocketCommunications, MQTTCommunications
 from Menubar import PokeController_Menubar
 import PokeConLogger
 import Utility as util
-from Commands import McuCommandBase, PythonCommandBase, Sender
+from Commands import McuCommandBase, PythonCommandBase, PythonSampleCommand, Sender
 from Commands.Keys import KeyPress, Button, Hat, Stick, Direction
 from Commands.ProController import ProController
 from Commands.CommandBase import Command
@@ -370,6 +370,7 @@ class PokeControllerApp:
         self.recording_lf.pack(fill="x", padx=5, pady=5)
         self.recording_f.pack(side="top", fill="both", expand=True)
         self.controller_nb.add(self.recording_f, padding="5", sticky="nsew", text="Recording")
+        self._build_input_set_tab()
         self.serial_f = ttk.Frame(self.controller_nb)
         self.settings_lf = ttk.Labelframe(self.serial_f)
         self.com_port_label = ttk.Label(self.settings_lf)
@@ -514,6 +515,20 @@ class PokeControllerApp:
         self.py_f.pack(fill="x", side="top")
         self.py_f.columnconfigure(1, weight=1)
         self.command_nb.add(self.py_f, padding="5", text="Python Command")
+        self.sample_py_f = ttk.Frame(self.command_nb)
+        ttk.Label(self.sample_py_f, text="Filter: ").grid(column="0", padx="5", pady="4", row="0", sticky="ew")
+        self.command_filter_sample_py_name = tk.StringVar(value="-")
+        self.command_filter_sample_py_cb = ttk.Combobox(
+            self.sample_py_f, state="readonly", textvariable=self.command_filter_sample_py_name)
+        self.command_filter_sample_py_cb.grid(column="1", padx="5", pady="4", row="0", sticky="ew")
+        self.command_filter_sample_py_cb.bind("<<ComboboxSelected>>", self.applyFilterSamplePy, add="")
+        ttk.Label(self.sample_py_f, text="Command: ").grid(column="0", padx="5", pady="4", row="1", sticky="ew")
+        self.sample_py_name = tk.StringVar(value="")
+        self.sample_py_cb = ttk.Combobox(self.sample_py_f, state="readonly", textvariable=self.sample_py_name)
+        self.sample_py_cb.grid(column="1", padx="5", pady="4", row="1", sticky="ew")
+        self.sample_py_f.pack(fill="x", side="top")
+        self.sample_py_f.columnconfigure(1, weight=1)
+        self.command_nb.add(self.sample_py_f, padding="5", text="Python Sample Command")
         self.mcu_f = ttk.Frame(self.command_nb)
         self.command_filter_mcu_label = ttk.Label(self.mcu_f)
         self.command_filter_mcu_label.configure(text="Filter: ")
@@ -696,7 +711,17 @@ class PokeControllerApp:
         self.discord_notification_lf.grid(column="0", padx="5", pady="0", row="1", sticky="ew")
         self.notification_f.pack()
         self.controller_nb.add(self.notification_f, sticky="nsew", text="Notification")
-        self.others_f = ttk.Frame(self.controller_nb)
+        self.others_tab = ttk.Frame(self.controller_nb)
+        self.others_canvas = tk.Canvas(self.others_tab, highlightthickness=0, borderwidth=0)
+        self.others_scrollbar = ttk.Scrollbar(self.others_tab, orient="vertical", command=self.others_canvas.yview)
+        self.others_canvas.configure(yscrollcommand=self.others_scrollbar.set)
+        self.others_canvas.pack(side="left", fill="both", expand=True)
+        self.others_scrollbar.pack(side="right", fill="y")
+        self.others_f = ttk.Frame(self.others_canvas)
+        self.others_canvas_window = self.others_canvas.create_window((0, 0), window=self.others_f, anchor="nw")
+        self.others_f.bind("<Configure>", self._update_others_scrollregion)
+        self.others_canvas.bind("<Configure>", self._resize_others_content)
+        self.root.bind_all("<MouseWheel>", self._scroll_others_with_wheel, add="+")
         self.others_preset_lf = ttk.Labelframe(self.others_f, text="Others setting set")
         ttk.Label(self.others_preset_lf, text="Set:").grid(column=0, row=0, padx=(5, 2), pady=4)
         self.others_preset_name = tk.StringVar()
@@ -878,9 +903,8 @@ class PokeControllerApp:
         # self.others_help_lf = ttk.Labelframe(self.others_f)
         # self.others_help_lf.configure(text='Help')
         # self.others_help_lf.grid(column='0', padx='5', row='1', sticky='ew')
-        self.others_f.configure(height="200", width="200")
-        self.others_f.pack()
-        self.controller_nb.add(self.others_f, sticky="nsew", text="Others")
+        self.others_f.columnconfigure(0, weight=1)
+        self.controller_nb.add(self.others_tab, sticky="nsew", text="Others")
         self.command_watch_f = ttk.Frame(self.controller_nb)
         self.command_watch_lf = ttk.Labelframe(self.command_watch_f, text="Watch variables from the active Python Command")
         self.command_watch_enabled = tk.BooleanVar(value=False)
@@ -1952,8 +1976,11 @@ class PokeControllerApp:
         thread.start()
 
     def OpenCommandDir(self):
-        if self.command_nb.index("current") == 1:
+        selected_tab = self.command_nb.tab(self.command_nb.select(), "text")
+        if selected_tab == "Mcu Command":
             directory = os.path.join("Commands", "McuCommands")
+        elif selected_tab == "Python Sample Command":
+            directory = os.path.join(dirname(dirname(abspath(__file__))), "DevStudio", "SampleCommands")
         else:
             directory = os.path.join("Commands", "PythonCommands")
         self._logger.debug(f"Open folder: '{directory}'")
@@ -1963,10 +1990,46 @@ class PokeControllerApp:
             command = f'open "{directory}"'
             subprocess.run(command, shell=True)
 
+    def _update_others_scrollregion(self, event=None):
+        self.others_canvas.configure(scrollregion=self.others_canvas.bbox("all"))
+
+    def _resize_others_content(self, event):
+        self.others_canvas.itemconfigure(self.others_canvas_window, width=max(1, event.width))
+
+    def _scroll_others_with_wheel(self, event):
+        canvas = getattr(self, "others_canvas", None)
+        if canvas is None or not canvas.winfo_exists():
+            return
+        x, y = self.root.winfo_pointerx(), self.root.winfo_pointery()
+        if not (canvas.winfo_rootx() <= x < canvas.winfo_rootx() + canvas.winfo_width() and
+                canvas.winfo_rooty() <= y < canvas.winfo_rooty() + canvas.winfo_height()):
+            return
+        canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
+    def _update_input_set_scrollregion(self, event=None):
+        canvas = getattr(self, "input_set_canvas", None)
+        if canvas is not None and canvas.winfo_exists():
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+    def _resize_input_set_content(self, event):
+        self.input_set_canvas.itemconfigure(self.input_set_canvas_window, width=max(1, event.width))
+
+    def _scroll_input_set_with_wheel(self, event):
+        canvas = getattr(self, "input_set_canvas", None)
+        if canvas is None or not canvas.winfo_exists():
+            return
+        x, y = self.root.winfo_pointerx(), self.root.winfo_pointery()
+        if not (canvas.winfo_rootx() <= x < canvas.winfo_rootx() + canvas.winfo_width() and
+                canvas.winfo_rooty() <= y < canvas.winfo_rooty() + canvas.winfo_height()):
+            return
+        canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
     def refresh_command_watch_commands(self):
         if not hasattr(self, "command_watch_command_cb"):
             return
-        values = list(getattr(self, "py_cb_all", []))
+        values = list(getattr(self, "py_cb_all", [])) + list(getattr(self, "sample_py_cb_all", []))
         self.command_watch_command_cb.configure(values=values)
         if values and self.command_watch_command.get() not in values:
             self.command_watch_command.set(values[0])
@@ -1992,7 +2055,7 @@ class PokeControllerApp:
         self.image_match_debug_status = tk.StringVar(value="Select a command that implements get_detection_targets().")
         ttk.Label(dialog, text="Command:").grid(column=0, row=0, padx=6, pady=5, sticky="w")
         ttk.Combobox(dialog, state="readonly", width=48, textvariable=self.image_match_debug_command,
-                     values=getattr(self, "py_cb_all", [])).grid(column=1, columnspan=2, row=0, padx=6, pady=5, sticky="ew")
+                     values=list(getattr(self, "py_cb_all", [])) + list(getattr(self, "sample_py_cb_all", []))).grid(column=1, columnspan=2, row=0, padx=6, pady=5, sticky="ew")
         ttk.Label(dialog, text="Log output:").grid(column=0, row=1, padx=6, pady=5, sticky="w")
         ttk.Combobox(dialog, state="readonly", width=14, textvariable=self.image_match_debug_output,
                      values=("Output#1", "Output#2")).grid(column=1, row=1, padx=6, pady=5, sticky="w")
@@ -2021,7 +2084,7 @@ class PokeControllerApp:
             return
         try:
             selected = self.image_match_debug_command.get()
-            command_class = next((item for item in getattr(self, "py_classes", []) if item.NAME == selected), None)
+            command_class = next((item for item in list(getattr(self, "py_classes", [])) + list(getattr(self, "sample_py_classes", [])) if item.NAME == selected), None)
             if command_class is None:
                 self.image_match_debug_status.set("Command was not found. Reload Commands and select it again.")
             else:
@@ -2357,6 +2420,17 @@ class PokeControllerApp:
         )  # ディレクトリのタグは後半にまとめる
         self.command_filter_py_cb["values"] = ["-"] + self.py_tags_values
 
+        # PythonSampleCommands authored in DevStudio and kept separate from
+        # normal Commands/PythonCommands.
+        sample_commands_path = os.path.join(dirname(dirname(abspath(__file__))), "DevStudio", "SampleCommands")
+        self.sample_py_loader = FileCommandLoader(
+            sample_commands_path, PythonSampleCommand.PythonSampleCommand)
+        self.sample_py_classes = self.sample_py_loader.load()
+        self.sample_py_tags = set(tag for command_class in self.sample_py_classes for tag in getattr(command_class, "TAGS", []))
+        self.sample_py_tags_values = sorted([tag for tag in self.sample_py_tags if not tag.startswith("@")] ) + sorted(
+            [tag for tag in self.sample_py_tags if tag.startswith("@")] )
+        self.command_filter_sample_py_cb["values"] = ["-"] + self.sample_py_tags_values
+
         # McuCommands
         self.mcu_loader = CommandLoader(
             util.ospath("Commands/McuCommands"), McuCommandBase.McuCommand
@@ -2382,7 +2456,15 @@ class PokeControllerApp:
             self.py_cb["values"] = self.py_cb_all
         else:
             self.py_cb["values"] = [c.NAME for c in self.py_classes if self.command_filter_py_cb.get() in c.TAGS]
-        self.py_cb.current(0)
+        if self.py_cb_all: self.py_cb.current(0)
+
+        # PythonSampleCommands
+        self.sample_py_cb_all = [c.NAME for c in self.sample_py_classes]
+        if self.command_filter_sample_py_cb.get() == "-":
+            self.sample_py_cb["values"] = self.sample_py_cb_all
+        else:
+            self.sample_py_cb["values"] = [c.NAME for c in self.sample_py_classes if self.command_filter_sample_py_cb.get() in c.TAGS]
+        if self.sample_py_cb["values"]: self.sample_py_cb.current(0)
 
         # McuCommands
         self.mcu_cb_all = [c.NAME for c in self.mcu_classes]
@@ -2390,7 +2472,7 @@ class PokeControllerApp:
             self.mcu_cb["values"] = self.mcu_cb_all
         else:
             self.mcu_cb["values"] = [c.NAME for c in self.mcu_classes if self.command_filter_mcu_cb.get() in c.TAGS]
-        self.mcu_cb.current(0)
+        if self.mcu_cb_all: self.mcu_cb.current(0)
 
     def assignShortcutButton(self):
         self.assignCommand()
@@ -2400,10 +2482,12 @@ class PokeControllerApp:
             num = int(self.set_shortcut_num.get())
             self.shortcut_command_name[num] = self.cur_command.NAME
 
-            if self.command_nb.index(self.command_nb.select()) == 0:
+            selected_tab = self.command_nb.tab(self.command_nb.select(), "text")
+            if selected_tab == "Python Command":
                 self.shortcut_command_class[num] = "Python"
-
-            elif self.command_nb.index(self.command_nb.select()) == 1:
+            elif selected_tab == "Python Sample Command":
+                self.shortcut_command_class[num] = "Sample"
+            elif selected_tab == "Mcu Command":
                 self.shortcut_command_class[num] = "Mcu"
             if num == 1:
                 self.shortcut_1.set(self.shortcut_command_name[num][:8])
@@ -2455,9 +2539,15 @@ class PokeControllerApp:
         else:
             self.py_cur_command = cmd_class()
 
-        if self.command_nb.index(self.command_nb.select()) == 0:
+        sample_i = [i for i, name in enumerate([c.NAME for c in self.sample_py_classes]) if name == self.sample_py_cb.get()]
+        self.sample_py_cur_command = self.sample_py_classes[sample_i[0]]() if sample_i else None
+
+        selected_tab = self.command_nb.tab(self.command_nb.select(), "text")
+        if selected_tab == "Python Command":
             self.cur_command = self.py_cur_command
-        else:
+        elif selected_tab == "Python Sample Command":
+            self.cur_command = self.sample_py_cur_command
+        elif selected_tab == "Mcu Command":
             self.cur_command = self.mcu_cur_command
 
     def assignShortcutCommand(self, num):
@@ -2489,6 +2579,14 @@ class PokeControllerApp:
                     self.py_cur_command = cmd_class()
                 self.cur_command = self.py_cur_command
             return True
+        elif commandtype in ["Sample", "SAMPLE", "sample"]:
+            for command_class in self.sample_py_classes:
+                if command_class.NAME == commandname:
+                    self.sample_py_cur_command = command_class()
+                    self.cur_command = self.sample_py_cur_command
+                    return True
+            print("shortcut Python sample command name error.")
+            return False
         elif commandtype in ["Mcu", "MCU", "mcu"]:
             # ループを回してショートカットに割り当てられているmcu_classのindexを探索する
             for i, name in enumerate(self.mcu_cb["values"]):
@@ -2512,30 +2610,42 @@ class PokeControllerApp:
 
     def controllButtons(self, event):
         note = event.widget
-        if self.start_button["text"] == "Start":
-            if note.tab(note.select(), "text") == "Shortcut":
-                self.start_button["state"] = "disabled"
-                self.start_top_button["state"] = "disabled"
-            else:
-                self.start_button["state"] = "normal"
-                self.start_top_button["state"] = "normal"
-        else:
-            pass
         if note.tab(note.select(), "text") == "Shortcut":
             self.shortcut_set_button["state"] = "disabled"
             self.py_cb["values"] = self.py_cb_all
+            self.sample_py_cb["values"] = self.sample_py_cb_all
             self.mcu_cb["values"] = self.mcu_cb_all
         else:
             self.shortcut_set_button["state"] = "normal"
             self.applyFilterPy()
+            self.applyFilterSamplePy()
             self.applyFilterMcu()
+        self._update_command_start_state()
+
+    def _update_command_start_state(self):
+        """Re-evaluate Start after reload, tab changes and filtering."""
+        if not hasattr(self, "start_button") or self.start_button["text"] != "Start":
+            return
+        selected_tab = self.command_nb.tab(self.command_nb.select(), "text")
+        command_boxes = {
+            "Python Command": self.py_cb,
+            "Python Sample Command": self.sample_py_cb,
+            "Mcu Command": self.mcu_cb,
+        }
+        command_box = command_boxes.get(selected_tab)
+        enabled = command_box is not None and bool(command_box["values"]) and bool(command_box.get())
+        state = "normal" if enabled else "disabled"
+        self.start_button["state"] = state
+        self.start_top_button["state"] = state
 
     def reloadCommands(self):
         # 表示しているタブを読み取って、どのコマンドを表示しているか取得、リロード後もそれが選択されるようにする
         oldval_mcu = self.mcu_cb.get()
         oldval_py = self.py_cb.get()
+        oldval_sample_py = self.sample_py_cb.get()
 
         self.py_classes = self.py_loader.reload()
+        self.sample_py_classes = self.sample_py_loader.reload()
         self.mcu_classes = self.mcu_loader.reload()
 
         self.py_tags = []
@@ -2546,6 +2656,10 @@ class PokeControllerApp:
             [s for s in self.py_tags if s[0] == "@"]
         )
 
+        self.sample_py_tags = set(tag for command_class in self.sample_py_classes for tag in getattr(command_class, "TAGS", []))
+        self.sample_py_tags_values = sorted([tag for tag in self.sample_py_tags if not tag.startswith("@")] ) + sorted(
+            [tag for tag in self.sample_py_tags if tag.startswith("@")] )
+
         self.mcu_tags = []
         for c in self.mcu_classes:
             self.mcu_tags.extend(c.TAGS)
@@ -2555,6 +2669,7 @@ class PokeControllerApp:
         )
 
         self.command_filter_py_cb["values"] = ["-"] + self.py_tags_values
+        self.command_filter_sample_py_cb["values"] = ["-"] + self.sample_py_tags_values
         self.command_filter_mcu_cb["values"] = ["-"] + self.mcu_tags_values
 
         # Restore the command selecting state if possible
@@ -2563,7 +2678,10 @@ class PokeControllerApp:
             self.mcu_cb.set(oldval_mcu)
         if oldval_py in self.py_cb["values"]:
             self.py_cb.set(oldval_py)
+        if oldval_sample_py in self.sample_py_cb["values"]:
+            self.sample_py_cb.set(oldval_sample_py)
         self.assignCommand()
+        self._update_command_start_state()
         print("Finished reloading command modules.")
         self._logger.info("Reloaded commands.")
 
@@ -2573,6 +2691,7 @@ class PokeControllerApp:
         else:
             self.py_cb["values"] = [c.NAME for c in self.py_classes if self.command_filter_py_cb.get() in c.TAGS]
             self.py_cb.current(0)
+        self._update_command_start_state()
 
     def applyFilterMcu(self, event=None):
         if self.command_filter_mcu_cb.get() == "-":
@@ -2580,6 +2699,15 @@ class PokeControllerApp:
         else:
             self.mcu_cb["values"] = [c.NAME for c in self.mcu_classes if self.command_filter_mcu_cb.get() in c.TAGS]
             self.mcu_cb.current(0)
+        self._update_command_start_state()
+
+    def applyFilterSamplePy(self, event=None):
+        if self.command_filter_sample_py_cb.get() == "-":
+            self.sample_py_cb["values"] = self.sample_py_cb_all
+        else:
+            self.sample_py_cb["values"] = [c.NAME for c in self.sample_py_classes if self.command_filter_sample_py_cb.get() in c.TAGS]
+        if self.sample_py_cb["values"]: self.sample_py_cb.current(0)
+        self._update_command_start_state()
 
     def pausePlay(self, *event):
         Command.isPause = True
@@ -2592,14 +2720,14 @@ class PokeControllerApp:
         self.pause_button["command"] = self.pausePlay
 
     def startPlay(self, *event):
-        if self.cur_command is None:
-            print("No commands have been assigned yet.")
-            self._logger.info("No commands have been assigned yet.")
-
         self.is_use_Pro_Controller.set(False)
         self.mode_change_Pro_Controller()
         # set and init selected command
         self.assignCommand()
+        if self.cur_command is None:
+            print("No commands have been assigned yet.")
+            self._logger.info("No commands have been assigned yet.")
+            return
 
         print(self.start_button["text"] + " " + self.cur_command.NAME)
         Command.cur_command_name = self.cur_command.NAME
@@ -2711,7 +2839,7 @@ class PokeControllerApp:
         self.start_top_button["text"] = "Start"
         self.start_button["command"] = self.startPlay
         self.start_top_button["command"] = self.startPlay
-        if (self.command_nb.index(self.command_nb.select())) == 2:
+        if self.command_nb.tab(self.command_nb.select(), "text") == "Shortcut":
             self.start_button["state"] = "disable"
             self.start_top_button["state"] = "disable"
         else:
@@ -2770,15 +2898,17 @@ class PokeControllerApp:
             self.root.after(250, self._wait_for_recording_finalization)
             return
         self._exit_waiting = False
-        self._exit_now()
+        # The user already confirmed closing in the MP4 conversion dialog.
+        # Do not ask the generic exit question a second time after ffmpeg ends.
+        self._exit_now(confirm=False)
 
-    def _exit_now(self):
+    def _exit_now(self, confirm=True):
         # 一度proconのスレッドを落とす
         self.flag_procon = False
         self.record_pro_controller_checkbox["state"] = "normal"
         self.is_use_Pro_Controller.set(False)
 
-        ret = tkmsg.askyesno("確認", "Poke Controllerを終了しますか？")
+        ret = not confirm or tkmsg.askyesno("確認", "Poke Controllerを終了しますか？")
         if ret:
             if self.ser.isOpened():
                 self.ser.closeSerial()
@@ -3234,6 +3364,483 @@ class PokeControllerApp:
         except Exception as error:
             self._logger.warning(f"Live analysis error: {error}")
 
+    def _build_input_set_tab(self):
+        """Build the left-most Camera/Audio and Recording combination tab."""
+        self.input_set_f = ttk.Frame(self.controller_nb)
+        self.controller_nb.insert(0, self.input_set_f, padding="5", sticky="nsew", text="InputSet")
+        self.input_set_canvas = tk.Canvas(self.input_set_f, highlightthickness=0, borderwidth=0)
+        self.input_set_scrollbar = ttk.Scrollbar(
+            self.input_set_f, orient="vertical", command=self.input_set_canvas.yview)
+        self.input_set_canvas.configure(yscrollcommand=self.input_set_scrollbar.set)
+        self.input_set_canvas.pack(side="left", fill="both", expand=True)
+        self.input_set_scrollbar.pack(side="right", fill="y")
+        self.input_set_content = ttk.Frame(self.input_set_canvas)
+        self.input_set_canvas_window = self.input_set_canvas.create_window(
+            (0, 0), window=self.input_set_content, anchor="nw")
+        self.input_set_content.bind("<Configure>", self._update_input_set_scrollregion)
+        self.input_set_canvas.bind("<Configure>", self._resize_input_set_content)
+        self.root.bind_all("<MouseWheel>", self._scroll_input_set_with_wheel, add="+")
+
+        input_box = ttk.Labelframe(self.input_set_content, text="Camera・Audio 入力セット")
+        input_box.pack(fill="x", padx=6, pady=6)
+        ttk.Label(input_box, text="入力セット名:").grid(column=0, row=0, padx=5, pady=5, sticky="w")
+        self.input_set_name = tk.StringVar()
+        self.input_set_cb = ttk.Combobox(input_box, textvariable=self.input_set_name, width=34)
+        self.input_set_cb.grid(column=1, row=0, padx=5, pady=5, sticky="ew")
+        ttk.Button(input_box, text="呼び出し", command=self.load_input_set).grid(column=2, row=0, padx=2, pady=5)
+        ttk.Button(input_box, text="新規登録", command=lambda: self.save_input_set(False)).grid(column=3, row=0, padx=2, pady=5)
+        ttk.Button(input_box, text="変更保存", command=lambda: self.save_input_set(True)).grid(column=4, row=0, padx=2, pady=5)
+        ttk.Button(input_box, text="削除", command=self.delete_input_set).grid(column=5, row=0, padx=2, pady=5)
+        self.input_set_include_audio = tk.BooleanVar(value=True)
+        ttk.Checkbutton(input_box, text="Audio設定を含める", variable=self.input_set_include_audio).grid(
+            column=0, columnspan=2, row=1, padx=5, pady=(0, 4), sticky="w")
+        ttk.Label(input_box, text="SerialのDevice Nameが設定済みの場合は自動的に含めます。").grid(
+            column=2, columnspan=4, row=1, padx=5, pady=(0, 4), sticky="w")
+        self.input_set_summary = tk.StringVar(value="CameraタブとAudioタブの現在値を登録します。")
+        ttk.Label(input_box, textvariable=self.input_set_summary, anchor="w").grid(
+            column=0, columnspan=6, row=2, padx=5, pady=(0, 5), sticky="ew")
+        input_box.columnconfigure(1, weight=1)
+
+        combined_box = ttk.Labelframe(self.input_set_content, text="InputSet・Recording 組み合わせセット")
+        combined_box.pack(fill="x", padx=6, pady=6)
+        ttk.Label(combined_box, text="組み合わせ名:").grid(column=0, row=0, padx=5, pady=5, sticky="w")
+        self.input_recording_set_name = tk.StringVar()
+        self.input_recording_set_cb = ttk.Combobox(combined_box, textvariable=self.input_recording_set_name, width=34)
+        self.input_recording_set_cb.grid(column=1, row=0, padx=5, pady=5, sticky="ew")
+        ttk.Label(combined_box, text="InputSet:").grid(column=0, row=1, padx=5, pady=5, sticky="w")
+        self.input_recording_input_name = tk.StringVar()
+        self.input_recording_input_cb = ttk.Combobox(
+            combined_box, textvariable=self.input_recording_input_name, state="readonly", width=34)
+        self.input_recording_input_cb.grid(column=1, row=1, padx=5, pady=5, sticky="ew")
+        ttk.Label(combined_box, text="Recordingセット:").grid(column=0, row=2, padx=5, pady=5, sticky="w")
+        self.input_recording_record_name = tk.StringVar()
+        self.input_recording_record_cb = ttk.Combobox(
+            combined_box, textvariable=self.input_recording_record_name, state="readonly", width=34)
+        self.input_recording_record_cb.grid(column=1, row=2, padx=5, pady=5, sticky="ew")
+        actions = ttk.Frame(combined_box)
+        actions.grid(column=2, columnspan=4, row=0, rowspan=3, padx=4, pady=4, sticky="ns")
+        ttk.Button(actions, text="呼び出し", command=self.load_input_recording_set).pack(fill="x", pady=1)
+        ttk.Button(actions, text="新規登録", command=lambda: self.save_input_recording_set(False)).pack(fill="x", pady=1)
+        ttk.Button(actions, text="変更保存", command=lambda: self.save_input_recording_set(True)).pack(fill="x", pady=1)
+        ttk.Button(actions, text="削除", command=self.delete_input_recording_set).pack(fill="x", pady=1)
+        self.input_recording_summary = tk.StringVar(value="登録済みInputSetとRecordingセットを組み合わせます。")
+        ttk.Label(combined_box, textvariable=self.input_recording_summary, anchor="w").grid(
+            column=0, columnspan=6, row=3, padx=5, pady=(0, 5), sticky="ew")
+        combined_box.columnconfigure(1, weight=1)
+        self.input_set_cb.bind("<<ComboboxSelected>>", self._show_input_set_summary)
+        self.input_recording_set_cb.bind("<<ComboboxSelected>>", self._select_input_recording_set)
+        self.refresh_input_sets()
+
+    def _input_sets_path(self):
+        return os.path.join(os.path.dirname(Settings.GuiSettings.SETTING_PATH), "input_sets.json")
+
+    def _read_input_sets(self):
+        try:
+            with open(self._input_sets_path(), "r", encoding="utf-8") as file:
+                data = json.load(file)
+            if not isinstance(data, dict):
+                return {"schema_version": 1, "input_sets": {}, "combined_sets": {}}
+            data.setdefault("schema_version", 1)
+            data.setdefault("input_sets", {})
+            data.setdefault("combined_sets", {})
+            return data
+        except (OSError, ValueError):
+            return {"schema_version": 1, "input_sets": {}, "combined_sets": {}}
+
+    def _write_input_sets(self, data):
+        path = self._input_sets_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temporary = path + ".tmp"
+        with open(temporary, "w", encoding="utf-8", newline="\n") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
+            file.write("\n")
+        os.replace(temporary, path)
+
+    @staticmethod
+    def _usb_identity(value):
+        value = str(value or "")
+        vid = re.search(r"(?i)vid[_:-]?([0-9a-f]{4})", value)
+        pid = re.search(r"(?i)pid[_:-]?([0-9a-f]{4})", value)
+        return (vid.group(1).upper() if vid else "", pid.group(1).upper() if pid else "")
+
+    def _current_camera_data(self):
+        camera_id = self.camera_id.get()
+        devices = self.camera_dic or {}
+        value = devices.get(camera_id, devices.get(str(camera_id), self.camera_name_fromDLL.get()))
+        vid, pid = self._usb_identity(value)
+        display_name = str(value or "")
+        device_path = ""
+        if display_name.endswith(")") and " (" in display_name:
+            possible_name, possible_path = display_name.rsplit(" (", 1)
+            possible_path = possible_path[:-1]
+            if "vid_" in possible_path.lower() or "pid_" in possible_path.lower() or possible_path.startswith("@"):
+                display_name, device_path = possible_name, possible_path
+        return {
+            "camera_id": camera_id,
+            "display_name": display_name,
+            "device_value": str(value or ""),
+            "device_path": device_path,
+            "vid": vid,
+            "pid": pid,
+            "fps": self.fps.get(),
+            "show_size": self.show_size.get(),
+        }
+
+    def _current_input_set_data(self):
+        include_audio = self.input_set_include_audio.get()
+        return {
+            "camera": self._current_camera_data(),
+            "audio": {
+                "enabled": include_audio,
+                "device_name": self.audio_input.get() if include_audio else "",
+                "normalized_name": self._normalize_audio_device_name(self.audio_input.get()) if include_audio else "",
+                "gain": self.audio_gain.get(),
+                "filter_camera": self.audio_filter_camera.get(),
+                "auto_start": self.audio_auto_start.get(),
+            },
+            "serial": self._current_serial_data(),
+        }
+
+    def _current_serial_data(self):
+        selected = self.serial_device_name.get().strip() if hasattr(self, "serial_device_name") else ""
+        if not selected or selected.startswith("("):
+            return {"enabled": False}
+        current_port = "COM{}".format(self.com_port.get())
+        matched = None
+        for port in list_ports.comports():
+            if port.description == selected or str(port.device).casefold() == current_port.casefold():
+                matched = port
+                break
+        return {
+            "enabled": True,
+            "device_name": selected,
+            "port": str(getattr(matched, "device", current_port)),
+            "description": str(getattr(matched, "description", selected)),
+            "vid": getattr(matched, "vid", None),
+            "pid": getattr(matched, "pid", None),
+            "serial_number": str(getattr(matched, "serial_number", "") or ""),
+        }
+
+    def refresh_input_sets(self):
+        if not hasattr(self, "input_set_cb"):
+            return
+        data = self._read_input_sets()
+        input_names = sorted(data["input_sets"])
+        combined_names = sorted(data["combined_sets"])
+        self.input_set_cb.configure(values=input_names)
+        self.input_recording_set_cb.configure(values=combined_names)
+        self.input_recording_input_cb.configure(values=input_names)
+        self.input_recording_record_cb.configure(values=sorted(self._read_recording_presets()))
+
+    def save_input_set(self, update=False):
+        name = self.input_set_name.get().strip()
+        if not name:
+            tkmsg.showwarning("InputSet", "入力セット名を入力してください。")
+            return
+        data = self._read_input_sets()
+        exists = name in data["input_sets"]
+        if update and not exists:
+            tkmsg.showwarning("InputSet", "変更する登録済みInputSetを選択してください。")
+            return
+        if not update and exists:
+            tkmsg.showwarning("InputSet", "同名のInputSetが登録済みです。変更保存を使用してください。")
+            return
+        data["input_sets"][name] = self._current_input_set_data()
+        self._write_input_sets(data)
+        self.refresh_input_sets()
+        self._show_input_set_summary()
+
+    def delete_input_set(self):
+        name = self.input_set_name.get().strip()
+        data = self._read_input_sets()
+        if name not in data["input_sets"]:
+            tkmsg.showwarning("InputSet", "削除する登録済みInputSetを選択してください。")
+            return
+        used = [set_name for set_name, item in data["combined_sets"].items() if item.get("input_set") == name]
+        detail = "\n使用中の組み合わせ: " + ", ".join(used) if used else ""
+        if not tkmsg.askyesno("InputSet", "InputSet「{}」を削除しますか？{}".format(name, detail)):
+            return
+        del data["input_sets"][name]
+        for set_name in used:
+            del data["combined_sets"][set_name]
+        self._write_input_sets(data)
+        self.input_set_name.set("")
+        self.refresh_input_sets()
+
+    def _resolve_camera_id(self, saved):
+        devices = [(key, str(value)) for key, value in (self.camera_dic or {}).items() if value != "Disable"]
+        saved_value = saved.get("device_value", "")
+        saved_path = saved.get("device_path", "")
+        for key, value in devices:
+            if saved_value and value.casefold() == saved_value.casefold():
+                return int(key)
+            if saved_path and saved_path.casefold() in value.casefold():
+                return int(key)
+        vid, pid = saved.get("vid", ""), saved.get("pid", "")
+        if vid and pid:
+            matches = [key for key, value in devices if self._usb_identity(value) == (vid, pid)]
+            if len(matches) == 1:
+                return int(matches[0])
+            if len(matches) > 1:
+                return self._choose_camera_candidate(saved, matches, "VID/PIDが同じカメラが複数見つかりました。")
+        display_name = saved.get("display_name", "")
+        matches = [key for key, value in devices if display_name and display_name.casefold() in value.casefold()]
+        if len(matches) == 1:
+            return int(matches[0])
+        if len(matches) > 1:
+            return self._choose_camera_candidate(saved, matches, "同じ名前のカメラが複数見つかりました。")
+        fallback = saved.get("camera_id")
+        if any(str(key) == str(fallback) for key, _ in devices):
+            return int(fallback)
+        return None
+
+    def _choose_camera_candidate(self, saved, candidate_ids, reason):
+        """Let the user preview ambiguous cameras before committing a match."""
+        original_id = self.camera_id.get()
+        devices = self.camera_dic or {}
+        candidates = [(int(camera_id), str(devices.get(camera_id, devices.get(str(camera_id), ""))))
+                      for camera_id in candidate_ids]
+        result = {"camera_id": None, "preview_id": None}
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("InputSet カメラの確認")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.resizable(True, False)
+        ttk.Label(dialog, text=reason).grid(column=0, columnspan=3, row=0, padx=10, pady=(10, 3), sticky="w")
+        ttk.Label(dialog, text="候補を切り替えてメイン画面の映像を確認し、正しいカメラを決定してください。").grid(
+            column=0, columnspan=3, row=1, padx=10, pady=(0, 8), sticky="w")
+        ttk.Label(dialog, text="登録時: {} / VID:{} PID:{}".format(
+            saved.get("display_name", ""), saved.get("vid", "-"), saved.get("pid", "-"))).grid(
+                column=0, columnspan=3, row=2, padx=10, pady=(0, 8), sticky="w")
+        selected = tk.StringVar()
+        labels = ["Camera ID {}: {}".format(camera_id, value) for camera_id, value in candidates]
+        combo = ttk.Combobox(dialog, textvariable=selected, values=labels, state="readonly", width=90)
+        combo.grid(column=0, columnspan=3, row=3, padx=10, pady=5, sticky="ew")
+        if labels:
+            selected.set(labels[0])
+
+        status = tk.StringVar(value="まだテスト切替していません。")
+        ttk.Label(dialog, textvariable=status).grid(column=0, columnspan=3, row=4, padx=10, pady=5, sticky="w")
+
+        def selected_camera_id():
+            try:
+                return candidates[labels.index(selected.get())][0]
+            except (ValueError, IndexError):
+                return None
+
+        def preview_candidate():
+            camera_id = selected_camera_id()
+            if camera_id is None:
+                return
+            self.camera_id.set(camera_id)
+            self.camera_name_fromDLL.set(devices.get(camera_id, devices.get(str(camera_id), "")))
+            self.camera_name_cb.current(camera_id)
+            if hasattr(self, "camera"):
+                self.openCamera()
+            result["preview_id"] = camera_id
+            status.set("Camera ID {}へ切り替えました。メイン画面の映像を確認してください。".format(camera_id))
+
+        def accept_candidate():
+            camera_id = selected_camera_id()
+            if camera_id is None:
+                return
+            if result["preview_id"] != camera_id:
+                tkmsg.showwarning("InputSet カメラの確認", "決定前に、選択したカメラへ「テスト切替」して映像を確認してください。", parent=dialog)
+                return
+            result["camera_id"] = camera_id
+            dialog.destroy()
+
+        def cancel_candidate():
+            if result["preview_id"] is not None and any(str(key) == str(original_id) for key in devices):
+                self.camera_id.set(original_id)
+                self.camera_name_fromDLL.set(devices.get(original_id, devices.get(str(original_id), "")))
+                self.camera_name_cb.current(original_id)
+                if hasattr(self, "camera"):
+                    self.openCamera()
+            dialog.destroy()
+
+        ttk.Button(dialog, text="テスト切替", command=preview_candidate).grid(column=0, row=5, padx=10, pady=10, sticky="ew")
+        ttk.Button(dialog, text="このカメラに決定", command=accept_candidate).grid(column=1, row=5, padx=4, pady=10, sticky="ew")
+        ttk.Button(dialog, text="キャンセル", command=cancel_candidate).grid(column=2, row=5, padx=10, pady=10, sticky="ew")
+        dialog.protocol("WM_DELETE_WINDOW", cancel_candidate)
+        dialog.columnconfigure(0, weight=1)
+        dialog.columnconfigure(1, weight=1)
+        dialog.columnconfigure(2, weight=1)
+        dialog.wait_window()
+        return result["camera_id"]
+
+    @staticmethod
+    def _normalize_audio_device_name(value):
+        """Remove PortAudio/Windows enumeration numbers from a device name."""
+        value = re.sub(r"^\s*\d+\s*:\s*", "", str(value or ""))
+        # Windows may rename a reconnected device from "(USB...)" to
+        # "(2- USB...)".  That instance counter is not part of its identity.
+        value = re.sub(r"\(\s*\d+\s*-\s*", "(", value)
+        value = re.sub(r"\s+", " ", value).strip()
+        return value.casefold()
+
+    def _resolve_audio_name(self, saved_name, saved_normalized=""):
+        inputs = list(getattr(self, "all_audio_inputs", []))
+        for value in inputs:
+            if value.casefold() == str(saved_name).casefold():
+                return value
+        normalized = saved_normalized or self._normalize_audio_device_name(saved_name)
+        matches = [value for value in inputs if normalized and
+                   self._normalize_audio_device_name(value) == normalized]
+        if matches:
+            return matches[0]
+        matches = [value for value in inputs if normalized and
+                   (normalized in self._normalize_audio_device_name(value) or
+                    self._normalize_audio_device_name(value) in normalized)]
+        return matches[0] if matches else None
+
+    def _apply_serial_input_set(self, saved):
+        if not saved.get("enabled", bool(saved.get("device_name"))):
+            return
+        ports = list(list_ports.comports())
+        serial_number = str(saved.get("serial_number", "") or "").casefold()
+        vid, pid = saved.get("vid"), saved.get("pid")
+        matches = [port for port in ports if serial_number and
+                   str(getattr(port, "serial_number", "") or "").casefold() == serial_number and
+                   (vid is None or getattr(port, "vid", None) == vid) and
+                   (pid is None or getattr(port, "pid", None) == pid)]
+        if not matches and vid is not None and pid is not None:
+            matches = [port for port in ports if getattr(port, "vid", None) == vid and
+                       getattr(port, "pid", None) == pid]
+        if not matches:
+            saved_description = str(saved.get("description", saved.get("device_name", ""))).casefold()
+            matches = [port for port in ports if str(getattr(port, "description", "")).casefold() == saved_description]
+        if not matches:
+            saved_port = str(saved.get("port", "")).casefold()
+            matches = [port for port in ports if str(getattr(port, "device", "")).casefold() == saved_port]
+        if not matches:
+            tkmsg.showwarning("InputSet", "登録したSerial Device Nameを検出できませんでした。Serialタブで選択し直してください。")
+            return
+        port = matches[0]
+        description = str(getattr(port, "description", saved.get("device_name", "")))
+        device = str(getattr(port, "device", saved.get("port", "")))
+        self.locateDeviceCmbbox()
+        self.serial_device_name.set(description)
+        match = re.search(r"(?i)COM(\d+)", device + " " + description)
+        if match:
+            self.com_port.set(int(match.group(1)))
+
+    def _apply_input_set_data(self, item):
+        camera = item.get("camera", {})
+        audio = item.get("audio", {})
+        serial = item.get("serial", {})
+        self.locateCameraCmbbox()
+        camera_id = self._resolve_camera_id(camera)
+        if camera_id is None:
+            tkmsg.showwarning("InputSet", "登録したカメラを検出できませんでした。Cameraタブで選択し直してください。")
+        else:
+            self.camera_id.set(camera_id)
+            self.camera_name_cb.current(camera_id)
+            self.camera_name_fromDLL.set((self.camera_dic or {}).get(camera_id, (self.camera_dic or {}).get(str(camera_id), "")))
+            self.fps.set(str(camera.get("fps", self.fps.get())))
+            self.show_size.set(camera.get("show_size", self.show_size.get()))
+            if hasattr(self, "camera"):
+                self.camera.fps = int(self.fps.get())
+                self.openCamera()
+        audio_enabled = audio.get("enabled", bool(audio.get("device_name")))
+        self.input_set_include_audio.set(audio_enabled)
+        if audio_enabled:
+            self.audio_filter_camera.set(audio.get("filter_camera", False))
+            self.audio_auto_start.set(audio.get("auto_start", False))
+            self.audio_gain.set(audio.get("gain", 100))
+            self.refresh_audio_devices()
+            audio_name = self._resolve_audio_name(
+                audio.get("device_name", ""), audio.get("normalized_name", ""))
+            if audio_name:
+                self.audio_input.set(audio_name)
+            elif audio.get("device_name"):
+                tkmsg.showwarning("InputSet", "登録した音声デバイスを検出できませんでした。Audioタブで選択し直してください。")
+        else:
+            self.audio_input.set("")
+            self.audio_auto_start.set(False)
+        self._apply_serial_input_set(serial)
+
+    def load_input_set(self):
+        name = self.input_set_name.get().strip()
+        item = self._read_input_sets()["input_sets"].get(name)
+        if not item:
+            tkmsg.showwarning("InputSet", "呼び出す登録済みInputSetを選択してください。")
+            return
+        self._apply_input_set_data(item)
+        self._show_input_set_summary()
+
+    def _show_input_set_summary(self, event=None):
+        item = self._read_input_sets()["input_sets"].get(self.input_set_name.get().strip())
+        if not item:
+            self.input_set_summary.set("CameraタブとAudioタブの現在値を登録します。")
+            return
+        camera, audio, serial = item.get("camera", {}), item.get("audio", {}), item.get("serial", {})
+        audio_enabled = audio.get("enabled", bool(audio.get("device_name")))
+        self.input_set_include_audio.set(audio_enabled)
+        identity = "VID:{} PID:{}".format(camera.get("vid", "-"), camera.get("pid", "-"))
+        audio_text = "{} / Gain: {}%".format(audio.get("device_name", ""), audio.get("gain", 100)) \
+            if audio_enabled else "設定なし"
+        serial_text = serial.get("device_name", "設定なし") if serial.get("enabled", bool(serial.get("device_name"))) else "設定なし"
+        self.input_set_summary.set("Camera: {} ({}) / Audio: {} / Serial: {}".format(
+            camera.get("display_name", ""), identity, audio_text, serial_text))
+
+    def save_input_recording_set(self, update=False):
+        name = self.input_recording_set_name.get().strip()
+        input_name = self.input_recording_input_name.get().strip()
+        recording_name = self.input_recording_record_name.get().strip()
+        data = self._read_input_sets()
+        if not name or input_name not in data["input_sets"] or recording_name not in self._read_recording_presets():
+            tkmsg.showwarning("組み合わせセット", "組み合わせ名、登録済みInputSet、Recordingセットを選択してください。")
+            return
+        exists = name in data["combined_sets"]
+        if update and not exists:
+            tkmsg.showwarning("組み合わせセット", "変更する登録済み組み合わせセットを選択してください。")
+            return
+        if not update and exists:
+            tkmsg.showwarning("組み合わせセット", "同名の組み合わせセットが登録済みです。変更保存を使用してください。")
+            return
+        data["combined_sets"][name] = {"input_set": input_name, "recording_set": recording_name}
+        self._write_input_sets(data)
+        self.refresh_input_sets()
+        self._select_input_recording_set()
+
+    def _select_input_recording_set(self, event=None):
+        item = self._read_input_sets()["combined_sets"].get(self.input_recording_set_name.get().strip())
+        if not item:
+            return
+        self.input_recording_input_name.set(item.get("input_set", ""))
+        self.input_recording_record_name.set(item.get("recording_set", ""))
+        self.input_recording_summary.set("InputSet: {} / Recording: {}".format(
+            item.get("input_set", ""), item.get("recording_set", "")))
+
+    def load_input_recording_set(self):
+        item = self._read_input_sets()["combined_sets"].get(self.input_recording_set_name.get().strip())
+        if not item:
+            tkmsg.showwarning("組み合わせセット", "呼び出す登録済み組み合わせセットを選択してください。")
+            return
+        input_item = self._read_input_sets()["input_sets"].get(item.get("input_set"))
+        if not input_item:
+            tkmsg.showerror("組み合わせセット", "参照しているInputSetがありません。")
+            return
+        self._apply_input_set_data(input_item)
+        self.recording_preset_name.set(item.get("recording_set", ""))
+        self.load_recording_preset()
+        self._select_input_recording_set()
+
+    def delete_input_recording_set(self):
+        name = self.input_recording_set_name.get().strip()
+        data = self._read_input_sets()
+        if name not in data["combined_sets"]:
+            tkmsg.showwarning("組み合わせセット", "削除する登録済み組み合わせセットを選択してください。")
+            return
+        if not tkmsg.askyesno("組み合わせセット", "組み合わせセット「{}」を削除しますか？".format(name)):
+            return
+        del data["combined_sets"][name]
+        self._write_input_sets(data)
+        self.input_recording_set_name.set("")
+        self.refresh_input_sets()
+
     def refresh_audio_devices(self):
         self.all_audio_inputs = AudioMonitor.devices("input")
         self.update_audio_input_list()
@@ -3325,6 +3932,8 @@ class PokeControllerApp:
     def refresh_recording_presets(self):
         if hasattr(self, "recording_preset_cb"):
             self.recording_preset_cb.configure(values=sorted(self._read_recording_presets().keys()))
+        if hasattr(self, "input_recording_record_cb"):
+            self.refresh_input_sets()
 
     def _recording_preset_data(self):
         return {

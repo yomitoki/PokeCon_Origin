@@ -41,7 +41,8 @@ def command_path(commands_root, tags, filename):
 
 
 def template_source(kind, class_name, display_name, tags, steps, step_loop=True,
-                    detection_targets=None, step_start=0, special_steps=None):
+                    detection_targets=None, step_start=0, special_steps=None,
+                    step_custom_bodies=None):
     class_name = python_identifier(class_name)
     display_name = display_name.replace("'", "\\'")
     tag_repr = repr(list(tags))
@@ -88,6 +89,7 @@ class {class_name}(PythonCommand):
             self.wait(1.0)
 """
     if kind == "Step" or kind.startswith("Step (state") or kind.startswith("Step (nested"):
+        step_custom_bodies = dict(step_custom_bodies or {})
         nested = kind.startswith("Step (nested")
         special_steps = list(special_steps or [])
         raw_steps = steps or ([{"key": "1", "label": "Chapter 1: preparation"}, {"key": "1_1", "label": "Child 1: check"}, {"key": "1_2", "label": "Child 2: action"}, {"key": "2", "label": "Chapter 2: finish"}] if nested else ["Chapter 1: preparation", "Chapter 2: action", "Chapter 3: finish"])
@@ -108,20 +110,27 @@ class {class_name}(PythonCommand):
             labels = dict(step_items)
             nested_methods = []
             for key in step_keys:
+                user_body = step_custom_bodies.get(key, "        # Write this step's command here / このStepの処理をここへ書きます。\n")
+                if not user_body.endswith("\n"):
+                    user_body += "\n"
                 child_calls = "".join("""        result = self._step_{child}()
         if result is not None:
             return result
 """.format(child=child) for child in children.get(key, []))
                 nested_methods.append("""    def _step_{key}(self):
+        # @pokedev-step: key={key}, mode=nested, role={role}
         # {label} / {label} の処理
         self.current_step = "{root}"
         self.current_substep = "{key}"
         self.stop_checkpoint()
         print('[STEP] {{}} / {{}}'.format(self.current_step, self.current_substep))
+        # POKECON_STEP_USER_BEGIN {key}
+{user_body}        # POKECON_STEP_USER_END {key}
 {child_calls}        # Parent completion / 親Stepの終了処理
         return None
 
-""".format(key=key, label=labels[key], root=key.split("_")[0], child_calls=child_calls))
+""".format(key=key, label=labels[key], root=key.split("_")[0], child_calls=child_calls, user_body=user_body,
+             role="chapter" if children.get(key) else "leaf"))
             top_keys = [key for key in step_keys if "_" not in key]
             runner = """    def do(self):
         # Nested chapters / 親Stepが子Stepを順に実行します。
@@ -139,17 +148,23 @@ class {class_name}(PythonCommand):
         methods = []
         for number, (step_key, label) in enumerate(step_items):
             safe_label = label.replace("'", "\\'")
+            user_body = step_custom_bodies.get(step_key, "        # Write this step's command here / このStepの処理をここへ書きます。\n")
+            if not user_body.endswith("\n"):
+                user_body += "\n"
             methods.append("""    def _step_{step_key}(self):
+        # @pokedev-step: key={step_key}, mode=state, role=state
         # Step {step_key}: {label} / ステップ{step_key}: {label}
         self.stop_checkpoint()
         # self.press(Button.A, duration=0.1, wait=0.1)
+        # POKECON_STEP_USER_BEGIN {step_key}
+{user_body}        # POKECON_STEP_USER_END {step_key}
         # return None        # next step / 次のステップへ（標準）
         # return self.step   # repeat this step / このステップを繰り返す
         # return "{step_key}" # jump by step key / ステップ番号を指定して移動
         # return "{label}"  # jump by name / 名前を指定して移動
         return None
 
-""".format(number=number, step_key=step_key, label=safe_label))
+""".format(number=number, step_key=step_key, label=safe_label, user_body=user_body))
         helper = """    def stop_checkpoint(self):
         # Call in loops/long tasks. / ループ・長時間処理の途中で必ず呼びます。
         self.checkIfAlive()
