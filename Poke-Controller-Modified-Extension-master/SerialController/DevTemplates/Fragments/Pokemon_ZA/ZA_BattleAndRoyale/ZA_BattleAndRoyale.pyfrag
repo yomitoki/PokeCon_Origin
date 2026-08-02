@@ -1,0 +1,2081 @@
+def ZA_load_json_with_comments(self, filename):
+    """コメント付きJSONを読み込む関数（// や # 行を無視）"""
+    with open(filename, "r", encoding="utf-8") as f:
+        lines = []
+        for line in f:
+            stripped = line.strip()
+            # コメントや空行をスキップ
+            if stripped.startswith("//") or stripped.startswith("#") or stripped == "":
+                continue
+            lines.append(line)
+        json_text = "".join(lines)
+        return json.loads(json_text)
+
+def ZA_save_sleeps(self):
+    """SLEEPLISTをJSONファイルに保存（整形付き）"""
+    try:
+        # キーを文字列に変換して保存（JSONでは数値キーが文字列化されるため）
+        data_to_save = {str(k): v for k, v in self.ZA_SLEEPLIST.items()}
+        
+        with open(self.ZA_config_path2, "w", encoding="utf-8") as f:
+            json.dump(data_to_save, f, ensure_ascii=False, indent=4)
+        
+        print("SLEEPLISTをファイルに保存しました。")
+    except Exception as e:
+        print(f"SLEEPLISTの保存エラー: {e}")
+
+def ZA_load_zones(self):
+    added, changed = [], []
+    """ファイルからZONELISTを更新"""
+    try:
+        data = self.ZA_load_json_with_comments(self.ZA_config_path)
+        # JSONではキーが文字列になるのでintキーに変換
+        self.ZA_ZONELIST = {int(k): v for k, v in data.items()}
+        print("ZONELISTを更新しました。")
+        if not added and not changed:
+            print("（変更はありません）")
+        elif self.ZA_ZONELIST[key] != value:
+            print(f"ZONE {key} が更新されました。")
+            print(f"旧: {self.ZA_ZONELIST[key]}")
+            print(f"新: {value}")
+            changed.append(key)
+    except Exception as e:
+        print(f"ZONELISTの読み込みエラー: {e}")
+
+def ZA_load_sleeps(self):
+    added, changed = [], []  
+    try:
+        data = self.ZA_load_json_with_comments(self.ZA_config_path2)
+        # JSONではキーが文字列になるのでintキーに変換
+        self.ZA_SLEEPLIST = {int(k): v for k, v in data.items()}
+        print("SLEEPLISTを更新しました。")
+        if not added and not changed:
+            print("（変更はありません）")
+        elif self.ZA_SLEEPLIST[key] != value:
+            print(f"SLEEP {key} が更新されました。")
+            print(f"旧: {self.ZA_SLEEPLIST[key]}")
+            print(f"新: {value}")
+            changed2.append(key)
+    except Exception as e:
+        print(f"SLEEPLISTの読み込みエラー: {e}")
+
+def ZA_battle_coCp_noloop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endskip=0,battle_mode=0):
+    if battle_mode==0 and self.image_check("POKEMON_ZA_SELECT"):
+        self.ZA_etc_sendCommand("Lbutton_up")
+    if battle_mode==1 and self.image_check("POKEMON_ZA_FIELD_W"):
+        self.ZA_etc_sendCommand("Lbutton_up")
+    self.ZA_ZL_ACTION("")
+    for i in range(3):
+        if Xaction==1:
+            self.pressRep(Button.X, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+        if Aaction==1:
+            self.pressRep(Button.A, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+        if Yaction==1:
+            self.pressRep(Button.Y, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+        if Baction==1:
+            self.pressRep(Button.B, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+    if lockon_endskip==0:
+        self.ZA_ZL_ACTION("END")
+
+def ZA_battle_Cp_loop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endskip=0,get_chanceicon4=0,mode=0,battle_mode=0,Cp_low_check=0,usenum=1):
+    noCp_count=0
+    target_marker=1
+    nofiled=1
+    while True:
+        print(f'noCp_count = {noCp_count} mode = {mode} battle_mode = {battle_mode}')
+        self.checkIfAlive()
+        
+        if nofiled==1 and (self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W")):
+            if (usenum==1 and (self.image_check("POKEMON_ZA_FIELD1") or self.image_check("POKEMON_ZA_FIELD_BACK1"))):
+                self.wait(0.5)
+                self.ZA_etc_sendCommand("Lbutton_up")
+                nofiled=0
+            elif (usenum==2 and (self.image_check("POKEMON_ZA_FIELD2") or self.image_check("POKEMON_ZA_FIELD_BACK2"))):
+                self.wait(0.5)
+                self.ZA_etc_sendCommand("Lbutton_up")
+                nofiled=0
+            elif (usenum==3 and (self.image_check("POKEMON_ZA_FIELD3") or self.image_check("POKEMON_ZA_FIELD_BACK3"))):
+                self.wait(0.5)
+                self.ZA_etc_sendCommand("Lbutton_up")
+                nofiled=0
+            elif (usenum==4 and (self.image_check("POKEMON_ZA_FIELD4") or self.image_check("POKEMON_ZA_FIELD_BACK4"))):
+                self.wait(0.5)
+                self.ZA_etc_sendCommand("Lbutton_up")
+                nofiled=0
+            elif (usenum==5 and (self.image_check("POKEMON_ZA_FIELD5") or self.image_check("POKEMON_ZA_FIELD_BACK5"))):
+                self.wait(0.5)
+                self.ZA_etc_sendCommand("Lbutton_up")
+                nofiled=0
+            elif (usenum==6 and (self.image_check("POKEMON_ZA_FIELD6") or self.image_check("POKEMON_ZA_FIELD_BACK6"))):
+                self.wait(0.5)
+                self.ZA_etc_sendCommand("Lbutton_up")
+                nofiled=0
+            else:
+                self.ZA_etc_sendCommand("Lbutton_left")
+                self.wait(0.5)
+                continue
+        
+        elif battle_mode==0 and self.image_check("POKEMON_ZA_SELECT"):
+            self.ZA_etc_sendCommand("Lbutton_up")
+        elif battle_mode==1 and self.image_check("POKEMON_ZA_FIELD_W"):
+            self.ZA_etc_sendCommand("Lbutton_up")
+            
+        if self.image_check("POKEMON_ZA_R_push"):
+            self.press(Button.RCLICK,0.05,0.1) 
+            
+        self.ZA_ZL_ACTION("")
+        
+        for i in range(5):
+            #バトル中チェック チェックできない場合は、一旦抜ける
+            if mode==0 and (self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") or self.image_check("POKEMON_ZA_ESCAPE") or self.image_check("POKEMON_ZA_C+")):
+                
+                if get_chanceicon4==1 and self.image_check("POKEMON_ZA_GETCHANCE_ICON4"):
+                    self.ZA_get_pokemon()
+                if self.image_check("POKEMON_ZA_C+"):
+                    noCp_count=0
+                    if Xaction==1:
+                        self.pressRep(Button.X, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    if Aaction==1:
+                        self.pressRep(Button.A, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    if Yaction==1:
+                        self.pressRep(Button.Y, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    if Baction==1:
+                        self.pressRep(Button.B, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    self.ZA_MOVE_SEE(action = "END",in_see_r=0.6)
+                elif (self.image_check("POKEMON_ZA_TARGET_LEFT_MID") or self.image_check("POKEMON_ZA_TARGET_RIGHT_MID") or self.image_check("POKEMON_ZA_TARGET_RIGHT_RIHGT_CHECK_MID") or self.image_check("POKEMON_ZA_TARGET_LEFT_RIHGT_CHECK_MID")):
+                    if target_marker>=1:
+                        self.ZA_MOVE_SEE(action = "END",in_see_r=0.6)
+                        target_marker=0
+                    else:
+                        target_marker+=1
+                        if noCp_count>=3:
+                            self.ZA_MOVE_SEE(action = "",in_see_r=0.6)
+                        print(f'noCp_count = {noCp_count} 1')
+                        if self.image_check("POKEMON_ZA_ESCAPE"):
+                            noCp_count+=1#ロックオンはできていないためカウントは行う
+                else:
+                    if noCp_count>=3:
+                        print(f'noCp_count = {noCp_count} 6')
+                        self.ZA_MOVE_SEE(action = "",in_see_r=0.6)
+                    print(f'noCp_count = {noCp_count} 2')
+                    if self.image_check("POKEMON_ZA_ESCAPE"):
+                        noCp_count+=1
+            elif mode==1 and (self.image_check("POKEMON_ZA_EYE_CHECK_HIGH_POKE") or self.image_check("POKEMON_ZA_C+")):
+                if self.image_check("POKEMON_ZA_FIELD_W"):
+                    self.ZA_etc_sendCommand("Lbutton_up")
+                    
+                if get_chanceicon4==1 and self.image_check("POKEMON_ZA_GETCHANCE_ICON4"):
+                    self.ZA_get_pokemon()
+                if self.image_check("POKEMON_ZA_C+"):
+                    noCp_count=0
+                    if Xaction==1:
+                        self.pressRep(Button.X, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    if Aaction==1:
+                        self.pressRep(Button.A, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    if Yaction==1:
+                        self.pressRep(Button.Y, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    if Baction==1:
+                        self.pressRep(Button.B, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    self.ZA_MOVE_SEE(action = "END",in_see_r=0.6)
+                elif (self.image_check("POKEMON_ZA_TARGET_LEFT_MID") or self.image_check("POKEMON_ZA_TARGET_RIGHT_MID") or self.image_check("POKEMON_ZA_TARGET_RIGHT_RIHGT_CHECK_MID") or self.image_check("POKEMON_ZA_TARGET_LEFT_RIHGT_CHECK_MID")):
+                    if target_marker>=1:
+                        self.ZA_MOVE_SEE(action = "END",in_see_r=0.6)
+                        target_marker=0
+                    else:
+                        target_marker+=1
+                        if noCp_count>=3:
+                            self.ZA_MOVE_SEE(action = "",in_see_r=0.6)
+                        print(f'noCp_count = {noCp_count} 1')
+                        if self.image_check("POKEMON_ZA_ESCAPE"):
+                            noCp_count+=1#ロックオンはできていないためカウントは行う
+                else:
+                    if noCp_count>=3:
+                        print(f'noCp_count = {noCp_count} 5')
+                        self.ZA_MOVE_SEE(action = "",in_see_r=0.6)
+                    print(f'noCp_count = {noCp_count} 4')
+                    if self.image_check("POKEMON_ZA_ESCAPE"):
+                        noCp_count+=1
+            else:
+                self.ZA_MOVE_SEE(action = "END",in_see_r=0.6)
+                if lockon_endskip==0:
+                    self.ZA_ZL_ACTION("END")
+                print("return")
+                return True
+            
+        if lockon_endskip==0:
+            self.ZA_ZL_ACTION("END")
+    return True
+
+def ZA_battle_Cp_loop_move(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endskip=0,get_chanceicon4=0,mode=0,battle_mode=0,Cp_low_check=0,usenum=1):
+    noCp_count=0
+    target_marker=1
+    nofiled=1
+    see_r=0.3
+    while True:
+        print(f'noCp_count = {noCp_count} mode = {mode} battle_mode = {battle_mode}')
+        self.checkIfAlive()
+        
+        if battle_mode==0 and self.image_check("POKEMON_ZA_SELECT"):
+            self.ZA_etc_sendCommand("Lbutton_up")
+        elif battle_mode==1 and self.image_check("POKEMON_ZA_FIELD_W"):
+            self.ZA_etc_sendCommand("Lbutton_up")
+            
+        if self.image_check("POKEMON_ZA_R_push"):
+            self.ZA_MOVE_SEE(action = "END",in_see_r=see_r)
+            self.press(Button.RCLICK,0.05,0.1) 
+            self.wait(1.0)
+            self.ZA_MOVE_SEE(action = "",in_see_r=see_r)
+            
+        self.ZA_ZL_ACTION("")
+        
+        self.ZA_MOVE_LStick(350,350,350,350,1,"RELOAD")
+        
+        for i in range(5):
+            #バトル中チェック チェックできない場合は、一旦抜ける
+            if mode==0 and (self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") or self.image_check("POKEMON_ZA_ESCAPE") or self.image_check("POKEMON_ZA_C+")):
+                
+                if get_chanceicon4==1 and self.image_check("POKEMON_ZA_GETCHANCE_ICON4"):
+                    self.ZA_get_pokemon()
+                if self.image_check("POKEMON_ZA_C+"):
+                    noCp_count=0
+                    if Xaction==1:
+                        self.pressRep(Button.X, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    if Aaction==1:
+                        self.pressRep(Button.A, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    if Yaction==1:
+                        self.pressRep(Button.Y, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    if Baction==1:
+                        self.pressRep(Button.B, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    self.ZA_MOVE_SEE(action = "END",in_see_r=0.6)
+                elif (self.image_check("POKEMON_ZA_TARGET_LEFT_MID") or self.image_check("POKEMON_ZA_TARGET_RIGHT_MID") or self.image_check("POKEMON_ZA_TARGET_RIGHT_RIHGT_CHECK_MID") or self.image_check("POKEMON_ZA_TARGET_LEFT_RIHGT_CHECK_MID")):
+                    if target_marker>=1:
+                        self.ZA_MOVE_SEE(action = "END",in_see_r=0.6)
+                        target_marker=0
+                    else:
+                        target_marker+=1
+                        if noCp_count>=3:
+                            self.ZA_MOVE_SEE(action = "",in_see_r=0.6)
+                        print(f'noCp_count = {noCp_count} 1')
+                        if self.image_check("POKEMON_ZA_ESCAPE"):
+                            noCp_count+=1#ロックオンはできていないためカウントは行う
+                else:
+                    if noCp_count>=3:
+                        print(f'noCp_count = {noCp_count} 6')
+                        self.ZA_MOVE_SEE(action = "",in_see_r=0.6)
+                    print(f'noCp_count = {noCp_count} 2')
+                    if self.image_check("POKEMON_ZA_ESCAPE"):
+                        noCp_count+=1
+            elif mode==1 and (self.image_check("POKEMON_ZA_EYE_CHECK_HIGH_POKE") or self.image_check("POKEMON_ZA_C+")):
+                if self.image_check("POKEMON_ZA_FIELD_W"):
+                    self.ZA_etc_sendCommand("Lbutton_up")
+                    
+                if get_chanceicon4==1 and self.image_check("POKEMON_ZA_GETCHANCE_ICON4"):
+                    self.ZA_get_pokemon()
+                if self.image_check("POKEMON_ZA_C+"):
+                    noCp_count=0
+                    if Xaction==1:
+                        self.pressRep(Button.X, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    if Aaction==1:
+                        self.pressRep(Button.A, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    if Yaction==1:
+                        self.pressRep(Button.Y, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    if Baction==1:
+                        self.pressRep(Button.B, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    self.ZA_MOVE_SEE(action = "END",in_see_r=0.6)
+                elif (self.image_check("POKEMON_ZA_TARGET_LEFT_MID") or self.image_check("POKEMON_ZA_TARGET_RIGHT_MID") or self.image_check("POKEMON_ZA_TARGET_RIGHT_RIHGT_CHECK_MID") or self.image_check("POKEMON_ZA_TARGET_LEFT_RIHGT_CHECK_MID")):
+                    if target_marker>=1:
+                        self.ZA_MOVE_SEE(action = "END",in_see_r=0.6)
+                        target_marker=0
+                    else:
+                        target_marker+=1
+                        if noCp_count>=3:
+                            self.ZA_MOVE_SEE(action = "",in_see_r=0.6)
+                        print(f'noCp_count = {noCp_count} 1')
+                        if self.image_check("POKEMON_ZA_ESCAPE"):
+                            noCp_count+=1#ロックオンはできていないためカウントは行う
+                else:
+                    if noCp_count>=3:
+                        print(f'noCp_count = {noCp_count} 5')
+                        self.ZA_MOVE_SEE(action = "",in_see_r=0.6)
+                    print(f'noCp_count = {noCp_count} 4')
+                    if self.image_check("POKEMON_ZA_ESCAPE"):
+                        noCp_count+=1
+            else:
+                self.ZA_MOVE_LStick(350,350,350,350,1,"END")
+                self.ZA_MOVE_SEE(action = "END",in_see_r=0.6)
+                if lockon_endskip==0:
+                    self.ZA_ZL_ACTION("END")
+                print("return")
+                return True
+            
+        if lockon_endskip==0:
+            self.ZA_ZL_ACTION("END")
+            
+            
+    if lockon_endskip==0:
+        self.ZA_ZL_ACTION("END")
+    self.ZA_MOVE_LStick(350,350,350,350,1,"END")
+    self.ZA_MOVE_SEE(action = "END",in_see_r=0.6)
+    return True
+
+def ZA_battle_infi_main(self):
+    
+    while True:
+        
+        self.ZA_za_infi_main_current_state = self.ZA_STATE_ZA_INFI_MAIN_FUNCTION[self.ZA_za_infi_main_current_state]()
+        self.wait(self.ZA_SLEEPLIST[9][2])
+        self.out_str = (
+            f'----------------------------'
+            f'\n STATE_MAIN_FUNCTION   :: {self.ZA_za_infi_main_current_state}'
+            f'\n'
+            f'\n STATE_BENCH_FUNCTION  :: {self.ZA_bench_current_state}'
+            f'\n STATE_BATTLE_FUNCTION :: {self.ZA_battle_current_state}'
+            f'\n STATE_QUASAR_FUNCTION :: {self.ZA_quasar_current_state}'
+            f'\n battlecount::{self.ZA_battlecount}'
+            f'\n battle_step::{self.ZA_battle_step}'      
+            f'\n chicketmaxflag::{self.ZA_chicketmaxflag}'
+            f'\n ZL_state::{self.ZA_ZL_state}'  
+            f'\n'  
+            f'\n ZONECOUNT'
+            f'\n[ 1 :{self.ZA_zonemisscount[0]}/{self.ZA_zonecount[0]}] '
+            f'[ 2 :{self.ZA_zonemisscount[1]}/{self.ZA_zonecount[1]}] '
+            f'[ 3 :{self.ZA_zonemisscount[2]}/{self.ZA_zonecount[2]}] '
+            f'[ 4 :{self.ZA_zonemisscount[3]}/{self.ZA_zonecount[3]}] '
+            f'[ 5 :{self.ZA_zonemisscount[4]}/{self.ZA_zonecount[4]}] '
+            f'[ 6 :{self.ZA_zonemisscount[5]}/{self.ZA_zonecount[5]}] '
+            f'\n[ 7 :{self.ZA_zonemisscount[6]}/{self.ZA_zonecount[6]}] '
+            f'[ 8 :{self.ZA_zonemisscount[7]}/{self.ZA_zonecount[7]}] '
+            f'[ 9 :{self.ZA_zonemisscount[8]}/{self.ZA_zonecount[8]}] '
+            f'[10 :{self.ZA_zonemisscount[9]}/{self.ZA_zonecount[9]}] '
+            f'[11 :{self.ZA_zonemisscount[10]}/{self.ZA_zonecount[10]}] '
+            f'[12 :{self.ZA_zonemisscount[11]}/{self.ZA_zonecount[11]}]'
+            f'\n'  
+            f'\n QUASAR_LOSE_COUNT::{self.ZA_quasarlosecount}/{self.ZA_quasarcount}'
+            f'\n battle_escape_count::{self.ZA_battleescapecount}'
+            f'\n inactioncount::{self.ZA_inactioncount}'
+            f'\n timechangemiss_count::{self.ZA_changetimemisscount}/{self.ZA_changetimecount}'
+            f'\n'
+            f' target_maker low:{self.ZA_target_end_low_count}/{self.ZA_target_start_low_count} mid:{self.ZA_target_end_mid_count}/{self.ZA_target_start_mid_count} normal:{self.ZA_target_end_count}/{self.ZA_target_start_count}\n'
+            f' quasar_target_maker low:{self.ZA_quasar_target_end_low_count}/{self.ZA_quasar_target_start_low_count} mid:{self.ZA_quasar_target_end_mid_count}/{self.ZA_quasar_target_start_mid_count} normal:{self.ZA_quasar_target_end_count}/{self.ZA_quasar_target_start_count}\n'
+            f' quasar_battle_display :{self.ZA_quasar_battle_display_end_count}/{self.ZA_quasar_battle_display_start_count}\n'
+            f' battlemarker_skipcount {self.battlemarker_skipcount}/{self.ZA_battlemarker_skipcount_threshold}\n'
+            f'\n'
+            f'以下はTESTCODE=1でチェック {self.ZA_TESTADDCODE} ※PythonCommandBaseの編集が必要なため0とすること\n'  
+            f'--------[ 50][ 55][ 60][ 65][ 70][ 75][ 80][ 85][ 90][ 95][100]\n'
+            f'[left ::'
+            f'[{self.ZA_target_left_max_val_list[0]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[1]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[2]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[3]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[4]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[5]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[6]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[7]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[8]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[9]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[10]:03d}]'
+            f']\n'
+            f'[right::'
+            f'[{self.ZA_target_right_max_val_list[0]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[1]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[2]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[3]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[4]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[5]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[6]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[7]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[8]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[9]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[10]:03d}]'
+            f']\n'
+            f'\n----------------------------'
+            )
+
+        self.print_tb("d"); self.print_t(f'{self.out_str}')
+        self.checkIfAlive()
+    return True
+
+def ZA_za_infi_main_start(self):
+    self.ZA_load_zones()
+    self.ZA_no_Cplus=0      
+    if self.ZA_fastread:
+        self.ZA_load_sleeps()
+    self.ZA_fastread = False
+    #print(f'{self.ZA_SLEEPLIST}')
+    return "ZA_INFI_MAIN_BENCH"
+
+def ZA_za_infi_main_bench(self):
+    self.ZA_bench_current_state = self.ZA_STATE_BENCH_FUNCTION[self.ZA_bench_current_state]()
+    if self.ZA_bench_current_state == "BATTLE_RETURN":
+        self.ZA_bench_current_state="BENCH_START"
+        self.ZA_battle_current_state="BATTLE_MOVE"
+        return "ZA_INFI_MAIN_BATTLE_LOOP"
+    elif self.ZA_bench_current_state == "BENCH_START":
+        if self.ZA_chicketmaxflag == 2:
+            return "ZA_INFI_QUASAR_LOOP"
+        else:
+            return "ZA_INFI_MAIN_BATTLE_LOOP"
+    else:
+        return "ZA_INFI_MAIN_BENCH"
+
+def ZA_za_infi_main_battle_loop(self):
+    self.ZA_battle_current_state = self.ZA_STATE_BATTLE_FUNCTION[self.ZA_battle_current_state]()
+    
+    if self.ZA_battle_current_state == "BATTLE_START":
+        return "ZA_INFI_MAIN_END"
+    else:
+        return "ZA_INFI_MAIN_BATTLE_LOOP"
+
+def ZA_za_infi_main_end(self):
+    return "ZA_INFI_MAIN_START"
+
+def ZA_za_infi_quasar_loop(self):
+    self.ZA_quasar_current_state = self.ZA_STATE_QUASAR_FUNCTION[self.ZA_quasar_current_state]()
+    if self.ZA_quasar_current_state == "QUASAR_START":
+        return "ZA_INFI_MAIN_END"
+    else:
+        return "ZA_INFI_QUASAR_LOOP"
+
+def ZA_Benchi(self):
+    if self.ZA_sleepcount==0:
+        self.press(Direction(Stick.LEFT, 180), duration=0.7, wait=0.1)
+        self.press(Direction(Stick.LEFT, 90), duration=0.5, wait=0.1)
+    else:
+        self.press(Direction(Stick.LEFT, 270), duration=0.5, wait=0.1)
+    self.pressRep(Button.A, repeat=12, duration=0.15, wait=0.2, interval=0.3)
+
+def ZA_bench_start(self):
+    return "BENCH_MAP_OPEN"
+
+def ZA_bench_map_open(self):
+    self.ZA_ZL_ACTION("END")
+    self.wait(self.ZA_SLEEPLIST[8][2])
+    
+    # 想定外の話しかけ用
+    if self.image_check("POKEMON_ZA_TEXT_BOX"):
+        self.pressRep(Button.B, repeat=5, duration=0.15, wait=0.01, interval=0.1)
+        self.wait(0.1)
+    if self.image_check("POKEMON_ZA_TEXT_BOX2"):
+        self.pressRep(Button.A, repeat=5, duration=0.15, wait=0.01, interval=0.1)
+        self.wait(0.1)        
+    #マップコメントの捕捉失敗用
+    if self.image_check("POKEMON_ZA_ESCAPE"):
+        self.ZA_battlecheck=1
+        self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+        return "BENCH_POKECENTER_SELECT1"   
+    elif self.image_check("POKEMON_ZA_FIELD") or self.image_check("POKEMON_ZA_FIELD_BACK") or self.image_check("POKEMON_ZA_DEAD"):
+
+        #マップコメントの捕捉失敗用
+        if self.image_check("POKEMON_ZA_ESCAPE"):
+            self.ZA_battlecheck=1
+        else:
+            self.ZA_battlecheck=0
+        self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+        self.wait(0.1)
+        return "BENCH_POKECENTER_SELECT1"
+    # ステップ遷移ミス用
+    elif self.image_check("POKEMON_ZA_MAP"):
+        return "BENCH_POKECENTER_SELECT1"
+    elif self.image_check("POKEMON_ZA_MORNING"):  
+        return "BENCH_CHECK_TIME"
+    elif self.image_check("POKEMON_ZA_NIGHT"):
+        return "BENCH_CHECK_TIME"
+    
+    #バトルタイムアウト用
+    elif self.image_check("POKEMON_ZA_ESCAPE"):
+        self.ZA_battlecheck=1
+        self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+        return "BENCH_POKECENTER_SELECT1"
+
+    #はしごでマップ開けていない用
+    
+    elif self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
+        noescapeflg=0
+        for i in range(1,20):
+            if self.image_check("POKEMON_ZA_ESCAPE"):
+                noescapeflg=1
+                break
+            elif self.image_check("POKEMON_ZA_SELECT"):
+                self.ZA_etc_sendCommand("Lbutton_up")
+                noescapeflg=1
+                break
+            self.wait(0.1)
+        
+        if noescapeflg==0 and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
+            self.ZA_MOVE_SEE("END")
+            self.ZA_ZL_ACTION("END")
+            self.press(Direction(Stick.LEFT, 90), duration=10.0, wait=0.1)
+
+            self.wait(0.3)
+            
+            self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+            self.ZA_battlecount=self.ZA_battlecount+1
+            return "BENCH_POKECENTER_SELECT1"
+    
+    elif not (self.image_check("POKEMON_ZA_FIELD") or self.image_check("POKEMON_ZA_FIELD_BACK") or self.image_check("POKEMON_ZA_DEAD")):
+        self.ZA_etc_sendCommand("Lbutton_left")
+        #話しかけた時用のキャンセル
+        self.pressRep(Button.B, repeat=1, duration=0.15, wait=0.2, interval=0.1)
+        self.wait(self.ZA_SLEEPLIST[0][2])
+        #戦闘中、マップを開けない状態用
+        #if self.image_check("BATTLE"):
+        #    if self.image_check("ESCAPE"):
+        #        self.ZA_battlecheck=1
+        #        self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+        #        return "BENCH_POKECENTER_SELECT1"
+        #    else:
+        #        self.press(Direction(Stick.LEFT, 90), duration=4.0, wait=0.01)
+        #        return "BENCH_MAP_OPEN"
+        
+    return "BENCH_MAP_OPEN"
+
+def ZA_bench_goto_pokecenter1(self):        
+    self.wait(self.ZA_SLEEPLIST[7][2])
+    
+    if self.image_check("POKEMON_ZA_MOVE_COMMENT_BATTLE"): 
+        self.ZA_inactioncount+=1
+        self.pressRep(Button.B, repeat=20, duration=0.15, wait=0.1, interval=0.1)
+        self.ZA_battle_step_return=1
+        return "BATTLE_RETURN"
+    if self.image_check("POKEMON_ZA_MAP2"):      
+        self.wait(0.1)
+        if self.image_check("POKEMON_ZA_MOVESPOT_TAB"):         
+            if self.image_check("POKEMON_ZA_TAB_FILTER"):       
+                self.pressRep(Button.MINUS, repeat=1, duration=0.15, wait=0.01, interval=0.1)
+                
+            elif self.image_check("POKEMON_ZA_SELECT_ALL"):        
+                self.ZA_etc_sendCommand("Lbutton_down")
+                self.ZA_etc_sendCommand("Lbutton_down")
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.01, interval=0.1)
+                return "BENCH_POKECENTER_SELECT2"
+        else:
+                self.pressRep(Button.Y, repeat=1, duration=0.15, wait=0.1, interval=0.1)
+    
+    # ステップ遷移ミス用
+    elif self.image_check("POKEMON_ZA_MORNING"):  
+        return "BENCH_CHECK_TIME"
+    elif self.image_check("POKEMON_ZA_NIGHT"):
+        return "BENCH_CHECK_TIME"
+    elif self.image_check("POKEMON_ZA_FIELD") or self.image_check("POKEMON_ZA_FIELD_BACK") or self.image_check("POKEMON_ZA_DEAD"):
+        return "BENCH_MAP_OPEN"
+    elif not self.image_check("POKEMON_ZA_MAP2"):
+        # マップ開きミス用
+        self.wait(1.0)
+        if not self.image_check("POKEMON_ZA_MAP2"):
+            self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+    return "BENCH_POKECENTER_SELECT1"
+
+def ZA_bench_goto_pokecenter2(self):
+    self.wait(self.ZA_SLEEPLIST[7][2])
+    if self.image_check("POKEMON_ZA_MAP2"):        
+        if self.image_check("POKEMON_ZA_MOVESPOT_TAB"):         
+            if self.image_check("POKEMON_ZA_TAB_FILTER"):
+                self.ZA_etc_sendCommand("Lbutton_down")
+                self.ZA_etc_sendCommand("Lbutton_down")
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.1, interval=0.1)
+                for i in range(1,10):
+                    self.wait(self.ZA_SLEEPLIST[10][2])
+                    if self.image_check("POKEMON_ZA_MOVE_COMMENT"): 
+                        self.pressRep(Button.A, repeat=5, duration=0.15, wait=0.1, interval=0.1)
+                        self.ZA_sleepcount=0
+                        return "BENCH_CHANGE_TIME"
+                    elif self.image_check("POKEMON_ZA_MOVE_COMMENT_BATTLE"):
+                        self.ZA_inactioncount+=1
+                        self.pressRep(Button.B, repeat=10, duration=0.15, wait=0.1, interval=0.1)
+                        self.ZA_battle_step_return=1
+                        return "BATTLE_RETURN"
+                    elif i == 1:
+                        if self.image_check("POKEMON_ZA_MOVE_COMMENT"): 
+                            self.pressRep(Button.A, repeat=5, duration=0.15, wait=0.1, interval=0.1)
+                            self.ZA_sleepcount=0
+                            return "BENCH_CHANGE_TIME"
+                        self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.2, interval=0.1)
+                print("MOVE_COM_ELSE")
+                if self.ZA_battlecheck == 1:
+                    self.ZA_inactioncount+=1
+                    self.pressRep(Button.B, repeat=20, duration=0.15, wait=0.1, interval=0.1)
+                    self.ZA_battle_step_return=1
+                    return "BATTLE_RETURN"
+                
+                self.pressRep(Button.A, repeat=5, duration=0.15, wait=0.1, interval=0.1)
+                return "BENCH_CHANGE_TIME"
+    return "BENCH_POKECENTER_SELECT2"
+
+def ZA_bench_change_time(self):
+    
+    #マップコメントの捕捉失敗用
+    if self.image_check("POKEMON_ZA_ESCAPE"):
+        self.ZA_battlecheck=1
+        return "BENCH_POKECENTER_SELECT1"
+    
+    if not (self.image_check("POKEMON_ZA_FIELD") or self.image_check("POKEMON_ZA_FIELD_BACK") or self.image_check("POKEMON_ZA_DEAD")):
+        self.ZA_etc_sendCommand("Lbutton_left")
+        #話しかけた時用のキャンセル
+        self.pressRep(Button.B, repeat=1, duration=0.15, wait=0.2, interval=0.1)
+        self.wait(self.ZA_SLEEPLIST[0][2])
+        return "BENCH_CHANGE_TIME"
+   
+    elif self.image_check("POKEMON_ZA_DEAD") or self.ZA_chicketmaxflag == 1:
+        self.press(Direction(Stick.LEFT, 90), duration=2.0, wait=0.1)
+        self.pressRep(Button.A, repeat=10, duration=0.15, wait=0.2, interval=0.1)
+        self.pressRep(Button.B, repeat=50, duration=0.15, wait=0.2, interval=0.1)
+        if self.ZA_chicketmaxflag == 1:
+            self.ZA_chicketmaxflag = 2
+            return "QUASAR_MAP_OPEN"
+        else:
+            return "BENCH_MAP_OPEN"
+    elif self.image_check("POKEMON_ZA_FIELD") or self.image_check("POKEMON_ZA_FIELD_BACK"):
+        self.ZA_Benchi()
+        return "BENCH_CHECK_TIME"
+
+    else:
+        self.ZA_etc_sendCommand("Lbutton_left")
+        self.wait(self.ZA_SLEEPLIST[0][2])
+    return "BENCH_CHANGE_TIME"
+
+def ZA_bench_check_time(self):
+
+    # (時間切り替わりの補足ができない？その場合は朝扱いで一度抜ける(夜だった場合再度、朝・夜の切り替えを行う))
+    #必ずMORNING、NIGHT判定できる時間以上のカウント数にしてください。
+    if self.ZA_timecount > 100:
+    
+        self.ZA_changetimemisscount+=1
+    if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W") or self.image_check("POKEMON_ZA_DEAD"):
+        return "BENCH_START"
+    elif self.image_check("POKEMON_ZA_MORNING") or self.ZA_timecount > 100:
+        print("朝")
+        self.ZA_sleepcount=1
+        self.ZA_timecount=0
+        while True:
+            #ジャスティス会への話しかけが発生する可能性があるので、ループしてしまう場合はBボタンが必要になる場合がある                
+            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+            # 画像認識のずれで処理前に抜ける可能性があるので削除
+            #if not self.image_check("MORNING") or self.ZA_timecount > 150:
+            #    self.ZA_timecount=0
+            #    return "BENCH_CHANGE_TIME"
+            if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W") or self.image_check("POKEMON_ZA_DEAD"):
+                self.ZA_timecount=0
+                self.ZA_changetimecount+=1
+                return "BENCH_CHANGE_TIME"
+            #抜けミス用カウント
+            #self.ZA_timecount+=1
+    elif self.image_check("POKEMON_ZA_NIGHT"):
+        #1ループの戦闘中移動失敗カウンタの初期化
+        self.ZA_inactioncount=0
+        print("夜")
+        while True:
+            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+            # 画像認識のずれで処理前に抜ける可能性があるので削除
+            #if not self.image_check("NIGHT"):#解決後完全に削除 or self.ZA_timecount > 150:
+            #    self.ZA_timecount=0
+            #    return "BENCH_START"
+            if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W") or self.image_check("POKEMON_ZA_DEAD"):
+                self.ZA_timecount=0
+                self.ZA_changetimecount+=1
+                return "BENCH_START"
+            #抜けミス用カウント
+            #self.ZA_timecount+=1
+    
+    self.wait(self.ZA_SLEEPLIST[6][2])
+    #抜けミス用カウント
+    self.ZA_timecount+=1
+    return "BENCH_CHECK_TIME"
+
+def ZA_quasar_map_open(self):
+    
+    ret = self.ZA_bench_map_open()
+    if ret == "BENCH_POKECENTER_SELECT1":
+        return "QUASAR_SELECT1"    
+    else:
+        return "QUASAR_MAP_OPEN"
+
+def ZA_goto_quasar1(self):
+    self.wait(self.ZA_SLEEPLIST[7][2])
+    if self.image_check("POKEMON_ZA_MAP2"):      
+        if self.image_check("POKEMON_ZA_MOVESPOT_TAB"):         
+            if self.image_check("POKEMON_ZA_TAB_FILTER"):       
+                self.pressRep(Button.MINUS, repeat=1, duration=0.15, wait=0.01, interval=0.1)
+            elif self.image_check("POKEMON_ZA_SELECT_ALL"):        
+                self.ZA_etc_sendCommand("Lbutton_down")
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.01, interval=0.1)
+                return "QUASAR_SELECT2"
+        else:
+                self.pressRep(Button.Y, repeat=1, duration=0.15, wait=0.1, interval=0.1)
+    
+    # ステップ遷移ミス用    
+    elif self.image_check("POKEMON_ZA_FIELD") or self.image_check("POKEMON_ZA_FIELD_BACK") or self.image_check("POKEMON_ZA_DEAD"):
+        return "QUASAR_MAP_OPEN"
+    elif not self.image_check("POKEMON_ZA_MAP2"):
+        # マップ開きミス用
+        self.wait(1.0)
+        if not self.image_check("POKEMON_ZA_MAP2"):
+            self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+    return "QUASAR_SELECT1"
+
+def ZA_goto_quasar2(self):
+    self.wait(self.ZA_SLEEPLIST[7][2])
+    if self.image_check("POKEMON_ZA_MAP2"):        
+        if self.image_check("POKEMON_ZA_MOVESPOT_TAB"):         
+            if self.image_check("POKEMON_ZA_TAB_FILTER"):
+                self.ZA_etc_sendCommand("Lbutton_right")
+                self.wait(self.ZA_SLEEPLIST[1][2])
+                self.ZA_etc_sendCommand("Lbutton_down")
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.2, interval=0.1)
+                for i in range(1,10):
+                    self.wait(self.ZA_SLEEPLIST[10][2])
+                    if self.image_check("POKEMON_ZA_MOVE_COMMENT"): 
+                        self.pressRep(Button.A, repeat=5, duration=0.15, wait=0.1, interval=0.1)
+                        self.ZA_sleepcount=0
+                        return "BENCH_START"
+                    elif i == 1:
+                        if self.image_check("POKEMON_ZA_MOVE_COMMENT"): 
+                            self.pressRep(Button.A, repeat=5, duration=0.15, wait=0.1, interval=0.1)
+                            self.ZA_sleepcount=0
+                            return "BENCH_START"
+                        self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.2, interval=0.1)
+                print("MOVE_COM_ELSE_Q")
+                if self.ZA_battlecheck == 1:
+                    self.ZA_inactioncount+=1
+                    self.pressRep(Button.B, repeat=20, duration=0.15, wait=0.1, interval=0.1)
+                    self.ZA_battle_step_return=1
+                    return "BENCH_START"
+
+                self.pressRep(Button.A, repeat=5, duration=0.15, wait=0.1, interval=0.1)
+                self.ZA_sleepcount=0
+                if self.ZA_battlecount> (self.ZA_battle_zone_loop_num - 1):
+                    return "BENCH_START"
+                else:
+                    self.ZA_battle_step_return=0
+                    return "BENCH_START"
+                        
+    return "QUASAR_SELECT2"
+
+def ZA_battle_return(self):
+    return "BATTLE_RETURN"
+
+def ZA_battle_start(self):
+    self.ZA_battlecount=0
+    return "BATTLE_MAP_OPEN"
+
+def ZA_battle_map_open(self):
+    self.wait(self.ZA_SLEEPLIST[8][2])
+    
+    if self.image_check("POKEMON_ZA_MORNING"):
+        print("朝_loop battle_map_open")
+        while True:
+            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+            if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W") or self.image_check("POKEMON_ZA_DEAD"):
+                break
+        self.ZA_MOVE_SEE("END")
+        self.ZA_ZL_ACTION("END")
+
+        self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+        self.ZA_battlecount=3
+        return "BATTLE_START" 
+    
+    if self.image_check("POKEMON_ZA_LOSE"):
+        for i in range(20):
+            self.press(Button.B, wait=0.0)
+        self.ZA_quasarcount += 1
+        self.ZA_quasarlosecount += 1
+        self.ZA_MOVE_SEE("END")
+        self.ZA_ZL_ACTION("END")
+        if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP": 
+            return "QUASAR_START"
+        else:
+            return "BATTLE_START"
+    # 想定外の話しかけ用
+    if self.image_check("POKEMON_ZA_TEXT_BOX"):
+        self.pressRep(Button.B, repeat=5, duration=0.15, wait=0.01, interval=0.1)
+        self.wait(0.1)
+    if self.image_check("POKEMON_ZA_TEXT_BOX2"):
+        self.pressRep(Button.A, repeat=5, duration=0.15, wait=0.01, interval=0.1)
+        self.wait(0.1)    
+    
+    if self.image_check("POKEMON_ZA_ESCAPE"):
+        return "BATTLE_MOVE"
+    elif self.image_check("POKEMON_ZA_MAP"):
+        return "BATTLE_GOTO_BATTLE_ZONE1"
+    elif self.image_check("POKEMON_ZA_DEAD"):
+        return "BATTLE_START"
+    elif self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W"):
+        #マップコメントの捕捉失敗用
+        if self.image_check("POKEMON_ZA_ESCAPE"):
+            return "BATTLE_MOVE"
+        else:
+            self.ZA_battlecheck=0
+        self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+        return "BATTLE_GOTO_BATTLE_ZONE1"
+    elif not(self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W")):
+        for i in range(20):
+            if (self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W")):
+                 return "BATTLE_MAP_OPEN"
+            self.wait(1.0)
+        self.press(Direction(Stick.LEFT, 90), duration=6.0, wait=0.1)
+        self.wait(0.3)
+        self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+        return "BATTLE_MAP_OPEN"
+    else:
+        self.ZA_etc_sendCommand("Lbutton_left")
+        self.wait(self.ZA_SLEEPLIST[0][2])
+    return "BATTLE_MAP_OPEN"
+
+def ZA_battle_goto_battle_zone1(self):
+    self.wait(self.ZA_SLEEPLIST[7][2])
+
+    if self.image_check("POKEMON_ZA_MAP2"):      
+        if self.image_check("POKEMON_ZA_MOVESPOT_TAB"):         
+            if self.image_check("POKEMON_ZA_TAB_FILTER"):       
+                self.pressRep(Button.MINUS, repeat=1, duration=0.15, wait=0.01, interval=0.1)
+            elif self.image_check("POKEMON_ZA_SELECT_ALL"):        
+                self.ZA_etc_sendCommand("Lbutton_down")
+                self.ZA_etc_sendCommand("Lbutton_down")
+                self.ZA_etc_sendCommand("Lbutton_down")
+                self.ZA_etc_sendCommand("Lbutton_down")
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.01, interval=0.1)
+                return "BATTLE_GOTO_BATTLE_ZONE2"
+        else:
+                self.pressRep(Button.Y, repeat=1, duration=0.15, wait=0.1, interval=0.1)
+    
+    # ステップ遷移ミス用            
+    elif self.image_check("POKEMON_ZA_FIELD") or self.image_check("POKEMON_ZA_FIELD_BACK") or self.image_check("POKEMON_ZA_DEAD"):
+        return "BATTLE_MAP_OPEN"
+    elif not self.image_check("POKEMON_ZA_MAP2"):
+        # マップ開きミス用
+        self.wait(1.0)
+        if not self.image_check("POKEMON_ZA_MAP2"):
+            self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+    return "BATTLE_GOTO_BATTLE_ZONE1"
+
+def ZA_battle_goto_battle_zone2(self):
+    self.wait(self.ZA_SLEEPLIST[7][2])
+    if self.image_check("POKEMON_ZA_MAP2"):        
+        if self.image_check("POKEMON_ZA_MOVESPOT_TAB"):         
+            if self.image_check("POKEMON_ZA_TAB_FILTER"):
+                for i in range(0,(self.ZA_battlecount + 1)):
+                    self.ZA_etc_sendCommand("Lbutton_up")
+                    
+                for i in range(0,self.ZA_battle_zone_loop_num):
+                    if not self.ZA_battlecount > (self.ZA_battle_zone_loop_num - 1):
+                        self.ZA_targetzone=self.ZA_zone_check()
+                    if self.ZA_battlecount > (self.ZA_battle_zone_loop_num - 1):
+                        break
+                    elif (self.ZA_testcode==0 and(not self.ZA_ZONELIST[self.ZA_targetzone][2]) or (self.ZA_testcode==2 and (not (self.ZA_targetzone == self.ZA_testtarget)))):
+                        print(str(self.ZA_targetzone) + ": " + self.ZA_ZONELIST[self.ZA_targetzone][1])
+                        self.ZA_battlecount=self.ZA_battlecount+1
+                        self.ZA_etc_sendCommand("Lbutton_up")
+                        self.ZA_zonemisscount[self.ZA_targetzone-1]+=1
+                        print("SKIP")
+                        print("==================================")
+                        self.wait(self.ZA_SLEEPLIST[1][2])
+                    else:
+                        print(str(self.ZA_targetzone) + ": " + self.ZA_ZONELIST[self.ZA_targetzone][1])
+                        break
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.1, interval=0.1)
+
+                for i in range(1,10):
+                    self.wait(self.ZA_SLEEPLIST[10][2])
+                    if self.image_check("POKEMON_ZA_MOVE_COMMENT"): 
+                        self.pressRep(Button.A, repeat=5, duration=0.15, wait=0.1, interval=0.1)
+                        self.ZA_sleepcount=0
+
+                        if self.ZA_battlecount> (self.ZA_battle_zone_loop_num - 1):
+                            return "BATTLE_START"
+                        else:
+                            self.ZA_battle_step_return=0
+                            return "BATTLE_MOVE"
+                    elif self.image_check("POKEMON_ZA_MOVE_COMMENT_BATTLE"):
+                        self.ZA_inactioncount+=1
+                        self.pressRep(Button.B, repeat=10, duration=0.15, wait=0.1, interval=0.1)
+                        self.ZA_battle_step_return=1
+                        return "BATTLE_MOVE"
+                    elif i == 1:
+                        if self.image_check("POKEMON_ZA_MOVE_COMMENT"): 
+                            self.pressRep(Button.A, repeat=5, duration=0.15, wait=0.1, interval=0.1)
+                            self.ZA_sleepcount=0
+                            if self.ZA_battlecount> (self.ZA_battle_zone_loop_num - 1):
+                                return "BATTLE_START"
+                            else:
+                                self.ZA_battle_step_return=0
+                                return "BATTLE_MOVE"
+                        self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.2, interval=0.1)
+                        
+                print("MOVE_COM_ELSE")
+                if self.ZA_battlecheck == 1:
+                    self.ZA_inactioncount+=1
+                    self.pressRep(Button.B, repeat=20, duration=0.15, wait=0.1, interval=0.1)
+                    self.ZA_battle_step_return=1
+                    return "BATTLE_MOVE"
+
+                self.pressRep(Button.A, repeat=5, duration=0.15, wait=0.1, interval=0.1)
+                self.ZA_sleepcount=0
+                if self.ZA_battlecount> (self.ZA_battle_zone_loop_num - 1):
+                    return "BATTLE_START"
+                else:
+                    self.ZA_battle_step_return=0
+                    return "BATTLE_MOVE"
+    return "BATTLE_GOTO_BATTLE_ZONE2"
+
+def ZA_battle_move(self):
+    
+    if self.ZA_battle_step_return == 0:
+        self.ZA_battle_step=0
+    else:
+    	self.ZA_battle_step=self.ZA_battle_step_return  
+    
+    count=0
+    if self.ZA_battle_step_return == 0:
+        if not (self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W")):
+            for i in range(20):
+                if (self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W")):
+                    return "BATTLE_MOVE"
+                self.wait(1.0)
+            return "BATTLE_START"
+
+        elif not (self.image_check("POKEMON_ZA_FIELD") or self.image_check("POKEMON_ZA_FIELD_BACK")):
+            self.ZA_etc_sendCommand("Lbutton_left")
+            if self.ZA_battle_current_state=="BATTLE_MOVE":
+                self.pressRep(Button.B, repeat=10, duration=0.15, wait=0.1, interval=0.1)
+            if self.image_check("POKEMON_ZA_DEAD"):
+                return "BATTLE_START"
+            elif not self.image_check("POKEMON_ZA_BATTLE"):
+                return "BATTLE_MOVE"
+            #else:
+            #    return "BATTLE_MOVE"
+        elif self.image_check("POKEMON_ZA_DEAD"):
+            return "BATTLE_START"
+     
+  #TEST
+    if self.ZA_battle_step_return == 0:
+        return self.ZA_battle_move_test()
+    else:
+        self.ZA_battle_step_return = 0
+        return self.ZA_battle_move_test(1)
+
+def ZA_battle_move_test(self,fast=0):
+    self.ZA_quasar_battle_lockon=0
+    count=0
+    movestep=0
+    Seecheckflg=0
+    Seecheckflg2=0
+    self.ZA_notargetcount=0
+    self.see_r=self.ZA_SEE_DEFAULT
+    
+    self.ZA_MOVE_SEE("END")
+    self.ZA_ZL_ACTION("END")
+    
+    if self.ZA_battle_current_state=="BATTLE_MOVE" and self.ZA_inactioncount>3 and self.image_check("POKEMON_ZA_ESCAPE"):
+        self.ZA_MOVE_SEE("END")
+        self.ZA_ZL_ACTION("END")
+
+        self.ZA_battleescapecount+=1
+        self.pressRep(Button.MINUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+        for loop in range(100):
+            if self.image_check("POKEMON_ZA_ESCAPE_SELECT"):
+                self.press(Button.A, wait=0.0)
+            elif self.image_check("POKEMON_ZA_ESCAPE_COMMENT1"):
+                self.press(Button.A, wait=0.0)
+            elif self.image_check("POKEMON_ZA_ESCAPE_COMMENT2"):
+                for i in range(1,10):
+                    self.press(Button.B, wait=0.0)
+                    return "BATTLE_START"
+            #補足できなかった場合の代用
+            elif self.image_check("POKEMON_ZA_FIELD") or self.image_check("POKEMON_ZA_FIELD_BACK") or self.image_check("POKEMON_ZA_DEAD"):
+                for i in range(1,10):
+                    self.press(Button.B, wait=0.0)
+                    return "BATTLE_START"
+
+    if self.ZA_ZONELIST[self.ZA_targetzone][4] == -1 or self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP":
+        lockonflg = 1
+    else:
+        lockonflg = 0
+    
+    start = time.perf_counter()  # 計測開始
+    end = start
+    endbk = end
+    lastescape = time.perf_counter() 
+    
+    if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP":
+        self.ZA_battle_step=1
+        self.ZA_ZL_ACTION("END")
+        self.ZA_ZL_ACTION("")
+    else:
+        if fast==0:
+            #ワイルドゾーンIN
+            self.press(Direction(Stick.LEFT, 90), duration=1.8, wait=0.01)
+            for i in range(0,3):
+                self.press(Button.A, wait=0.0)
+            self.ZA_battle_step=0
+        #バトルゾーン入った直後に停止する＿
+        #else:
+        #    self.ZA_battle_step=1
+        #    self.ZA_ZL_ACTION("END")
+        #    self.ZA_ZL_ACTION("")
+    
+    while True:
+        self.out_str = (
+            f'----------------------------'
+            f'\n STATE_MAIN_FUNCTION   :: {self.ZA_main_current_state}'
+            f'\n'
+            f'\n STATE_BENCH_FUNCTION  :: {self.ZA_bench_current_state}'
+            f'\n STATE_BATTLE_FUNCTION :: {self.ZA_battle_current_state}'
+            f'\n STATE_QUASAR_FUNCTION :: {self.ZA_quasar_current_state}'
+            f'\n battlecount::{self.ZA_battlecount}'
+            f'\n battle_step::{self.ZA_battle_step}'      
+            f'\n chicketmaxflag::{self.ZA_chicketmaxflag}'
+            f'\n ZL_state::{self.ZA_ZL_state}'  
+            f'\n'  
+            f'\n ZONECOUNT'
+            f'\n[ 1 :{self.ZA_zonemisscount[0]}/{self.ZA_zonecount[0]}] '
+            f'[ 2 :{self.ZA_zonemisscount[1]}/{self.ZA_zonecount[1]}] '
+            f'[ 3 :{self.ZA_zonemisscount[2]}/{self.ZA_zonecount[2]}] '
+            f'[ 4 :{self.ZA_zonemisscount[3]}/{self.ZA_zonecount[3]}] '
+            f'[ 5 :{self.ZA_zonemisscount[4]}/{self.ZA_zonecount[4]}] '
+            f'[ 6 :{self.ZA_zonemisscount[5]}/{self.ZA_zonecount[5]}] '
+            f'\n[ 7 :{self.ZA_zonemisscount[6]}/{self.ZA_zonecount[6]}] '
+            f'[ 8 :{self.ZA_zonemisscount[7]}/{self.ZA_zonecount[7]}] '
+            f'[ 9 :{self.ZA_zonemisscount[8]}/{self.ZA_zonecount[8]}] '
+            f'[10 :{self.ZA_zonemisscount[9]}/{self.ZA_zonecount[9]}] '
+            f'[11 :{self.ZA_zonemisscount[10]}/{self.ZA_zonecount[10]}] '
+            f'[12 :{self.ZA_zonemisscount[11]}/{self.ZA_zonecount[11]}]'
+            f'\n'  
+            f'\n QUASAR_LOSE_COUNT::{self.ZA_quasarlosecount}/{self.ZA_quasarcount}'
+            f'\n battle_escape_count::{self.ZA_battleescapecount}'
+            f'\n inactioncount::{self.ZA_inactioncount}'
+            f'\n timechangemiss_count::{self.ZA_changetimemisscount}/{self.ZA_changetimecount}'
+            f'\n'
+            f' target_maker low:{self.ZA_target_end_low_count}/{self.ZA_target_start_low_count} mid:{self.ZA_target_end_mid_count}/{self.ZA_target_start_mid_count} normal:{self.ZA_target_end_count}/{self.ZA_target_start_count}\n'
+            f' quasar_target_maker low:{self.ZA_quasar_target_end_low_count}/{self.ZA_quasar_target_start_low_count} mid:{self.ZA_quasar_target_end_mid_count}/{self.ZA_quasar_target_start_mid_count} normal:{self.ZA_quasar_target_end_count}/{self.ZA_quasar_target_start_count}\n'
+            f' quasar_battle_display :{self.ZA_quasar_battle_display_end_count}/{self.ZA_quasar_battle_display_start_count}\n'
+            f' battlemarker_skipcount {self.battlemarker_skipcount}/{self.ZA_battlemarker_skipcount_threshold}\n'
+            f'\n'
+            f'以下はTESTCODE=1でチェック {self.ZA_TESTADDCODE} ※PythonCommandBaseの編集が必要なため0とすること\n'  
+            f'--------[ 50][ 55][ 60][ 65][ 70][ 75][ 80][ 85][ 90][ 95][100]\n'
+            f'[left ::'
+            f'[{self.ZA_target_left_max_val_list[0]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[1]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[2]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[3]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[4]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[5]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[6]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[7]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[8]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[9]:03d}]'
+            f'[{self.ZA_target_left_max_val_list[10]:03d}]'
+            f']\n'
+            f'[right::'
+            f'[{self.ZA_target_right_max_val_list[0]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[1]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[2]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[3]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[4]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[5]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[6]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[7]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[8]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[9]:03d}]'
+            f'[{self.ZA_target_right_max_val_list[10]:03d}]'
+            f']\n'
+            f'\n----------------------------'
+            )
+        self.print_tb("d"); self.print_t(f'{self.out_str}')
+        
+        #バトルゾーンで朝になった場合
+        if self.image_check("POKEMON_ZA_MORNING") and self.ZA_battle_current_state=="BATTLE_MOVE":
+            print("朝_BATTLE_LOOP")
+
+            self.wait(0.3)
+            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+            #リザルト判定の取得ミスのため、ミスカウントはしない
+            #self.ZA_zonemisscount[self.ZA_targetzone-1]+=1
+            self.ZA_MOVE_SEE("END")
+            self.ZA_ZL_ACTION("END")
+            #マップコメントの捕捉失敗用
+            self.wait(0.3)
+            
+            self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+            self.ZA_battlecount=self.ZA_battlecount+1
+            return "BATTLE_START"
+        #はしごなどで逃げるボタン非活性の場合、はしごにのぼる
+        
+        
+        if self.ZA_battle_current_state=="BATTLE_MOVE" and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
+            print("check1")
+            noescapeflg=0
+            for i in range(1,self.ZA_escapecheckrange):
+                if self.image_check("POKEMON_ZA_ESCAPE"):
+                    noescapeflg=1
+                    break
+                elif self.image_check("POKEMON_ZA_SELECT"):
+                    self.ZA_etc_sendCommand("Lbutton_up")
+                    noescapeflg=1
+                    break
+                self.wait(0.1)
+            
+            if noescapeflg==0 and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
+                self.ZA_MOVE_SEE("END")
+                self.ZA_ZL_ACTION("END")
+                self.press(Direction(Stick.LEFT, 90), duration=10.0, wait=0.1)
+
+                self.wait(0.3)
+                
+                self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+                self.ZA_battlecount=self.ZA_battlecount+1
+                return "BATTLE_START"
+        #バトルゾーン話しかけ対応(ひとまずひたすらAで再度話しかけを許容して、その後話しかけをBで終了(アイテムはＡボタンでないと進めないため))
+        if self.ZA_battle_current_state=="BATTLE_MOVE" and (self.image_check("POKEMON_ZA_TEXT_BOX") or self.image_check("POKEMON_ZA_TEXT_BOX2")):
+            self.ZA_MOVE_SEE("END")
+            self.ZA_ZL_ACTION("END")
+            self.pressRep(Button.A, repeat=20, duration=0.15, wait=0.1, interval=0.1)
+            self.pressRep(Button.B, repeat=20, duration=0.15, wait=0.1, interval=0.1)
+
+        #敗北用の保険                
+        if self.ZA_battle_current_state=="BATTLE_MOVE" and self.image_check("POKEMON_ZA_LOSE"):
+            self.wait(1.0)
+            self.pressRep(Button.A, repeat=10, duration=0.15, wait=0.01, interval=0.1)
+            self.pressRep(Button.B, repeat=30, duration=0.15, wait=0.01, interval=0.1)
+            return "BATTLE_START"
+
+        if self.ZA_battle_step==0 and self.ZA_battle_current_state=="BATTLE_MOVE":
+            self.ZA_etc_sendCommand("Lbutton_up")
+        # 想定外の話しかけ用
+        if self.image_check("POKEMON_ZA_TEXT_BOX"):
+            if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_REWORD_END"):
+                for i in range(5):
+                    self.press(Button.B, wait=0.0)
+                self.ZA_quasarcount += 1
+                self.ZA_MOVE_SEE("END")
+                self.ZA_ZL_ACTION("END")
+                return "QUASAR_START"
+            elif self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_REWORD_LOSE"):
+                for i in range(5):
+                    self.press(Button.B, wait=0.0)
+                self.ZA_quasarcount += 1
+                self.ZA_quasarlosecount += 1
+                self.ZA_MOVE_SEE("END")
+                self.ZA_ZL_ACTION("END")
+                return "QUASAR_START"
+            else:
+                self.wait(1.0)#判定できない場合待機してから再度確認
+                if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_REWORD_END"):
+                    for i in range(5):
+                        self.press(Button.B, wait=0.0)
+                    self.ZA_quasarcount += 1
+                    self.ZA_MOVE_SEE("END")
+                    self.ZA_ZL_ACTION("END")
+                    return "QUASAR_START"
+                elif self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_REWORD_LOSE"):
+                    for i in range(5):
+                        self.press(Button.B, wait=0.0)
+                    self.ZA_quasarcount += 1
+                    self.ZA_quasarlosecount += 1
+                    self.ZA_MOVE_SEE("END")
+                    self.ZA_ZL_ACTION("END")
+                    return "QUASAR_START"
+                self.pressRep(Button.B, repeat=1, duration=0.15, wait=0.05, interval=0.1)
+                self.wait(0.1)
+        #アイテムテキスト用
+        if self.image_check("POKEMON_ZA_TEXT_BOX2"):#基本的にこちらに入る場合、報酬ありなので問題なし
+            if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_REWORD_END"):
+                for i in range(5):
+                    self.press(Button.B, wait=0.0)
+                self.ZA_quasarcount += 1
+                self.ZA_MOVE_SEE("END")
+                self.ZA_ZL_ACTION("END")
+                return "QUASAR_START"
+            elif self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_REWORD_LOSE"):
+                for i in range(5):
+                    self.press(Button.B, wait=0.0)
+                self.ZA_quasarcount += 1
+                self.ZA_quasarlosecount += 1
+                self.ZA_MOVE_SEE("END")
+                self.ZA_ZL_ACTION("END")
+                return "QUASAR_START"
+            else:
+                self.wait(1.0)#判定できない場合待機してから再度確認
+                if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_REWORD_END"):
+                    for i in range(5):
+                        self.press(Button.B, wait=0.0)
+                    self.ZA_quasarcount += 1
+                    self.ZA_MOVE_SEE("END")
+                    self.ZA_ZL_ACTION("END")
+                    return "QUASAR_START"
+                elif self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_REWORD_LOSE"):
+                    for i in range(5):
+                        self.press(Button.B, wait=0.0)
+                    self.ZA_quasarcount += 1
+                    self.ZA_quasarlosecount += 1
+                    self.ZA_MOVE_SEE("END")
+                    self.ZA_ZL_ACTION("END")
+                    return "QUASAR_START"
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.05, interval=0.1)
+                self.wait(0.1)        
+   #バトル中はチェックしない
+        if self.ZA_battle_current_state=="BATTLE_MOVE" and self.ZA_battle_step != 1 and self.image_check("POKEMON_ZA_CHICKET_MAX_RIGHT"):
+            print("CHICKET_MAX2")
+            self.ZA_chicketmaxflag = 1
+            self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+            self.ZA_battlecount=3
+            return "BATTLE_START"   
+        if self.ZA_battle_current_state=="BATTLE_MOVE" and self.image_check("POKEMON_ZA_MORNING"):
+            print("朝_loop")
+            for i in range(100):
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                if self.image_check("POKEMON_ZA_FIELD") or self.image_check("POKEMON_ZA_FIELD_BACK") or self.image_check("POKEMON_ZA_DEAD"):
+                    break
+            self.ZA_MOVE_SEE("END")
+            self.ZA_ZL_ACTION("END")
+
+            if self.image_check("POKEMON_ZA_ESCAPE"):
+                self.ZA_battlecheck=1
+                self.ZA_battle_nofiled_count=0
+                break
+            elif self.ZA_battle_current_state=="BATTLE_MOVE" and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
+                self.ZA_battlecheck=1
+                print("check2")
+                noescapeflg=0
+                for i in range(1,self.ZA_escapecheckrange):
+                    if self.image_check("POKEMON_ZA_ESCAPE"):
+                        noescapeflg=1
+                        break
+                    elif self.image_check("POKEMON_ZA_SELECT"):
+                        self.ZA_etc_sendCommand("Lbutton_up")
+                        noescapeflg=1
+                        break
+                    self.wait(0.1)
+                
+                if noescapeflg==0 and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
+                    self.ZA_MOVE_SEE("END")
+                    self.ZA_ZL_ACTION("END")
+                    self.press(Direction(Stick.LEFT, 90), duration=10.0, wait=0.1)
+
+                    self.wait(0.3)
+                    
+                    self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+                    self.ZA_battlecount=self.ZA_battlecount+1
+                    return "BATTLE_START"
+            
+            else:
+                self.ZA_battlecheck=0
+                break
+            self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+            self.ZA_battlecount=3
+            return "BATTLE_START"             
+            
+
+        ### バトル終了の抜けミス対策
+        if self.ZA_battle_step==1 and self.ZA_battle_current_state=="BATTLE_MOVE":
+            noescapetime = time.perf_counter()
+            escapeelapsed = noescapetime - lastescape
+            if escapeelapsed >= 30:
+                print("エスケープマークが30.0秒以上経過しました。強制的に終了します。")
+                #リザルト判定の取得ミスのため、ミスカウントはしない
+                #self.ZA_zonemisscount[self.ZA_targetzone-1]+=1
+                self.ZA_MOVE_SEE("END")
+                self.ZA_ZL_ACTION("END")
+                #マップコメントの捕捉失敗用
+
+                if self.image_check("POKEMON_ZA_ESCAPE"):
+                    self.ZA_battlecheck=1
+                    self.ZA_battle_nofiled_count=0
+                    break
+                elif self.ZA_battle_current_state=="BATTLE_MOVE" and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
+                    self.ZA_battlecheck=1
+                    print("check3")
+                    noescapeflg=0
+                    for i in range(1,self.ZA_escapecheckrange):
+                        if self.image_check("POKEMON_ZA_ESCAPE"):
+                            noescapeflg=1
+                            break
+                        elif self.image_check("POKEMON_ZA_SELECT"):
+                            self.ZA_etc_sendCommand("Lbutton_up")
+                            noescapeflg=1
+                            break
+                        self.wait(0.1)
+                    
+                    if noescapeflg==0 and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
+                        self.ZA_MOVE_SEE("END")
+                        self.ZA_ZL_ACTION("END")
+                        self.press(Direction(Stick.LEFT, 90), duration=10.0, wait=0.1)
+
+                        self.wait(0.3)
+                        
+                        self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+                        self.ZA_battlecount=self.ZA_battlecount+1
+                        return "BATTLE_MAP_OPEN"
+
+                else:
+                    self.ZA_battlecheck=0
+                    break
+                
+                # コメントなどの場合用のキャンセル
+                for i in range(1,20):
+                    self.press(Button.B, wait=0.0)
+                self.wait(0.1)
+                
+                self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+                self.ZA_battlecount=self.ZA_battlecount+1
+                return "BATTLE_MAP_OPEN"
+                
+        self.ZA_ZL_ACTION(lockonflg=lockonflg)
+        if self.ZA_ZL_state == 1:
+            for i in range(5):
+                # 技使用を判定させるため
+                if self.ZA_no_Cplus==0 and self.image_check("POKEMON_ZA_C+"):
+                    self.ZA_notarget_movecount=0
+                    self.press(Button.A, wait=0.0)
+                    self.press(Button.B, wait=0.0)
+                    self.ZA_notargetcount=0
+                elif self.ZA_no_Cplus==1:#C+がない場合の処理
+                    self.press(Button.A, wait=0.0)
+                    self.press(Button.B, wait=0.0)
+                    self.press(Button.X, wait=0.0)
+                ### リワード戦コメント送り or カード拾いなど
+                elif self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" or (self.ZA_battle_step==0 and self.ZA_battle_current_state=="BATTLE_MOVE"):
+                    self.press(Button.A, wait=0.0)
+
+                if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_REWORD_END"):
+                    for i in range(5):
+                        self.press(Button.B, wait=0.0)
+                    self.ZA_quasarcount += 1
+                    self.ZA_MOVE_SEE("END")
+                    self.ZA_ZL_ACTION("END")
+                    return "QUASAR_START"
+                elif self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_REWORD_LOSE"):
+                    for i in range(5):
+                        self.press(Button.B, wait=0.0)
+                    self.ZA_quasarcount += 1
+                    self.ZA_quasarlosecount += 1
+                    self.ZA_MOVE_SEE("END")
+                    self.ZA_ZL_ACTION("END")
+                    return "QUASAR_START"
+            if self.ZA_no_Cplus==0 and self.image_check("POKEMON_ZA_C+"):
+                self.press(Button.A, wait=0.0)
+                self.press(Button.B, wait=0.0)
+                self.ZA_notargetcount=0
+                if not self.image_check("POKEMON_ZA_ESCAPE"):
+                    self.ZA_notargetcount=0
+            elif self.ZA_no_Cplus==1:#C+がない場合の処理
+                self.press(Button.A, wait=0.0)
+                self.press(Button.B, wait=0.0)
+                self.press(Button.X, wait=0.0)
+            if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_REWORD_END"):
+                for i in range(5):
+                    self.press(Button.B, wait=0.0)
+                self.ZA_quasarcount += 1
+                self.ZA_MOVE_SEE("END")
+                self.ZA_ZL_ACTION("END")
+                return "QUASAR_START"
+            elif self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_REWORD_LOSE"):
+                for i in range(5):
+                    self.press(Button.B, wait=0.0)
+                self.ZA_quasarcount += 1
+                self.ZA_quasarlosecount += 1
+                self.ZA_MOVE_SEE("END")
+                self.ZA_ZL_ACTION("END")
+                return "QUASAR_START"
+            if self.ZA_no_Cplus==0 and self.image_check("POKEMON_ZA_C+"):
+                self.press(Button.X, wait=0.0)
+                self.ZA_notargetcount=0
+            elif self.ZA_no_Cplus==1:#C+がない場合の処理
+                self.press(Button.A, wait=0.0)
+                self.press(Button.B, wait=0.0)
+                self.press(Button.X, wait=0.0)
+                if not self.image_check("POKEMON_ZA_ESCAPE"):
+                    self.ZA_notargetcount=0
+            
+        if self.ZA_battle_current_state=="BATTLE_MOVE" and self.image_check("POKEMON_ZA_EYE_CHECK_HIGH"):
+            Seecheckflg+=1
+            if Seecheckflg>7 or (((movestep - 1) == self.ZA_ZONELIST[self.ZA_targetzone][3]) and Seecheckflg2 == 2):
+                self.ZA_MOVE_SEE()
+                #self.press(Direction(Stick.RIGHT, 90), duration=0.03, wait=0.1)
+            elif Seecheckflg>5 and (self.ZA_no_Cplus==0 and self.image_check("POKEMON_ZA_C+")) or (((movestep - 1) == self.ZA_ZONELIST[self.ZA_targetzone][3]) and (Seecheckflg2 == 1 and (self.ZA_no_Cplus==0 and self.image_check("POKEMON_ZA_C+")))):
+                self.ZA_MOVE_SEE("END")
+                Seecheckflg2=2
+            elif Seecheckflg>5 and ((self.ZA_no_Cplus==0 and (not self.image_check("POKEMON_ZA_C+")))) or (((movestep - 1) == self.ZA_ZONELIST[self.ZA_targetzone][3]) and Seecheckflg2 == 0 and ((self.ZA_no_Cplus==0 and (not self.image_check("POKEMON_ZA_C+"))))):
+                self.ZA_MOVE_SEE()
+
+        elif self.ZA_battle_current_state=="BATTLE_MOVE" and (self.ZA_ZONELIST[self.ZA_targetzone][5 + movestep][3] and self.image_check("POKEMON_ZA_EYE_CHECK")):
+            Seecheckflg+=1
+            if Seecheckflg>7 or (((movestep - 1) == self.ZA_ZONELIST[self.ZA_targetzone][3]) and Seecheckflg2 == 2):
+                self.ZA_MOVE_SEE()
+                #self.press(Direction(Stick.RIGHT, 90), duration=0.03, wait=0.1)
+            elif Seecheckflg>5 and (self.ZA_no_Cplus==0 and self.image_check("POKEMON_ZA_C+")) or (((movestep - 1) == self.ZA_ZONELIST[self.ZA_targetzone][3]) and (Seecheckflg2 == 1 and (self.ZA_no_Cplus==0 and self.image_check("POKEMON_ZA_C+")))):
+                self.ZA_MOVE_SEE("END")
+                Seecheckflg2=2
+            elif Seecheckflg>5 and ((self.ZA_no_Cplus==0 and (not self.image_check("POKEMON_ZA_C+")))) or (((movestep - 1) == self.ZA_ZONELIST[self.ZA_targetzone][3]) and Seecheckflg2 == 0 and ((self.ZA_no_Cplus==0 and (not self.image_check("POKEMON_ZA_C+"))))):
+                self.ZA_MOVE_SEE()
+                
+        elif self.ZA_battle_current_state=="BATTLE_MOVE" and (not (self.ZA_ZONELIST[self.ZA_targetzone][5 + movestep][3] and self.image_check("POKEMON_ZA_EYE_CHECK"))): 
+            self.ZA_MOVE_SEE("END")
+            Seecheckflg=0
+
+        #敗北用の保険                
+        if self.ZA_battle_current_state=="BATTLE_MOVE" and self.image_check("POKEMON_ZA_LOSE"):
+            self.wait(1.0)
+            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.01, interval=0.1)
+            self.pressRep(Button.B, repeat=5, duration=0.15, wait=0.01, interval=0.1)
+            return "BATTLE_START"
+            
+        if (self.ZA_battle_step==1 and self.ZA_battle_current_state=="BATTLE_MOVE" and self.image_check("POKEMON_ZA_REWARD_RESULT")) or self.ZA_battle_step==2:
+            lastescape = time.perf_counter() 
+            endbk = end
+            end = time.perf_counter()
+            self.ZA_DebugLog(2,"while if REWARD_RESULT",end,endbk)
+            
+            self.ZA_battle_step=2
+            for i in range(1,15):
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.01, interval=0.1)
+                if (self.image_check("POKEMON_ZA_CHICKET_MAX") or self.image_check("POKEMON_ZA_CHICKET_MAX_RIGHT"))and self.ZA_chicketmaxflag == 0:
+                    print("POKEMON_ZA_CHICKET_MAX")
+                    self.ZA_battlecount=3
+                    self.ZA_chicketmaxflag = 1
+                
+            self.ZA_battlecount=self.ZA_battlecount+1
+            
+            end = time.perf_counter()    # 計測終了
+            print(f"処理時間: {end - start:.5f} 秒")
+            print("==================================")
+            self.ZA_notargetcount=0
+            
+            if self.ZA_battlecount>(self.ZA_battle_zone_loop_num - 1):
+                self.ZA_battle_step=0
+                self.ZA_MOVE_SEE("END")
+                self.ZA_ZL_ACTION("END")
+                return "BATTLE_START"
+            self.ZA_battle_step=0
+            self.ZA_MOVE_SEE("END")
+            self.ZA_ZL_ACTION("END")
+            return "BATTLE_MAP_OPEN"
+        
+        elif self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_REWORD_END"):
+            for i in range(5):
+                self.press(Button.B, wait=0.0)
+            self.ZA_quasarcount += 1
+            self.ZA_MOVE_SEE("END")
+            self.ZA_ZL_ACTION("END")
+            return "QUASAR_START"
+        elif self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_REWORD_LOSE"):
+            for i in range(5):
+                self.press(Button.B, wait=0.0)
+            self.ZA_quasarcount += 1
+            self.ZA_quasarlosecount += 1
+            self.ZA_MOVE_SEE("END")
+            self.ZA_ZL_ACTION("END")
+            return "QUASAR_START"
+
+        elif self.image_check("POKEMON_ZA_ESCAPE") or self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK"):
+            
+            endbk = end
+            end = time.perf_counter()
+            self.ZA_DebugLog(3,"while elif ESCAPE",end,endbk)
+            
+            if self.ZA_battle_step==0:
+                
+                endbk = end
+                end = time.perf_counter()
+                self.ZA_DebugLog(4,"while elif ESCAPE step0",end,endbk)
+                
+                #end = time.perf_counter()    # 計測途中
+                print(f"バトル開始時間: {end - start:.5f} 秒")
+                self.ZA_battle_step=1
+                self.ZA_notargetcount=0
+                lockonflg=1
+            self.ZA_ZL_ACTION("END")
+            self.ZA_ZL_ACTION("")
+
+            self.ZA_battle_lockon_test()
+               
+            if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_REWORD_END"):
+                for i in range(5):
+                    self.press(Button.B, wait=0.0)
+                self.ZA_quasarcount += 1
+                self.ZA_MOVE_SEE("END")
+                self.ZA_ZL_ACTION("END")
+                return "QUASAR_START"
+            elif self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_REWORD_LOSE"):
+                for i in range(5):
+                    self.press(Button.B, wait=0.0)
+                self.ZA_quasarcount += 1
+                self.ZA_quasarlosecount += 1
+                self.ZA_MOVE_SEE("END")
+                self.ZA_ZL_ACTION("END")
+                return "QUASAR_START"
+               
+                
+            if self.ZA_battle_step==1:
+                if ((not self.image_check("POKEMON_ZA_ESCAPE")) and (self.ZA_no_Cplus==0 and (not self.image_check("POKEMON_ZA_C+"))) and (self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK"))and self.ZA_battle_current_state=="BATTLE_MOVE"):
+
+                    self.ZA_battlecheck=1
+                    print("check4")
+                    noescapeflg=0
+                    for i in range(1,self.ZA_escapecheckrange):
+                        if self.image_check("POKEMON_ZA_ESCAPE"):
+                            noescapeflg=1
+                            break
+                        elif self.image_check("POKEMON_ZA_SELECT"):
+                            self.ZA_etc_sendCommand("Lbutton_up")
+                            noescapeflg=1
+                            break
+                        self.wait(0.1)
+                    
+                    if noescapeflg==0 and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
+                        self.ZA_MOVE_SEE("END")
+                        self.ZA_ZL_ACTION("END")
+                        self.press(Direction(Stick.LEFT, 90), duration=10.0, wait=0.1)
+
+                        self.wait(0.3)
+                        
+                        self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+                        self.ZA_battlecount=self.ZA_battlecount+1
+                        return "BATTLE_MAP_OPEN"             
+                
+                lockonflg = 1
+                lastescape = time.perf_counter() 
+                endbk = end
+                end = time.perf_counter()
+                elapsed = end - start
+                #ハマった場合の逃走(ヤミラミループなど)
+                if elapsed >= 200 and self.ZA_battle_current_state=="BATTLE_MOVE":
+                    print("200.0秒以上経過しました。逃走し強制的に終了します。")
+                    self.ZA_MOVE_SEE("END")
+                    self.ZA_ZL_ACTION("END")
+                    if self.image_check("POKEMON_ZA_ESCAPE"):
+                        self.ZA_battleescapecount+=1
+                        self.ZA_battle_nofiled_count=0
+                        self.pressRep(Button.MINUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+                        for i in range(100):#無限ループ抜け
+                            if self.image_check("POKEMON_ZA_ESCAPE_SELECT"):
+                                self.press(Button.A, wait=0.0)
+                            elif self.image_check("POKEMON_ZA_ESCAPE_COMMENT1"):
+                                self.press(Button.A, wait=0.0)
+                            elif self.image_check("POKEMON_ZA_ESCAPE_COMMENT2"):
+                                for i in range(1,10):
+                                    self.press(Button.B, wait=0.0)
+                                    return "BATTLE_START"
+                            #補足できなかった場合の代用
+                            elif self.image_check("POKEMON_ZA_FIELD") or self.image_check("POKEMON_ZA_FIELD_BACK") or self.image_check("POKEMON_ZA_DEAD"):
+                                for i in range(1,10):
+                                    self.press(Button.B, wait=0.0)
+                                    return "BATTLE_START"
+                            self.wait(0.1)
+                    
+                    elif self.ZA_battle_current_state=="BATTLE_MOVE" and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
+
+                        print("check5")
+                        noescapeflg=0
+                        for i in range(1,self.ZA_escapecheckrange):
+                            if self.image_check("POKEMON_ZA_ESCAPE"):
+                                noescapeflg=1
+                                break
+                            elif self.image_check("POKEMON_ZA_SELECT"):
+                                self.ZA_etc_sendCommand("Lbutton_up")
+                                noescapeflg=1
+                                break
+                            self.wait(0.1)
+                        
+                        if noescapeflg==0 and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
+                            self.ZA_MOVE_SEE("END")
+                            self.ZA_ZL_ACTION("END")
+                            self.press(Direction(Stick.LEFT, 90), duration=10.0, wait=0.1)
+
+                            self.wait(0.3)
+                            
+                            self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+                            self.ZA_battlecount=self.ZA_battlecount+1
+                            return "BATTLE_MAP_OPEN"           
+
+                    else:
+                        #マップコメントの捕捉失敗用
+
+                        if self.image_check("POKEMON_ZA_ESCAPE"):
+                            self.ZA_battlecheck=1
+                            self.ZA_battle_nofiled_count=0
+                            break
+                        elif self.ZA_battle_current_state=="BATTLE_MOVE" and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
+                            print("check6")
+                            noescapeflg=0
+                            for i in range(1,self.ZA_escapecheckrange):
+                                if self.image_check("POKEMON_ZA_ESCAPE"):
+                                    noescapeflg=1
+                                    break
+                                elif self.image_check("POKEMON_ZA_SELECT"):
+                                    self.ZA_etc_sendCommand("Lbutton_up")
+                                    noescapeflg=1
+                                    break
+                                self.wait(0.1)
+                            
+                            if noescapeflg==0 and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
+                                self.ZA_MOVE_SEE("END")
+                                self.ZA_ZL_ACTION("END")
+                                self.press(Direction(Stick.LEFT, 90), duration=10.0, wait=0.1)
+
+                                self.wait(0.3)
+                                
+                                self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+                                self.ZA_battlecount=self.ZA_battlecount+1
+                                return "BATTLE_MAP_OPEN"
+                        else:
+
+                            self.ZA_battlecheck=0
+                            break
+                    self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+                    self.ZA_battlecount=self.ZA_battlecount+1
+                    return "BATTLE_MAP_OPEN"    
+
+                self.ZA_DebugLog(5,"while elif ESCAPE step1",end,endbk)
+                
+                if self.image_check("POKEMON_ZA_SELECT"):
+
+                    endbk = end
+                    end = time.perf_counter()
+                    self.ZA_DebugLog(6,"while elif ESCAPE step1 SELECT",end,endbk)
+                    for i in range(0,3):
+                        self.ZA_etc_sendCommand("Lbutton_up")
+                elif (self.ZA_no_Cplus==0 and self.image_check("POKEMON_ZA_C+")):
+                    self.ZA_notargetcount=0
+                    self.ZA_MOVE_SEE("END")
+                elif not self.image_check("POKEMON_ZA_ESCAPE"):
+                    self.ZA_notargetcount=0
+                    self.ZA_MOVE_SEE("END")
+                else:
+                    if self.ZA_notargetcount > 8:
+                        self.ZA_ZL_ACTION(lockonflg=lockonflg)
+                        self.ZA_MOVE_SEE()
+                    #ハマり対策仮
+                    #if notargetcount % 2 == 1:
+                    #    self.ZA_MOVE_SEE("END")
+                    #    self.ZA_ZL_ACTION("END")
+                    #    self.wait(0.1)
+                    #    self.ZA_ZL_ACTION()
+                    #    self.ZA_MOVE_SEE()
+                    if self.ZA_notargetcount % 10 == 9:
+                        if self.ZA_battle_current_state=="BATTLE_MOVE":
+                            self.press(Direction(Stick.LEFT, 90), duration=0.3, wait=0.1)
+                        else:
+                            #リワードロック対策での移動距離を多めにする。
+                            self.ZA_MOVE_SEE("END")
+                            self.ZA_ZL_ACTION("END")
+                            self.press(Direction(Stick.LEFT, 90), duration=3.0, wait=0.1)
+                            self.ZA_ZL_ACTION()
+                            self.ZA_MOVE_SEE()
+                            
+                        self.ZA_notarget_movecount+=1
+                        if self.ZA_notarget_movecount>3:
+                            #逃げ
+                            self.ZA_MOVE_SEE("END")
+                            self.ZA_ZL_ACTION("END")
+                            if self.image_check("POKEMON_ZA_ESCAPE"):
+                                self.ZA_battleescapecount+=1
+                                self.ZA_battle_nofiled_count=0
+                                self.pressRep(Button.MINUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+                                for i in range(100):
+                                    if self.image_check("POKEMON_ZA_ESCAPE_SELECT"):
+                                        self.press(Button.A, wait=0.0)
+                                    elif self.image_check("POKEMON_ZA_ESCAPE_COMMENT1"):
+                                        self.press(Button.A, wait=0.0)
+                                    elif self.image_check("POKEMON_ZA_ESCAPE_COMMENT2"):
+                                        for i in range(1,10):
+                                            self.press(Button.B, wait=0.0)
+                                            return "BATTLE_START"
+                                    #補足できなかった場合の代用
+                                    elif self.image_check("POKEMON_ZA_FIELD") or self.image_check("POKEMON_ZA_FIELD_BACK") or self.image_check("POKEMON_ZA_DEAD"):
+                                        for i in range(1,10):
+                                            self.press(Button.B, wait=0.0)
+                                            return "BATTLE_START"
+                                    self.wait(0.1)
+                            elif self.ZA_battle_current_state=="BATTLE_MOVE" and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
+                                print("check7")
+                                noescapeflg=0
+                                for i in range(1,self.ZA_escapecheckrange):
+                                    if self.image_check("POKEMON_ZA_ESCAPE"):
+                                        noescapeflg=1
+                                        break
+                                    elif self.image_check("POKEMON_ZA_SELECT"):
+                                        self.ZA_etc_sendCommand("Lbutton_up")
+                                        noescapeflg=1
+                                        break
+                                    self.wait(0.1)
+                                
+                                if noescapeflg==0 and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
+                                    self.ZA_MOVE_SEE("END")
+                                    self.ZA_ZL_ACTION("END")
+                                    self.press(Direction(Stick.LEFT, 90), duration=10.0, wait=0.1)
+
+                                    self.wait(0.3)
+                                    
+                                    self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+                                    self.ZA_battlecount=self.ZA_battlecount+1
+                                    return "BATTLE_MAP_OPEN"
+                            
+                            else:
+                                #マップコメントの捕捉失敗用
+
+                                if self.image_check("POKEMON_ZA_ESCAPE"):
+                                    self.ZA_battlecheck=1
+                                    self.ZA_battle_nofiled_count=0
+                                    break
+                                elif self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
+                                    self.ZA_battlecheck=1
+                                    print("check8")
+                                    noescapeflg=0
+                                    for i in range(1,self.ZA_escapecheckrange):
+                                        if self.image_check("POKEMON_ZA_ESCAPE"):
+                                            noescapeflg=1
+                                            break
+                                        elif self.image_check("POKEMON_ZA_SELECT"):
+                                            self.ZA_etc_sendCommand("Lbutton_up")
+                                            noescapeflg=1
+                                            break
+                                        self.wait(0.1)
+                                    
+                                    if noescapeflg==0 and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
+                                        self.ZA_MOVE_SEE("END")
+                                        self.ZA_ZL_ACTION("END")
+                                        self.press(Direction(Stick.LEFT, 90), duration=10.0, wait=0.1)
+
+                                        self.wait(0.3)
+                                        
+                                        self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+                                        self.ZA_battlecount=self.ZA_battlecount+1
+                                        return "BATTLE_MAP_OPEN"
+                                else:
+
+                                    self.ZA_battlecheck=0
+                                    break
+                            self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+                            self.ZA_battlecount=self.ZA_battlecount+1
+                            return "BATTLE_MAP_OPEN"
+                    
+        else:
+            if self.ZA_battle_step==0 and self.ZA_battle_current_state=="BATTLE_MOVE":
+                if count > self.ZA_ZONELIST[self.ZA_targetzone][4]:
+                    lockonflg=1
+                self.ZA_etc_sendCommand("Lbutton_up")
+                if Seecheckflg==0:
+                    movestep = self.ZA_MOVE_ACTION(movestep,lockonflg=lockonflg)
+                #movestep=+1
+                end = time.perf_counter()
+                elapsed = end - start
+
+                if elapsed >= 40 and self.ZA_battle_current_state=="BATTLE_MOVE":
+                    print("40.0秒以上経過しました。強制的に終了します。")
+                    self.ZA_battlecount=self.ZA_battlecount+1
+                    self.ZA_zonemisscount[self.ZA_targetzone-1]+=1
+                    self.ZA_MOVE_SEE("END")
+                    self.ZA_ZL_ACTION("END")
+                    #マップコメントの捕捉失敗用
+
+                    if self.image_check("POKEMON_ZA_ESCAPE"):
+                        self.ZA_battlecheck=1
+                        self.ZA_battle_nofiled_count=0
+                        break
+                    else:
+
+                        self.ZA_battlecheck=0
+                        break
+                    # コメントなどの場合用のキャンセル
+                    for i in range(1,20):
+                        self.press(Button.B, wait=0.0)
+                    self.wait(0.1)
+                        
+                    self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+                    self.ZA_battlecount=self.ZA_battlecount+1
+                    return "BATTLE_MAP_OPEN"
+                self.ZA_notargetcount=0
+
+        self.checkIfAlive()
+        count=count+1
+        self.ZA_notargetcount += 1
+
+    self.ZA_MOVE_SEE("END")
+    self.ZA_ZL_ACTION("END")
+
+    return "BATTLE_MAP_OPEN"
+
+def ZA_battle_lockon_test(self):
+    self.ZA_quasar_battle_lockon=1
+    self.battlemarker_skipcount=self.ZA_battlemarker_skipcount_threshold
+    self.ZA_notargetcount=0
+    start = time.perf_counter()  # 計測開始
+    while True:
+        if self.ZA_notargetcount>3:
+            if (self.ZA_battle_current_state=="BATTLE_MOVE" and (self.ZA_notargetcount % 9 == 1)):
+                self.press(Direction(Stick.LEFT, 90), duration=0.9, wait=0.1)
+            elif (self.ZA_battle_current_state=="QUASAR_BATTLE_LOOP" and (self.ZA_notargetcount % 9 == 1)):
+                self.press(Direction(Stick.LEFT, 90), duration=0.9, wait=0.1)
+            self.ZA_MOVE_SEE("")
+        self.ZA_ZL_ACTION("END")
+        self.ZA_ZL_ACTION("")
+        #self.press(Button.A, wait=0.0)
+        end = time.perf_counter()
+        elapsed = end - start
+        
+
+        if self.image_check("POKEMON_ZA_R_push"):
+            self.press(Button.RCLICK,0.05,0.1) 
+
+        if (self.ZA_no_Cplus==0 and self.image_check("POKEMON_ZA_C+")):
+            self.ZA_MOVE_SEE("END")
+            self.press(Button.A, wait=0.0)
+            self.press(Button.B, wait=0.0)
+            self.ZA_notargetcount=0
+            return
+        elif self.ZA_no_Cplus==1:#C+がない場合の処理
+            self.press(Button.A, wait=0.0)
+            self.press(Button.B, wait=0.0)
+            self.press(Button.X, wait=0.0)
+        
+        elif self.ZA_battle_step==1 and self.ZA_battle_current_state=="BATTLE_MOVE" and self.image_check("POKEMON_ZA_REWARD_RESULT"):
+            self.ZA_battle_step=2
+            self.ZA_MOVE_SEE("END")
+            return
+        elif self.ZA_battle_current_state=="BATTLE_MOVE" and self.image_check("POKEMON_ZA_LOSE"):
+            self.ZA_MOVE_SEE("END")
+            return
+        
+        if (self.image_check("POKEMON_ZA_REWORD_END") or self.image_check("POKEMON_ZA_REWORD_LOSE")):
+            self.ZA_MOVE_SEE("END")
+            return
+        if self.image_check("POKEMON_ZA_SELECT"):
+            self.ZA_MOVE_SEE("END")
+            return
+        if not self.image_check("POKEMON_ZA_ESCAPE"):
+            self.ZA_MOVE_SEE("END")
+            return
+        
+        if self.image_check("POKEMON_ZA_ESCAPE") or self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W"):
+            #if self.image_check("TARGET_L_ALL"):
+            self.battlemarker_skipcount+=1
+            if ((self.battlemarker_skipcount > self.ZA_battlemarker_skipcount_threshold) and (self.image_check("POKEMON_ZA_TARGET_RIGHT_LOW") or self.image_check("POKEMON_ZA_TARGET_LEFT_LOW") or (self.ZA_Rstick_state == 0 and (self.image_check("POKEMON_ZA_TARGET_RIGHT_RIHGT_CHECK_LOW") or self.image_check("POKEMON_ZA_TARGET_LEFT_RIHGT_CHECK_LOW"))))):# LOWで数回確認後通常のマーカーでもチェックできた場合継続(画像検知位置は回転を考慮し左寄り) 視点回転していない場合右も確認
+
+            
+                self.ZA_MOVE_SEE("END")
+                if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP":
+                    self.ZA_quasar_target_start_low_count+=1
+                else:
+                    self.ZA_target_start_low_count+=1
+                time.sleep(0.2)
+                for i in range(0,3):
+                   #print("target_loop")
+
+                    if (self.ZA_no_Cplus==0 and self.image_check("POKEMON_ZA_C+")):
+                        self.ZA_notargetcount=0
+                        self.press(Button.A, wait=0.0)
+                        self.press(Button.B, wait=0.0)
+                        #print("##### target_loop_END")
+                        if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP":
+                            self.ZA_quasar_target_end_low_count+=1
+                        else:
+                            self.ZA_target_end_low_count+=1
+                        return
+                    elif self.ZA_no_Cplus==1:#C+がない場合の処理
+                        self.press(Button.A, wait=0.0)
+                        self.press(Button.B, wait=0.0)
+                        self.press(Button.X, wait=0.0)
+                    elif self.image_check("POKEMON_ZA_SELECT"):
+                        if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP":
+                            self.ZA_quasar_target_start_low_count+=1
+                        else:
+                            self.ZA_target_start_low_count-=1
+                        return
+                    elif not self.image_check("POKEMON_ZA_ESCAPE"):
+                        if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP":
+                            self.ZA_quasar_target_start_low_count+=1
+                        else:
+                            self.ZA_target_start_low_count-=1
+                        return
+                    
+                    if not self.image_check("POKEMON_ZA_ESCAPE"):
+                        self.ZA_notargetcount=0
+                        
+                    self.ZA_ZL_ACTION("END")
+                    time.sleep(0.2)
+                    self.ZA_ZL_ACTION("")
+                    time.sleep(0.2)
+                    #self.ZA_notargetcount=0#
+                    
+                if self.image_check("POKEMON_ZA_TARGET_RIGHT") or self.image_check("POKEMON_ZA_TARGET_LEFT") or (self.ZA_Rstick_state == 0 and (self.image_check("POKEMON_ZA_TARGET_RIGHT_RIHGT_CHECK") or self.image_check("POKEMON_ZA_TARGET_LEFT_RIHGT_CHECK"))):# 視点回転していない場合右も確認
+                    if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP":
+                        self.ZA_quasar_target_start_mid_count+=1
+                    else:
+                        self.ZA_target_start_mid_count+=1
+                    if (self.ZA_no_Cplus==0 and self.image_check("POKEMON_ZA_C+")):
+                        self.ZA_notargetcount=0
+                        self.press(Button.A, wait=0.0)
+                        self.press(Button.B, wait=0.0)
+                        #print("##### target_loop_END")
+                        if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP":
+                            self.ZA_quasar_target_end_mid_count+=1
+                        else:
+                            self.ZA_target_end_mid_count+=1
+                        return
+                    elif self.ZA_no_Cplus==1:#C+がない場合の処理
+                        self.press(Button.A, wait=0.0)
+                        self.press(Button.B, wait=0.0)
+                        self.press(Button.X, wait=0.0)
+                    elif self.image_check("POKEMON_ZA_SELECT"):
+                        if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP":
+                            self.ZA_quasar_target_start_mid_count-=1
+                        else:
+                            self.ZA_target_start_mid_count-=1
+                        return
+                    elif not self.image_check("POKEMON_ZA_ESCAPE"):
+                        if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP":
+                            self.ZA_quasar_target_start_mid_count-=1
+                        else:
+                            self.ZA_target_start_mid_count-=1
+                        return
+                    
+                    if not self.image_check("POKEMON_ZA_ESCAPE"):
+                        self.ZA_notargetcount=0
+                    
+                    self.ZA_ZL_ACTION("END")
+                    time.sleep(0.2)
+                    self.ZA_ZL_ACTION("")
+                    time.sleep(0.2)
+                    self.ZA_notargetcount+=1
+                else:
+                    #LOWでチェックできない場合、しばらくLOWでのチェックをしない(同じ画面でLOWチェックを連続しておこなわないように) 主に車のタイヤで誤チェックされてしまう
+                    #if self.ZA_battle_current_state=="BATTLE_MOVE":
+                        #テスト バトルエリアのみLOWモードの間隔をあける
+                    self.battlemarker_skipcount=0
+                    self.ZA_notargetcount+=1
+                         
+                
+            elif ((self.battlemarker_skipcount <= self.ZA_battlemarker_skipcount_threshold) and (self.image_check("POKEMON_ZA_TARGET_RIGHT") or self.image_check("POKEMON_ZA_TARGET_LEFT") or (self.ZA_Rstick_state == 0 and (self.image_check("POKEMON_ZA_TARGET_RIGHT_RIHGT_CHECK") or self.image_check("POKEMON_ZA_TARGET_LEFT_RIHGT_CHECK"))))):# 視点回転していない場合右も確認 LOWでチェックミスがある場合しばらくLOWを使用しない。
+
+                self.ZA_MOVE_SEE("END")
+                
+                if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP":
+                    self.ZA_quasar_target_start_count+=1
+                else:
+                    self.ZA_target_start_count+=1
+                time.sleep(0.2)
+                for i in range(0,3):
+                   #print("target_loop")
+
+                    if (self.ZA_no_Cplus==0 and self.image_check("POKEMON_ZA_C+")):
+                        self.ZA_notargetcount=0
+                        self.press(Button.A, wait=0.0)
+                        self.press(Button.B, wait=0.0)
+                        #print("##### target_loop_END")
+                        if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP":
+                            self.ZA_quasar_target_end_count+=1
+                        else:
+                            self.ZA_target_end_count+=1
+                        return
+                    elif self.ZA_no_Cplus==1:#C+がない場合の処理
+                        self.press(Button.A, wait=0.0)
+                        self.press(Button.B, wait=0.0)
+                        self.press(Button.X, wait=0.0)
+                    elif self.image_check("POKEMON_ZA_SELECT"):
+                        if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP":
+                            self.ZA_quasar_target_start_count-=1
+                        else:
+                            self.ZA_target_start_count-=1
+                        return
+                    elif not self.image_check("POKEMON_ZA_ESCAPE"):
+                        if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP":
+                            self.ZA_quasar_target_start_count-=1
+                        else:
+                            self.ZA_target_start_count-=1
+                        return
+                    
+                    if not self.image_check("POKEMON_ZA_ESCAPE"):
+                        self.ZA_notargetcount=0
+                    
+                    self.ZA_ZL_ACTION("END")
+                    time.sleep(0.2)
+                    self.ZA_ZL_ACTION("")
+                    time.sleep(0.2)
+                self.ZA_notargetcount+=1
+            elif ((self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and (self.image_check("POKEMON_ZA_ATTACK_DISPLAY") or self.image_check("POKEMON_ZA_ATTACK_C+_DISPLAY"))) or (self.ZA_Rstick_state == 0 and (self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and (self.image_check("POKEMON_ZA_ATTACK_DISPLAY_RIHGT_CHECKW") or self.image_check("POKEMON_ZA_ATTACK_C+_DISPLAY_RIHGT_CHECKW"))))):# 攻撃表示による判定
+            #elif ( (self.image_check("ATTACK_DISPLAY") or self.image_check("ATTACK_C+_DISPLAY"))or (self.ZA_Rstick_state == 0 and (self.image_check("ATTACK_DISPLAY_RIHGT_CHECKW") or self.image_check("ATTACK_C+_DISPLAY_RIHGT_CHECKW")))):# 攻撃表示による判定
+                self.ZA_MOVE_SEE("END")
+                self.ZA_quasar_battle_display_start_count+=1
+                time.sleep(0.2)
+                for i in range(0,3):
+                    if (self.ZA_no_Cplus==0 and self.image_check("POKEMON_ZA_C+")):
+                        self.ZA_notargetcount=0
+                        self.press(Button.A, wait=0.0)
+                        self.press(Button.B, wait=0.0)
+                        #print("##### target_loop_END")
+                        self.ZA_quasar_battle_display_end_count+=1
+                        return
+                    elif self.ZA_no_Cplus==1:#C+がない場合の処理
+                        self.press(Button.A, wait=0.0)
+                        self.press(Button.B, wait=0.0)
+                        self.press(Button.X, wait=0.0)
+                    elif self.image_check("POKEMON_ZA_SELECT"):
+                        self.ZA_quasar_battle_display_start_count-=1
+                        return
+                    elif not self.image_check("POKEMON_ZA_ESCAPE"):
+                        self.ZA_quasar_battle_display_start_count-=1
+                        return
+                    
+                    if not self.image_check("POKEMON_ZA_ESCAPE"):
+                        self.ZA_notargetcount=0
+                    
+                    self.ZA_ZL_ACTION("END")
+                    time.sleep(0.2)
+                    self.ZA_ZL_ACTION("")
+                    time.sleep(0.2)
+                    self.ZA_notargetcount+=1
+            else:
+                self.ZA_notargetcount+=1
+        else:
+            ## 交換中などのため0にする(間隔をあけるため-8?)
+            self.ZA_MOVE_SEE("END")
+            self.ZA_notargetcount=0#-8
+            self.press(Button.A, wait=0.0)
+                
+        if elapsed >= 20:
+            return
+
+def ZA_battle_lockon_test_all(self):
+    if self.image_check("POKEMON_ZA_TARGET_LEFT"):
+        print("left_check")
+    
+    if self.image_check("POKEMON_ZA_TARGET_RIGHT"):
+        print("right_check")
+
+def ZA_DebugLog(self,num,logmessage,endtime=0,starttime=0):
+    return
+    if starttime == 0:
+        print(f"[lognum:{num}] {logmessage}")
+    else:
+        print(f"[lognum:{num}] {logmessage} 処理時間: {endtime - starttime:.5f} 秒")
+
+def ZA_quasar_start(self):
+    self.ZA_chicketmaxflag = 0
+    return "QUASAR_MOVE_DOOR"
+
+def ZA_quasar_move_door(self):
+    if not (self.image_check("POKEMON_ZA_FIELD") or self.image_check("POKEMON_ZA_FIELD_BACK") or self.image_check("POKEMON_ZA_DEAD")):
+        self.ZA_etc_sendCommand("Lbutton_left")
+        self.wait(self.ZA_SLEEPLIST[0][2])
+        return "QUASAR_MOVE_DOOR"
+    
+    self.press(Direction(Stick.LEFT, 90), duration=7.0, wait=0.1)
+    if self.image_check("POKEMON_ZA_DOOR_A"):
+        self.press(Button.A, wait=0.0)
+        return "QUASAR_MOVE_ENTRANCE"
+    return "QUASAR_MOVE_DOOR"
+
+def ZA_quasar_move_entrance(self):
+    if not (self.image_check("POKEMON_ZA_FIELD") or self.image_check("POKEMON_ZA_FIELD_BACK") or self.image_check("POKEMON_ZA_DEAD")):
+        self.ZA_etc_sendCommand("Lbutton_left")
+        self.wait(self.ZA_SLEEPLIST[0][2])
+        return "QUASAR_MOVE_ENTRANCE"
+    
+    self.press(Direction(Stick.LEFT, 90), duration=11.0, wait=0.1)
+    self.press(Direction(Stick.LEFT, 10), duration=1.0, wait=0.1)
+    for i in range(30):
+        self.press(Button.A, wait=0.0)
+    return "QUASAR_BATTLE_LOOP"
+
+def ZA_quasar_battle_loop(self):
+    self.ZA_notargetcount=0
+    return self.ZA_battle_move_test()

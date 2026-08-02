@@ -12,14 +12,17 @@ from __future__ import print_function
 
 import ast
 import hashlib
+import io
 import json
 import os
 import queue
 import re
+import shutil
 import subprocess
 import sys
 import threading
 import textwrap
+import tokenize
 import tkinter as tk
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
@@ -27,12 +30,34 @@ from CommandBuilder import command_path, folder_segment, python_identifier, temp
 from SampleLibrary import (catalog, compose_preview, detect_conflicts, load_fragment,
                            load_library, merge_preview, resolve_members, save_library)
 from SampleProgramLoader import inspect_sample_program
+from SampleFunctionSync import compare_folder as compare_sample_function_folder
+from SampleFunctionSync import update_fragments as update_sample_function_fragments
+from SampleFunctionSync import update_source as update_source_sample_functions
+from ImageDetectionLibrary import (folder_tags as image_folder_tags,
+                                   generate_image_check,
+                                   load_library as load_image_library,
+                                   resolve_list as resolve_image_list,
+                                   save_library as save_image_library)
+from ImageDetectionSync import (compare_settings as compare_image_detection_settings,
+                                parse_source_settings as parse_source_image_detection_settings,
+                                update_library_from_source)
 
 
 PYTHON_SUFFIXES = (".py", ".pyfrag")
 TAG_RE = re.compile(r"@pokedev\s*:\s*(.+)", re.IGNORECASE)
 BEGIN_RE = re.compile(r"@pokedev-begin\s*:\s*(.+)", re.IGNORECASE)
 END_RE = re.compile(r"@pokedev-end", re.IGNORECASE)
+TODO_HELP_MARKER = "# TODO紐づけの記載例"
+TODO_SIMPLE_FUNCTION_HELP = "# 関数名だけで紐づけ: - [ ] [_1_story_out_hotel_z_18] 修正内容\n"
+TODO_PLAIN_FUNCTION_HELP = "# 本文中の関数名でも移動: 1_STORY_OUT_HOTEL_Z_72 ログ出力を追加\n"
+TODO_HELP_TEXT = (
+    TODO_HELP_MARKER + "（項目をダブルクリックすると移動）\n"
+    "# 行番号に紐づけ: - [ ] [L123] 修正内容\n"
+    "# 関数に紐づけ: - [ ] [F:ClassName.function_name+0] [L123] 修正内容\n"
+    + TODO_SIMPLE_FUNCTION_HELP
+    + TODO_PLAIN_FUNCTION_HELP
+    + "# ※［＋現在の関数へ紐づけ］を使うと自動で記載されます。\n\n"
+)
 
 
 class Fragment(object):
@@ -128,6 +153,7 @@ class DevStudio(tk.Tk):
         self.tag_text = tk.StringVar()
         self.files = []
         self.fragments = []
+        self._fragment_catalog_cache = None
         self.editing_fragment_id = None
         self.search_hits = []
         self.current_path = None
@@ -136,9 +162,10 @@ class DevStudio(tk.Tk):
         self.active_editor_tab = None
         self._switching_editor_tab = False
         self.ui_state = self.load_ui_state()
-        self.run_process = None
-        self.run_queue = queue.Queue()
+        self.background_queue = queue.Queue()
+        self.background_tasks = set()
         self.find_text = tk.StringVar()
+        self.find_result_text = tk.StringVar(value="0 / 0")
         self.replace_text = tk.StringVar()
         self.ui_language = tk.StringVar(value="日本語")
         self._build()
@@ -146,12 +173,63 @@ class DevStudio(tk.Tk):
         self.apply_language()
         self.after_idle(self.set_default_pane_sizes)
         self.after(100, self.restore_ui_state)
+        self.after(50, self._drain_background_tasks)
         self.protocol("WM_DELETE_WINDOW", self.close_dev_studio)
         self.refresh_index()
         self.refresh_local_explorer()
         self.refresh_sample_apply_lists()
         self.refresh_sample_lists_tab()
         self.refresh_registered_fragment_choices()
+
+    def run_background(self, key, label, worker, on_success, on_error=None):
+        """Run non-Tk work without blocking the UI and marshal completion safely."""
+        if key in self.background_tasks:
+            self.status.set(label + "（処理中です）")
+            return False
+        self.background_tasks.add(key)
+        self.status.set(label + "...")
+        self.configure(cursor="watch")
+
+        def run():
+            try:
+                self.background_queue.put((key, label, True, worker(), on_success, on_error))
+            except Exception as error:
+                self.background_queue.put((key, label, False, error, on_success, on_error))
+        threading.Thread(target=run, daemon=True).start()
+        return True
+
+    def _drain_background_tasks(self):
+        try:
+            while True:
+                key, label, succeeded, value, on_success, on_error = self.background_queue.get_nowait()
+                self.background_tasks.discard(key)
+                if not self.background_tasks:
+                    self.configure(cursor="")
+                try:
+                    if succeeded:
+                        on_success(value)
+                    elif on_error is not None:
+                        on_error(value)
+                    else:
+                        messagebox.showerror("Dev Studio", "{}に失敗しました。\n{}".format(label, value), parent=self)
+                except Exception as callback_error:
+                    messagebox.showerror("Dev Studio", "{}の画面更新に失敗しました。\n{}".format(label, callback_error), parent=self)
+        except queue.Empty:
+            pass
+        if self.winfo_exists():
+            self.after(50, self._drain_background_tasks)
+
+    def debounce(self, key, delay_ms, callback):
+        jobs = getattr(self, "_debounce_jobs", None)
+        if jobs is None:
+            jobs = self._debounce_jobs = {}
+        job = jobs.pop(key, None)
+        if job is not None:
+            try: self.after_cancel(job)
+            except tk.TclError: pass
+        def run():
+            jobs.pop(key, None); callback()
+        jobs[key] = self.after(delay_ms, run)
 
     def _build_menu(self):
         menu = tk.Menu(self)
@@ -274,6 +352,7 @@ class DevStudio(tk.Tk):
             pass
 
     def close_dev_studio(self):
+        self.save_current_todo(silent=True)
         self.save_ui_state()
         self.destroy()
 
@@ -302,25 +381,32 @@ class DevStudio(tk.Tk):
         edit_tools = ttk.Frame(self)
         edit_tools.pack(fill="x", padx=7, pady=(0, 5))
         ttk.Button(edit_tools, text="Go to line", command=self.go_to_line).pack(side="left", padx=(8, 3))
-        ttk.Button(edit_tools, text="Check syntax", command=self.check_syntax).pack(side="left")
-        ttk.Button(edit_tools, text="Run  F5", command=self.run_current).pack(side="left", padx=(8, 3))
-        ttk.Button(edit_tools, text="Stop", command=self.stop_run).pack(side="left")
+        ttk.Button(edit_tools, text="構文チェック  F5", command=self.check_syntax).pack(side="left")
         ttk.Label(edit_tools, text="   Find:").pack(side="left")
         find_entry = ttk.Entry(edit_tools, textvariable=self.find_text, width=16)
         find_entry.pack(side="left", padx=2)
         find_entry.bind("<Return>", lambda event: self.find_next())
-        ttk.Button(edit_tools, text="Next", command=self.find_next).pack(side="left")
+        self.find_text.trace_add("write", lambda *args: self.debounce(
+            "editor_find_count", 120, self.refresh_find_count))
+        ttk.Button(edit_tools, text="前へ", command=self.find_previous).pack(side="left")
+        ttk.Button(edit_tools, text="次へ", command=self.find_next).pack(side="left", padx=(2, 0))
+        ttk.Label(edit_tools, textvariable=self.find_result_text, width=9, anchor="center").pack(side="left", padx=(3, 0))
         ttk.Entry(edit_tools, textvariable=self.replace_text, width=16).pack(side="left", padx=(7, 2))
         ttk.Button(edit_tools, text="Replace", command=self.replace_one).pack(side="left")
         ttk.Button(edit_tools, text="All", command=self.replace_all).pack(side="left", padx=2)
         self.right_panel_button = ttk.Button(edit_tools, text="Hide right", command=self.toggle_right_panel)
         self.right_panel_button.pack(side="right")
         self.workspace_tabs = ttk.Notebook(self)
-        self.workspace_tabs.pack(fill="both", expand=True, padx=7, pady=(0, 7), before=top)
+        # Keep the global toolbars pinned above the expanding workspace. Using
+        # before=top placed the workspace first, so it consumed the available
+        # height and pushed these controls below the visible window.
+        self.workspace_tabs.pack(fill="both", expand=True, padx=7, pady=(0, 7))
         source_workspace = ttk.Frame(self.workspace_tabs)
         sample_functions_workspace = ttk.Frame(self.workspace_tabs)
         sample_lists_workspace = ttk.Frame(self.workspace_tabs)
         sample_program_workspace = ttk.Frame(self.workspace_tabs)
+        image_library_workspace = ttk.Frame(self.workspace_tabs)
+        self.image_library_workspace = image_library_workspace
         self.workspace_tabs.add(source_workspace, text="🟦 ソース編集")
         self.workspace_tabs.add(sample_functions_workspace, text="🟩 サンプル関数")
         self.workspace_tabs.add(sample_lists_workspace, text="🟨 サンプルリスト")
@@ -329,6 +415,8 @@ class DevStudio(tk.Tk):
         self.workspace_tabs.tab(sample_functions_workspace, padding=(10, 4))
         self.workspace_tabs.tab(sample_lists_workspace, padding=(10, 4))
         self.workspace_tabs.tab(sample_program_workspace, padding=(10, 4))
+        self.workspace_tabs.add(image_library_workspace, text="画像検知")
+        self.workspace_tabs.tab(image_library_workspace, padding=(10, 4))
         style = ttk.Style(self)
         style.configure("Workspace.TNotebook.Tab", padding=(12, 5))
         self.workspace_tabs.configure(style="Workspace.TNotebook")
@@ -381,11 +469,34 @@ class DevStudio(tk.Tk):
         self.local_tree.configure(yscrollcommand=local_scroll.set)
         self.local_tree.bind("<<TreeviewSelect>>", self.open_local_tree_file)
 
-        ttk.Label(sample_apply_tab, text="Apply saved sample lists to the current source / selected Step.").pack(anchor="w", padx=4, pady=4)
-        self.sample_apply_list = tk.Listbox(sample_apply_tab, exportselection=False)
+        sample_apply_pane = ttk.Panedwindow(sample_apply_tab, orient="vertical")
+        sample_apply_pane.pack(fill="both", expand=True)
+        function_apply = ttk.Labelframe(sample_apply_pane, text="サンプル関数リスト")
+        image_apply = ttk.Labelframe(sample_apply_pane, text="画像検知設定")
+        sample_apply_pane.add(function_apply, weight=2); sample_apply_pane.add(image_apply, weight=3)
+        self.sample_apply_list = tk.Listbox(function_apply, exportselection=False)
         self.sample_apply_list.pack(fill="both", expand=True, padx=4, pady=4)
-        ttk.Button(sample_apply_tab, text="Refresh lists", command=self.refresh_sample_apply_lists).pack(side="left", padx=4, pady=4)
-        ttk.Button(sample_apply_tab, text="Apply selected", command=self.apply_selected_sample_list).pack(side="right", padx=4, pady=4)
+        function_buttons = ttk.Frame(function_apply); function_buttons.pack(fill="x")
+        ttk.Button(function_buttons, text="リスト更新", command=self.refresh_sample_apply_lists).pack(side="left", padx=4, pady=4)
+        ttk.Button(function_buttons, text="選択を反映", command=self.apply_selected_sample_list).pack(side="right", padx=4, pady=4)
+
+        self.sample_apply_image_search = tk.StringVar()
+        image_search = ttk.Frame(image_apply); image_search.pack(fill="x", padx=4, pady=3)
+        ttk.Label(image_search, text="階層検索:").pack(side="left")
+        ttk.Entry(image_search, textvariable=self.sample_apply_image_search).pack(side="left", fill="x", expand=True, padx=3)
+        self.sample_apply_image_search.trace_add("write", lambda *args: self.debounce(
+            "sample_apply_image_search", 150, self.refresh_sample_apply_image_tree))
+        tree_frame = ttk.Frame(image_apply); tree_frame.pack(fill="both", expand=True, padx=4)
+        self.sample_apply_image_tree = ttk.Treeview(tree_frame, show="tree", selectmode="extended", height=8)
+        self.sample_apply_image_tree.pack(side="left", fill="both", expand=True)
+        image_tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.sample_apply_image_tree.yview)
+        image_tree_scroll.pack(side="right", fill="y"); self.sample_apply_image_tree.configure(yscrollcommand=image_tree_scroll.set)
+        image_add_row = ttk.Frame(image_apply); image_add_row.pack(fill="x", padx=4, pady=3)
+        ttk.Button(image_add_row, text="＋必要リストへ追加", command=self.add_sample_apply_image_selection).pack(side="left")
+        ttk.Button(image_add_row, text="－必要リストから外す", command=self.remove_sample_apply_image_selection).pack(side="left", padx=3)
+        self.sample_apply_image_selected = tk.Listbox(image_apply, exportselection=False, height=4)
+        self.sample_apply_image_selected.pack(fill="x", padx=4)
+        ttk.Button(image_apply, text="必要な画像検知を編集中ソースへ反映", command=self.apply_sample_apply_images).pack(fill="x", padx=4, pady=4)
 
         ttk.Label(search_tab, text="Search / tagged / reusable results (Ctrl+click to select multiple)").pack(anchor="w")
         self.results = tk.Listbox(search_tab, selectmode="extended", exportselection=False)
@@ -431,9 +542,10 @@ class DevStudio(tk.Tk):
         editor_scroll.pack(fill="y", side="right")
         self.editor.configure(yscrollcommand=lambda first, last: self._sync_editor_scroll(editor_scroll, first, last))
         self.editor.bind("<<Modified>>", self.editor_modified)
-        self.editor.bind("<KeyRelease>", lambda event: self.after_idle(self.update_editor_view))
+        self.editor.bind("<KeyRelease>", lambda event: self.update_editor_view())
         self.editor.bind("<Control-s>", lambda event: (self.save_current(), "break"))
-        self.editor.bind("<F5>", lambda event: (self.run_current(), "break"))
+        self.bind_text_undo_redo(self.editor)
+        self.editor.bind("<F5>", lambda event: (self.check_syntax(), "break"))
         self.editor.tag_configure("keyword", foreground="#569cd6")
         self.editor.tag_configure("string", foreground="#ce9178")
         self.editor.tag_configure("comment", foreground="#6a9955")
@@ -441,16 +553,34 @@ class DevStudio(tk.Tk):
         editor_actions.pack(fill="x", pady=(4, 0))
         ttk.Button(editor_actions, text="Save output as...", command=self.save_output).pack(side="left")
         ttk.Button(editor_actions, text="Clear", command=lambda: self.editor.delete("1.0", "end")).pack(side="left", padx=4)
-        console_frame = ttk.Labelframe(center, text="Run output")
-        console_frame.pack(fill="x", pady=(5, 0))
-        self.console = tk.Text(console_frame, height=8, wrap="word", background="#111111", foreground="#dddddd",
-                               insertbackground="white", state="disabled")
-        self.console.pack(fill="both", expand=True, padx=3, pady=3)
+        ttk.Button(editor_actions, text="カーソル位置の画像検知を開く",
+                   command=self.open_image_detection_at_cursor).pack(side="left", padx=4)
+        self.vscode_executable = self.find_vscode_executable()
+        if self.vscode_executable:
+            ttk.Button(editor_actions, text="VS Codeで現在行を開く",
+                       command=self.open_current_in_vscode).pack(side="left", padx=4)
+        self.editor.bind("<Control-Alt-i>", lambda event: (self.open_image_detection_at_cursor(), "break"))
+        todo_frame = ttk.Labelframe(center, text="TODO / 改修予定（ソースファイル別）")
+        todo_frame.pack(fill="x", pady=(5, 0))
+        todo_top = ttk.Frame(todo_frame); todo_top.pack(fill="x", padx=3, pady=(3, 0))
+        self.todo_source_label = tk.StringVar(value="保存済みソースを開くとTODOを記録できます。")
+        ttk.Label(todo_top, textvariable=self.todo_source_label).pack(side="left", fill="x", expand=True)
+        ttk.Button(todo_top, text="＋項目", command=self.insert_todo_item).pack(side="right", padx=2)
+        ttk.Button(todo_top, text="＋現在の関数へ紐づけ", command=self.insert_linked_todo_item).pack(side="right", padx=2)
+        ttk.Button(todo_top, text="TODOを保存", command=self.save_current_todo).pack(side="right", padx=2)
+        self.todo_editor = tk.Text(todo_frame, height=8, wrap="word", undo=True,
+                                   background="#171717", foreground="#dddddd", insertbackground="white")
+        self.todo_editor.pack(fill="both", expand=True, padx=3, pady=3)
+        self.todo_editor.bind("<<Modified>>", self.todo_modified)
+        self.todo_editor.bind("<FocusOut>", lambda event: self.save_current_todo(silent=True))
+        self.todo_editor.bind("<Double-Button-1>", self.open_todo_source_location)
+        self.bind_text_undo_redo(self.todo_editor)
         self._build_image_targets_tab(image_targets_tab)
         self._build_step_hierarchy_tab(step_hierarchy_tab)
         self._build_sample_functions_tab(sample_functions_workspace)
         self._build_sample_lists_tab(sample_lists_workspace)
         self._build_sample_program_tab(sample_program_workspace)
+        self._build_image_library_workspace(image_library_workspace)
         self.add_editor_document("", None)
 
         self.status = tk.StringVar(value="Ready")
@@ -479,6 +609,11 @@ class DevStudio(tk.Tk):
             self.right_panel_button.configure(text="Hide right")
 
     def _build_step_hierarchy_tab(self, parent):
+        self.step_source_mode = "generated"
+        self.step_state_locations = {}
+        self.step_state_original_names = {}
+        self.step_state_dictionary_names = {}
+        self._step_load_in_progress = False
         self.step_entry = tk.StringVar()
         self.step_loop = tk.BooleanVar(value=True)
         self.step_template_mode = tk.StringVar(value="Step (state transition / 状態遷移)")
@@ -487,17 +622,25 @@ class DevStudio(tk.Tk):
         ttk.Label(parent, text="Add steps after creating a Step command. Apply rebuilds its generated Step skeleton.").grid(column=0, columnspan=3, row=0, padx=7, pady=(7, 3), sticky="w")
         ttk.Button(parent, text="Load current command", command=self.load_steps_from_editor).grid(column=3, row=0, padx=5, pady=(7, 3), sticky="e")
         ttk.Entry(parent, textvariable=self.step_entry).grid(column=0, columnspan=3, row=1, padx=7, pady=4, sticky="ew")
-        self.step_tree = ttk.Treeview(parent, show="tree", height=15)
-        self.step_tree.grid(column=0, columnspan=3, row=2, padx=7, pady=4, sticky="nsew")
-        ttk.Button(parent, text="Add chapter", command=lambda: self.add_step_item("")).grid(column=0, row=3, padx=5, pady=4)
-        ttk.Button(parent, text="Add child", command=lambda: self.add_step_item(self.step_tree.focus())).grid(column=1, row=3, padx=5, pady=4)
-        ttk.Button(parent, text="Rename", command=self.rename_step_item).grid(column=2, row=3, padx=5, pady=4)
-        ttk.Button(parent, text="Remove", command=self.remove_step_item).grid(column=3, row=3, padx=5, pady=4)
+        step_actions = ttk.Frame(parent)
+        step_actions.grid(column=0, columnspan=4, row=2, padx=5, pady=(0, 3), sticky="ew")
+        ttk.Button(step_actions, text="辞書を追加", command=self.add_state_dictionary).pack(side="left", padx=2)
+        ttk.Button(step_actions, text="ステップを追加", command=lambda: self.add_step_item(self.step_tree.focus())).pack(side="left", padx=2)
+        ttk.Button(step_actions, text="名前を変更", command=self.rename_step_item).pack(side="left", padx=2)
+        ttk.Button(step_actions, text="削除", command=self.remove_step_item).pack(side="left", padx=2)
+        ttk.Button(step_actions, text="メソッドを開く", command=self.open_selected_state_method).pack(side="left", padx=2)
+        ttk.Button(step_actions, text="変更をソースへ反映", command=self.apply_steps_to_editor).pack(side="right", padx=2)
+        step_tree_frame = ttk.Frame(parent)
+        step_tree_frame.grid(column=0, columnspan=4, row=3, padx=7, pady=4, sticky="nsew")
+        self.step_tree = ttk.Treeview(step_tree_frame, show="tree", height=10)
+        self.step_tree.pack(side="left", fill="both", expand=True)
+        step_tree_scroll = ttk.Scrollbar(step_tree_frame, orient="vertical", command=self.step_tree.yview)
+        step_tree_scroll.pack(side="right", fill="y")
+        self.step_tree.configure(yscrollcommand=step_tree_scroll.set)
         ttk.Checkbutton(parent, text="Use loop to advance steps", variable=self.step_loop).grid(column=0, columnspan=2, row=4, padx=7, pady=3, sticky="w")
         ttk.Combobox(parent, state="readonly", width=34, textvariable=self.step_template_mode, values=("Step (state transition / 状態遷移)", "Step (nested chapters / 階層チャプター)")).grid(column=2, columnspan=2, row=4, padx=3, pady=3, sticky="e")
         ttk.Label(parent, text="First step:").grid(column=0, row=5, padx=7, pady=3, sticky="w")
         ttk.Combobox(parent, state="readonly", width=12, textvariable=self.step_start, values=("0 (_step_0)", "1 (_step_1)")).grid(column=1, row=5, padx=3, pady=3, sticky="w")
-        ttk.Button(parent, text="Apply to current Step command", command=self.apply_steps_to_editor).grid(column=3, row=5, padx=5, pady=5, sticky="e")
         special_box = ttk.Labelframe(parent, text="Special steps (called explicitly, not in normal order)")
         special_box.grid(column=0, columnspan=4, row=6, padx=7, pady=(5, 7), sticky="nsew")
         ttk.Entry(special_box, textvariable=self.special_step_entry, width=24).pack(side="left", padx=4, pady=4)
@@ -506,7 +649,7 @@ class DevStudio(tk.Tk):
         ttk.Button(special_box, text="Add", command=self.add_special_step).pack(side="left", padx=2)
         ttk.Button(special_box, text="Remove", command=self.remove_special_step).pack(side="left", padx=4)
         parent.columnconfigure(0, weight=1)
-        parent.rowconfigure(2, weight=1)
+        parent.rowconfigure(3, weight=1)
 
     def on_right_tool_tab_changed(self, event=None):
         if self.right_tabs.select() == str(self.step_hierarchy_tab):
@@ -515,8 +658,31 @@ class DevStudio(tk.Tk):
     def add_step_item(self, parent):
         label = self.step_entry.get().strip()
         if not label:
-            label = "New child step" if parent else "New chapter"
+            if self.step_source_mode == "state_machine":
+                label = "NEW_STATE -> method_name" if parent else "STATE_NEW_FUNCTION"
+            else:
+                label = "New child step" if parent else "New chapter"
+        if self.step_source_mode == "state_machine" and parent:
+            dictionary_names = getattr(self, "step_state_dictionary_names", {})
+            while parent and parent not in dictionary_names:
+                parent = self.step_tree.parent(parent)
         item = self.step_tree.insert(parent, "end", text=label, open=True)
+        if self.step_source_mode == "state_machine" and label.startswith("STATE_") and label.endswith("_FUNCTION"):
+            self.step_state_dictionary_names[item] = label
+        self.step_tree.selection_set(item)
+        self.step_tree.focus(item)
+        self.step_entry.set("")
+
+    def add_state_dictionary(self):
+        label = self.step_entry.get().strip() or "STATE_NEW_FUNCTION"
+        parent = ""
+        if self.step_source_mode == "state_machine":
+            selected = self.step_tree.focus()
+            if selected and selected not in getattr(self, "step_state_dictionary_names", {}):
+                parent = selected
+        item = self.step_tree.insert(parent, "end", text=label, open=True)
+        if self.step_source_mode == "state_machine":
+            self.step_state_dictionary_names[item] = label
         self.step_tree.selection_set(item)
         self.step_tree.focus(item)
         self.step_entry.set("")
@@ -531,6 +697,8 @@ class DevStudio(tk.Tk):
             messagebox.showinfo("Step hierarchy", "Enter a new name above, then press Rename.", parent=self)
             return
         self.step_tree.item(selected[0], text=label)
+        if selected[0] in getattr(self, "step_state_dictionary_names", {}):
+            self.step_state_dictionary_names[selected[0]] = label
         self.step_entry.set("")
 
     def remove_step_item(self):
@@ -565,8 +733,11 @@ class DevStudio(tk.Tk):
         return values
 
     def load_steps_from_editor(self, silent=False):
+        if self._step_load_in_progress:
+            return
+        source = self.editor.get("1.0", "end-1c")
         try:
-            tree = ast.parse(self.editor.get("1.0", "end-1c"))
+            tree = ast.parse(source)
             command = next(node for node in tree.body if isinstance(node, ast.ClassDef))
             assignment = next(node for node in command.body if isinstance(node, ast.Assign) and any(getattr(target, "id", "") == "STEP_LABELS" for target in node.targets))
             steps = ast.literal_eval(assignment.value)
@@ -577,9 +748,15 @@ class DevStudio(tk.Tk):
             if not isinstance(steps, list):
                 raise ValueError
         except (SyntaxError, StopIteration, ValueError, TypeError):
+            if self._load_state_machine_steps(source):
+                return
             if not silent:
                 messagebox.showwarning("Step hierarchy", "The current source must be a generated Step command with STEP_LABELS.", parent=self)
             return
+        self.step_source_mode = "generated"
+        self.step_state_locations = {}
+        self.step_state_original_names = {}
+        self.step_state_dictionary_names = {}
         self.step_tree.delete(*self.step_tree.get_children())
         inserted = {}
         for key, label in zip(step_keys, steps):
@@ -592,7 +769,96 @@ class DevStudio(tk.Tk):
             self.special_step_list.insert("end", value)
         self.status.set("Loaded {} step(s) from current command".format(len(steps)))
 
+    def _load_state_machine_steps(self, source):
+        """Read self.STATE_*_FUNCTION dictionaries without rewriting the command."""
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return False
+        methods = {}
+        method_dictionary_refs = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                methods.setdefault(node.name, node.lineno)
+                method_dictionary_refs[node.name] = {
+                    child.attr for child in ast.walk(node)
+                    if isinstance(child, ast.Attribute) and
+                    isinstance(child.value, ast.Name) and child.value.id == "self" and
+                    child.attr.startswith("STATE_") and child.attr.endswith("_FUNCTION")
+                }
+        dictionaries = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Dict):
+                continue
+            target_names = [target.attr for target in node.targets
+                            if isinstance(target, ast.Attribute) and
+                            isinstance(target.value, ast.Name) and target.value.id == "self" and
+                            target.attr.startswith("STATE_") and target.attr.endswith("_FUNCTION")]
+            if not target_names:
+                continue
+            members = []
+            for key, value in zip(node.value.keys, node.value.values):
+                if not isinstance(key, ast.Str):
+                    continue
+                if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name) and value.value.id == "self":
+                    members.append((key.s, value.attr, methods.get(value.attr, getattr(value, "lineno", 1))))
+            if members:
+                dictionaries.append((target_names[0], members))
+        if not dictionaries:
+            return False
+        self.step_tree.delete(*self.step_tree.get_children())
+        self.step_state_locations = {}
+        self.step_state_original_names = {}
+        self.step_state_dictionary_names = {}
+        state_items_by_method = {}
+        count = 0
+        self._step_load_in_progress = True
+        try:
+            for dictionary_name, members in dictionaries:
+                parent_candidates = list(dict.fromkeys(
+                    state_items_by_method[method_name]
+                    for method_name, references in method_dictionary_refs.items()
+                    if dictionary_name in references and method_name in state_items_by_method
+                ))
+                parent = parent_candidates[0] if len(parent_candidates) == 1 else ""
+                root = self.step_tree.insert(parent, "end", text=dictionary_name, open=False)
+                self.step_state_dictionary_names[root] = dictionary_name
+                for state_name, method_name, line_number in members:
+                    item = self.step_tree.insert(root, "end", text="{} -> {}".format(state_name, method_name))
+                    self.step_state_locations[item] = (method_name, line_number)
+                    self.step_state_original_names[item] = state_name
+                    state_items_by_method.setdefault(method_name, item)
+                    count += 1
+                    if count % 100 == 0:
+                        self.status.set("Step階層を読み込み中... {}件".format(count))
+                        self.update()
+        finally:
+            self._step_load_in_progress = False
+        self.step_source_mode = "state_machine"
+        self.special_step_list.delete(0, "end")
+        self.status.set("Loaded {} state-machine transition(s), read-only hierarchy".format(count))
+        return True
+
+    def open_selected_state_method(self):
+        selected = self.step_tree.selection()
+        if not selected or selected[0] not in self.step_state_locations:
+            messagebox.showinfo("Step hierarchy", "Select a state transition first.", parent=self)
+            return
+        method_name, line_number = self.step_state_locations[selected[0]]
+        self.editor.mark_set("insert", "{}.0".format(line_number))
+        self.editor.see("{}.0".format(line_number))
+        self.editor.tag_remove("sel", "1.0", "end")
+        self.editor.tag_add("sel", "{}.0".format(line_number), "{}.end".format(line_number))
+        self.editor.focus_set()
+        self.status.set("Opened {} at line {}".format(method_name, line_number))
+
     def apply_steps_to_editor(self):
+        if self._step_load_in_progress:
+            messagebox.showinfo("Step hierarchy", "Step階層の読み込み完了後に反映してください。", parent=self)
+            return
+        if self.step_source_mode == "state_machine":
+            self.apply_state_machine_steps_to_editor()
+            return
         steps = self._flatten_step_tree()
         if not steps:
             messagebox.showwarning("Step hierarchy", "Add at least one chapter or step.", parent=self)
@@ -619,6 +885,148 @@ class DevStudio(tk.Tk):
         self.update_editor_view()
         self.status.set("Applied {} step(s). Save the command to keep them.".format(len(steps)))
 
+    def _state_machine_tree_values(self):
+        definitions = []
+        renames = {}
+        dictionary_names = getattr(self, "step_state_dictionary_names", {})
+        roots = []
+        def collect_dictionaries(parent=""):
+            for item in self.step_tree.get_children(parent):
+                if item in dictionary_names:
+                    roots.append(item)
+                collect_dictionaries(item)
+        collect_dictionaries()
+        for root in roots:
+            dictionary_name = self.step_tree.item(root, "text").strip()
+            if not re.match(r"^STATE_[A-Za-z0-9_]*_FUNCTION$", dictionary_name):
+                raise ValueError("Invalid state dictionary name: " + dictionary_name)
+            members = []
+            for item in self.step_tree.get_children(root):
+                if item in dictionary_names:
+                    continue
+                label = self.step_tree.item(item, "text").strip()
+                match = re.match(r"^([^\s]+)\s*->\s*([A-Za-z_]\w*)$", label)
+                if not match:
+                    raise ValueError("Use STATE_NAME -> method_name: " + label)
+                state_name, method_name = match.groups()
+                members.append((state_name, method_name))
+                old_name = self.step_state_original_names.get(item)
+                if old_name and old_name != state_name:
+                    renames[old_name] = state_name
+            definitions.append((dictionary_name, members))
+        return definitions, renames
+
+    @staticmethod
+    def _rename_state_literals(source, renames):
+        if not renames:
+            return source
+        tokens = []
+        for token in tokenize.generate_tokens(io.StringIO(source).readline):
+            if token.type == tokenize.STRING:
+                try:
+                    value = ast.literal_eval(token.string)
+                except (SyntaxError, ValueError):
+                    value = None
+                if isinstance(value, str) and value in renames:
+                    token = tokenize.TokenInfo(token.type, repr(renames[value]), token.start, token.end, token.line)
+            tokens.append(token)
+        return tokenize.untokenize(tokens)
+
+    @staticmethod
+    def _assignment_end_line(lines, start_index):
+        depth = 0
+        started = False
+        for index in range(start_index, len(lines)):
+            code = lines[index].split("#", 1)[0]
+            for character in code:
+                if character in "([{":
+                    depth += 1
+                    started = True
+                elif character in ")]}":
+                    depth -= 1
+            if started and depth <= 0:
+                return index + 1
+        return start_index + 1
+
+    def apply_state_machine_steps_to_editor(self):
+        try:
+            definitions, renames = self._state_machine_tree_values()
+            source = self.editor.get("1.0", "end-1c")
+            tree = ast.parse(source)
+        except (SyntaxError, ValueError) as error:
+            messagebox.showwarning("Step hierarchy", str(error), parent=self)
+            return
+        methods = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+        missing = sorted({method for _, members in definitions for _, method in members if method not in methods})
+        if missing:
+            state_for_method = {method: state for _, members in definitions for state, method in members}
+            command = next((node for node in tree.body if isinstance(node, ast.ClassDef)), None)
+            if command is None:
+                messagebox.showwarning("Step hierarchy", "A command class is required.", parent=self)
+                return
+            source_lines = source.splitlines(True)
+            insert_at = next((node.lineno - 1 for node in tree.body
+                              if isinstance(node, ast.ClassDef) and node.lineno > command.lineno), len(source_lines))
+            method_blocks = ["\n"]
+            for method in missing:
+                state = state_for_method[method]
+                method_blocks.extend([
+                    "    def {}(self):\n".format(method),
+                    "        # POKECON_STATE_USER_BEGIN {}\n".format(state),
+                    "        # Add this state's processing and return the next state name.\n",
+                    "        return {!r}\n".format(state),
+                    "        # POKECON_STATE_USER_END {}\n\n".format(state),
+                ])
+            source_lines[insert_at:insert_at] = method_blocks
+            source = "".join(source_lines)
+            tree = ast.parse(source)
+        existing = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Dict):
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name) and target.value.id == "self":
+                    existing[target.attr] = node.lineno - 1
+        lines = source.splitlines(True)
+        replacements = []
+        new_blocks = []
+        for dictionary_name, members in definitions:
+            block = ["        self.{} = {{\n".format(dictionary_name)]
+            block.extend("            {!r}: self.{},\n".format(state, method) for state, method in members)
+            block.append("        }\n")
+            if dictionary_name in existing:
+                start = existing[dictionary_name]
+                replacements.append((start, self._assignment_end_line(lines, start), block))
+            else:
+                new_blocks.extend(block)
+        for start, end, block in sorted(replacements, reverse=True):
+            lines[start:end] = block
+        source = "".join(lines)
+        if new_blocks:
+            parsed = ast.parse(source)
+            initializer = next((node for node in ast.walk(parsed) if isinstance(node, ast.FunctionDef) and node.name == "__init__"), None)
+            if initializer is None:
+                messagebox.showwarning("Step hierarchy", "__init__ is required to add a new state dictionary.", parent=self)
+                return
+            source_lines = source.splitlines(True)
+            insert_at = next((index for index in range(initializer.lineno, len(source_lines))
+                              if source_lines[index].startswith("    def ")), len(source_lines))
+            source_lines[insert_at:insert_at] = ["\n"] + new_blocks
+            source = "".join(source_lines)
+        source = self._rename_state_literals(source, renames)
+        try:
+            ast.parse(source)
+        except SyntaxError as error:
+            messagebox.showerror("Step hierarchy", "Generated state dictionaries are invalid: {}".format(error), parent=self)
+            return
+        if not messagebox.askyesno("Apply state machine", "Apply {} state dictionaries to the current source? Renamed state literals are updated too.".format(len(definitions)), parent=self):
+            return
+        self.set_editor_content(source, self.current_path)
+        self.editor_dirty = True
+        self.update_editor_view()
+        self.load_steps_from_editor(silent=True)
+        self.status.set("Applied {} state-machine dictionaries".format(len(definitions)))
+
     def _build_image_targets_tab(self, parent):
         self.image_detection_targets = []
         self.image_target_name = tk.StringVar(value="target")
@@ -627,6 +1035,8 @@ class DevStudio(tk.Tk):
         self.image_target_roi = tk.StringVar(value="0,0,0,0")
         self.image_target_gray = tk.BooleanVar(value=False)
         self.image_target_resolution = tk.StringVar(value="0,0")
+        self.image_target_description = tk.StringVar()
+        self.image_target_edit_mode = tk.StringVar(value="新規追加モード")
         ttk.Label(parent, text="Targets for the command currently open in Editor. They run only in Image match debug.").grid(column=0, columnspan=6, row=0, padx=7, pady=(7, 3), sticky="w")
         ttk.Button(parent, text="Load current command", command=self.load_image_targets_from_editor).grid(column=6, row=0, padx=5, pady=(7, 3), sticky="e")
         ttk.Label(parent, text="Name:").grid(column=0, row=1, padx=(7, 2), pady=3, sticky="w")
@@ -641,23 +1051,290 @@ class DevStudio(tk.Tk):
         ttk.Checkbutton(parent, text="Monochrome", variable=self.image_target_gray).grid(column=4, row=2, padx=5, pady=3, sticky="w")
         ttk.Label(parent, text="Reference w,h:").grid(column=5, row=2, padx=(5, 2), pady=3, sticky="w")
         ttk.Entry(parent, textvariable=self.image_target_resolution, width=12).grid(column=6, row=2, padx=2, pady=3, sticky="w")
-        self.image_target_tree = ttk.Treeview(parent, columns=("name", "image", "threshold", "roi", "mode", "resolution"), show="headings", height=12)
-        for column, label, width in (("name", "Name", 110), ("image", "Image", 330), ("threshold", "Threshold", 72), ("roi", "ROI", 100), ("mode", "Mode", 82), ("resolution", "Reference", 95)):
+        ttk.Label(parent, text="説明:").grid(column=0, row=3, padx=(7, 2), pady=3, sticky="w")
+        ttk.Entry(parent, textvariable=self.image_target_description).grid(column=1, columnspan=6, row=3, padx=2, pady=3, sticky="ew")
+        self.image_target_tree = ttk.Treeview(parent, columns=("name", "description", "image", "threshold", "roi", "mode", "resolution"), show="headings", height=12)
+        for column, label, width in (("name", "Name", 110), ("description", "説明", 170), ("image", "Image", 300), ("threshold", "Threshold", 72), ("roi", "ROI", 100), ("mode", "Mode", 82), ("resolution", "Reference", 95)):
             self.image_target_tree.heading(column, text=label)
             self.image_target_tree.column(column, width=width, stretch=(column == "image"))
-        self.image_target_tree.grid(column=0, columnspan=6, row=3, padx=7, pady=(5, 5), sticky="nsew")
+        self.image_target_tree.grid(column=0, columnspan=6, row=4, padx=7, pady=(5, 5), sticky="nsew")
         scrollbar = ttk.Scrollbar(parent, orient="vertical", command=self.image_target_tree.yview)
-        scrollbar.grid(column=6, row=3, padx=(0, 5), pady=(5, 5), sticky="ns")
+        scrollbar.grid(column=6, row=4, padx=(0, 5), pady=(5, 5), sticky="ns")
         self.image_target_tree.configure(yscrollcommand=scrollbar.set)
         self.image_target_tree.bind("<<TreeviewSelect>>", self.load_selected_image_target)
+        self.image_target_tree.bind("<Double-1>", self.enter_selected_image_target_change_mode)
         controls = ttk.Frame(parent)
-        controls.grid(column=0, columnspan=7, row=4, padx=7, pady=(0, 6), sticky="e")
-        ttk.Button(controls, text="Add", command=self.add_image_target).pack(side="left", padx=2)
-        ttk.Button(controls, text="Change selected", command=self.change_image_target).pack(side="left", padx=2)
-        ttk.Button(controls, text="Remove selected", command=self.remove_image_target).pack(side="left", padx=2)
-        ttk.Button(controls, text="Apply to current command", command=self.apply_image_targets_to_editor).pack(side="left", padx=(14, 2))
+        controls.grid(column=0, columnspan=7, row=5, padx=7, pady=(0, 6), sticky="ew")
+        target_actions = ttk.Frame(controls); target_actions.pack(fill="x")
+        ttk.Label(target_actions, textvariable=self.image_target_edit_mode).pack(side="left", padx=(0, 8))
+        ttk.Button(target_actions, text="新規追加", command=self.add_image_target).pack(side="left", padx=2)
+        ttk.Button(target_actions, text="選択内容を変更", command=self.change_image_target).pack(side="left", padx=2)
+        ttk.Button(target_actions, text="ソース対象から外す", command=self.remove_image_target).pack(side="left", padx=2)
+        library_actions = ttk.Frame(controls); library_actions.pack(fill="x", pady=(3, 0))
+        ttk.Button(library_actions, text="単品画像検知として登録", command=self.register_current_image_target).pack(side="left", padx=2)
+        ttk.Button(library_actions, text="登録済みから追加/削除", command=self.open_registered_image_target_dialog).pack(side="left", padx=2)
+        ttk.Button(library_actions, text="現在のコマンドへ反映", command=self.apply_image_targets_to_editor).pack(side="right", padx=2)
         parent.columnconfigure(3, weight=1)
-        parent.rowconfigure(3, weight=1)
+        parent.rowconfigure(4, weight=1)
+
+    def _build_image_library_workspace(self, parent):
+        pane = ttk.Panedwindow(parent, orient="horizontal")
+        pane.pack(fill="both", expand=True, padx=8, pady=8)
+        left, right = ttk.Frame(pane), ttk.Frame(pane)
+        pane.add(left, weight=3); pane.add(right, weight=2)
+
+        self.image_library_search = tk.StringVar()
+        self.image_library_name = tk.StringVar(value="PROFILE")
+        self.image_library_description = tk.StringVar()
+        self.image_library_path = tk.StringVar()
+        self.image_library_threshold = tk.DoubleVar(value=0.80)
+        self.image_library_crop = tk.StringVar(value="0,0,0,0")
+        self.image_library_gray = tk.BooleanVar(value=True)
+        self.image_library_show_value = tk.BooleanVar(value=False)
+        self.image_library_target_operator = tk.StringVar(value="OR")
+        self.image_library_list_name = tk.StringVar(value="new_image_set")
+        self.image_library_list_description = tk.StringVar()
+        self.image_library_member = tk.StringVar()
+        self.image_library_apply_target = tk.StringVar(value="サンプルプログラム")
+
+        search = ttk.Frame(left); search.pack(fill="x")
+        ttk.Label(search, text="検索（名前・タグ・フォルダ）:").pack(side="left")
+        entry = ttk.Entry(search, textvariable=self.image_library_search)
+        entry.pack(side="left", fill="x", expand=True, padx=5)
+        self.image_library_search.trace_add("write", lambda *args: self.debounce(
+            "image_library_search", 150, self.refresh_image_library_tree))
+        ttk.Button(search, text="Template画像を再読込", command=self.scan_template_images).pack(side="right")
+
+        form = ttk.Labelframe(left, text="画像検知設定（同名で別パターンを追加可能）")
+        form.pack(fill="x", pady=6)
+        ttk.Label(form, text="検知名:").grid(column=0, row=0, padx=4, pady=3, sticky="w")
+        ttk.Entry(form, textvariable=self.image_library_name).grid(column=1, row=0, padx=4, pady=3, sticky="ew")
+        ttk.Label(form, text="説明:").grid(column=0, row=1, padx=4, pady=3, sticky="w")
+        ttk.Entry(form, textvariable=self.image_library_description).grid(column=1, columnspan=2, row=1, padx=4, pady=3, sticky="ew")
+        ttk.Label(form, text="画像:").grid(column=0, row=2, padx=4, pady=3, sticky="w")
+        ttk.Entry(form, textvariable=self.image_library_path).grid(column=1, row=2, padx=4, pady=3, sticky="ew")
+        ttk.Button(form, text="選択", command=self.choose_image_library_path).grid(column=2, row=2, padx=4)
+        ttk.Label(form, text="閾値:").grid(column=0, row=3, padx=4, pady=3, sticky="w")
+        ttk.Spinbox(form, from_=0.0, to=1.0, increment=0.01, textvariable=self.image_library_threshold, width=8).grid(column=1, row=3, padx=4, sticky="w")
+        ttk.Label(form, text="範囲 x1,y1,x2,y2:").grid(column=0, row=4, padx=4, pady=3, sticky="w")
+        ttk.Entry(form, textvariable=self.image_library_crop).grid(column=1, row=4, padx=4, sticky="ew")
+        flags = ttk.Frame(form); flags.grid(column=1, row=5, sticky="w")
+        ttk.Checkbutton(flags, text="グレースケール", variable=self.image_library_gray).pack(side="left")
+        ttk.Checkbutton(flags, text="類似度をログ出力", variable=self.image_library_show_value).pack(side="left", padx=8)
+        ttk.Label(form, text="複数画像の判定:").grid(column=0, row=6, padx=4, pady=3, sticky="w")
+        ttk.Combobox(form, textvariable=self.image_library_target_operator, state="readonly",
+                     values=("OR", "AND"), width=8).grid(column=1, row=6, padx=4, sticky="w")
+        buttons = ttk.Frame(form); buttons.grid(column=1, columnspan=2, row=7, sticky="e", pady=4)
+        ttk.Button(buttons, text="＋別パターンとして保存", command=self.save_image_library_variant).pack(side="left", padx=2)
+        ttk.Button(buttons, text="選択パターンを上書き", command=self.overwrite_image_library_variant).pack(side="left", padx=2)
+        ttk.Button(buttons, text="選択パターンを削除", command=self.delete_image_library_variant).pack(side="left", padx=2)
+        form.columnconfigure(1, weight=1)
+
+        self.image_library_tree = ttk.Treeview(left, columns=("path", "threshold", "crop", "tags"), show="tree headings")
+        self.image_library_tree.heading("#0", text="検知名 / パターン")
+        for column, label, width in (("path", "画像", 280), ("threshold", "閾値", 55), ("crop", "範囲", 120), ("tags", "タグ", 130)):
+            self.image_library_tree.heading(column, text=label); self.image_library_tree.column(column, width=width)
+        self.image_library_tree.pack(fill="both", expand=True)
+        self.image_library_tree.bind("<<TreeviewSelect>>", self.load_selected_image_library_variant)
+
+        list_box = ttk.Labelframe(right, text="画像検知フォルダー（フォルダー内フォルダー対応）")
+        list_box.pack(fill="both", expand=True)
+        row = ttk.Frame(list_box); row.pack(fill="x", padx=5, pady=5)
+        ttk.Label(row, text="フォルダー名:").pack(side="left")
+        ttk.Entry(row, textvariable=self.image_library_list_name).pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Button(row, text="新規/更新", command=self.save_image_detection_list).pack(side="left")
+        ttk.Button(row, text="削除", command=self.delete_image_detection_list).pack(side="left", padx=3)
+        description_row = ttk.Frame(list_box); description_row.pack(fill="x", padx=5, pady=(0, 4))
+        ttk.Label(description_row, text="フォルダー説明:").pack(side="left")
+        ttk.Entry(description_row, textvariable=self.image_library_list_description).pack(side="left", fill="x", expand=True, padx=4)
+        self.image_library_lists = tk.Listbox(list_box, height=7, exportselection=False)
+        self.image_library_lists.pack(fill="x", padx=5)
+        self.image_library_lists.bind("<<ListboxSelect>>", self.load_image_detection_list)
+        member_row = ttk.Frame(list_box); member_row.pack(fill="x", padx=5, pady=5)
+        self.image_library_member_combo = ttk.Combobox(member_row, textvariable=self.image_library_member, state="readonly")
+        self.image_library_member_combo.pack(side="left", fill="x", expand=True)
+        ttk.Button(member_row, text="＋追加", command=self.add_image_detection_member).pack(side="left", padx=3)
+        ttk.Button(member_row, text="－外す", command=self.remove_image_detection_member).pack(side="left")
+        self.image_library_members = tk.Listbox(list_box, height=9, exportselection=False)
+        self.image_library_members.pack(fill="both", expand=True, padx=5)
+        apply_row = ttk.Frame(right); apply_row.pack(fill="x", pady=6)
+        ttk.Combobox(apply_row, textvariable=self.image_library_apply_target, state="readonly",
+                     values=("サンプルプログラム", "ソース編集"), width=18).pack(side="left")
+        ttk.Button(apply_row, text="image_checkを生成/更新", command=self.apply_image_detection_code).pack(side="left", padx=5)
+        ttk.Button(apply_row, text="生成内容を確認", command=self.preview_image_detection_code).pack(side="left")
+        ttk.Button(right, text="ソース ⇄ 画像検知記録：差分チェック・同期",
+                   command=self.open_image_detection_sync_mode).pack(fill="x", pady=(0, 3))
+        ttk.Button(right, text="ソース → 画像検知記録へ直接更新", command=self.load_image_detection_from_source).pack(fill="x", pady=(0, 6))
+        self.refresh_image_library_workspace()
+
+    def open_image_detection_sync_mode(self):
+        dialog = tk.Toplevel(self); dialog.title("画像検知：差分チェック・双方向同期")
+        dialog.geometry("1100x680"); dialog.transient(self)
+        state = {"comparisons": [], "source_settings": {}}
+        search_var, mismatch_only = tk.StringVar(), tk.BooleanVar(value=True)
+        summary_var = tk.StringVar(); sync_source_var = tk.StringVar(value="比較対象: 未選択")
+        top = ttk.Frame(dialog); top.pack(fill="x", padx=7, pady=7)
+        ttk.Label(top, textvariable=sync_source_var).pack(side="left", padx=(0, 10))
+        ttk.Label(top, text="検知名検索:").pack(side="left")
+        ttk.Entry(top, textvariable=search_var).pack(side="left", fill="x", expand=True, padx=4)
+        ttk.Checkbutton(top, text="不一致のみ表示", variable=mismatch_only).pack(side="left", padx=5)
+        tree = ttk.Treeview(dialog, columns=("status", "source", "library"), show="tree headings")
+        tree.heading("#0", text="画像検知名"); tree.heading("status", text="状態")
+        tree.heading("source", text="ソース設定"); tree.heading("library", text="画像検知記録")
+        tree.column("#0", width=390); tree.column("status", width=150)
+        tree.column("source", width=250); tree.column("library", width=250)
+        tree.pack(fill="both", expand=True, padx=7, pady=4)
+        status_labels = {"match": "一致", "different": "設定不一致", "source_only": "ソースのみ", "library_only": "記録のみ"}
+        tree.tag_configure("different", foreground="#b36b00")
+        tree.tag_configure("source_only", foreground="#a00000")
+        tree.tag_configure("library_only", foreground="#7050a0")
+
+        def alive():
+            try: return bool(dialog.winfo_exists())
+            except tk.TclError: return False
+
+        def setting_text(item):
+            if not item: return "－"
+            return "{} / {}画像".format(item.get("operator", "OR"), len(item.get("variants", [])))
+
+        def populate():
+            if not alive(): return
+            needle = search_var.get().strip().lower(); only = mismatch_only.get()
+            tree.delete(*tree.get_children()); shown = 0
+            counts = {key: 0 for key in status_labels}
+            for item in state["comparisons"]:
+                counts[item["status"]] += 1
+                if only and item["status"] == "match": continue
+                if needle and needle not in item["name"].lower(): continue
+                tree.insert("", "end", text=item["name"],
+                            values=(status_labels[item["status"]], setting_text(item["source"]), setting_text(item["library"])),
+                            tags=(item["status"],)); shown += 1
+            summary_var.set("表示{}件 / 一致{} / 不一致{} / ソースのみ{} / 記録のみ{}".format(
+                shown, counts["match"], counts["different"], counts["source_only"], counts["library_only"]))
+
+        def refresh():
+            source = self.editor.get("1.0", "end-1c")
+            if "IMAGE_DETECTION_TARGETS" not in source:
+                self.capture_active_editor_document()
+                candidate = next(((tab_id, document) for tab_id, document in self.editor_documents.items()
+                                  if "IMAGE_DETECTION_TARGETS" in document.get("content", "")), None)
+                if candidate is not None:
+                    tab_id, document = candidate
+                    self._switching_editor_tab = True
+                    self.editor_tabs.select(tab_id)
+                    self._switching_editor_tab = False
+                    self.load_editor_document(tab_id)
+                    source = self.editor.get("1.0", "end-1c")
+                    self.status.set("画像検知設定を持つソースへ自動切替しました: " + os.path.basename(document.get("path") or "Untitled"))
+            if "IMAGE_DETECTION_TARGETS" not in source:
+                sync_source_var.set("比較対象: 見つかりません")
+                messagebox.showwarning("画像検知差分チェック",
+                                       "開いているソースにIMAGE_DETECTION_TARGETSがありません。\n"
+                                       "画像検知設定を含むソースを開くか、画像検知を一度ソースへ反映してください。",
+                                       parent=dialog)
+                return
+            sync_source_var.set("比較対象: " + os.path.basename(self.current_path or "Untitled"))
+            library = self._read_image_library()
+            def worker():
+                parsed = parse_source_image_detection_settings(source)
+                return parsed, compare_image_detection_settings(parsed, library)
+            def completed(result):
+                if not alive(): return
+                state["source_settings"], state["comparisons"] = result; populate()
+            def failed(error):
+                if alive(): messagebox.showwarning("画像検知差分チェック", str(error), parent=dialog)
+            self.run_background("image_detection_compare", "画像検知設定を比較中", worker, completed, failed)
+
+        def source_to_library():
+            names = [item["name"] for item in state["comparisons"] if item["status"] in ("different", "source_only")]
+            if not names:
+                messagebox.showinfo("画像検知同期", "画像検知記録へ反映する不一致はありません。", parent=dialog); return
+            if not messagebox.askyesno("ソース → 画像検知記録", "{}件をソース設定で画像検知記録へ更新しますか？".format(len(names)), parent=dialog): return
+            source_settings = dict(state["source_settings"]); config_path = self._image_library_config_path()
+            def worker():
+                library = self._read_image_library()
+                update_library_from_source(library, source_settings, names)
+                save_image_library(config_path, library)
+                return len(names)
+            def completed(count):
+                self.refresh_image_library_workspace(); refresh()
+                self.status.set("ソースから画像検知記録へ{}件更新しました。".format(count))
+            self.run_background("source_to_image_library", "ソース設定を画像検知記録へ更新中", worker, completed)
+
+        def library_to_source():
+            changed = [item for item in state["comparisons"] if item["status"] in ("different", "library_only")]
+            if not changed:
+                messagebox.showinfo("画像検知同期", "ソースへ反映する記録側の不一致はありません。", parent=dialog); return
+            if not messagebox.askyesno("画像検知記録 → ソース", "記録側の不一致{}件をソースへ反映しますか？\nソースのみの設定は保持します。".format(len(changed)), parent=dialog): return
+            source_settings = dict(state["source_settings"]); library = self._read_image_library()
+            def worker():
+                targets = {name: dict(item) for name, item in library["targets"].items()}
+                for name, item in source_settings.items():
+                    if name not in targets:
+                        targets[name] = {"description": item.get("description", ""), "operator": item.get("operator", "OR"),
+                                         "tags": [], "variants": item.get("variants", [])}
+                names = sorted(set(source_settings) | set(library["targets"]), key=str.lower)
+                temporary = {"schema_version": library.get("schema_version", 1), "targets": targets,
+                             "lists": {"SyncSelection": {"description": "画像検知差分同期",
+                                                          "members": [{"type": "target", "id": name} for name in names]}}}
+                return generate_image_check(temporary, "SyncSelection", "list")
+            def completed(code):
+                if self._apply_image_code_to_editor(self.editor, code):
+                    refresh(); self.status.set("画像検知記録の設定をソースへ反映しました。保存してください。")
+            self.run_background("image_library_to_source", "画像検知記録をソースへ反映中", worker, completed)
+
+        search_var.trace_add("write", lambda *args: self.debounce("image_sync_search", 150, populate))
+        mismatch_only.trace_add("write", lambda *args: populate())
+        buttons = ttk.Frame(dialog); buttons.pack(fill="x", padx=7, pady=7)
+        ttk.Label(buttons, textvariable=summary_var).pack(side="left")
+        ttk.Button(buttons, text="再チェック", command=refresh).pack(side="right", padx=3)
+        ttk.Button(buttons, text="不一致をすべて 記録設定 → ソース", command=library_to_source).pack(side="right", padx=3)
+        ttk.Button(buttons, text="不一致をすべて ソース → 画像検知記録", command=source_to_library).pack(side="right", padx=3)
+        refresh()
+
+    def open_image_detection_at_cursor(self):
+        """Open the registered image target referenced at the source cursor."""
+        data = self._read_image_library()
+        target_names = set(data["targets"])
+        name = None
+        try:
+            selected = self.editor.get("sel.first", "sel.last").strip().strip("'\" ,:()[]{}")
+            if selected in target_names:
+                name = selected
+            else:
+                name = next((value for value in target_names if value in selected), None)
+        except tk.TclError:
+            pass
+        if name is None:
+            insert = self.editor.index("insert")
+            line_number, column = [int(value) for value in insert.split(".")]
+            line = self.editor.get("{}.0".format(line_number), "{}.end".format(line_number))
+            candidates = []
+            for value in target_names:
+                start = line.find(value)
+                while start >= 0:
+                    end = start + len(value)
+                    distance = 0 if start <= column <= end else min(abs(column - start), abs(column - end))
+                    candidates.append((distance, start, value))
+                    start = line.find(value, start + 1)
+            if candidates:
+                name = min(candidates)[2]
+        if name is None:
+            messagebox.showinfo("画像検知", "画像検知名を選択するか、その名前の上へカーソルを置いてください。", parent=self)
+            return
+        variants = data["targets"][name].get("variants", [])
+        if not variants:
+            messagebox.showwarning("画像検知", "登録画像がありません: " + name, parent=self)
+            return
+        self.workspace_tabs.select(self.image_library_workspace)
+        self.image_library_search.set(name)
+        pending = getattr(self, "_debounce_jobs", {}).pop("image_library_search", None)
+        if pending is not None:
+            try: self.after_cancel(pending)
+            except tk.TclError: pass
+        self.refresh_image_library_workspace(select=(name, 0))
+        self.load_selected_image_library_variant()
+        self.status.set("画像検知設定を開きました: " + name)
 
     def _build_sample_functions_tab(self, parent):
         self.sample_functions_workspace = parent
@@ -680,11 +1357,16 @@ class DevStudio(tk.Tk):
         ttk.Label(form, text="クラス変数（1行ずつ）:").grid(column=0, row=4, padx=6, pady=4, sticky="nw")
         self.fragment_class_vars = tk.Text(form, height=4, undo=True)
         self.fragment_class_vars.grid(column=1, row=4, padx=6, pady=4, sticky="ew")
-        ttk.Label(form, text="関数・処理コード:").grid(column=0, row=5, padx=6, pady=4, sticky="nw")
+        ttk.Label(form, text="実行開始時の初期化コード:").grid(column=0, row=5, padx=6, pady=4, sticky="nw")
+        self.fragment_initializer = tk.Text(form, height=5, undo=True, wrap="none", tabs=("4c",))
+        self.fragment_initializer.grid(column=1, row=5, padx=6, pady=4, sticky="ew")
+        ttk.Label(form, text="Start後、関数処理より前に実行します。self.xxx = 0 やSteam画面のアクティブ化を記述します。").grid(
+            column=2, columnspan=2, row=5, padx=6, pady=4, sticky="nw")
+        ttk.Label(form, text="関数・処理コード:").grid(column=0, row=6, padx=6, pady=4, sticky="nw")
         ttk.Label(form, text="Tabは半角スペース4文字です。改行時はインデントを維持し、行番号のドラッグで複数行を選択できます。").grid(
-            column=1, row=5, padx=6, pady=(0, 2), sticky="nw")
+            column=1, row=6, padx=6, pady=(0, 2), sticky="nw")
         fragment_editor_frame = ttk.Frame(form)
-        fragment_editor_frame.grid(column=1, row=5, padx=6, pady=(24, 4), sticky="nsew")
+        fragment_editor_frame.grid(column=1, row=6, padx=6, pady=(24, 4), sticky="nsew")
         self.fragment_line_numbers = tk.Text(fragment_editor_frame, width=6, padx=4, takefocus=0, state="disabled",
                                              wrap="none", background="#252526", foreground="#858585",
                                              selectbackground="#264f78", cursor="arrow")
@@ -699,7 +1381,7 @@ class DevStudio(tk.Tk):
         self.fragment_body.configure(
             yscrollcommand=lambda first, last: self._sync_fragment_scroll(fragment_y, first, last),
             xscrollcommand=fragment_x.set)
-        for editor in (self.fragment_imports, self.fragment_class_vars, self.fragment_body):
+        for editor in (self.fragment_imports, self.fragment_class_vars, self.fragment_initializer, self.fragment_body):
             editor.bind("<Tab>", lambda event, widget=editor: self._python_editor_tab(widget))
             editor.bind("<Shift-Tab>", lambda event, widget=editor: self._python_editor_shift_tab(widget))
             editor.bind("<Return>", lambda event, widget=editor: self._python_editor_newline(widget))
@@ -711,16 +1393,18 @@ class DevStudio(tk.Tk):
         self._fragment_line_anchor = 1
         self._update_fragment_line_numbers()
         helpers = ttk.Labelframe(form, text="入力補助")
-        helpers.grid(column=2, columnspan=2, row=3, rowspan=3, padx=6, pady=4, sticky="ns")
+        helpers.grid(column=2, columnspan=2, row=3, rowspan=2, padx=6, pady=4, sticky="ns")
         ttk.Button(helpers, text="関数枠を追加", command=self.insert_fragment_function_skeleton).pack(fill="x", padx=4, pady=(4, 2))
         ttk.Button(helpers, text="Step処理を追加", command=self.insert_fragment_step_skeleton).pack(fill="x", padx=4, pady=2)
         ttk.Button(helpers, text="Import例を追加", command=self.insert_fragment_import_examples).pack(fill="x", padx=4, pady=2)
         ttk.Button(helpers, text="クラス変数例を追加", command=self.insert_fragment_class_var_example).pack(fill="x", padx=4, pady=(2, 4))
+        ttk.Button(helpers, text="初期化例を追加", command=self.insert_fragment_initializer_example).pack(fill="x", padx=4, pady=(2, 4))
+        ttk.Button(helpers, text="フォルダー比較・同期", command=self.open_sample_function_check_mode).pack(fill="x", padx=4, pady=(8, 4))
         self.fragment_save_button = ttk.Button(form, text="サンプルとして保存", command=self.create_fragment_from_tab)
-        self.fragment_save_button.grid(column=1, row=6, padx=6, pady=8, sticky="e")
-        ttk.Button(form, text="サンプルライブラリを開く", command=self.open_fragment_library).grid(column=0, row=6, padx=6, pady=8, sticky="w")
+        self.fragment_save_button.grid(column=1, row=7, padx=6, pady=8, sticky="e")
+        ttk.Button(form, text="サンプルライブラリを開く", command=self.open_fragment_library).grid(column=0, row=7, padx=6, pady=8, sticky="w")
         registered = ttk.Frame(form)
-        registered.grid(column=2, columnspan=2, row=6, padx=6, pady=8, sticky="e")
+        registered.grid(column=2, columnspan=2, row=7, padx=6, pady=8, sticky="e")
         self.registered_fragment_choice = tk.StringVar()
         ttk.Label(registered, text="登録済みサンプル関数:").pack(side="left", padx=(0, 3))
         self.registered_fragment_combo = ttk.Combobox(registered, textvariable=self.registered_fragment_choice, state="readonly", width=34)
@@ -729,7 +1413,7 @@ class DevStudio(tk.Tk):
         ttk.Button(registered, text="削除", command=self.delete_registered_fragment).pack(side="left", padx=2)
         ttk.Button(registered, text="新規へ戻る", command=self.cancel_fragment_edit).pack(side="left", padx=2)
         form.columnconfigure(1, weight=1)
-        form.rowconfigure(5, weight=1)
+        form.rowconfigure(6, weight=1)
 
     def _python_editor_selected_line_range(self, editor):
         try:
@@ -836,6 +1520,100 @@ class DevStudio(tk.Tk):
         self.fragment_class_vars.insert("end", "" if not self.fragment_class_vars.get("1.0", "end-1c") else "\n")
         self.fragment_class_vars.insert("end", "SAMPLE_ROI = (0, 0, 0, 0)  # x, y, width, height\n")
 
+    def insert_fragment_initializer_example(self):
+        existing = self.fragment_initializer.get("1.0", "end-1c")
+        self.fragment_initializer.insert("end", "" if not existing else "\n")
+        self.fragment_initializer.insert("end", "self.sample_count = 0\n# Steam画面のアクティブ化など、Start後に必要な準備処理\n")
+
+    def open_sample_function_check_mode(self):
+        dialog = tk.Toplevel(self)
+        dialog.title("サンプル関数チェックモード")
+        dialog.geometry("1050x650")
+        dialog.transient(self)
+        folder_var = tk.StringVar(value=self.fragment_folder.get() or self.fragment_root())
+        summary_var = tk.StringVar(value="")
+        top = ttk.Frame(dialog); top.pack(fill="x", padx=7, pady=7)
+        ttk.Label(top, text="比較フォルダー:").pack(side="left")
+        ttk.Entry(top, textvariable=folder_var).pack(side="left", fill="x", expand=True, padx=4)
+        state = {"comparisons": []}
+        tree = ttk.Treeview(dialog, columns=("status", "path"), show="tree headings", selectmode="extended")
+        tree.heading("#0", text="関数名"); tree.heading("status", text="状態"); tree.heading("path", text="サンプル関数ファイル")
+        tree.column("#0", width=330); tree.column("status", width=150); tree.column("path", width=520)
+        tree.pack(fill="both", expand=True, padx=7, pady=4)
+        tree.tag_configure("different", foreground="#b36b00")
+        tree.tag_configure("missing_source", foreground="#a00000")
+        tree.tag_configure("duplicate", foreground="#a00000")
+        status_labels = {"match": "一致", "different": "不一致", "missing_source": "ソース側に未登録", "duplicate": "サンプル側で重複"}
+
+        def dialog_alive():
+            try: return bool(dialog.winfo_exists())
+            except tk.TclError: return False
+
+        def refresh():
+            source, root, folder = self.editor.get("1.0", "end-1c"), self.fragment_root(), folder_var.get()
+            def completed(comparisons):
+                if not dialog_alive(): return
+                state["comparisons"] = comparisons
+                tree.delete(*tree.get_children())
+                counts = {key: 0 for key in status_labels}
+                for item in comparisons:
+                    counts[item["status"]] += 1
+                    paths = ", ".join(os.path.relpath(value["path"], root) for value in item["fragments"])
+                    iid = tree.insert("", "end", text=item["name"], values=(status_labels[item["status"]], paths), tags=(item["status"],))
+                    if item["status"] != "match": tree.selection_add(iid)
+                summary_var.set("全{}件 / 一致{} / 不一致{} / 未登録{} / 重複{}".format(
+                    len(comparisons), counts["match"], counts["different"], counts["missing_source"], counts["duplicate"]))
+            def failed(error):
+                if dialog_alive(): messagebox.showwarning("サンプル関数チェック", str(error), parent=dialog)
+            self.run_background("sample_function_check", "サンプル関数を比較中",
+                                lambda: compare_sample_function_folder(source, root, folder), completed, failed)
+
+        def choose_folder():
+            selected = filedialog.askdirectory(parent=dialog, initialdir=folder_var.get() or self.fragment_root())
+            if selected:
+                folder_var.set(selected); self.fragment_folder.set(selected); refresh()
+
+        def mismatch_names(for_source):
+            allowed = ("different", "missing_source") if for_source else ("different",)
+            return [item["name"] for item in state["comparisons"] if item["status"] in allowed]
+
+        def library_to_source():
+            names = mismatch_names(True)
+            if not names:
+                messagebox.showinfo("サンプル関数チェック", "ソースへ反映する不一致はありません。", parent=dialog); return
+            if not messagebox.askyesno("サンプル関数 → ソース", "{}件の関数を現在のソースへ反映しますか？".format(len(names)), parent=dialog): return
+            source, comparisons = self.editor.get("1.0", "end-1c"), list(state["comparisons"])
+            def completed(updated):
+                if not dialog_alive(): return
+                self.set_editor_content(updated, self.current_path)
+                self.editor_dirty = True; self.update_editor_view(); refresh()
+                self.status.set("サンプル関数からソースへ{}件反映しました。保存してください。".format(len(names)))
+            self.run_background("sample_to_source", "サンプル関数をソースへ反映中",
+                                lambda: update_source_sample_functions(source, comparisons, names), completed)
+
+        def source_to_library():
+            names = mismatch_names(False)
+            if not names:
+                messagebox.showinfo("サンプル関数チェック", "サンプル関数へ反映する不一致はありません。", parent=dialog); return
+            if not messagebox.askyesno("ソース → サンプル関数", "{}件のサンプル関数を現在のソース内容で更新しますか？".format(len(names)), parent=dialog): return
+            source, comparisons = self.editor.get("1.0", "end-1c"), list(state["comparisons"])
+            def completed(changed):
+                if not dialog_alive(): return
+                refresh(); self.refresh_index(); self.refresh_registered_fragment_choices()
+                self.status.set("ソースからサンプル関数{}件（{}ファイル）を更新しました。".format(len(names), len(changed)))
+            self.run_background("source_to_samples", "ソース内容をサンプル関数へ反映中",
+                                lambda: update_sample_function_fragments(source, comparisons, names), completed)
+
+        ttk.Button(top, text="フォルダー選択", command=choose_folder).pack(side="left", padx=2)
+        ttk.Button(top, text="再チェック", command=refresh).pack(side="left", padx=2)
+        bottom = ttk.Frame(dialog); bottom.pack(fill="x", padx=7, pady=7)
+        ttk.Label(bottom, textvariable=summary_var).pack(side="left")
+        ttk.Button(bottom, text="画像検知も ソース → 登録設定", command=lambda: (
+            self.image_library_apply_target.set("ソース編集"), self.load_image_detection_from_source())).pack(side="right", padx=3)
+        ttk.Button(bottom, text="不一致をすべて ソース → サンプル関数", command=source_to_library).pack(side="right", padx=3)
+        ttk.Button(bottom, text="不一致をすべて サンプル関数 → ソース", command=library_to_source).pack(side="right", padx=3)
+        refresh()
+
     def create_fragment_from_tab(self):
         safe_name = python_identifier(self.fragment_name.get())
         base = os.path.abspath(self.fragment_root())
@@ -866,10 +1644,19 @@ class DevStudio(tk.Tk):
         if any(not isinstance(node, (ast.Import, ast.ImportFrom)) for node in import_tree.body):
             messagebox.showwarning("Fragment", "Importsにはimport文またはfrom ... import ...文だけを入力してください。", parent=self)
             return
+        initializer = textwrap.dedent(self.fragment_initializer.get("1.0", "end-1c")).strip("\n")
+        if initializer:
+            try:
+                compile("def _sample_initializer(self):\n" + textwrap.indent(initializer, "    ") + "\n",
+                        "<sample-initializer>", "exec")
+            except SyntaxError as error:
+                messagebox.showwarning("Fragment", "実行開始時の初期化コードを確認してください。\n{}".format(error), parent=self)
+                return
         metadata = {"schema_version": 1, "name": self.fragment_name.get().strip() or safe_name,
                     "tags": self.fragment_tag_picker.get_tags(),
                     "imports": import_lines,
                     "class_variables": [item.strip() for item in self.fragment_class_vars.get("1.0", "end-1c").splitlines() if item.strip()],
+                    "initializer": initializer,
                     "fragment": os.path.basename(body_path)}
         if existing.get("target"):
             metadata["target"] = existing["target"]
@@ -926,7 +1713,7 @@ class DevStudio(tk.Tk):
         self.fragment_name.set("new_fragment")
         self.fragment_tag_picker.set_tags([])
         self.fragment_folder.set(self.fragment_root())
-        for widget in (self.fragment_imports, self.fragment_class_vars, self.fragment_body): widget.delete("1.0", "end")
+        for widget in (self.fragment_imports, self.fragment_class_vars, self.fragment_initializer, self.fragment_body): widget.delete("1.0", "end")
         self.fragment_body.insert("1.0", "# @pokedev-fragment: new_fragment\n# Inserted into the selected Step user block.\n")
         self.fragment_save_button.configure(text="サンプルとして保存")
         self.status.set(self.ui_text("New sample-function mode", "サンプル関数の新規登録モード"))
@@ -959,6 +1746,7 @@ class DevStudio(tk.Tk):
             messagebox.showerror(self.ui_text("Sample function", "サンプル関数"),
                                  self.ui_text("References were removed, but a file could not be deleted: {}",
                                               "リストからの参照は削除されましたが、ファイルを削除できませんでした: {}").format(error), parent=self); return
+        self._fragment_catalog_cache = None
         if self.editing_fragment_id == fragment_id: self.cancel_fragment_edit()
         self.refresh_registered_fragment_choices(); self.refresh_sample_lists_tab(select=self.sample_list_name.get().strip())
         self.refresh_catalog_tag_choices(); self.rebuild_catalog_folder_tree()
@@ -990,7 +1778,9 @@ class DevStudio(tk.Tk):
         save_library(self.sample_lists_path(), data)
 
     def fragment_catalog(self):
-        return catalog(self.fragment_root())
+        if self._fragment_catalog_cache is None:
+            self._fragment_catalog_cache = catalog(self.fragment_root())
+        return list(self._fragment_catalog_cache)
 
     def refresh_sample_catalog(self):
         if not hasattr(self, 'sample_catalog_list'): return
@@ -1076,6 +1866,8 @@ class DevStudio(tk.Tk):
         for widget, values in ((self.fragment_imports, imports),
                                (self.fragment_class_vars, metadata.get("class_variables", []))):
             widget.delete("1.0", "end"); widget.insert("1.0", "\n".join(values))
+        self.fragment_initializer.delete("1.0", "end")
+        self.fragment_initializer.insert("1.0", metadata.get("initializer", ""))
         self.fragment_body.delete("1.0", "end"); self.fragment_body.insert("1.0", body)
         self.fragment_save_button.configure(text="変更を保存")
         self.workspace_tabs.select(self.sample_functions_workspace)
@@ -1411,6 +2203,107 @@ class DevStudio(tk.Tk):
         self.sample_apply_list.delete(0, "end")
         for name in sorted(self._read_sample_lists()["lists"]):
             self.sample_apply_list.insert("end", name)
+        self.refresh_sample_apply_image_tree()
+
+    def refresh_sample_apply_image_tree(self):
+        if not hasattr(self, "sample_apply_image_tree"):
+            return
+        tree = self.sample_apply_image_tree; tree.delete(*tree.get_children()); self.sample_apply_image_nodes = {}
+        data = self._read_image_library(); needle = self.sample_apply_image_search.get().strip().lower()
+        visible_targets = set()
+        for name, item in data["targets"].items():
+            searchable = " ".join([name, item.get("description", "")] + item.get("tags", []) + [v.get("template_path", "") for v in item.get("variants", [])]).lower()
+            if not needle or needle in searchable: visible_targets.add(name)
+
+        folder_nodes = {}
+        root = tree.insert("", "end", text="Template画像階層", open=True)
+        for name in sorted(visible_targets, key=str.lower):
+            item = data["targets"][name]; variants = item.get("variants", [])
+            path = variants[0].get("template_path", "") if variants else ""
+            parts = path.replace("\\", "/").split("/")
+            if parts and parts[0].lower() == "template": parts = parts[1:]
+            parent, accumulated = root, []
+            for folder in parts[:-1]:
+                accumulated.append(folder); key = "/".join(accumulated)
+                if key not in folder_nodes: folder_nodes[key] = tree.insert(parent, "end", text=folder, open=bool(needle))
+                parent = folder_nodes[key]
+            iid = tree.insert(parent, "end", text="画像検知: {} [{}]".format(name, item.get("operator", "OR")))
+            self.sample_apply_image_nodes[iid] = "target:" + name
+
+        list_root = tree.insert("", "end", text="画像検知リスト", open=True)
+        counter = [0]
+        def add_list(parent, list_name, stack):
+            try: target_names = resolve_image_list(data, list_name)
+            except ValueError: target_names = []
+            list_item = data["lists"].get(list_name, {})
+            searchable = " ".join([list_name, list_item.get("description", "")] + target_names).lower()
+            if needle and needle not in searchable and not any(target in visible_targets for target in target_names): return
+            counter[0] += 1; iid = tree.insert(parent, "end", text="フォルダー: {}".format(list_name), open=bool(needle))
+            self.sample_apply_image_nodes[iid] = "list:" + list_name
+            if list_name in stack: return
+            for member in data["lists"].get(list_name, {}).get("members", []):
+                if member["type"] == "list": add_list(iid, member["id"], stack + [list_name])
+                elif member["id"] in visible_targets:
+                    target_item = data["targets"].get(member["id"], {})
+                    child = tree.insert(iid, "end", text="画像検知: {} [{}]".format(member["id"], target_item.get("operator", "OR")))
+                    self.sample_apply_image_nodes[child] = "target:" + member["id"]
+        for name in sorted(data["lists"], key=str.lower): add_list(list_root, name, [])
+
+    def add_sample_apply_image_selection(self):
+        existing = set(self.sample_apply_image_selected.get(0, "end"))
+        for iid in self.sample_apply_image_tree.selection():
+            value = self.sample_apply_image_nodes.get(iid)
+            if value and value not in existing:
+                self.sample_apply_image_selected.insert("end", value); existing.add(value)
+
+    def remove_sample_apply_image_selection(self):
+        selected = list(self.sample_apply_image_selected.curselection())
+        for index in reversed(selected): self.sample_apply_image_selected.delete(index)
+
+    def apply_sample_apply_images(self):
+        values = list(self.sample_apply_image_selected.get(0, "end"))
+        if not values:
+            messagebox.showinfo("画像検知", "必要リストへ画像検知または画像検知リストを追加してください。", parent=self); return
+        data = self._read_image_library(); targets, members = [], []
+        try:
+            for value in values:
+                kind, name = value.split(":", 1)
+                member = {"type": kind, "id": name}
+                if member not in members: members.append(member)
+                names = resolve_image_list(data, name) if kind == "list" else [name]
+                for target in names:
+                    if target not in targets: targets.append(target)
+        except ValueError as error:
+            messagebox.showwarning("画像検知", str(error), parent=self); return
+        temporary_lists = {key: dict(value) for key, value in data["lists"].items()}
+        temporary_lists["ApplySelection"] = {"description": "Apply Sample Listで選択", "members": members}
+        temporary = {"schema_version": data.get("schema_version", 1), "targets": data["targets"], "lists": temporary_lists}
+        code = generate_image_check(temporary, "ApplySelection", "list")
+        if not messagebox.askyesno("画像検知を反映", "{}件の画像検知を編集中ソースへ生成・更新しますか？".format(len(targets)), parent=self): return
+        self._apply_image_code_to_editor(self.editor, code)
+        self.status.set("Apply Sample Listから{}件の画像検知を反映しました。".format(len(targets)))
+
+    def _image_code_for_target_names(self, target_names):
+        names = list(dict.fromkeys(str(name) for name in target_names if str(name).strip()))
+        if not names:
+            return ""
+        data = self._read_image_library()
+        names = [name for name in names if name in data["targets"]]
+        if not names:
+            return ""
+        temporary = {
+            "schema_version": data.get("schema_version", 1),
+            "targets": data["targets"],
+            "lists": {"SampleRequiredImages": {
+                "description": "サンプル関数から自動抽出",
+                "members": [{"type": "target", "id": name} for name in names],
+            }},
+        }
+        return generate_image_check(temporary, "SampleRequiredImages", "list")
+
+    def _missing_image_target_names(self, target_names):
+        registered = self._read_image_library()["targets"]
+        return [name for name in dict.fromkeys(target_names) if name not in registered]
 
     def apply_selected_sample_list(self):
         selected = self.sample_apply_list.curselection()
@@ -1425,15 +2318,24 @@ class DevStudio(tk.Tk):
             messagebox.showerror(self.ui_text("Sample list", "サンプルリスト"), str(error), parent=self); return
         source = self.editor.get("1.0", "end-1c")
         conflicts = detect_conflicts(source, preview)
+        image_targets = preview.get("image_targets", [])
+        image_code = self._image_code_for_target_names(image_targets)
+        missing_image_targets = self._missing_image_target_names(image_targets)
         summary = self.ui_text(
             "Apply '{}':\n\n{}\n\nConflicts / changes are shown before insertion. Continue?",
             "「{}」を反映します。\n\n{}\n\n競合・変更内容を確認して挿入を続けますか？").format(
                 name, "\n".join("- " + item for item in conflicts) if conflicts
                 else self.ui_text("No conflicts detected.", "競合は検出されませんでした。"))
+        if image_targets:
+            summary += "\n\n必要な画像検知{}件も同時に反映します。".format(len(image_targets))
+        if missing_image_targets:
+            summary += "\n画像ライブラリ未登録（例外判定として保持）: " + ", ".join(missing_image_targets)
         if not messagebox.askyesno(self.ui_text("Apply sample list", "サンプルリストの反映"), summary, parent=self):
             return
         merged = merge_preview(source, preview, name)
         self.editor.delete("1.0", "end"); self.editor.insert("1.0", merged)
+        if image_code:
+            self._apply_image_code_to_editor(self.editor, image_code)
         self.editor.edit_modified(True)
         self.status.set(self.ui_text("Applied sample list after conflict review: ", "競合確認後にサンプルリストを反映しました: ") + name)
 
@@ -1579,6 +2481,8 @@ class DevStudio(tk.Tk):
         safe = python_identifier(name) + "SampleCommand"
         imports = self._generated_region("IMPORTS", "\n".join(preview["imports"]), "")
         variables = self._generated_region("CLASS_VARIABLES", "\n".join("    " + line for line in preview["class_variables"]), "    ")
+        initializer_body = "\n".join(self._indent_source(value, "        ") for value in preview.get("initializers", []))
+        initializers = self._generated_region("INITIALIZERS", initializer_body or "        pass", "        ")
         step_blocks, helper_blocks = [], []
         for member in resolve_members(data, name):
             metadata, body, _, _ = load_fragment(self.fragment_root(), member["id"])
@@ -1588,23 +2492,33 @@ class DevStudio(tk.Tk):
                 helper_blocks.append(self._fragment_region(member["id"], body, "    "))
         step_source = "\n".join(step_blocks)
         helper_source = "\n".join(helper_blocks)
+        image_code = self._image_code_for_target_names(preview.get("image_targets", []))
+        image_import = ("from LocalFunction.ImageDetection import SimilarityHistory, detect_image\n"
+                        if image_code else "")
+        image_source = textwrap.indent(image_code.rstrip(), "    ") + "\n\n" if image_code else ""
         return ("#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n"
                 "# Authored by PokeCon Dev Studio from sample list: {name}\n"
                 "from Commands.PythonSampleCommand import PythonSampleCommand\n"
-                "{imports}\n"
+                "{image_import}{imports}\n"
                 "class {safe}(PythonSampleCommand):\n"
                 "    NAME = {name!r}\n    SAMPLE_LIST = {name!r}\n    INCLUDED_SAMPLES = {included!r}\n"
                 "{variables}\n"
-                "    def do(self):\n        self.checkIfAlive()\n"
+                "    def initialize_sample(self):\n"
+                "{initializers}"
+                "        # POKECON_USER_INIT_BEGIN\n"
+                "        # Add per-run initialization that must be preserved here.\n"
+                "        # POKECON_USER_INIT_END\n\n"
+                "    def do(self):\n        self.checkIfAlive()\n        self.initialize_sample()\n"
                 "        # POKECON_USER_DO_BEGIN\n"
                 "        # Compose/call selected sample functions here.\n"
                 "        # POKECON_USER_DO_END\n"
-                "{step_source}\n\n{helper_source}\n"
+                "{step_source}\n\n{helper_source}\n{image_source}"
                 "    # POKECON_USER_METHODS_BEGIN\n"
                 "    # Add methods that must be preserved across sample updates here.\n"
                 "    # POKECON_USER_METHODS_END\n").format(
-                    name=name, imports=imports, safe=safe, included=preview["included"],
-                    variables=variables, step_source=step_source, helper_source=helper_source)
+                    name=name, image_import=image_import, imports=imports, safe=safe, included=preview["included"],
+                    variables=variables, initializers=initializers,
+                    step_source=step_source, helper_source=helper_source, image_source=image_source)
 
     def _source_hash(self, value):
         return hashlib.sha256(value.encode("utf-8")).hexdigest()
@@ -1641,6 +2555,11 @@ class DevStudio(tk.Tk):
         indent = match.group("indent")
         replacement = indent + "# POKECON_USER_" + name + "_BEGIN\n" + body + indent + "# POKECON_USER_" + name + "_END"
         return source[:match.start()] + replacement + source[match.end():]
+
+    def _extract_image_check_block(self, source):
+        pattern = re.compile(r"(?ms)^(?P<indent>[ \t]*)# POKECON_IMAGE_CHECK_BEGIN\n.*?^\1# POKECON_IMAGE_CHECK_END\s*$")
+        match = pattern.search(source)
+        return match.group(0).rstrip() if match else None
 
     def _fragment_blocks(self, source):
         pattern = re.compile(r"(?ms)^(?P<indent>[ \t]*)# POKECON_FRAGMENT_BEGIN (?P<hash>[0-9a-f]{64}) (?P<id>[^\n]+)\n(?P<body>.*?)^\1# POKECON_FRAGMENT_END (?P=id)$")
@@ -1681,9 +2600,19 @@ class DevStudio(tk.Tk):
                                                    "\n".join(notices) + self.ui_text("\n\nReplace generated blocks and keep user regions?",
                                                                                      "\n\n生成領域を置き換え、ユーザー編集領域を保持しますか？"), parent=self): return
             updated = fresh
-            for region_name in ("DO", "METHODS"):
+            for region_name in ("INIT", "DO", "METHODS"):
                 body = self._extract_user_region(current, region_name)
                 if body is not None: updated = self._replace_user_region(updated, region_name, body)
+            image_user = self._extract_image_check_user(current)
+            if image_user is not None and "POKECON_IMAGE_CHECK_BEGIN" in updated:
+                updated = self._replace_image_check_user(updated, textwrap.dedent(image_user))
+            image_check_block = self._extract_image_check_block(current)
+            if image_check_block and "POKECON_IMAGE_CHECK_BEGIN" not in fresh:
+                image_import = "from LocalFunction.ImageDetection import SimilarityHistory, detect_image"
+                if image_import not in updated:
+                    class_at = updated.find("class "); updated = updated[:class_at] + image_import + "\n\n" + updated[class_at:]
+                marker = "    # POKECON_USER_METHODS_BEGIN"
+                updated = updated.replace(marker, image_check_block + "\n\n" + marker, 1)
         try:
             compile(updated, "<sample-program-update>", "exec")
         except SyntaxError as error:
@@ -1769,6 +2698,325 @@ class DevStudio(tk.Tk):
             if self.image_target_name.get().strip() in ("", "target"):
                 self.image_target_name.set(os.path.splitext(os.path.basename(path))[0])
 
+    def _image_library_config_path(self):
+        return os.path.join(self.template_root(), "image_detection_profiles.json")
+
+    def template_root(self):
+        return os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "SerialController", "Template"))
+
+    def _read_image_library(self):
+        return load_image_library(self._image_library_config_path())
+
+    def _portable_template_path(self, path):
+        path = os.path.abspath(path)
+        try:
+            if os.path.commonpath([self.template_root(), path]) == self.template_root():
+                return os.path.relpath(path, os.path.dirname(self.template_root())).replace("\\", "/")
+        except ValueError:
+            pass
+        return path
+
+    def choose_image_library_path(self):
+        path = filedialog.askopenfilename(parent=self, initialdir=self.template_root(), title="画像検知テンプレートを選択",
+                                          filetypes=[("画像", "*.png *.jpg *.jpeg *.bmp"), ("すべて", "*.*")])
+        if path:
+            self.image_library_path.set(path)
+            if self.image_library_name.get().strip() in ("", "PROFILE"):
+                self.image_library_name.set(os.path.splitext(os.path.basename(path))[0].upper())
+
+    def _image_variant_fields(self):
+        name, path = self.image_library_name.get().strip(), self.image_library_path.get().strip()
+        if not name or not path or not os.path.isfile(os.path.abspath(path)):
+            raise ValueError("検知名と存在する画像を指定してください。")
+        try:
+            crop = [int(part.strip()) for part in self.image_library_crop.get().split(",")]
+            threshold = float(self.image_library_threshold.get())
+            if len(crop) != 4 or not 0.0 <= threshold <= 1.0:
+                raise ValueError
+        except (ValueError, tk.TclError):
+            raise ValueError("閾値は0～1、範囲はx1,y1,x2,y2で指定してください。")
+        portable = self._portable_template_path(path)
+        tags = image_folder_tags(self.template_root(), os.path.abspath(path))
+        return name, {"template_path": portable, "threshold": threshold, "use_gray": bool(self.image_library_gray.get()),
+                      "show_value": bool(self.image_library_show_value.get()), "show_position": True,
+                      "show_only_true_rect": False, "ms": 2000, "crop": crop}, tags
+
+    def save_image_library_variant(self):
+        try:
+            name, variant, tags = self._image_variant_fields()
+        except ValueError as error:
+            messagebox.showwarning("画像検知", str(error), parent=self); return
+        data = self._read_image_library()
+        target = data["targets"].setdefault(name, {"operator": "OR", "tags": [], "variants": []})
+        target["description"] = self.image_library_description.get().strip()
+        target["operator"] = self.image_library_target_operator.get()
+        target["tags"] = list(dict.fromkeys(target.get("tags", []) + tags))
+        target["variants"].append(variant)
+        save_image_library(self._image_library_config_path(), data)
+        self.refresh_image_library_workspace(select=(name, len(target["variants"]) - 1))
+
+    def overwrite_image_library_variant(self):
+        selected = getattr(self, "image_library_selected_variant", None)
+        if selected is None:
+            messagebox.showinfo("画像検知", "上書きするパターンを選択してください。", parent=self); return
+        try:
+            name, variant, tags = self._image_variant_fields()
+        except ValueError as error:
+            messagebox.showwarning("画像検知", str(error), parent=self); return
+        old_name, index = selected
+        data = self._read_image_library()
+        if old_name not in data["targets"] or index >= len(data["targets"][old_name]["variants"]): return
+        if name != old_name:
+            del data["targets"][old_name]["variants"][index]
+            if not data["targets"][old_name]["variants"]: del data["targets"][old_name]
+            target = data["targets"].setdefault(name, {"operator": "OR", "tags": [], "variants": []})
+            target["variants"].append(variant); index = len(target["variants"]) - 1
+        else:
+            data["targets"][name]["variants"][index] = variant
+            target = data["targets"][name]
+        target["description"] = self.image_library_description.get().strip()
+        target["operator"] = self.image_library_target_operator.get()
+        target["tags"] = list(dict.fromkeys(target.get("tags", []) + tags))
+        save_image_library(self._image_library_config_path(), data)
+        self.refresh_image_library_workspace(select=(name, index))
+
+    def delete_image_library_variant(self):
+        selected = getattr(self, "image_library_selected_variant", None)
+        if selected is None: return
+        name, index = selected
+        if not messagebox.askyesno("画像検知", "選択した検知パターンを削除しますか？", parent=self): return
+        data = self._read_image_library()
+        if name in data["targets"] and index < len(data["targets"][name]["variants"]):
+            del data["targets"][name]["variants"][index]
+            if not data["targets"][name]["variants"]:
+                del data["targets"][name]
+                for item in data["lists"].values():
+                    item["members"] = [member for member in item["members"] if not (member["type"] == "target" and member["id"] == name)]
+            save_image_library(self._image_library_config_path(), data)
+        self.image_library_selected_variant = None
+        self.refresh_image_library_workspace()
+
+    def scan_template_images(self):
+        data, template_root, config_path = self._read_image_library(), self.template_root(), self._image_library_config_path()
+        def worker():
+            added = 0
+            known = {variant.get("template_path") for target in data["targets"].values() for variant in target["variants"]}
+            for directory, _, names in os.walk(template_root):
+                for filename in sorted(names):
+                    if os.path.splitext(filename)[1].lower() not in (".png", ".jpg", ".jpeg", ".bmp"): continue
+                    absolute = os.path.join(directory, filename)
+                    portable = os.path.relpath(absolute, os.path.dirname(template_root)).replace("\\", "/")
+                    if portable in known: continue
+                    relative = os.path.relpath(absolute, template_root).replace("\\", "/")
+                    target_name = os.path.splitext(relative)[0].replace("/", "_").upper()
+                    target = data["targets"].setdefault(target_name, {"description": "Templateから自動登録", "operator": "OR", "tags": image_folder_tags(template_root, absolute), "variants": []})
+                    target["variants"].append({"template_path": portable, "threshold": 0.8, "use_gray": True,
+                                               "show_value": False, "show_position": True, "show_only_true_rect": False,
+                                               "ms": 2000, "crop": [0, 0, 0, 0]})
+                    known.add(portable); added += 1
+            save_image_library(config_path, data)
+            return added
+        def completed(added):
+            self.refresh_image_library_workspace()
+            self.status.set("Template画像から{}件の検知設定を追加しました。".format(added))
+        self.run_background("scan_template_images", "Template画像を走査中", worker, completed)
+
+    def refresh_image_library_tree(self, select=None):
+        if not hasattr(self, "image_library_tree"): return
+        self.image_library_tree.delete(*self.image_library_tree.get_children()); self.image_library_tree_ids = {}
+        data, needle = self._read_image_library(), self.image_library_search.get().strip().lower()
+        root = self.image_library_tree.insert("", "end", text="Template", values=("", "", "", ""), open=True)
+        folder_nodes, target_nodes = {}, {}
+        for name in sorted(data["targets"], key=str.lower):
+            item = data["targets"][name]; searchable = " ".join([name, item.get("description", "")] + item.get("tags", []) + [v.get("template_path", "") for v in item["variants"]]).lower()
+            if needle and needle not in searchable: continue
+            for index, variant in enumerate(item["variants"]):
+                parts = variant.get("template_path", "").replace("\\", "/").split("/")
+                if parts and parts[0].lower() == "template": parts = parts[1:]
+                parent, accumulated = root, []
+                for folder in parts[:-1]:
+                    accumulated.append(folder); key = "/".join(accumulated)
+                    if key not in folder_nodes:
+                        folder_nodes[key] = self.image_library_tree.insert(parent, "end", text=folder, values=("", "", "", folder), open=bool(needle))
+                    parent = folder_nodes[key]
+                target_key = (parent, name)
+                if target_key not in target_nodes:
+                    target_nodes[target_key] = self.image_library_tree.insert(parent, "end", text="{} [{}]".format(name, item.get("operator", "OR")),
+                        values=(item.get("description", ""), "", "", ", ".join(item.get("tags", []))), open=True)
+                iid = self.image_library_tree.insert(target_nodes[target_key], "end", text="パターン{}".format(index + 1),
+                    values=(variant.get("template_path", ""), variant.get("threshold", 0.8), ",".join(map(str, variant.get("crop", []))), ", ".join(item.get("tags", []))))
+                self.image_library_tree_ids[iid] = (name, index)
+                if select == (name, index): self.image_library_tree.selection_set(iid); self.image_library_tree.see(iid)
+
+    def load_selected_image_library_variant(self, event=None):
+        selected = self.image_library_tree.selection()
+        if not selected or selected[0] not in self.image_library_tree_ids: return
+        name, index = self.image_library_tree_ids[selected[0]]; self.image_library_selected_variant = (name, index)
+        variant = self._read_image_library()["targets"][name]["variants"][index]
+        path = variant.get("template_path", "")
+        if path and not os.path.isabs(path): path = os.path.join(os.path.dirname(self.template_root()), path)
+        self.image_library_name.set(name); self.image_library_path.set(path)
+        target = self._read_image_library()["targets"][name]
+        self.image_library_description.set(target.get("description", ""))
+        self.image_library_target_operator.set(target.get("operator", "OR"))
+        self.image_library_threshold.set(variant.get("threshold", 0.8)); self.image_library_crop.set(",".join(map(str, variant.get("crop", [0,0,0,0]))))
+        self.image_library_gray.set(bool(variant.get("use_gray", True))); self.image_library_show_value.set(bool(variant.get("show_value", False)))
+
+    def refresh_image_library_workspace(self, select=None):
+        if not hasattr(self, "image_library_tree"): return
+        self.refresh_image_library_tree(select)
+        data = self._read_image_library(); selected_list = self.image_library_list_name.get().strip()
+        self.image_library_lists.delete(0, "end")
+        for name in sorted(data["lists"], key=str.lower):
+            item = data["lists"][name]
+            self.image_library_lists.insert("end", "{} {}".format(name, item.get("description", "")))
+        choices = ["target:" + name for name in sorted(data["targets"])] + ["list:" + name for name in sorted(data["lists"])]
+        self.image_library_member_combo.configure(values=choices)
+        if choices and self.image_library_member.get() not in choices: self.image_library_member.set(choices[0])
+        self.refresh_image_detection_members(selected_list)
+
+    def refresh_image_detection_members(self, name=None):
+        self.image_library_members.delete(0, "end"); data = self._read_image_library()
+        if name in data["lists"]:
+            for member in data["lists"][name]["members"]: self.image_library_members.insert("end", member["type"] + ":" + member["id"])
+
+    def load_image_detection_list(self, event=None):
+        selected = self.image_library_lists.curselection()
+        if selected:
+            data = self._read_image_library(); display = self.image_library_lists.get(selected[0])
+            name = next((value for value in sorted(data["lists"]) if display == "{} {}".format(value, data["lists"][value].get("description", ""))), "")
+            if not name: return
+            item = data["lists"][name]; self.image_library_list_name.set(name)
+            self.image_library_list_description.set(item.get("description", ""))
+            self.refresh_image_detection_members(name)
+
+    def save_image_detection_list(self):
+        name = self.image_library_list_name.get().strip()
+        if not name: messagebox.showwarning("画像検知リスト", "リスト名を入力してください。", parent=self); return
+        data = self._read_image_library(); existing = data["lists"].get(name, {"members": []})
+        existing["description"] = self.image_library_list_description.get().strip()
+        data["lists"][name] = existing; save_image_library(self._image_library_config_path(), data); self.refresh_image_library_workspace()
+
+    def delete_image_detection_list(self):
+        name = self.image_library_list_name.get().strip(); data = self._read_image_library()
+        used = [other for other, item in data["lists"].items() if any(m["type"] == "list" and m["id"] == name for m in item["members"])]
+        if used: messagebox.showwarning("画像検知リスト", "次のリストから先に外してください: " + ", ".join(used), parent=self); return
+        if name in data["lists"] and messagebox.askyesno("画像検知リスト", "リストを削除しますか？", parent=self):
+            del data["lists"][name]; save_image_library(self._image_library_config_path(), data); self.image_library_list_name.set(""); self.refresh_image_library_workspace()
+
+    def add_image_detection_member(self):
+        list_name, value = self.image_library_list_name.get().strip(), self.image_library_member.get().strip()
+        if not list_name or ":" not in value: return
+        member_type, member_id = value.split(":", 1); data = self._read_image_library()
+        item = data["lists"].setdefault(list_name, {"description": "", "members": []}); member = {"type": member_type, "id": member_id}
+        if member not in item["members"]: item["members"].append(member)
+        try: resolve_image_list(data, list_name)
+        except ValueError as error:
+            item["members"].remove(member); messagebox.showwarning("画像検知リスト", str(error), parent=self); return
+        save_image_library(self._image_library_config_path(), data); self.refresh_image_library_workspace()
+
+    def remove_image_detection_member(self):
+        selected = self.image_library_members.curselection(); name = self.image_library_list_name.get().strip()
+        if not selected: return
+        data = self._read_image_library()
+        if name in data["lists"] and selected[0] < len(data["lists"][name]["members"]):
+            del data["lists"][name]["members"][selected[0]]; save_image_library(self._image_library_config_path(), data); self.refresh_image_library_workspace()
+
+    def _current_image_detection_code(self):
+        name = self.image_library_list_name.get().strip(); data = self._read_image_library()
+        if name not in data["lists"]: raise ValueError("生成する画像検知リストを選択してください。")
+        return generate_image_check(data, name, "list")
+
+    def preview_image_detection_code(self):
+        try: code = self._current_image_detection_code()
+        except ValueError as error: messagebox.showwarning("画像検知", str(error), parent=self); return
+        dialog = tk.Toplevel(self); dialog.title("生成されるimage_check")
+        editor = tk.Text(dialog, wrap="none", background="#1e1e1e", foreground="#d4d4d4"); editor.pack(fill="both", expand=True)
+        editor.insert("1.0", code); editor.configure(state="disabled"); dialog.geometry("900x600")
+
+    def apply_image_detection_code(self):
+        try: code = self._current_image_detection_code()
+        except ValueError as error: messagebox.showwarning("画像検知", str(error), parent=self); return
+        editor = self.sample_program_editor if self.image_library_apply_target.get() == "サンプルプログラム" else self.editor
+        if self._apply_image_code_to_editor(editor, code):
+            self.status.set("image_checkを生成/更新しました。保存してください。")
+
+    def _extract_image_check_user(self, source):
+        pattern = re.compile(r"(?ms)^(?P<indent>[ \t]*)# POKECON_IMAGE_CHECK_USER_BEGIN\n(?P<body>.*?)^\1# POKECON_IMAGE_CHECK_USER_END[ \t]*$")
+        match = pattern.search(source)
+        return match.group("body") if match else None
+
+    def _replace_image_check_user(self, code, body):
+        pattern = re.compile(r"(?ms)^(?P<indent>[ \t]*)# POKECON_IMAGE_CHECK_USER_BEGIN\n.*?^\1# POKECON_IMAGE_CHECK_USER_END[ \t]*$")
+        match = pattern.search(code)
+        if not match or body is None: return code
+        indent = match.group("indent")
+        replacement = indent + "# POKECON_IMAGE_CHECK_USER_BEGIN\n" + body + indent + "# POKECON_IMAGE_CHECK_USER_END"
+        return code[:match.start()] + replacement + code[match.end():]
+
+    def _apply_image_code_to_editor(self, editor, code):
+        source = editor.get("1.0", "end-1c")
+        if "class " not in source:
+            messagebox.showwarning("画像検知", "先に対象エディタへコマンドを作成または読込してください。", parent=self); return False
+        preserved_user = self._extract_image_check_user(source)
+        if preserved_user is not None: code = self._replace_image_check_user(code, textwrap.dedent(preserved_user))
+        import_line = "from LocalFunction.ImageDetection import SimilarityHistory, detect_image"
+        if import_line not in source:
+            class_at = source.find("class "); source = source[:class_at] + import_line + "\n\n" + source[class_at:]
+        indented = textwrap.indent(code.rstrip(), "    ")
+        pattern = re.compile(r"(?ms)^[ \t]*# POKECON_IMAGE_CHECK_BEGIN\n.*?^[ \t]*# POKECON_IMAGE_CHECK_END[ \t]*$")
+        if pattern.search(source):
+            source = pattern.sub(indented, source, count=1)
+        else:
+            marker = "    # POKECON_USER_METHODS_BEGIN"
+            source = source.replace(marker, indented + "\n\n" + marker, 1) if marker in source else source.rstrip() + "\n\n" + indented + "\n"
+        editor.delete("1.0", "end"); editor.insert("1.0", source)
+        if editor is self.sample_program_editor:
+            self.sample_program_dirty = True; self._update_sample_program_line_numbers()
+        else:
+            self.editor_dirty = True; self.update_editor_view()
+        return True
+
+    def load_image_detection_from_source(self):
+        editor = self.sample_program_editor if self.image_library_apply_target.get() == "サンプルプログラム" else self.editor
+        source = editor.get("1.0", "end-1c")
+        try:
+            tree = ast.parse(source)
+            assignments = {}
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if getattr(target, "id", "").startswith("IMAGE_DETECTION_"):
+                            assignments[target.id] = node.value
+            targets = ast.literal_eval(assignments["IMAGE_DETECTION_TARGETS"])
+            if not isinstance(targets, dict): raise ValueError
+        except (SyntaxError, StopIteration, ValueError, TypeError):
+            messagebox.showwarning("画像検知", "対象ソースにリテラル形式のIMAGE_DETECTION_TARGETSがありません。", parent=self); return
+        try: operators = ast.literal_eval(assignments.get("IMAGE_DETECTION_OPERATORS")) if "IMAGE_DETECTION_OPERATORS" in assignments else {}
+        except (ValueError, TypeError): operators = {}
+        try: descriptions = ast.literal_eval(assignments.get("IMAGE_DETECTION_DESCRIPTIONS")) if "IMAGE_DETECTION_DESCRIPTIONS" in assignments else {}
+        except (ValueError, TypeError): descriptions = {}
+        data = self._read_image_library(); imported = 0; updated_targets = 0; first = None
+        for name, variants in targets.items():
+            if not isinstance(variants, list): continue
+            target = data["targets"].setdefault(str(name), {"operator": "OR", "tags": [], "variants": []})
+            before = (target.get("description", ""), target.get("operator", "OR"), list(target.get("variants", [])))
+            target["description"] = str(descriptions.get("targets", {}).get(str(name), target.get("description", "")))
+            target["operator"] = str(operators.get(str(name), target.get("operator", "OR"))).upper()
+            new_variants = [dict(variant) for variant in variants if isinstance(variant, dict)]
+            target["variants"] = new_variants
+            if before != (target["description"], target["operator"], target["variants"]): updated_targets += 1
+            imported += len(new_variants)
+            for variant in new_variants:
+                raw_path = variant.get("template_path", "")
+                absolute = raw_path if os.path.isabs(raw_path) else os.path.join(os.path.dirname(self.template_root()), raw_path)
+                target["tags"] = list(dict.fromkeys(target.get("tags", []) + image_folder_tags(self.template_root(), absolute)))
+                if first is None: first = (str(name), target["variants"].index(variant))
+        save_image_library(self._image_library_config_path(), data)
+        self.refresh_image_library_workspace(select=first)
+        if first: self.load_selected_image_library_variant()
+        self.status.set("ソースから画像検知{}件・{}パターンを登録設定へ更新しました。".format(updated_targets, imported))
+
     def _image_target_from_fields(self):
         try:
             roi = tuple(int(part.strip()) for part in self.image_target_roi.get().split(","))
@@ -1781,13 +3029,13 @@ class DevStudio(tk.Tk):
         path = self.image_target_path.get().strip()
         if not path or not os.path.isfile(path):
             raise ValueError("Select an existing image file.")
-        return {"name": self.image_target_name.get().strip() or os.path.basename(path), "path": path, "threshold": threshold,
+        return {"name": self.image_target_name.get().strip() or os.path.basename(path), "description": self.image_target_description.get().strip(), "path": path, "threshold": threshold,
                 "roi": roi, "grayscale": bool(self.image_target_gray.get()), "reference_resolution": resolution}
 
     def refresh_image_target_tree(self, selected=None):
         self.image_target_tree.delete(*self.image_target_tree.get_children())
         for index, item in enumerate(self.image_detection_targets):
-            self.image_target_tree.insert("", "end", iid=str(index), values=(item["name"], item["path"], item["threshold"],
+            self.image_target_tree.insert("", "end", iid=str(index), values=(item["name"], item.get("description", ""), item["path"], item["threshold"],
                 ",".join(str(value) for value in item["roi"]), "mono" if item.get("grayscale") else "color",
                 ",".join(str(value) for value in item.get("reference_resolution", (0, 0)))))
         if selected is not None and 0 <= selected < len(self.image_detection_targets):
@@ -1819,6 +3067,7 @@ class DevStudio(tk.Tk):
         if selected:
             del self.image_detection_targets[int(selected[0])]
             self.refresh_image_target_tree()
+            self.image_target_edit_mode.set("新規追加モード")
 
     def load_selected_image_target(self, event=None):
         selected = self.image_target_tree.selection()
@@ -1826,8 +3075,135 @@ class DevStudio(tk.Tk):
             return
         item = self.image_detection_targets[int(selected[0])]
         self.image_target_name.set(item["name"]); self.image_target_path.set(item["path"]); self.image_target_threshold.set(item["threshold"])
+        self.image_target_description.set(item.get("description", ""))
         self.image_target_roi.set(",".join(str(value) for value in item["roi"])); self.image_target_gray.set(bool(item.get("grayscale")))
         self.image_target_resolution.set(",".join(str(value) for value in item.get("reference_resolution", (0, 0))))
+        self.image_target_edit_mode.set("変更モード: {}".format(item["name"]))
+
+    def enter_selected_image_target_change_mode(self, event=None):
+        self.load_selected_image_target()
+        self.after_idle(lambda: self.image_target_name.set(self.image_target_name.get()))
+
+    def _debug_target_to_library_variant(self, item):
+        x, y, width, height = [int(value) for value in item.get("roi", (0, 0, 0, 0))]
+        crop = [x, y, x + width, y + height] if width and height else [0, 0, 0, 0]
+        return {
+            "template_path": self._portable_template_path(item["path"]),
+            "threshold": float(item.get("threshold", 0.8)),
+            "use_gray": bool(item.get("grayscale", False)),
+            "show_value": False,
+            "show_position": True,
+            "show_only_true_rect": False,
+            "ms": 2000,
+            "crop": crop,
+        }
+
+    def _library_variant_to_debug_target(self, name, variant):
+        raw_path = variant.get("template_path", "")
+        path = raw_path if os.path.isabs(raw_path) else os.path.join(os.path.dirname(self.template_root()), raw_path)
+        x1, y1, x2, y2 = [int(value) for value in variant.get("crop", [0, 0, 0, 0])]
+        roi = (x1, y1, max(0, x2 - x1), max(0, y2 - y1)) if any((x1, y1, x2, y2)) else (0, 0, 0, 0)
+        return {"name": str(name), "description": "", "path": os.path.abspath(path), "threshold": float(variant.get("threshold", 0.8)),
+                "roi": roi, "grayscale": bool(variant.get("use_gray", True)), "reference_resolution": (0, 0)}
+
+    def register_current_image_target(self):
+        try:
+            debug_target = self._image_target_from_fields()
+        except ValueError as error:
+            messagebox.showwarning("単品画像検知の登録", str(error), parent=self); return
+        name = str(debug_target["name"]); variant = self._debug_target_to_library_variant(debug_target)
+        data = self._read_image_library(); item = data["targets"].setdefault(name, {"operator": "OR", "tags": [], "variants": []})
+        item["description"] = debug_target.get("description", "")
+        tags = image_folder_tags(self.template_root(), debug_target["path"])
+        item["tags"] = list(dict.fromkeys(item.get("tags", []) + tags))
+        if variant not in item["variants"]: item["variants"].append(variant)
+        single_list = "単品_" + name
+        data["lists"].setdefault(single_list, {"description": debug_target.get("description", ""), "members": [{"type": "target", "id": name}]})
+        save_image_library(self._image_library_config_path(), data)
+        self.refresh_image_library_workspace(select=(name, item["variants"].index(variant)))
+        self.refresh_sample_apply_image_tree()
+        self.status.set("登録済み単品画像検知として保存しました: {}（リスト: {}）".format(name, single_list))
+
+    def open_registered_image_target_dialog(self):
+        dialog = tk.Toplevel(self); dialog.title("登録済み画像検知から追加・削除")
+        dialog.geometry("920x620"); dialog.transient(self)
+        search = tk.StringVar(); ttk.Label(dialog, text="名前・タグ・フォルダ検索:").pack(anchor="w", padx=7, pady=(7, 2))
+        ttk.Entry(dialog, textvariable=search).pack(fill="x", padx=7)
+        frame = ttk.Frame(dialog); frame.pack(fill="both", expand=True, padx=7, pady=6)
+        tree = ttk.Treeview(frame, columns=("path", "threshold", "crop"), show="tree headings", selectmode="extended")
+        tree.heading("#0", text="フォルダ / 登録名 / パターン"); tree.heading("path", text="画像")
+        tree.heading("threshold", text="閾値"); tree.heading("crop", text="検知範囲")
+        tree.column("path", width=410); tree.column("threshold", width=70); tree.column("crop", width=140)
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview); scrollbar.pack(side="right", fill="y"); tree.configure(yscrollcommand=scrollbar.set)
+        nodes = {}
+
+        def populate(*args):
+            tree.delete(*tree.get_children()); nodes.clear(); data = self._read_image_library(); needle = search.get().strip().lower()
+            root = tree.insert("", "end", text="Template", open=True); folders, targets = {}, {}
+            for name in sorted(data["targets"], key=str.lower):
+                item = data["targets"][name]
+                text = " ".join([name, item.get("description", "")] + item.get("tags", []) + [v.get("template_path", "") for v in item["variants"]]).lower()
+                if needle and needle not in text: continue
+                for index, variant in enumerate(item["variants"]):
+                    parts = variant.get("template_path", "").replace("\\", "/").split("/")
+                    if parts and parts[0].lower() == "template": parts = parts[1:]
+                    parent, accumulated = root, []
+                    for folder in parts[:-1]:
+                        accumulated.append(folder); key = "/".join(accumulated)
+                        if key not in folders: folders[key] = tree.insert(parent, "end", text=folder, open=bool(needle))
+                        parent = folders[key]
+                    target_key = (parent, name)
+                    if target_key not in targets: targets[target_key] = tree.insert(parent, "end", text="登録済み: {} / {}".format(name, item.get("description", "")), open=True)
+                    iid = tree.insert(targets[target_key], "end", text="パターン{}".format(index + 1),
+                        values=(variant.get("template_path", ""), variant.get("threshold", 0.8), ",".join(map(str, variant.get("crop", [])))))
+                    nodes[iid] = (name, index)
+        search.trace_add("write", populate); populate()
+
+        def chosen(): return [nodes[iid] for iid in tree.selection() if iid in nodes]
+        def add_to_source_targets():
+            data = self._read_image_library(); added = 0
+            for name, index in chosen():
+                target = self._library_variant_to_debug_target(name, data["targets"][name]["variants"][index])
+                target["description"] = data["targets"][name].get("description", "")
+                if target not in self.image_detection_targets: self.image_detection_targets.append(target); added += 1
+            self.refresh_image_target_tree(len(self.image_detection_targets) - 1 if added else None)
+            self.status.set("登録済み画像検知をソース対象へ{}件追加しました。".format(added))
+        def remove_from_source_targets():
+            data = self._read_image_library(); selected_targets = []
+            for n, i in chosen():
+                target = self._library_variant_to_debug_target(n, data["targets"][n]["variants"][i])
+                target["description"] = data["targets"][n].get("description", "")
+                selected_targets.append(target)
+            before = len(self.image_detection_targets)
+            self.image_detection_targets = [item for item in self.image_detection_targets if item not in selected_targets]
+            self.refresh_image_target_tree(); self.image_target_edit_mode.set("新規追加モード")
+            self.status.set("ソース対象から{}件外しました。登録済み設定は削除していません。".format(before - len(self.image_detection_targets)))
+        def apply_as_image_check():
+            selections = chosen()
+            if not selections: return
+            data = self._read_image_library(); names = []
+            for name, _ in selections:
+                if name not in names: names.append(name)
+            temporary = {"schema_version": 1, "targets": data["targets"],
+                         "lists": {"RegisteredSelection": {"description": "登録済み選択", "members": [{"type": "target", "id": name} for name in names]}}}
+            if self._apply_image_code_to_editor(self.editor, generate_image_check(temporary, "RegisteredSelection", "list")):
+                self.status.set("登録済み画像検知{}件をimage_checkへ反映しました。".format(len(names)))
+        def delete_registration():
+            selections = chosen()
+            if not selections or not messagebox.askyesno("登録そのものを削除", "選択パターンを登録ライブラリから削除しますか？", parent=dialog): return
+            data = self._read_image_library()
+            for name, index in sorted(selections, key=lambda value: (value[0], -value[1])):
+                if name in data["targets"] and index < len(data["targets"][name]["variants"]): del data["targets"][name]["variants"][index]
+                if name in data["targets"] and not data["targets"][name]["variants"]:
+                    del data["targets"][name]
+                    for item in data["lists"].values(): item["members"] = [m for m in item["members"] if not (m["type"] == "target" and m["id"] == name)]
+            save_image_library(self._image_library_config_path(), data); populate(); self.refresh_image_library_workspace(); self.refresh_sample_apply_image_tree()
+        buttons = ttk.Frame(dialog); buttons.pack(fill="x", padx=7, pady=(0, 7))
+        ttk.Button(buttons, text="ソース対象へ追加", command=add_to_source_targets).pack(side="left", padx=2)
+        ttk.Button(buttons, text="ソース対象から外す", command=remove_from_source_targets).pack(side="left", padx=2)
+        ttk.Button(buttons, text="image_checkへ反映", command=apply_as_image_check).pack(side="left", padx=10)
+        ttk.Button(buttons, text="登録そのものを削除", command=delete_registration).pack(side="right", padx=2)
 
     def load_image_targets_from_editor(self):
         try:
@@ -1887,6 +3263,8 @@ class DevStudio(tk.Tk):
         return tab_id
 
     def load_editor_document(self, tab_id, line=None):
+        if hasattr(self, "todo_editor"):
+            self.save_current_todo(silent=True)
         document = self.editor_documents[tab_id]
         self.active_editor_tab = tab_id
         self.current_path = document["path"]
@@ -1898,6 +3276,251 @@ class DevStudio(tk.Tk):
         self.editor_dirty = document["dirty"]
         self.editor.edit_modified(False)
         self.update_editor_view()
+        self.load_current_todo()
+        if self.find_text.get():
+            self.debounce("editor_find_count", 120, self.refresh_find_count)
+
+    def todo_storage_path(self):
+        return os.path.join(os.path.dirname(__file__), "source_todos.json")
+
+    def _read_source_todos(self):
+        try:
+            with open(self.todo_storage_path(), "r", encoding="utf-8") as stream:
+                value = json.load(stream)
+                return value if isinstance(value, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def load_current_todo(self):
+        if not hasattr(self, "todo_editor"):
+            return
+        self._loading_todo = True
+        self.todo_editor.configure(state="normal")
+        self.todo_editor.delete("1.0", "end")
+        if self.current_path:
+            key = os.path.normcase(os.path.abspath(self.current_path))
+            value = self._read_source_todos().get(key, "")
+            if TODO_HELP_MARKER not in value:
+                value = TODO_HELP_TEXT + value.lstrip("\n")
+            elif TODO_SIMPLE_FUNCTION_HELP.strip() not in value:
+                value = TODO_SIMPLE_FUNCTION_HELP + value
+            if TODO_PLAIN_FUNCTION_HELP.strip() not in value:
+                value = TODO_PLAIN_FUNCTION_HELP + value
+            self.todo_editor.insert("1.0", value)
+            self.todo_source_label.set(os.path.basename(self.current_path) + " のTODO")
+        else:
+            self.todo_source_label.set("保存済みソースを開くとTODOを記録できます。")
+            self.todo_editor.configure(state="disabled")
+        self.todo_editor.edit_modified(False)
+        self._loading_todo = False
+
+    def save_current_todo(self, silent=False):
+        if not hasattr(self, "todo_editor") or not self.current_path:
+            return False
+        job = getattr(self, "_todo_save_job", None)
+        if job is not None:
+            try: self.after_cancel(job)
+            except tk.TclError: pass
+            self._todo_save_job = None
+        data = self._read_source_todos()
+        key = os.path.normcase(os.path.abspath(self.current_path))
+        value = self.todo_editor.get("1.0", "end-1c").rstrip()
+        if value:
+            data[key] = value + "\n"
+        else:
+            data.pop(key, None)
+        path, temporary = self.todo_storage_path(), self.todo_storage_path() + ".tmp"
+        try:
+            with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
+                json.dump(data, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+            os.replace(temporary, path)
+        except OSError as error:
+            if not silent: messagebox.showerror("TODO", str(error), parent=self)
+            return False
+        self.todo_editor.edit_modified(False)
+        if not silent: self.status.set("TODOを保存しました: " + os.path.basename(self.current_path))
+        return True
+
+    def todo_modified(self, event=None):
+        if getattr(self, "_loading_todo", False) or not self.todo_editor.edit_modified():
+            return
+        self.todo_editor.edit_modified(False)
+        job = getattr(self, "_todo_save_job", None)
+        if job is not None:
+            try: self.after_cancel(job)
+            except tk.TclError: pass
+        self._todo_save_job = self.after(700, lambda: self.save_current_todo(silent=True))
+
+    def insert_todo_item(self):
+        if not self.current_path:
+            messagebox.showinfo("TODO", "先にソースファイルを保存してください。", parent=self); return
+        self.todo_editor.configure(state="normal")
+        current = self.todo_editor.get("1.0", "end-1c")
+        self.todo_editor.insert("end", ("" if not current or current.endswith("\n") else "\n") + "- [ ] ")
+        self.todo_editor.focus_set()
+
+    @staticmethod
+    def bind_text_undo_redo(widget):
+        """Give every editor an explicit, symmetric undo/redo shortcut."""
+        def run(action):
+            try:
+                getattr(widget, action)()
+            except tk.TclError:
+                pass
+            return "break"
+        widget.bind("<Control-z>", lambda event: run("edit_undo"))
+        widget.bind("<Control-Z>", lambda event: run("edit_undo"))
+        widget.bind("<Control-y>", lambda event: run("edit_redo"))
+        widget.bind("<Control-Y>", lambda event: run("edit_redo"))
+        widget.bind("<Control-Shift-z>", lambda event: run("edit_redo"))
+        widget.bind("<Control-Shift-Z>", lambda event: run("edit_redo"))
+
+    @staticmethod
+    def _source_function_locations(source):
+        """Return qualified function names and their current source ranges."""
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return []
+        found = []
+
+        def visit(nodes, parents=()):
+            for node in nodes:
+                if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    qualified = ".".join(parents + (node.name,))
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        found.append((qualified, node.lineno,
+                                      getattr(node, "end_lineno", node.lineno)))
+                    visit(node.body, parents + (node.name,))
+        visit(tree.body)
+        return found
+
+    def _resolve_source_function(self, displayed_name):
+        """Resolve a function name or an upper-case state/log label."""
+        name = displayed_name.strip()
+        source = self.editor.get("1.0", "end-1c")
+        functions = self._source_function_locations(source)
+        candidates = (name, name.lower(), "_" + name.lower().lstrip("_"))
+        for candidate in candidates:
+            target = next((item for item in functions
+                           if item[0] == candidate or item[0].rsplit(".", 1)[-1] == candidate), None)
+            if target:
+                return target
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            return None
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Dict):
+                continue
+            for key, value in zip(node.keys, node.values):
+                try:
+                    key_value = ast.literal_eval(key)
+                except (ValueError, TypeError, SyntaxError):
+                    continue
+                if str(key_value).upper() != name.upper():
+                    continue
+                if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name) and value.value.id == "self":
+                    return next((item for item in functions
+                                 if item[0].rsplit(".", 1)[-1] == value.attr), None)
+        return None
+
+    def insert_linked_todo_item(self):
+        if not self.current_path:
+            messagebox.showinfo("TODO", "先にソースファイルを保存してください。", parent=self); return
+        try:
+            source_index = self.editor.index("sel.first")
+            selected = self.editor.get("sel.first", "sel.last").strip()
+        except tk.TclError:
+            source_index = self.editor.index("insert"); selected = ""
+        line = int(source_index.split(".")[0])
+        functions = self._source_function_locations(self.editor.get("1.0", "end-1c"))
+        containing = [item for item in functions if item[1] <= line <= item[2]]
+        function = min(containing, key=lambda item: item[2] - item[1]) if containing else None
+        hint = next((value.strip() for value in selected.splitlines() if value.strip()), "")[:100]
+        self.todo_editor.configure(state="normal")
+        current = self.todo_editor.get("1.0", "end-1c")
+        prefix = "" if not current or current.endswith("\n") else "\n"
+        if function:
+            anchor = "[F:{}+{}] [L{}]".format(function[0], line - function[1], line)
+        else:
+            anchor = "[L{}]".format(line)
+        self.todo_editor.insert("end", prefix + "- [ ] {} {}".format(anchor, hint))
+        self.todo_editor.focus_set(); self.todo_editor.see("end")
+
+    def open_todo_source_location(self, event=None):
+        try:
+            index = self.todo_editor.index("@{},{}".format(event.x, event.y)) if event is not None else self.todo_editor.index("insert")
+            text = self.todo_editor.get("{}.0".format(index.split(".")[0]), "{}.end".format(index.split(".")[0]))
+        except tk.TclError:
+            return
+        function_match = re.search(r"\[F:([\w.]+)\+(\d+)\]", text)
+        line_match = re.search(r"\[L(\d+)\]", text)
+        simple_function_match = re.search(r"\[([A-Za-z_]\w*)\]", text)
+        if simple_function_match and (simple_function_match.group(1).lower() == "x" or
+                                      re.fullmatch(r"L\d+", simple_function_match.group(1))):
+            simple_function_match = None
+        functions = self._source_function_locations(self.editor.get("1.0", "end-1c"))
+        plain_function = None
+        if not function_match and not simple_function_match:
+            words = {word.lower().lstrip("_") for word in re.findall(r"[A-Za-z0-9_]+", text)}
+            plain_function = next((item for item in functions
+                                   if item[0].rsplit(".", 1)[-1].lower().lstrip("_") in words), None)
+        if not function_match and not line_match and not simple_function_match and not plain_function:
+            return
+        line = max(1, int(line_match.group(1))) if line_match else 1
+        if function_match:
+            qualified_name, offset = function_match.group(1), int(function_match.group(2))
+            target = next((item for item in functions if item[0] == qualified_name), None)
+            if target:
+                line = min(target[2], target[1] + offset)
+            else:
+                self.status.set("紐づけ先の関数が見つからないため、保存時の行番号を開きます: " + qualified_name)
+        elif simple_function_match:
+            function_name = simple_function_match.group(1)
+            target = next((item for item in functions
+                           if item[0] == function_name or item[0].rsplit(".", 1)[-1] == function_name), None)
+            if not target:
+                self.status.set("紐づけ先の関数が見つかりません: " + function_name)
+                return
+            line = target[1]
+        elif plain_function:
+            line = plain_function[1]
+        self.editor.mark_set("insert", "{}.0".format(line)); self.editor.see("{}.0".format(line))
+        self.editor.tag_remove("sel", "1.0", "end")
+        self.editor.tag_add("sel", "{}.0".format(line), "{}.end".format(line))
+        self.editor.focus_set(); self.status.set("TODOの紐づけ先を開きました: {} 行{}".format(os.path.basename(self.current_path), line))
+
+    @staticmethod
+    def find_vscode_executable():
+        local = os.environ.get("LOCALAPPDATA", "")
+        program_files = os.environ.get("ProgramFiles", "")
+        candidates = [
+            os.path.join(local, "Programs", "Microsoft VS Code", "Code.exe") if local else "",
+            os.path.join(program_files, "Microsoft VS Code", "Code.exe") if program_files else "",
+            shutil.which("code.exe") or "",
+            shutil.which("code") or "",
+        ]
+        return next((path for path in candidates if path and os.path.isfile(path)), None)
+
+    def open_current_in_vscode(self):
+        if not self.current_path:
+            messagebox.showinfo("VS Code", "先にソースファイルを保存してください。", parent=self); return
+        executable = self.vscode_executable or self.find_vscode_executable()
+        if not executable:
+            messagebox.showwarning("VS Code", "VS Codeが見つかりません。", parent=self); return
+        line = int(self.editor.index("insert").split(".")[0])
+        target = "{}:{}".format(os.path.abspath(self.current_path), line)
+        try:
+            if executable.lower().endswith((".cmd", ".bat")):
+                command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", executable, "--goto", target]
+                subprocess.Popen(command, creationflags=0x08000000)
+            else:
+                subprocess.Popen([executable, "--goto", target])
+        except OSError as error:
+            messagebox.showerror("VS Code", str(error), parent=self); return
+        self.status.set("VS Codeで開きました: {} 行{}".format(os.path.basename(self.current_path), line))
 
     def on_editor_tab_changed(self, event=None):
         if self._switching_editor_tab:
@@ -1945,6 +3568,7 @@ class DevStudio(tk.Tk):
     def _sync_editor_scroll(self, scrollbar, first, last):
         scrollbar.set(first, last)
         self.line_numbers.yview_moveto(first)
+        self._schedule_python_highlight()
 
     def editor_modified(self, event=None):
         if self.editor.edit_modified():
@@ -1953,32 +3577,68 @@ class DevStudio(tk.Tk):
                 self.editor_documents[self.active_editor_tab]["dirty"] = True
             self.editor.edit_modified(False)
             self.update_editor_view()
+            if self.find_text.get():
+                self.debounce("editor_find_count", 120, self.refresh_find_count)
 
     def update_editor_view(self):
-        count = max(1, int(self.editor.index("end-1c").split(".")[0]))
-        self.line_numbers.configure(state="normal")
-        self.line_numbers.delete("1.0", "end")
-        self.line_numbers.insert("1.0", "\n".join(str(number) for number in range(1, count + 1)))
-        self.line_numbers.configure(state="disabled")
-        self._highlight_python()
         title = self.current_path or "Unsaved output"
         self.editor_title.set(("* " if self.editor_dirty else "") + title)
         if self.active_editor_tab in self.editor_documents:
             document = self.editor_documents[self.active_editor_tab]
             document["dirty"] = self.editor_dirty
             self.editor_tabs.tab(self.active_editor_tab, text=self._editor_tab_label(document))
+        self._schedule_editor_decorations()
+
+    def _schedule_editor_decorations(self):
+        """Keep file opening responsive by decorating the editor after it is visible."""
+        job = getattr(self, "_editor_decorations_job", None)
+        if job is not None:
+            try: self.after_cancel(job)
+            except tk.TclError: pass
+        self._editor_decorations_job = self.after(120, self._refresh_editor_decorations)
+
+    def _refresh_editor_decorations(self):
+        self._editor_decorations_job = None
+        count = max(1, int(self.editor.index("end-1c").split(".")[0]))
+        if count != getattr(self, "_line_number_count", None):
+            self.line_numbers.configure(state="normal")
+            self.line_numbers.delete("1.0", "end")
+            self.line_numbers.insert("1.0", "\n".join(str(number) for number in range(1, count + 1)))
+            self.line_numbers.configure(state="disabled")
+            self._line_number_count = count
+        self._highlight_python()
+
+    def _schedule_python_highlight(self):
+        job = getattr(self, "_python_highlight_job", None)
+        if job is not None:
+            try: self.after_cancel(job)
+            except tk.TclError: pass
+        self._python_highlight_job = self.after(80, self._run_scheduled_python_highlight)
+
+    def _run_scheduled_python_highlight(self):
+        self._python_highlight_job = None
+        self._highlight_python()
 
     def _highlight_python(self):
-        text = self.editor.get("1.0", "end-1c")
+        # Highlight only the visible area plus a margin. Full-file regex/tagging
+        # made opening large command sources unnecessarily expensive.
+        try:
+            first_line = max(1, int(self.editor.index("@0,0").split(".")[0]) - 100)
+            height = max(1, self.editor.winfo_height())
+            last_line = int(self.editor.index("@0,{}".format(height)).split(".")[0]) + 100
+        except (ValueError, tk.TclError):
+            first_line, last_line = 1, 300
+        start, end = "{}.0".format(first_line), "{}.0".format(last_line + 1)
+        text = self.editor.get(start, end)
         for tag in ("keyword", "string", "comment"):
             self.editor.tag_remove(tag, "1.0", "end")
         for match in re.finditer(r"#.*$", text, re.MULTILINE):
-            self.editor.tag_add("comment", "1.0+{}c".format(match.start()), "1.0+{}c".format(match.end()))
+            self.editor.tag_add("comment", "{}+{}c".format(start, match.start()), "{}+{}c".format(start, match.end()))
         for match in re.finditer(r"(?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\")", text):
-            self.editor.tag_add("string", "1.0+{}c".format(match.start()), "1.0+{}c".format(match.end()))
+            self.editor.tag_add("string", "{}+{}c".format(start, match.start()), "{}+{}c".format(start, match.end()))
         keywords = r"\b(?:and|as|assert|async|await|break|class|continue|def|del|elif|else|except|False|finally|for|from|global|if|import|in|is|lambda|None|nonlocal|not|or|pass|raise|return|True|try|while|with|yield)\b"
         for match in re.finditer(keywords, text):
-            self.editor.tag_add("keyword", "1.0+{}c".format(match.start()), "1.0+{}c".format(match.end()))
+            self.editor.tag_add("keyword", "{}+{}c".format(start, match.start()), "{}+{}c".format(start, match.end()))
 
     def set_editor_content(self, content, path=None, line=1):
         self.capture_active_editor_document()
@@ -2003,6 +3663,7 @@ class DevStudio(tk.Tk):
         return self._write_editor(self.current_path)
 
     def _write_editor(self, path):
+        self.save_current_todo(silent=True)
         try:
             with open(path, "w", encoding="utf-8", newline="\n") as handle:
                 handle.write(self.editor.get("1.0", "end-1c"))
@@ -2016,6 +3677,7 @@ class DevStudio(tk.Tk):
             document = self.editor_documents[self.active_editor_tab]
             document.update({"path": path, "content": self.editor.get("1.0", "end-1c"), "dirty": False})
         self.update_editor_view()
+        self.load_current_todo()
         self.status.set("Saved " + path)
         self.refresh_index()
         return True
@@ -2041,22 +3703,76 @@ class DevStudio(tk.Tk):
         entry.bind("<Return>", apply_line)
         entry.focus_set()
 
-    def find_next(self):
+    def _find_matches(self):
         needle = self.find_text.get()
         if not needle:
-            return
+            return []
+        matches = []
+        start = "1.0"
+        count = tk.IntVar(value=0)
+        while True:
+            found = self.editor.search(needle, start, stopindex="end", nocase=True, count=count)
+            if not found:
+                break
+            length = count.get()
+            if length <= 0:
+                break
+            end = "{}+{}c".format(found, length)
+            matches.append((found, end))
+            start = end
+        return matches
+
+    def refresh_find_count(self):
         self.editor.tag_remove("find", "1.0", "end")
-        start = self.editor.index("insert+1c")
-        found = self.editor.search(needle, start, stopindex="end", nocase=True)
-        if not found:
-            found = self.editor.search(needle, "1.0", stopindex="end", nocase=True)
-        if found:
-            end = "{}+{}c".format(found, len(needle))
-            self.editor.tag_configure("find", background="#515c6a")
-            self.editor.tag_add("find", found, end)
-            self.editor.mark_set("insert", end)
-            self.editor.see(found)
-            self.editor.focus_set()
+        total = len(self._find_matches())
+        self.find_result_text.set("0 / {}".format(total))
+
+    def _show_find_match(self, matches, index):
+        self.editor.tag_remove("find", "1.0", "end")
+        if not matches:
+            self.find_result_text.set("0 / 0")
+            return
+        index %= len(matches)
+        found, end = matches[index]
+        self.editor.tag_configure("find", background="#515c6a")
+        self.editor.tag_add("find", found, end)
+        self.editor.mark_set("insert", end)
+        self.editor.see(found)
+        self.editor.focus_set()
+        self.find_result_text.set("{} / {}".format(index + 1, len(matches)))
+
+    def find_next(self):
+        matches = self._find_matches()
+        if not matches:
+            self._show_find_match([], 0)
+            return
+        ranges = self.editor.tag_ranges("find")
+        if ranges:
+            current = self.editor.index(ranges[0])
+            index = next((i + 1 for i, item in enumerate(matches)
+                          if self.editor.compare(item[0], "==", current)), 0)
+        else:
+            cursor = self.editor.index("insert")
+            index = next((i for i, item in enumerate(matches)
+                          if self.editor.compare(item[0], ">=", cursor)), 0)
+        self._show_find_match(matches, index)
+
+    def find_previous(self):
+        matches = self._find_matches()
+        if not matches:
+            self._show_find_match([], 0)
+            return
+        ranges = self.editor.tag_ranges("find")
+        if ranges:
+            current = self.editor.index(ranges[0])
+            index = next((i - 1 for i, item in enumerate(matches)
+                          if self.editor.compare(item[0], "==", current)), len(matches) - 1)
+        else:
+            cursor = self.editor.index("insert")
+            candidates = [i for i, item in enumerate(matches)
+                          if self.editor.compare(item[0], "<", cursor)]
+            index = candidates[-1] if candidates else len(matches) - 1
+        self._show_find_match(matches, index)
 
     def replace_one(self):
         needle = self.find_text.get()
@@ -2098,65 +3814,15 @@ class DevStudio(tk.Tk):
         return True
 
     def console_write(self, text):
-        self.console.configure(state="normal")
-        self.console.insert("end", text)
-        self.console.see("end")
-        self.console.configure(state="disabled")
+        value = str(text).strip()
+        if value:
+            self.status.set(value)
 
     def run_current(self):
-        if self.run_process:
-            messagebox.showinfo("Run", "A Python process is already running.")
-            return
-        if not self.current_path:
-            messagebox.showwarning("Run", "Run requires a saved Python file.")
-            return
-        if self.editor_dirty and not self.save_current():
-            return
-        if not self.check_syntax():
-            return
-        self.console.configure(state="normal")
-        self.console.delete("1.0", "end")
-        self.console.configure(state="disabled")
-        self.console_write("$ {} {}\n\n".format(sys.executable, self.current_path))
-        try:
-            self.run_process = subprocess.Popen([sys.executable, self.current_path], cwd=os.path.dirname(self.current_path),
-                                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
-                                                bufsize=1)
-        except OSError as error:
-            self.console_write("Could not start: {}\n".format(error))
-            self.run_process = None
-            return
-        def read_output(process):
-            for line in iter(process.stdout.readline, ""):
-                self.run_queue.put(line)
-            process.stdout.close()
-            self.run_queue.put("\n[process finished: {}]\n".format(process.wait()))
-            self.run_queue.put(None)
-        threading.Thread(target=read_output, args=(self.run_process,), daemon=True).start()
-        self.after(50, self.drain_run_output)
-        self.status.set("Running " + os.path.basename(self.current_path))
-
-    def drain_run_output(self):
-        alive = True
-        while True:
-            try:
-                item = self.run_queue.get_nowait()
-            except queue.Empty:
-                break
-            if item is None:
-                alive = False
-                self.run_process = None
-            else:
-                self.console_write(item)
-        if alive and self.run_process:
-            self.after(50, self.drain_run_output)
-        elif not self.run_process:
-            self.status.set("Run finished")
-
-    def stop_run(self):
-        if self.run_process:
-            self.run_process.terminate()
-            self.console_write("\n[stop requested]\n")
+        messagebox.showinfo("PokeConコマンドの実行",
+                            "PokeConコマンドの実行はPokeCon本体側で行ってください。\nDevStudioでは構文チェックを実行します。",
+                            parent=self)
+        return self.check_syntax()
 
     def commands_root(self):
         root = self.root_dir.get()
@@ -2237,19 +3903,25 @@ class DevStudio(tk.Tk):
             return
         base = self.commands_root()
         os.makedirs(base, exist_ok=True)
-        self.local_tree.delete(*self.local_tree.get_children())
-        root_id = self.local_tree.insert("", "end", text=os.path.basename(base), open=True, values=("",))
-        nodes = {base: root_id}
-        for directory, dirs, filenames in os.walk(base):
-            dirs[:] = sorted(item for item in dirs if item != "__pycache__")
-            parent = nodes[directory]
-            for directory_name in dirs:
-                path = os.path.join(directory, directory_name)
-                nodes[path] = self.local_tree.insert(parent, "end", text=directory_name, open=True, values=("",))
-            for filename in sorted(filenames):
-                if filename.lower().endswith(".py"):
+        def worker():
+            entries = []
+            for directory, dirs, filenames in os.walk(base):
+                dirs[:] = sorted(item for item in dirs if item != "__pycache__")
+                entries.append((directory, list(dirs), [name for name in sorted(filenames) if name.lower().endswith(".py")]))
+            return entries
+        def completed(entries):
+            self.local_tree.delete(*self.local_tree.get_children())
+            root_id = self.local_tree.insert("", "end", text=os.path.basename(base), open=True, values=("",))
+            nodes = {base: root_id}
+            for directory, dirs, filenames in entries:
+                parent = nodes.get(directory, root_id)
+                for directory_name in dirs:
+                    path = os.path.join(directory, directory_name)
+                    nodes[path] = self.local_tree.insert(parent, "end", text=directory_name, open=False, values=("",))
+                for filename in filenames:
                     path = os.path.join(directory, filename)
                     self.local_tree.insert(parent, "end", text=filename, values=(path,))
+        self.run_background("local_explorer", "コマンド一覧を更新中", worker, completed)
 
     def open_local_tree_file(self, event=None):
         selected = self.local_tree.selection()
@@ -2370,27 +4042,43 @@ class DevStudio(tk.Tk):
         if not os.path.isdir(root):
             messagebox.showwarning("Dev Studio", "Select an existing code folder.")
             return
-        self.files, self.fragments = [], []
-        self.tree.delete(*self.tree.get_children())
-        nodes = {"": ""}
-        for directory, dirs, filenames in os.walk(root):
-            dirs[:] = [item for item in dirs if item not in ("__pycache__", ".git", ".venv", "venv")]
-            for filename in sorted(filenames):
-                if not filename.lower().endswith(PYTHON_SUFFIXES):
-                    continue
-                path = os.path.join(directory, filename)
-                self.files.append(path)
-                relative = os.path.relpath(path, root)
-                parent = ""
-                cumulative = ""
-                for part in relative.split(os.sep)[:-1]:
-                    cumulative = os.path.join(cumulative, part)
-                    if cumulative not in nodes:
-                        nodes[cumulative] = self.tree.insert(parent, "end", text=part, open=True, values=("",))
-                    parent = nodes[cumulative]
-                self.tree.insert(parent, "end", text=filename, values=(path,))
-                self.fragments.extend(self.extract_fragments(path))
-        self.status.set("{} Python files, {} tagged code fragments indexed".format(len(self.files), len(self.fragments)))
+        self._fragment_catalog_cache = None
+        def worker():
+            files, fragments = [], []
+            for directory, dirs, filenames in os.walk(root):
+                dirs[:] = [item for item in dirs if item not in ("__pycache__", ".git", ".venv", "venv")]
+                for filename in sorted(filenames):
+                    if filename.lower().endswith(PYTHON_SUFFIXES):
+                        path = os.path.join(directory, filename)
+                        files.append(path); fragments.extend(self.extract_fragments(path))
+            return root, files, fragments
+
+        def completed(result):
+            indexed_root, files, fragments = result
+            if os.path.abspath(indexed_root) != os.path.abspath(self.root_dir.get()):
+                return
+            self.files, self.fragments = files, fragments
+            self.tree.delete(*self.tree.get_children())
+            self._populate_index_tree(indexed_root, files, 0, {"": ""})
+        self.run_background("refresh_index", "ソース索引を更新中", worker, completed)
+
+    def _populate_index_tree(self, root, files, offset, nodes):
+        """Populate large indexes in batches so Tk can process events between chunks."""
+        for path in files[offset:offset + 100]:
+            relative = os.path.relpath(path, root)
+            parent, cumulative = "", ""
+            for part in relative.split(os.sep)[:-1]:
+                cumulative = os.path.join(cumulative, part)
+                if cumulative not in nodes:
+                    nodes[cumulative] = self.tree.insert(parent, "end", text=part, open=False, values=("",))
+                parent = nodes[cumulative]
+            self.tree.insert(parent, "end", text=os.path.basename(path), values=(path,))
+        next_offset = offset + 100
+        if next_offset < len(files):
+            self.status.set("ソース一覧を表示中... {}/{}".format(min(next_offset, len(files)), len(files)))
+            self.after(1, self._populate_index_tree, root, files, next_offset, nodes)
+        else:
+            self.status.set("{} Python files, {} tagged code fragments indexed".format(len(files), len(self.fragments)))
 
     def _read_lines(self, path):
         try:
@@ -2459,12 +4147,14 @@ class DevStudio(tk.Tk):
         needle = self.search_text.get().strip().lower()
         if not needle:
             return
-        hits = []
-        for path in self.files:
-            for number, line in enumerate(self._read_lines(path), 1):
-                if needle in line.lower():
-                    hits.append((path, number, line))
-        self._show_results(hits)
+        files = list(self.files)
+        def worker():
+            hits = []
+            for path in files:
+                for number, line in enumerate(self._read_lines(path), 1):
+                    if needle in line.lower(): hits.append((path, number, line))
+            return hits
+        self.run_background("search_all", "全文検索中", worker, self._show_results)
 
     def filter_tags(self):
         wanted = set(self._split_tags(self.tag_text.get()))
@@ -2475,22 +4165,23 @@ class DevStudio(tk.Tk):
         # A practical first pass: show every function/class.  Tagged entries
         # are included with their tag information, while untagged definitions
         # can be inspected and then tagged by the developer.
-        hits = list(self.fragments)
-        for path in self.files:
-            lines = self._read_lines(path)
-            try:
-                parsed = ast.parse("".join(lines), filename=path)
-            except SyntaxError:
-                continue
+        files, initial = list(self.files), list(self.fragments)
+        def worker():
+            hits = list(initial)
             tagged = {(item.path, item.start, item.end) for item in hits}
-            for node in ast.walk(parsed):
-                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    key = (path, node.lineno, getattr(node, "end_lineno", node.lineno))
-                    if key not in tagged:
-                        hits.append(Fragment(path, node.lineno, key[2], (),
-                                             "class" if isinstance(node, ast.ClassDef) else "function",
-                                             node.name, "".join(lines[node.lineno - 1:key[2]])))
-        self._show_results(sorted(hits, key=lambda item: (item.name.lower(), item.path, item.start)))
+            for path in files:
+                lines = self._read_lines(path)
+                try: parsed = ast.parse("".join(lines), filename=path)
+                except SyntaxError: continue
+                for node in ast.walk(parsed):
+                    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                        key = (path, node.lineno, getattr(node, "end_lineno", node.lineno))
+                        if key not in tagged:
+                            hits.append(Fragment(path, node.lineno, key[2], (),
+                                                 "class" if isinstance(node, ast.ClassDef) else "function",
+                                                 node.name, "".join(lines[node.lineno - 1:key[2]])))
+            return sorted(hits, key=lambda item: (item.name.lower(), item.path, item.start))
+        self.run_background("find_reusable", "再利用可能コードを解析中", worker, self._show_results)
 
     def open_tree_file(self, event=None):
         selected = self.tree.selection()

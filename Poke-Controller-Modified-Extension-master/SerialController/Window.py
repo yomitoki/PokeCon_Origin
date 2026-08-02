@@ -505,6 +505,11 @@ class PokeControllerApp:
         self.command_filter_py_cb.configure(state="readonly", textvariable=self.command_filter_py_name)
         self.command_filter_py_cb.grid(column="1", padx="5", pady="4", row="0", sticky="ew")
         self.command_filter_py_cb.bind("<<ComboboxSelected>>", self.applyFilterPy, add="")
+        self.show_python_samples = tk.BooleanVar(value=False)
+        self.show_python_samples_checkbox = ttk.Checkbutton(
+            self.py_f, text="Samples配下を表示", variable=self.show_python_samples,
+            command=self.togglePythonSamples)
+        self.show_python_samples_checkbox.grid(column="2", padx="5", pady="4", row="0", sticky="w")
         self.py_label = ttk.Label(self.py_f)
         self.py_label.configure(text="Command: ")
         self.py_label.grid(column="0", padx="5", pady="4", row="1", sticky="ew")
@@ -2451,12 +2456,14 @@ class PokeControllerApp:
 
     def setCommandItems(self):
         # PythonCommands
-        self.py_cb_all = [c.NAME for c in self.py_classes]
+        visible_py_classes = self._visible_python_classes()
+        self.py_cb_all = [c.NAME for c in visible_py_classes]
         if self.command_filter_py_cb.get() == "-":
             self.py_cb["values"] = self.py_cb_all
         else:
-            self.py_cb["values"] = [c.NAME for c in self.py_classes if self.command_filter_py_cb.get() in c.TAGS]
-        if self.py_cb_all: self.py_cb.current(0)
+            self.py_cb["values"] = [c.NAME for c in visible_py_classes if self.command_filter_py_cb.get() in c.TAGS]
+        if self.py_cb["values"]: self.py_cb.current(0)
+        else: self.py_cb.set("")
 
         # PythonSampleCommands
         self.sample_py_cb_all = [c.NAME for c in self.sample_py_classes]
@@ -2540,7 +2547,15 @@ class PokeControllerApp:
             self.py_cur_command = cmd_class()
 
         sample_i = [i for i, name in enumerate([c.NAME for c in self.sample_py_classes]) if name == self.sample_py_cb.get()]
-        self.sample_py_cur_command = self.sample_py_classes[sample_i[0]]() if sample_i else None
+        self.sample_py_cur_command = None
+        if sample_i:
+            sample_class = self.sample_py_classes[sample_i[0]]
+            try:
+                self.sample_py_cur_command = sample_class(self.camera, self.preview)
+            except TypeError:
+                self.sample_py_cur_command = sample_class()
+                self.sample_py_cur_command.camera = self.camera
+                self.sample_py_cur_command.gui = self.preview
 
         selected_tab = self.command_nb.tab(self.command_nb.select(), "text")
         if selected_tab == "Python Command":
@@ -2582,7 +2597,12 @@ class PokeControllerApp:
         elif commandtype in ["Sample", "SAMPLE", "sample"]:
             for command_class in self.sample_py_classes:
                 if command_class.NAME == commandname:
-                    self.sample_py_cur_command = command_class()
+                    try:
+                        self.sample_py_cur_command = command_class(self.camera, self.preview)
+                    except TypeError:
+                        self.sample_py_cur_command = command_class()
+                        self.sample_py_cur_command.camera = self.camera
+                        self.sample_py_cur_command.gui = self.preview
                     self.cur_command = self.sample_py_cur_command
                     return True
             print("shortcut Python sample command name error.")
@@ -2686,11 +2706,31 @@ class PokeControllerApp:
         self._logger.info("Reloaded commands.")
 
     def applyFilterPy(self, event=None):
+        visible_py_classes = self._visible_python_classes()
+        self.py_cb_all = [c.NAME for c in visible_py_classes]
         if self.command_filter_py_cb.get() == "-":
             self.py_cb["values"] = self.py_cb_all
         else:
-            self.py_cb["values"] = [c.NAME for c in self.py_classes if self.command_filter_py_cb.get() in c.TAGS]
+            self.py_cb["values"] = [c.NAME for c in visible_py_classes if self.command_filter_py_cb.get() in c.TAGS]
+        if self.py_cb["values"]:
             self.py_cb.current(0)
+        else:
+            self.py_cb.set("")
+        self._update_command_start_state()
+
+    def _visible_python_classes(self):
+        """Hide legacy commands below a Samples directory unless requested."""
+        if self.show_python_samples.get():
+            return list(self.py_classes)
+        return [command_class for command_class in self.py_classes
+                if "@Samples" not in getattr(command_class, "TAGS", [])]
+
+    def togglePythonSamples(self):
+        selected = self.py_cb.get()
+        self.applyFilterPy()
+        if selected in self.py_cb["values"]:
+            self.py_cb.set(selected)
+        self.assignCommand()
         self._update_command_start_state()
 
     def applyFilterMcu(self, event=None):

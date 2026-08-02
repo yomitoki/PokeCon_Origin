@@ -1,0 +1,19 @@
+def ZA_send_raw_switch_input(self, row, wait=0.04):
+    """Send one raw Switch packet and keep command cancellation responsive."""
+    self.keys.ser.ser.write((str(row) + '\r\n').encode('utf-8'))
+    self.wait(wait)
+    self.checkIfAlive()
+
+
+def ZA_move_left_stick_cardinal(self, direction, hold=0.04):
+    packets = {
+        'up': ('0x0000 0', '0x0000 8'),
+        'down': ('0x0000 4', '0x0000 8'),
+        'left': ('0x0000 6', '0x0000 8'),
+        'right': ('0x0000 2', '0x0000 8'),
+    }
+    if direction not in packets:
+        raise ValueError('Unknown ZA direction: ' + str(direction))
+    pressed, released = packets[direction]
+    self.ZA_send_raw_switch_input(pressed, hold)
+    self.ZA_send_raw_switch_input(released, 0.04)

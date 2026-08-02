@@ -1,0 +1,15 @@
+def ZA_press_until_image(self, button, target, repeat=20, interval=0.1):
+    """Press a button until a namespaced ZA image is detected."""
+    for _ in range(max(0, int(repeat))):
+        self.checkIfAlive()
+        if self.image_check(target):
+            return True
+        self.press(button, duration=0.05, wait=0.0)
+        self.wait(interval)
+    return bool(self.image_check(target))
+
+
+def ZA_reset_sub_state(self, attribute, start_state):
+    """Reset a reusable ZA sub-state machine explicitly."""
+    setattr(self, str(attribute), str(start_state))
+    return str(start_state)

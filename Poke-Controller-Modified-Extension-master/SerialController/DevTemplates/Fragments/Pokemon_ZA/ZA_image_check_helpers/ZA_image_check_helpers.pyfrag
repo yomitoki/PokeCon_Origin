@@ -1,0 +1,19 @@
+def ZA_wait_for_image(self, target, timeout=10.0, interval=0.1):
+    """Wait for a registered POKEMON_ZA_* target without blocking stop checks."""
+    started = time.time()
+    while self.alive and time.time() - started < float(timeout):
+        self.checkIfAlive()
+        if self.image_check(target):
+            return True
+        self.wait(interval)
+    return False
+
+
+def ZA_wait_until_image_gone(self, target, timeout=10.0, interval=0.1):
+    started = time.time()
+    while self.alive and time.time() - started < float(timeout):
+        self.checkIfAlive()
+        if not self.image_check(target):
+            return True
+        self.wait(interval)
+    return False

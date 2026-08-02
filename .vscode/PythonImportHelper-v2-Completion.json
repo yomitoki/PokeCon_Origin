@@ -40,7 +40,39 @@
         "documentation": {}
     },
     {
-        "label": "annotations",
+        "label": "print_function",
+        "importPath": "__future__",
+        "description": "__future__",
+        "isExtraImport": true,
+        "detail": "__future__",
+        "documentation": {}
+    },
+    {
+        "label": "print_function",
+        "importPath": "__future__",
+        "description": "__future__",
+        "isExtraImport": true,
+        "detail": "__future__",
+        "documentation": {}
+    },
+    {
+        "label": "print_function",
+        "importPath": "__future__",
+        "description": "__future__",
+        "isExtraImport": true,
+        "detail": "__future__",
+        "documentation": {}
+    },
+    {
+        "label": "print_function",
+        "importPath": "__future__",
+        "description": "__future__",
+        "isExtraImport": true,
+        "detail": "__future__",
+        "documentation": {}
+    },
+    {
+        "label": "print_function",
         "importPath": "__future__",
         "description": "__future__",
         "isExtraImport": true,
@@ -245,6 +277,40 @@
         "description": "__future__",
         "isExtraImport": true,
         "detail": "__future__",
+        "documentation": {}
+    },
+    {
+        "label": "annotations",
+        "importPath": "__future__",
+        "description": "__future__",
+        "isExtraImport": true,
+        "detail": "__future__",
+        "documentation": {}
+    },
+    {
+        "label": "annotations",
+        "importPath": "__future__",
+        "description": "__future__",
+        "isExtraImport": true,
+        "detail": "__future__",
+        "documentation": {}
+    },
+    {
+        "label": "ast",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "ast",
+        "description": "ast",
+        "detail": "ast",
+        "documentation": {}
+    },
+    {
+        "label": "io",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "io",
+        "description": "io",
+        "detail": "io",
         "documentation": {}
     },
     {
@@ -262,6 +328,97 @@
         "description": "os",
         "isExtraImport": true,
         "detail": "os",
+        "documentation": {}
+    },
+    {
+        "label": "sys",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "sys",
+        "description": "sys",
+        "detail": "sys",
+        "documentation": {}
+    },
+    {
+        "label": "tokenize",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "tokenize",
+        "description": "tokenize",
+        "detail": "tokenize",
+        "documentation": {}
+    },
+    {
+        "label": "generate_image_check",
+        "importPath": "ImageDetectionLibrary",
+        "description": "ImageDetectionLibrary",
+        "isExtraImport": true,
+        "detail": "ImageDetectionLibrary",
+        "documentation": {}
+    },
+    {
+        "label": "load_library",
+        "importPath": "ImageDetectionLibrary",
+        "description": "ImageDetectionLibrary",
+        "isExtraImport": true,
+        "detail": "ImageDetectionLibrary",
+        "documentation": {}
+    },
+    {
+        "label": "save_library",
+        "importPath": "ImageDetectionLibrary",
+        "description": "ImageDetectionLibrary",
+        "isExtraImport": true,
+        "detail": "ImageDetectionLibrary",
+        "documentation": {}
+    },
+    {
+        "label": "folder_tags",
+        "importPath": "ImageDetectionLibrary",
+        "description": "ImageDetectionLibrary",
+        "isExtraImport": true,
+        "detail": "ImageDetectionLibrary",
+        "documentation": {}
+    },
+    {
+        "label": "generate_image_check",
+        "importPath": "ImageDetectionLibrary",
+        "description": "ImageDetectionLibrary",
+        "isExtraImport": true,
+        "detail": "ImageDetectionLibrary",
+        "documentation": {}
+    },
+    {
+        "label": "load_library",
+        "importPath": "ImageDetectionLibrary",
+        "description": "ImageDetectionLibrary",
+        "isExtraImport": true,
+        "detail": "ImageDetectionLibrary",
+        "documentation": {}
+    },
+    {
+        "label": "resolve_list",
+        "importPath": "ImageDetectionLibrary",
+        "description": "ImageDetectionLibrary",
+        "isExtraImport": true,
+        "detail": "ImageDetectionLibrary",
+        "documentation": {}
+    },
+    {
+        "label": "save_library",
+        "importPath": "ImageDetectionLibrary",
+        "description": "ImageDetectionLibrary",
+        "isExtraImport": true,
+        "detail": "ImageDetectionLibrary",
+        "documentation": {}
+    },
+    {
+        "label": "json",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "json",
+        "description": "json",
+        "detail": "json",
         "documentation": {}
     },
     {
@@ -578,6 +735,14 @@
         "documentation": {}
     },
     {
+        "label": "ImageProcPythonCommand",
+        "importPath": "Commands.PythonCommandBase",
+        "description": "Commands.PythonCommandBase",
+        "isExtraImport": true,
+        "detail": "Commands.PythonCommandBase",
+        "documentation": {}
+    },
+    {
         "label": "PythonCommand",
         "importPath": "Commands.PythonCommandBase",
         "description": "Commands.PythonCommandBase",
@@ -979,6 +1144,38 @@
     },
     {
         "label": "Direction",
+        "importPath": "Commands.Keys",
+        "description": "Commands.Keys",
+        "isExtraImport": true,
+        "detail": "Commands.Keys",
+        "documentation": {}
+    },
+    {
+        "label": "Stick",
+        "importPath": "Commands.Keys",
+        "description": "Commands.Keys",
+        "isExtraImport": true,
+        "detail": "Commands.Keys",
+        "documentation": {}
+    },
+    {
+        "label": "Button",
+        "importPath": "Commands.Keys",
+        "description": "Commands.Keys",
+        "isExtraImport": true,
+        "detail": "Commands.Keys",
+        "documentation": {}
+    },
+    {
+        "label": "Direction",
+        "importPath": "Commands.Keys",
+        "description": "Commands.Keys",
+        "isExtraImport": true,
+        "detail": "Commands.Keys",
+        "documentation": {}
+    },
+    {
+        "label": "Hat",
         "importPath": "Commands.Keys",
         "description": "Commands.Keys",
         "isExtraImport": true,
@@ -1114,12 +1311,12 @@
         "documentation": {}
     },
     {
-        "label": "ast",
+        "label": "pprint",
         "kind": 6,
         "isExtraImport": true,
-        "importPath": "ast",
-        "description": "ast",
-        "detail": "ast",
+        "importPath": "pprint",
+        "description": "pprint",
+        "detail": "pprint",
         "documentation": {}
     },
     {
@@ -1132,15 +1329,6 @@
         "documentation": {}
     },
     {
-        "label": "json",
-        "kind": 6,
-        "isExtraImport": true,
-        "importPath": "json",
-        "description": "json",
-        "detail": "json",
-        "documentation": {}
-    },
-    {
         "label": "queue",
         "kind": 6,
         "isExtraImport": true,
@@ -1150,21 +1338,21 @@
         "documentation": {}
     },
     {
+        "label": "shutil",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "shutil",
+        "description": "shutil",
+        "detail": "shutil",
+        "documentation": {}
+    },
+    {
         "label": "subprocess",
         "kind": 6,
         "isExtraImport": true,
         "importPath": "subprocess",
         "description": "subprocess",
         "detail": "subprocess",
-        "documentation": {}
-    },
-    {
-        "label": "sys",
-        "kind": 6,
-        "isExtraImport": true,
-        "importPath": "sys",
-        "description": "sys",
-        "detail": "sys",
         "documentation": {}
     },
     {
@@ -1368,6 +1556,54 @@
         "description": "SampleProgramLoader",
         "isExtraImport": true,
         "detail": "SampleProgramLoader",
+        "documentation": {}
+    },
+    {
+        "label": "compare_folder",
+        "importPath": "SampleFunctionSync",
+        "description": "SampleFunctionSync",
+        "isExtraImport": true,
+        "detail": "SampleFunctionSync",
+        "documentation": {}
+    },
+    {
+        "label": "update_fragments",
+        "importPath": "SampleFunctionSync",
+        "description": "SampleFunctionSync",
+        "isExtraImport": true,
+        "detail": "SampleFunctionSync",
+        "documentation": {}
+    },
+    {
+        "label": "update_source",
+        "importPath": "SampleFunctionSync",
+        "description": "SampleFunctionSync",
+        "isExtraImport": true,
+        "detail": "SampleFunctionSync",
+        "documentation": {}
+    },
+    {
+        "label": "compare_settings",
+        "importPath": "ImageDetectionSync",
+        "description": "ImageDetectionSync",
+        "isExtraImport": true,
+        "detail": "ImageDetectionSync",
+        "documentation": {}
+    },
+    {
+        "label": "parse_source_settings",
+        "importPath": "ImageDetectionSync",
+        "description": "ImageDetectionSync",
+        "isExtraImport": true,
+        "detail": "ImageDetectionSync",
+        "documentation": {}
+    },
+    {
+        "label": "update_library_from_source",
+        "importPath": "ImageDetectionSync",
+        "description": "ImageDetectionSync",
+        "isExtraImport": true,
+        "detail": "ImageDetectionSync",
         "documentation": {}
     },
     {
@@ -2193,12 +2429,78 @@
         "documentation": {}
     },
     {
-        "label": "shutil",
+        "label": "SimilarityHistory",
+        "importPath": "LocalFunction.ImageDetection",
+        "description": "LocalFunction.ImageDetection",
+        "isExtraImport": true,
+        "detail": "LocalFunction.ImageDetection",
+        "documentation": {}
+    },
+    {
+        "label": "detect_image",
+        "importPath": "LocalFunction.ImageDetection",
+        "description": "LocalFunction.ImageDetection",
+        "isExtraImport": true,
+        "detail": "LocalFunction.ImageDetection",
+        "documentation": {}
+    },
+    {
+        "label": "enum",
         "kind": 6,
         "isExtraImport": true,
-        "importPath": "shutil",
-        "description": "shutil",
-        "detail": "shutil",
+        "importPath": "enum",
+        "description": "enum",
+        "detail": "enum",
+        "documentation": {}
+    },
+    {
+        "label": "Enum",
+        "importPath": "enum",
+        "description": "enum",
+        "isExtraImport": true,
+        "detail": "enum",
+        "documentation": {}
+    },
+    {
+        "label": "IntEnum",
+        "importPath": "enum",
+        "description": "enum",
+        "isExtraImport": true,
+        "detail": "enum",
+        "documentation": {}
+    },
+    {
+        "label": "IntFlag",
+        "importPath": "enum",
+        "description": "enum",
+        "isExtraImport": true,
+        "detail": "enum",
+        "documentation": {}
+    },
+    {
+        "label": "auto",
+        "importPath": "enum",
+        "description": "enum",
+        "isExtraImport": true,
+        "detail": "enum",
+        "documentation": {}
+    },
+    {
+        "label": "requests",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "requests",
+        "description": "requests",
+        "detail": "requests",
+        "documentation": {}
+    },
+    {
+        "label": "win32gui,win32con",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "win32gui.win32con",
+        "description": "win32gui.win32con",
+        "detail": "win32gui.win32con",
         "documentation": {}
     },
     {
@@ -2339,35 +2641,11 @@
         "documentation": {}
     },
     {
-        "label": "Enum",
-        "importPath": "enum",
-        "description": "enum",
+        "label": "deque",
+        "importPath": "collections",
+        "description": "collections",
         "isExtraImport": true,
-        "detail": "enum",
-        "documentation": {}
-    },
-    {
-        "label": "IntEnum",
-        "importPath": "enum",
-        "description": "enum",
-        "isExtraImport": true,
-        "detail": "enum",
-        "documentation": {}
-    },
-    {
-        "label": "IntFlag",
-        "importPath": "enum",
-        "description": "enum",
-        "isExtraImport": true,
-        "detail": "enum",
-        "documentation": {}
-    },
-    {
-        "label": "auto",
-        "importPath": "enum",
-        "description": "enum",
-        "isExtraImport": true,
-        "detail": "enum",
+        "detail": "collections",
         "documentation": {}
     },
     {
@@ -2643,24 +2921,6 @@
         "importPath": "configparser",
         "description": "configparser",
         "detail": "configparser",
-        "documentation": {}
-    },
-    {
-        "label": "requests",
-        "kind": 6,
-        "isExtraImport": true,
-        "importPath": "requests",
-        "description": "requests",
-        "detail": "requests",
-        "documentation": {}
-    },
-    {
-        "label": "io",
-        "kind": 6,
-        "isExtraImport": true,
-        "importPath": "io",
-        "description": "io",
-        "detail": "io",
         "documentation": {}
     },
     {
@@ -3085,6 +3345,294 @@
         "documentation": {}
     },
     {
+        "label": "image_check_node",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "def image_check_node(tree):\n    for node in ast.walk(tree):\n        if isinstance(node, ast.FunctionDef) and node.name == \"image_check\":\n            return node\n    raise RuntimeError(\"image_check was not found\")\ndef branch_names(test):\n    if isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq):\n        values = [test.left] + list(test.comparators)\n        return [value.s for value in values if isinstance(value, ast.Str)]\n    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "branch_names",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "def branch_names(test):\n    if isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq):\n        values = [test.left] + list(test.comparators)\n        return [value.s for value in values if isinstance(value, ast.Str)]\n    if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):\n        output = []\n        for value in test.values:\n            output.extend(branch_names(value))\n        return output\n    return []",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "direct_branches",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "def direct_branches(function):\n    for top_level in function.body:\n        first = top_level if isinstance(top_level, ast.If) and branch_names(top_level.test) else None\n        while first is not None:\n            yield first\n            first = first.orelse[0] if len(first.orelse) == 1 and isinstance(first.orelse[0], ast.If) else None\ndef literal_keyword(call, name, default):\n    value = next((keyword.value for keyword in call.keywords if keyword.arg == name), None)\n    if value is None:\n        return default",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "literal_keyword",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "def literal_keyword(call, name, default):\n    value = next((keyword.value for keyword in call.keywords if keyword.arg == name), None)\n    if value is None:\n        return default\n    try:\n        return ast.literal_eval(value)\n    except (ValueError, TypeError):\n        return default\ndef collect_profiles(source):\n    tree = ast.parse(source)",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "collect_profiles",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "def collect_profiles(source):\n    tree = ast.parse(source)\n    function = image_check_node(tree)\n    profiles = {}\n    for branch in direct_branches(function):\n        names = branch_names(branch.test)\n        calls = [node for statement in branch.body for node in ast.walk(statement) if isinstance(node, ast.Call) and\n                 ((isinstance(node.func, ast.Attribute) and node.func.attr.startswith(\"isContainTemplateUltra\")) or\n                  (isinstance(node.func, ast.Name) and node.func.id.startswith(\"isContainTemplateUltra\")))]\n        if not calls:",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "rename_exact_string_literals",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "def rename_exact_string_literals(source, mapping):\n    tokens = []\n    reader = io.StringIO(source).readline\n    for token in tokenize.generate_tokens(reader):\n        if token.type == tokenize.STRING:\n            try:\n                value = ast.literal_eval(token.string)\n            except (ValueError, SyntaxError):\n                value = None\n            if isinstance(value, str) and value in mapping:",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "register_profiles",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "def register_profiles(profiles):\n    library = load_library(PROFILE_PATH)\n    folder_members = {}\n    all_members = []\n    for old_name, variants in sorted(profiles.items()):\n        name = PREFIX + old_name\n        library[\"targets\"][name] = {\n            \"description\": \"Pokemon ZA image detection migrated from ZA_story: \" + old_name,\n            \"operator\": \"OR\",\n            \"tags\": [TAG],",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "replace_image_check",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "def replace_image_check(source, library):\n    tree = ast.parse(source)\n    function = image_check_node(tree)\n    generated = generate_image_check(library, \"POKEMON_ZA_ALL\", \"list\")\n    exception = '''def image_check_exception(self, targetimage):\n    \"\"\"Handle Pokemon ZA checks that do not use a template image.\"\"\"\n    if targetimage == \"POKEMON_ZA_TRUE_RETURN\":\n        return True\n    if targetimage == \"POKEMON_ZA_FALSE_RETURN\":\n        return False",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "add_import",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "def add_import(source):\n    statement = \"from LocalFunction.ImageDetection import SimilarityHistory, detect_image\\n\"\n    if statement.strip() in source:\n        return source\n    marker = \"from Commands.PythonCommandBase import ImageProcPythonCommand\\n\"\n    return source.replace(marker, marker + statement, 1)\ndef remove_class_methods(source, method_names):\n    \"\"\"Remove obsolete methods by AST start line and the following method boundary.\"\"\"\n    tree = ast.parse(source)\n    lines = source.splitlines(True)",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "remove_class_methods",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "def remove_class_methods(source, method_names):\n    \"\"\"Remove obsolete methods by AST start line and the following method boundary.\"\"\"\n    tree = ast.parse(source)\n    lines = source.splitlines(True)\n    targets = []\n    for class_node in [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]:\n        methods = [node for node in class_node.body if isinstance(node, ast.FunctionDef)]\n        for index, method in enumerate(methods):\n            if method.name not in method_names:\n                continue",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "cleanup_obsolete_code",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "def cleanup_obsolete_code(source):\n    source, removed = remove_class_methods(\n        source, {\"_legacy_Benchi\", \"isContainTemplateUltra\", \"isContainTemplateUltra_get_max_val\"})\n    dead_start = source.find(\"        # Kept unreachable only for compatibility with old source comparisons.\")\n    if dead_start >= 0:\n        dead_end = source.find(\"    ######################################################\\n    # Command\", dead_start)\n        if dead_end >= 0:\n            source = source[:dead_start] + source[dead_end:]\n            removed += 1\n    return source, removed",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "main",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "def main():\n    with open(SOURCE_PATH, \"r\", encoding=\"utf-8-sig\", newline=\"\") as stream:\n        source = stream.read().replace(\"\\r\\n\", \"\\n\")\n    if \"# POKECON_IMAGE_CHECK_BEGIN\" not in source:\n        function, profiles = collect_profiles(source)\n        if len(profiles) < 200:\n            raise RuntimeError(\"Expected at least 200 image profiles, found {}\".format(len(profiles)))\n        mapping = {name: PREFIX + name for name in profiles}\n        mapping.update(SPECIAL_NAMES)\n        source = rename_exact_string_literals(source, mapping)",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "DEV_STUDIO",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "DEV_STUDIO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))\nROOT = os.path.dirname(DEV_STUDIO)\nif DEV_STUDIO not in sys.path:\n    sys.path.insert(0, DEV_STUDIO)\nfrom ImageDetectionLibrary import generate_image_check, load_library, save_library\nSOURCE_PATH = os.path.join(ROOT, \"SerialController\", \"Commands\", \"PythonCommands\", \"ZA\", \"ZA_story\", \"ZA_story.py\")\nPROFILE_PATH = os.path.join(ROOT, \"SerialController\", \"Template\", \"image_detection_profiles.json\")\nTAG = \"Pokemon_ZA\"\nPREFIX = \"POKEMON_ZA_\"\nSPECIAL_NAMES = {",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "ROOT",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "ROOT = os.path.dirname(DEV_STUDIO)\nif DEV_STUDIO not in sys.path:\n    sys.path.insert(0, DEV_STUDIO)\nfrom ImageDetectionLibrary import generate_image_check, load_library, save_library\nSOURCE_PATH = os.path.join(ROOT, \"SerialController\", \"Commands\", \"PythonCommands\", \"ZA\", \"ZA_story\", \"ZA_story.py\")\nPROFILE_PATH = os.path.join(ROOT, \"SerialController\", \"Template\", \"image_detection_profiles.json\")\nTAG = \"Pokemon_ZA\"\nPREFIX = \"POKEMON_ZA_\"\nSPECIAL_NAMES = {\n    \"TRUE_RETURN\": \"POKEMON_ZA_TRUE_RETURN\",",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "SOURCE_PATH",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "SOURCE_PATH = os.path.join(ROOT, \"SerialController\", \"Commands\", \"PythonCommands\", \"ZA\", \"ZA_story\", \"ZA_story.py\")\nPROFILE_PATH = os.path.join(ROOT, \"SerialController\", \"Template\", \"image_detection_profiles.json\")\nTAG = \"Pokemon_ZA\"\nPREFIX = \"POKEMON_ZA_\"\nSPECIAL_NAMES = {\n    \"TRUE_RETURN\": \"POKEMON_ZA_TRUE_RETURN\",\n    \"FALSE_RETURN\": \"POKEMON_ZA_FALSE_RETURN\",\n    \"Filed_Hard_Check_0\": \"POKEMON_ZA_FILED_HARD_CHECK_0\",\n    \"Filed_Hard_Check_1\": \"POKEMON_ZA_FILED_HARD_CHECK_1\",\n    \"no_battle_filed_check_Hard_Check\": \"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK\",",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "PROFILE_PATH",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "PROFILE_PATH = os.path.join(ROOT, \"SerialController\", \"Template\", \"image_detection_profiles.json\")\nTAG = \"Pokemon_ZA\"\nPREFIX = \"POKEMON_ZA_\"\nSPECIAL_NAMES = {\n    \"TRUE_RETURN\": \"POKEMON_ZA_TRUE_RETURN\",\n    \"FALSE_RETURN\": \"POKEMON_ZA_FALSE_RETURN\",\n    \"Filed_Hard_Check_0\": \"POKEMON_ZA_FILED_HARD_CHECK_0\",\n    \"Filed_Hard_Check_1\": \"POKEMON_ZA_FILED_HARD_CHECK_1\",\n    \"no_battle_filed_check_Hard_Check\": \"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK\",\n    \"ZONE12\": \"POKEMON_ZA_ZONE12\",",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "TAG",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "TAG = \"Pokemon_ZA\"\nPREFIX = \"POKEMON_ZA_\"\nSPECIAL_NAMES = {\n    \"TRUE_RETURN\": \"POKEMON_ZA_TRUE_RETURN\",\n    \"FALSE_RETURN\": \"POKEMON_ZA_FALSE_RETURN\",\n    \"Filed_Hard_Check_0\": \"POKEMON_ZA_FILED_HARD_CHECK_0\",\n    \"Filed_Hard_Check_1\": \"POKEMON_ZA_FILED_HARD_CHECK_1\",\n    \"no_battle_filed_check_Hard_Check\": \"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK\",\n    \"ZONE12\": \"POKEMON_ZA_ZONE12\",\n}",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "PREFIX",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "PREFIX = \"POKEMON_ZA_\"\nSPECIAL_NAMES = {\n    \"TRUE_RETURN\": \"POKEMON_ZA_TRUE_RETURN\",\n    \"FALSE_RETURN\": \"POKEMON_ZA_FALSE_RETURN\",\n    \"Filed_Hard_Check_0\": \"POKEMON_ZA_FILED_HARD_CHECK_0\",\n    \"Filed_Hard_Check_1\": \"POKEMON_ZA_FILED_HARD_CHECK_1\",\n    \"no_battle_filed_check_Hard_Check\": \"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK\",\n    \"ZONE12\": \"POKEMON_ZA_ZONE12\",\n}\ndef image_check_node(tree):",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "SPECIAL_NAMES",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "peekOfCode": "SPECIAL_NAMES = {\n    \"TRUE_RETURN\": \"POKEMON_ZA_TRUE_RETURN\",\n    \"FALSE_RETURN\": \"POKEMON_ZA_FALSE_RETURN\",\n    \"Filed_Hard_Check_0\": \"POKEMON_ZA_FILED_HARD_CHECK_0\",\n    \"Filed_Hard_Check_1\": \"POKEMON_ZA_FILED_HARD_CHECK_1\",\n    \"no_battle_filed_check_Hard_Check\": \"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK\",\n    \"ZONE12\": \"POKEMON_ZA_ZONE12\",\n}\ndef image_check_node(tree):\n    for node in ast.walk(tree):",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.migrate_za_story",
+        "documentation": {}
+    },
+    {
+        "label": "method_end",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "peekOfCode": "def method_end(methods, index, total_lines):\n    return max(getattr(node, \"lineno\", methods[index].lineno) for node in ast.walk(methods[index]))\ndef namespaced(name):\n    return name if name.startswith(\"ZA_\") else \"ZA_\" + name\ndef replace_method_names(text, mapping):\n    for old_name in sorted(mapping, key=len, reverse=True):\n        new_name = mapping[old_name]\n        text = re.sub(r\"(?m)^(\\s*def\\s+)\" + re.escape(old_name) + r\"\\b\", r\"\\1\" + new_name, text)\n        text = re.sub(r\"\\bself\\.\" + re.escape(old_name) + r\"\\b\", \"self.\" + new_name, text)\n    return text",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "documentation": {}
+    },
+    {
+        "label": "namespaced",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "peekOfCode": "def namespaced(name):\n    return name if name.startswith(\"ZA_\") else \"ZA_\" + name\ndef replace_method_names(text, mapping):\n    for old_name in sorted(mapping, key=len, reverse=True):\n        new_name = mapping[old_name]\n        text = re.sub(r\"(?m)^(\\s*def\\s+)\" + re.escape(old_name) + r\"\\b\", r\"\\1\" + new_name, text)\n        text = re.sub(r\"\\bself\\.\" + re.escape(old_name) + r\"\\b\", \"self.\" + new_name, text)\n    return text\ndef state_initializers(initializer, group_methods, mapping):\n    blocks = []",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "documentation": {}
+    },
+    {
+        "label": "replace_method_names",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "peekOfCode": "def replace_method_names(text, mapping):\n    for old_name in sorted(mapping, key=len, reverse=True):\n        new_name = mapping[old_name]\n        text = re.sub(r\"(?m)^(\\s*def\\s+)\" + re.escape(old_name) + r\"\\b\", r\"\\1\" + new_name, text)\n        text = re.sub(r\"\\bself\\.\" + re.escape(old_name) + r\"\\b\", \"self.\" + new_name, text)\n    return text\ndef state_initializers(initializer, group_methods, mapping):\n    blocks = []\n    current_state_names = set()\n    for node in initializer.body:",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "documentation": {}
+    },
+    {
+        "label": "state_initializers",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "peekOfCode": "def state_initializers(initializer, group_methods, mapping):\n    blocks = []\n    current_state_names = set()\n    for node in initializer.body:\n        if not isinstance(node, ast.Assign) or not isinstance(node.value, ast.Dict):\n            continue\n        targets = [target.attr for target in node.targets if isinstance(target, ast.Attribute) and\n                   isinstance(target.value, ast.Name) and target.value.id == \"self\" and\n                   target.attr.startswith(\"STATE_\") and target.attr.endswith(\"_FUNCTION\")]\n        if not targets:",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "documentation": {}
+    },
+    {
+        "label": "rewrite_instance_attributes",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "peekOfCode": "def rewrite_instance_attributes(text, simple_attributes, state_attributes=None):\n    for attribute in sorted(simple_attributes, key=len, reverse=True):\n        text = re.sub(r\"\\bself\\.\" + re.escape(attribute) + r\"\\b\", \"self.ZA_\" + attribute, text)\n    for attribute in sorted(state_attributes or [], key=len, reverse=True):\n        text = re.sub(r\"\\bself\\.\" + re.escape(attribute) + r\"\\b\", \"self.ZA_\" + attribute, text)\n    return text\ndef main():\n    with open(SOURCE_PATH, \"r\", encoding=\"utf-8\") as stream:\n        source = stream.read()\n    lines = source.splitlines(True)",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "documentation": {}
+    },
+    {
+        "label": "main",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "peekOfCode": "def main():\n    with open(SOURCE_PATH, \"r\", encoding=\"utf-8\") as stream:\n        source = stream.read()\n    lines = source.splitlines(True)\n    tree = ast.parse(source)\n    command = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == \"ZA_story_Base\")\n    initializer = next(node for node in command.body if isinstance(node, ast.FunctionDef) and node.name == \"__init__\")\n    methods = [node for node in command.body if isinstance(node, ast.FunctionDef)]\n    by_name = {node.name: node for node in methods}\n    assigned = {}",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "documentation": {}
+    },
+    {
+        "label": "ROOT",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "peekOfCode": "ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))\nSOURCE_PATH = os.path.join(ROOT, \"SerialController\", \"Commands\", \"PythonCommands\", \"ZA\", \"ZA_story\", \"ZA_story.py\")\nFRAGMENT_ROOT = os.path.join(ROOT, \"SerialController\", \"DevTemplates\", \"Fragments\")\nZA_ROOT = os.path.join(FRAGMENT_ROOT, \"Pokemon_ZA\")\nLIST_PATH = os.path.join(FRAGMENT_ROOT, \"sample_lists.json\")\nTAG = \"Pokemon_ZA\"\nGROUP_PATTERNS = [\n    (\"ZA_MovementAndEvent\", [\n        r\"sendCommand\", r\"etc_sendCommand\", r\"zone_check\", r\"MOVE_.*\", r\"ROTOM_GLIDE\", r\"ZL_ACTION\", r\"renda_button\",\n        r\"mega_evolution_.*\", r\"story_Template_.*\", r\"no_battle_filed_check_HardGaurd\",",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "documentation": {}
+    },
+    {
+        "label": "SOURCE_PATH",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "peekOfCode": "SOURCE_PATH = os.path.join(ROOT, \"SerialController\", \"Commands\", \"PythonCommands\", \"ZA\", \"ZA_story\", \"ZA_story.py\")\nFRAGMENT_ROOT = os.path.join(ROOT, \"SerialController\", \"DevTemplates\", \"Fragments\")\nZA_ROOT = os.path.join(FRAGMENT_ROOT, \"Pokemon_ZA\")\nLIST_PATH = os.path.join(FRAGMENT_ROOT, \"sample_lists.json\")\nTAG = \"Pokemon_ZA\"\nGROUP_PATTERNS = [\n    (\"ZA_MovementAndEvent\", [\n        r\"sendCommand\", r\"etc_sendCommand\", r\"zone_check\", r\"MOVE_.*\", r\"ROTOM_GLIDE\", r\"ZL_ACTION\", r\"renda_button\",\n        r\"mega_evolution_.*\", r\"story_Template_.*\", r\"no_battle_filed_check_HardGaurd\",\n        r\"get_pokemon\", r\"ball_change\", r\"EventSkip_plus\", r\"markerdir\",",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "documentation": {}
+    },
+    {
+        "label": "FRAGMENT_ROOT",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "peekOfCode": "FRAGMENT_ROOT = os.path.join(ROOT, \"SerialController\", \"DevTemplates\", \"Fragments\")\nZA_ROOT = os.path.join(FRAGMENT_ROOT, \"Pokemon_ZA\")\nLIST_PATH = os.path.join(FRAGMENT_ROOT, \"sample_lists.json\")\nTAG = \"Pokemon_ZA\"\nGROUP_PATTERNS = [\n    (\"ZA_MovementAndEvent\", [\n        r\"sendCommand\", r\"etc_sendCommand\", r\"zone_check\", r\"MOVE_.*\", r\"ROTOM_GLIDE\", r\"ZL_ACTION\", r\"renda_button\",\n        r\"mega_evolution_.*\", r\"story_Template_.*\", r\"no_battle_filed_check_HardGaurd\",\n        r\"get_pokemon\", r\"ball_change\", r\"EventSkip_plus\", r\"markerdir\",\n    ]),",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "documentation": {}
+    },
+    {
+        "label": "ZA_ROOT",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "peekOfCode": "ZA_ROOT = os.path.join(FRAGMENT_ROOT, \"Pokemon_ZA\")\nLIST_PATH = os.path.join(FRAGMENT_ROOT, \"sample_lists.json\")\nTAG = \"Pokemon_ZA\"\nGROUP_PATTERNS = [\n    (\"ZA_MovementAndEvent\", [\n        r\"sendCommand\", r\"etc_sendCommand\", r\"zone_check\", r\"MOVE_.*\", r\"ROTOM_GLIDE\", r\"ZL_ACTION\", r\"renda_button\",\n        r\"mega_evolution_.*\", r\"story_Template_.*\", r\"no_battle_filed_check_HardGaurd\",\n        r\"get_pokemon\", r\"ball_change\", r\"EventSkip_plus\", r\"markerdir\",\n    ]),\n    (\"ZA_CommonPokemonManagement\", [r\"common_.*\"]),",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "documentation": {}
+    },
+    {
+        "label": "LIST_PATH",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "peekOfCode": "LIST_PATH = os.path.join(FRAGMENT_ROOT, \"sample_lists.json\")\nTAG = \"Pokemon_ZA\"\nGROUP_PATTERNS = [\n    (\"ZA_MovementAndEvent\", [\n        r\"sendCommand\", r\"etc_sendCommand\", r\"zone_check\", r\"MOVE_.*\", r\"ROTOM_GLIDE\", r\"ZL_ACTION\", r\"renda_button\",\n        r\"mega_evolution_.*\", r\"story_Template_.*\", r\"no_battle_filed_check_HardGaurd\",\n        r\"get_pokemon\", r\"ball_change\", r\"EventSkip_plus\", r\"markerdir\",\n    ]),\n    (\"ZA_CommonPokemonManagement\", [r\"common_.*\"]),\n    (\"ZA_CommonNavigation\", [r\"Common_.*\"]),",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "documentation": {}
+    },
+    {
+        "label": "TAG",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "peekOfCode": "TAG = \"Pokemon_ZA\"\nGROUP_PATTERNS = [\n    (\"ZA_MovementAndEvent\", [\n        r\"sendCommand\", r\"etc_sendCommand\", r\"zone_check\", r\"MOVE_.*\", r\"ROTOM_GLIDE\", r\"ZL_ACTION\", r\"renda_button\",\n        r\"mega_evolution_.*\", r\"story_Template_.*\", r\"no_battle_filed_check_HardGaurd\",\n        r\"get_pokemon\", r\"ball_change\", r\"EventSkip_plus\", r\"markerdir\",\n    ]),\n    (\"ZA_CommonPokemonManagement\", [r\"common_.*\"]),\n    (\"ZA_CommonNavigation\", [r\"Common_.*\"]),\n    (\"ZA_BattleAndRoyale\", [r\"load_json_with_comments\", r\"save_sleeps\", r\"load_zones\", r\"load_sleeps\",",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "documentation": {}
+    },
+    {
+        "label": "GROUP_PATTERNS",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "peekOfCode": "GROUP_PATTERNS = [\n    (\"ZA_MovementAndEvent\", [\n        r\"sendCommand\", r\"etc_sendCommand\", r\"zone_check\", r\"MOVE_.*\", r\"ROTOM_GLIDE\", r\"ZL_ACTION\", r\"renda_button\",\n        r\"mega_evolution_.*\", r\"story_Template_.*\", r\"no_battle_filed_check_HardGaurd\",\n        r\"get_pokemon\", r\"ball_change\", r\"EventSkip_plus\", r\"markerdir\",\n    ]),\n    (\"ZA_CommonPokemonManagement\", [r\"common_.*\"]),\n    (\"ZA_CommonNavigation\", [r\"Common_.*\"]),\n    (\"ZA_BattleAndRoyale\", [r\"load_json_with_comments\", r\"save_sleeps\", r\"load_zones\", r\"load_sleeps\",\n                              r\"battle_.*\", r\"bench_.*\", r\"quasar_.*\", r\"za_infi_.*\", r\"Benchi\",",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.scripts.register_za_samples",
+        "documentation": {}
+    },
+    {
         "label": "{class_name}",
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.CommandBuilder",
@@ -3157,6 +3705,105 @@
         "documentation": {}
     },
     {
+        "label": "empty_library",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "peekOfCode": "def empty_library():\n    return {\"schema_version\": SCHEMA_VERSION, \"targets\": {}, \"lists\": {}}\ndef load_library(path):\n    try:\n        with open(path, \"r\", encoding=\"utf-8\") as stream:\n            value = json.load(stream)\n    except (OSError, ValueError):\n        return empty_library()\n    result = empty_library()\n    if not isinstance(value, dict):",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "documentation": {}
+    },
+    {
+        "label": "load_library",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "peekOfCode": "def load_library(path):\n    try:\n        with open(path, \"r\", encoding=\"utf-8\") as stream:\n            value = json.load(stream)\n    except (OSError, ValueError):\n        return empty_library()\n    result = empty_library()\n    if not isinstance(value, dict):\n        return result\n    for name, item in value.get(\"targets\", {}).items():",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "documentation": {}
+    },
+    {
+        "label": "save_library",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "peekOfCode": "def save_library(path, data):\n    os.makedirs(os.path.dirname(path), exist_ok=True)\n    temporary = path + \".tmp\"\n    with open(temporary, \"w\", encoding=\"utf-8\", newline=\"\\n\") as stream:\n        json.dump(data, stream, ensure_ascii=False, indent=2)\n        stream.write(\"\\n\")\n    os.replace(temporary, path)\ndef folder_tags(template_root, image_path):\n    try:\n        relative = os.path.relpath(os.path.dirname(os.path.abspath(image_path)), os.path.abspath(template_root))",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "documentation": {}
+    },
+    {
+        "label": "folder_tags",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "peekOfCode": "def folder_tags(template_root, image_path):\n    try:\n        relative = os.path.relpath(os.path.dirname(os.path.abspath(image_path)), os.path.abspath(template_root))\n        if relative.startswith(\"..\"):\n            return []\n        return [part for part in relative.replace(\"\\\\\", \"/\").split(\"/\") if part and part != \".\"]\n    except ValueError:\n        return []\ndef resolve_list(data, list_name):\n    output = []",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "documentation": {}
+    },
+    {
+        "label": "resolve_list",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "peekOfCode": "def resolve_list(data, list_name):\n    output = []\n    def visit(name, stack):\n        if name in stack:\n            raise ValueError(\"画像検知リストが循環しています: \" + \" -> \".join(stack + [name]))\n        if name not in data[\"lists\"]:\n            raise ValueError(\"画像検知リストがありません: \" + name)\n        for member in data[\"lists\"][name][\"members\"]:\n            if member[\"type\"] == \"list\":\n                visit(member[\"id\"], stack + [name])",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "documentation": {}
+    },
+    {
+        "label": "selected_targets",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "peekOfCode": "def selected_targets(data, name, selection_type=\"list\"):\n    names = resolve_list(data, name) if selection_type == \"list\" else [name]\n    return {target_name: data[\"targets\"][target_name][\"variants\"] for target_name in names if target_name in data[\"targets\"]}\ndef generate_image_check(data, name, selection_type=\"list\"):\n    targets = selected_targets(data, name, selection_type)\n    operators = {target_name: data[\"targets\"].get(target_name, {}).get(\"operator\", \"OR\") for target_name in targets}\n    descriptions = {\n        \"targets\": {target_name: str(data[\"targets\"].get(target_name, {}).get(\"description\", \"\")) for target_name in targets},\n    }\n    lines = [",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "documentation": {}
+    },
+    {
+        "label": "generate_image_check",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "peekOfCode": "def generate_image_check(data, name, selection_type=\"list\"):\n    targets = selected_targets(data, name, selection_type)\n    operators = {target_name: data[\"targets\"].get(target_name, {}).get(\"operator\", \"OR\") for target_name in targets}\n    descriptions = {\n        \"targets\": {target_name: str(data[\"targets\"].get(target_name, {}).get(\"description\", \"\")) for target_name in targets},\n    }\n    lines = [\n        \"# POKECON_IMAGE_CHECK_BEGIN\",\n        \"# Generated image detection selection: {}:{}\".format(selection_type, name),\n        \"IMAGE_DETECTION_TARGETS = \" + pprint.pformat(targets, width=120),",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "documentation": {}
+    },
+    {
+        "label": "SCHEMA_VERSION",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "peekOfCode": "SCHEMA_VERSION = 1\ndef empty_library():\n    return {\"schema_version\": SCHEMA_VERSION, \"targets\": {}, \"lists\": {}}\ndef load_library(path):\n    try:\n        with open(path, \"r\", encoding=\"utf-8\") as stream:\n            value = json.load(stream)\n    except (OSError, ValueError):\n        return empty_library()\n    result = empty_library()",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionLibrary",
+        "documentation": {}
+    },
+    {
+        "label": "parse_source_settings",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionSync",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionSync",
+        "peekOfCode": "def parse_source_settings(source):\n    tree = ast.parse(source)\n    assignments = {}\n    for node in ast.walk(tree):\n        if not isinstance(node, ast.Assign):\n            continue\n        for target in node.targets:\n            name = getattr(target, \"id\", \"\")\n            if name.startswith(\"IMAGE_DETECTION_\"):\n                assignments[name] = node.value",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionSync",
+        "documentation": {}
+    },
+    {
+        "label": "compare_settings",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionSync",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionSync",
+        "peekOfCode": "def compare_settings(source_settings, library):\n    result = []\n    source_names, library_names = set(source_settings), set(library.get(\"targets\", {}))\n    for name in sorted(source_names | library_names, key=str.lower):\n        source_item, library_item = source_settings.get(name), library.get(\"targets\", {}).get(name)\n        if source_item is None:\n            status = \"library_only\"\n        elif library_item is None:\n            status = \"source_only\"\n        else:",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionSync",
+        "documentation": {}
+    },
+    {
+        "label": "update_library_from_source",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionSync",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionSync",
+        "peekOfCode": "def update_library_from_source(library, source_settings, names):\n    updated = set(names)\n    for name in updated:\n        if name not in source_settings:\n            continue\n        old = library[\"targets\"].get(name, {})\n        source_item = source_settings[name]\n        library[\"targets\"][name] = {\n            \"description\": source_item[\"description\"],\n            \"operator\": source_item[\"operator\"],",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.ImageDetectionSync",
+        "documentation": {}
+    },
+    {
         "label": "Fragment",
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
@@ -3188,7 +3835,7 @@
         "kind": 5,
         "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
         "description": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
-        "peekOfCode": "PYTHON_SUFFIXES = (\".py\", \".pyfrag\")\nTAG_RE = re.compile(r\"@pokedev\\s*:\\s*(.+)\", re.IGNORECASE)\nBEGIN_RE = re.compile(r\"@pokedev-begin\\s*:\\s*(.+)\", re.IGNORECASE)\nEND_RE = re.compile(r\"@pokedev-end\", re.IGNORECASE)\nclass Fragment(object):\n    def __init__(self, path, start, end, tags, kind, name, source):\n        self.path, self.start, self.end = path, start, end\n        self.tags, self.kind, self.name, self.source = tags, kind, name, source\n    @property\n    def label(self):",
+        "peekOfCode": "PYTHON_SUFFIXES = (\".py\", \".pyfrag\")\nTAG_RE = re.compile(r\"@pokedev\\s*:\\s*(.+)\", re.IGNORECASE)\nBEGIN_RE = re.compile(r\"@pokedev-begin\\s*:\\s*(.+)\", re.IGNORECASE)\nEND_RE = re.compile(r\"@pokedev-end\", re.IGNORECASE)\nTODO_HELP_MARKER = \"# TODO紐づけの記載例\"\nTODO_SIMPLE_FUNCTION_HELP = \"# 関数名だけで紐づけ: - [ ] [_1_story_out_hotel_z_18] 修正内容\\n\"\nTODO_PLAIN_FUNCTION_HELP = \"# 本文中の関数名でも移動: 1_STORY_OUT_HOTEL_Z_72 ログ出力を追加\\n\"\nTODO_HELP_TEXT = (\n    TODO_HELP_MARKER + \"（項目をダブルクリックすると移動）\\n\"\n    \"# 行番号に紐づけ: - [ ] [L123] 修正内容\\n\"",
         "detail": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
         "documentation": {}
     },
@@ -3197,7 +3844,7 @@
         "kind": 5,
         "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
         "description": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
-        "peekOfCode": "TAG_RE = re.compile(r\"@pokedev\\s*:\\s*(.+)\", re.IGNORECASE)\nBEGIN_RE = re.compile(r\"@pokedev-begin\\s*:\\s*(.+)\", re.IGNORECASE)\nEND_RE = re.compile(r\"@pokedev-end\", re.IGNORECASE)\nclass Fragment(object):\n    def __init__(self, path, start, end, tags, kind, name, source):\n        self.path, self.start, self.end = path, start, end\n        self.tags, self.kind, self.name, self.source = tags, kind, name, source\n    @property\n    def label(self):\n        return \"{}  {}:{}  [{}]\".format(",
+        "peekOfCode": "TAG_RE = re.compile(r\"@pokedev\\s*:\\s*(.+)\", re.IGNORECASE)\nBEGIN_RE = re.compile(r\"@pokedev-begin\\s*:\\s*(.+)\", re.IGNORECASE)\nEND_RE = re.compile(r\"@pokedev-end\", re.IGNORECASE)\nTODO_HELP_MARKER = \"# TODO紐づけの記載例\"\nTODO_SIMPLE_FUNCTION_HELP = \"# 関数名だけで紐づけ: - [ ] [_1_story_out_hotel_z_18] 修正内容\\n\"\nTODO_PLAIN_FUNCTION_HELP = \"# 本文中の関数名でも移動: 1_STORY_OUT_HOTEL_Z_72 ログ出力を追加\\n\"\nTODO_HELP_TEXT = (\n    TODO_HELP_MARKER + \"（項目をダブルクリックすると移動）\\n\"\n    \"# 行番号に紐づけ: - [ ] [L123] 修正内容\\n\"\n    \"# 関数に紐づけ: - [ ] [F:ClassName.function_name+0] [L123] 修正内容\\n\"",
         "detail": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
         "documentation": {}
     },
@@ -3206,7 +3853,7 @@
         "kind": 5,
         "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
         "description": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
-        "peekOfCode": "BEGIN_RE = re.compile(r\"@pokedev-begin\\s*:\\s*(.+)\", re.IGNORECASE)\nEND_RE = re.compile(r\"@pokedev-end\", re.IGNORECASE)\nclass Fragment(object):\n    def __init__(self, path, start, end, tags, kind, name, source):\n        self.path, self.start, self.end = path, start, end\n        self.tags, self.kind, self.name, self.source = tags, kind, name, source\n    @property\n    def label(self):\n        return \"{}  {}:{}  [{}]\".format(\n            self.kind, self.name, self.start, \", \".join(self.tags) or \"untagged\")",
+        "peekOfCode": "BEGIN_RE = re.compile(r\"@pokedev-begin\\s*:\\s*(.+)\", re.IGNORECASE)\nEND_RE = re.compile(r\"@pokedev-end\", re.IGNORECASE)\nTODO_HELP_MARKER = \"# TODO紐づけの記載例\"\nTODO_SIMPLE_FUNCTION_HELP = \"# 関数名だけで紐づけ: - [ ] [_1_story_out_hotel_z_18] 修正内容\\n\"\nTODO_PLAIN_FUNCTION_HELP = \"# 本文中の関数名でも移動: 1_STORY_OUT_HOTEL_Z_72 ログ出力を追加\\n\"\nTODO_HELP_TEXT = (\n    TODO_HELP_MARKER + \"（項目をダブルクリックすると移動）\\n\"\n    \"# 行番号に紐づけ: - [ ] [L123] 修正内容\\n\"\n    \"# 関数に紐づけ: - [ ] [F:ClassName.function_name+0] [L123] 修正内容\\n\"\n    + TODO_SIMPLE_FUNCTION_HELP",
         "detail": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
         "documentation": {}
     },
@@ -3215,8 +3862,80 @@
         "kind": 5,
         "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
         "description": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
-        "peekOfCode": "END_RE = re.compile(r\"@pokedev-end\", re.IGNORECASE)\nclass Fragment(object):\n    def __init__(self, path, start, end, tags, kind, name, source):\n        self.path, self.start, self.end = path, start, end\n        self.tags, self.kind, self.name, self.source = tags, kind, name, source\n    @property\n    def label(self):\n        return \"{}  {}:{}  [{}]\".format(\n            self.kind, self.name, self.start, \", \".join(self.tags) or \"untagged\")\nclass TagPicker(ttk.Frame):",
+        "peekOfCode": "END_RE = re.compile(r\"@pokedev-end\", re.IGNORECASE)\nTODO_HELP_MARKER = \"# TODO紐づけの記載例\"\nTODO_SIMPLE_FUNCTION_HELP = \"# 関数名だけで紐づけ: - [ ] [_1_story_out_hotel_z_18] 修正内容\\n\"\nTODO_PLAIN_FUNCTION_HELP = \"# 本文中の関数名でも移動: 1_STORY_OUT_HOTEL_Z_72 ログ出力を追加\\n\"\nTODO_HELP_TEXT = (\n    TODO_HELP_MARKER + \"（項目をダブルクリックすると移動）\\n\"\n    \"# 行番号に紐づけ: - [ ] [L123] 修正内容\\n\"\n    \"# 関数に紐づけ: - [ ] [F:ClassName.function_name+0] [L123] 修正内容\\n\"\n    + TODO_SIMPLE_FUNCTION_HELP\n    + TODO_PLAIN_FUNCTION_HELP",
         "detail": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
+        "documentation": {}
+    },
+    {
+        "label": "TODO_HELP_MARKER",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
+        "peekOfCode": "TODO_HELP_MARKER = \"# TODO紐づけの記載例\"\nTODO_SIMPLE_FUNCTION_HELP = \"# 関数名だけで紐づけ: - [ ] [_1_story_out_hotel_z_18] 修正内容\\n\"\nTODO_PLAIN_FUNCTION_HELP = \"# 本文中の関数名でも移動: 1_STORY_OUT_HOTEL_Z_72 ログ出力を追加\\n\"\nTODO_HELP_TEXT = (\n    TODO_HELP_MARKER + \"（項目をダブルクリックすると移動）\\n\"\n    \"# 行番号に紐づけ: - [ ] [L123] 修正内容\\n\"\n    \"# 関数に紐づけ: - [ ] [F:ClassName.function_name+0] [L123] 修正内容\\n\"\n    + TODO_SIMPLE_FUNCTION_HELP\n    + TODO_PLAIN_FUNCTION_HELP\n    + \"# ※［＋現在の関数へ紐づけ］を使うと自動で記載されます。\\n\\n\"",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
+        "documentation": {}
+    },
+    {
+        "label": "TODO_SIMPLE_FUNCTION_HELP",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
+        "peekOfCode": "TODO_SIMPLE_FUNCTION_HELP = \"# 関数名だけで紐づけ: - [ ] [_1_story_out_hotel_z_18] 修正内容\\n\"\nTODO_PLAIN_FUNCTION_HELP = \"# 本文中の関数名でも移動: 1_STORY_OUT_HOTEL_Z_72 ログ出力を追加\\n\"\nTODO_HELP_TEXT = (\n    TODO_HELP_MARKER + \"（項目をダブルクリックすると移動）\\n\"\n    \"# 行番号に紐づけ: - [ ] [L123] 修正内容\\n\"\n    \"# 関数に紐づけ: - [ ] [F:ClassName.function_name+0] [L123] 修正内容\\n\"\n    + TODO_SIMPLE_FUNCTION_HELP\n    + TODO_PLAIN_FUNCTION_HELP\n    + \"# ※［＋現在の関数へ紐づけ］を使うと自動で記載されます。\\n\\n\"\n)",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
+        "documentation": {}
+    },
+    {
+        "label": "TODO_PLAIN_FUNCTION_HELP",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
+        "peekOfCode": "TODO_PLAIN_FUNCTION_HELP = \"# 本文中の関数名でも移動: 1_STORY_OUT_HOTEL_Z_72 ログ出力を追加\\n\"\nTODO_HELP_TEXT = (\n    TODO_HELP_MARKER + \"（項目をダブルクリックすると移動）\\n\"\n    \"# 行番号に紐づけ: - [ ] [L123] 修正内容\\n\"\n    \"# 関数に紐づけ: - [ ] [F:ClassName.function_name+0] [L123] 修正内容\\n\"\n    + TODO_SIMPLE_FUNCTION_HELP\n    + TODO_PLAIN_FUNCTION_HELP\n    + \"# ※［＋現在の関数へ紐づけ］を使うと自動で記載されます。\\n\\n\"\n)\nclass Fragment(object):",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
+        "documentation": {}
+    },
+    {
+        "label": "TODO_HELP_TEXT",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
+        "peekOfCode": "TODO_HELP_TEXT = (\n    TODO_HELP_MARKER + \"（項目をダブルクリックすると移動）\\n\"\n    \"# 行番号に紐づけ: - [ ] [L123] 修正内容\\n\"\n    \"# 関数に紐づけ: - [ ] [F:ClassName.function_name+0] [L123] 修正内容\\n\"\n    + TODO_SIMPLE_FUNCTION_HELP\n    + TODO_PLAIN_FUNCTION_HELP\n    + \"# ※［＋現在の関数へ紐づけ］を使うと自動で記載されます。\\n\\n\"\n)\nclass Fragment(object):\n    def __init__(self, path, start, end, tags, kind, name, source):",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
+        "documentation": {}
+    },
+    {
+        "label": "scan_folder",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "peekOfCode": "def scan_folder(fragment_root, folder):\n    root, folder = os.path.abspath(fragment_root), os.path.abspath(folder)\n    if os.path.commonpath([root, folder]) != root:\n        raise ValueError(\"サンプル関数ライブラリ配下のフォルダーを選択してください。\")\n    found = {}\n    for directory, _, names in os.walk(folder):\n        for filename in sorted(names):\n            if not filename.endswith(\".pyfrag\"):\n                continue\n            path = os.path.join(directory, filename)",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "documentation": {}
+    },
+    {
+        "label": "compare_folder",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "peekOfCode": "def compare_folder(source, fragment_root, folder):\n    source_functions = _function_records(source, class_only=True)\n    fragment_functions = scan_folder(fragment_root, folder)\n    result = []\n    for name in sorted(fragment_functions, key=str.lower):\n        variants = fragment_functions[name]\n        if len(variants) > 1:\n            status = \"duplicate\"\n        elif name not in source_functions:\n            status = \"missing_source\"",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "documentation": {}
+    },
+    {
+        "label": "update_source",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "peekOfCode": "def update_source(source, comparisons, names):\n    selected = set(names)\n    records = _function_records(source, class_only=True)\n    tree = ast.parse(source)\n    command = next(node for node in tree.body if isinstance(node, ast.ClassDef))\n    lines = source.splitlines(True)\n    replacements, additions = [], []\n    for item in comparisons:\n        if item[\"name\"] not in selected or item[\"status\"] == \"duplicate\":\n            continue",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "documentation": {}
+    },
+    {
+        "label": "update_fragments",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "peekOfCode": "def update_fragments(source, comparisons, names):\n    selected = set(names)\n    source_functions = _function_records(source, class_only=True)\n    by_path = {}\n    for item in comparisons:\n        if item[\"name\"] not in selected or item[\"status\"] == \"duplicate\" or item[\"name\"] not in source_functions:\n            continue\n        by_path.setdefault(item[\"fragments\"][0][\"path\"], []).append(item[\"name\"])\n    changed = []\n    for path, function_names in by_path.items():",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
         "documentation": {}
     },
     {
@@ -3287,7 +4006,16 @@
         "kind": 2,
         "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.SampleLibrary",
         "description": "Poke-Controller-Modified-Extension-master.DevStudio.SampleLibrary",
-        "peekOfCode": "def compose_preview(fragment_root, data, list_name):\n    imports, variables, bodies, included = [], [], [], []\n    for member in resolve_members(data, list_name):\n        metadata, body, _, _ = load_fragment(fragment_root, member[\"id\"])\n        imports.extend(metadata.get(\"imports\", []))\n        variables.extend(metadata.get(\"class_variables\", []))\n        bodies.append(body.rstrip())\n        included.append(metadata.get(\"name\", member[\"id\"]))\n    return {\n        \"imports\": list(dict.fromkeys(imports)),",
+        "peekOfCode": "def compose_preview(fragment_root, data, list_name):\n    imports, variables, initializers, bodies, included = [], [], [], [], []\n    for member in resolve_members(data, list_name):\n        metadata, body, _, _ = load_fragment(fragment_root, member[\"id\"])\n        imports.extend(metadata.get(\"imports\", []))\n        variables.extend(metadata.get(\"class_variables\", []))\n        initializer = metadata.get(\"initializer\", \"\")\n        if str(initializer).strip():\n            initializers.append(str(initializer).rstrip())\n        bodies.append(body.rstrip())",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.SampleLibrary",
+        "documentation": {}
+    },
+    {
+        "label": "image_targets_from_bodies",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.SampleLibrary",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.SampleLibrary",
+        "peekOfCode": "def image_targets_from_bodies(bodies):\n    \"\"\"Return literal image_check target names used by sample functions.\"\"\"\n    targets = []\n    for body in bodies:\n        try:\n            tree = ast.parse(body)\n        except SyntaxError:\n            continue\n        for node in ast.walk(tree):\n            if not isinstance(node, ast.Call) or not node.args:",
         "detail": "Poke-Controller-Modified-Extension-master.DevStudio.SampleLibrary",
         "documentation": {}
     },
@@ -3814,6 +4542,24 @@
         "documentation": {}
     },
     {
+        "label": "ZA_story_Base",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.Commands.PythonCommands.ZA.ZA_story.ZA_story",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.Commands.PythonCommands.ZA.ZA_story.ZA_story",
+        "peekOfCode": "class ZA_story_Base(ImageProcPythonCommand):    \n    def __init__(self, cam):\n        super().__init__(cam)\n        self.isDebug = True\n        self.showNoMatchTemplate = True\n        self.showTemplateMatchVal = False\n        self.commandWaitTime = 0.02\n        self.frameWaitTime = 1.0/30.0\n        self.testcode=0\n        self.show_value_bool = False",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.Commands.PythonCommands.ZA.ZA_story.ZA_story",
+        "documentation": {}
+    },
+    {
+        "label": "ZA_story",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.Commands.PythonCommands.ZA.ZA_story.ZA_story",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.Commands.PythonCommands.ZA.ZA_story.ZA_story",
+        "peekOfCode": "class ZA_story(ZA_story_Base):\n    version_major = 0\n    version_minor = 0\n    version_patch = 0\n    ZA_infimode=0\n    if ZA_infimode==1:\n        ZA_infi_custom_name = \"_ZA_infi_custom_name\"\n    else:\n        ZA_infi_custom_name = \"\"\n    NAME = f'ZA_story_v{version_major}.{version_minor}.{version_patch}{ZA_infi_custom_name}'",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.Commands.PythonCommands.ZA.ZA_story.ZA_story",
+        "documentation": {}
+    },
+    {
         "label": "New_PokeCon_Command",
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.Commands.PythonCommands.new_command",
@@ -4187,7 +4933,7 @@
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.Commands.PythonSampleCommand",
         "description": "Poke-Controller-Modified-Extension-master.SerialController.Commands.PythonSampleCommand",
-        "peekOfCode": "class PythonSampleCommand(PythonCommand):\n    SAMPLE_LIST = \"\"\n    INCLUDED_SAMPLES = []",
+        "peekOfCode": "class PythonSampleCommand(PythonCommand):\n    SAMPLE_LIST = \"\"\n    INCLUDED_SAMPLES = []\n    def __init__(self, camera=None, gui=None):\n        super(PythonSampleCommand, self).__init__()\n        self.camera = camera\n        self.gui = gui",
         "detail": "Poke-Controller-Modified-Extension-master.SerialController.Commands.PythonSampleCommand",
         "documentation": {}
     },
@@ -4477,6 +5223,60 @@
         "description": "Poke-Controller-Modified-Extension-master.SerialController.DevTemplates.PythonCommands.StepCommand",
         "peekOfCode": "class StepCommandTemplate(PythonCommand):\n    NAME = \"Example step command\"\n    TAGS = [\"Example\"]\n    STEP_LABELS = [\"Chapter 1: preparation\", \"Chapter 2: detailed task\"]\n    @classmethod\n    def get_detection_targets(cls):\n        \"\"\"Used only by Commands > Image match debug; normal do() never calls it.\"\"\"\n        return []\n    def __init__(self):\n        super().__init__()",
         "detail": "Poke-Controller-Modified-Extension-master.SerialController.DevTemplates.PythonCommands.StepCommand",
+        "documentation": {}
+    },
+    {
+        "label": "SimilarityHistory",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
+        "peekOfCode": "class SimilarityHistory:\n    \"\"\"Bounded time series with summary/gap data for logging and graphing.\"\"\"\n    def __init__(self, max_samples=3600):\n        self.samples = deque(maxlen=max(1, int(max_samples)))\n    def add(self, name, score, threshold, matched, timestamp=None):\n        row = {\n            \"time\": float(time.time() if timestamp is None else timestamp),\n            \"name\": str(name),\n            \"score\": float(score),\n            \"threshold\": float(threshold),",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
+        "documentation": {}
+    },
+    {
+        "label": "detect_image",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
+        "peekOfCode": "def detect_image(\n        command,\n        name,\n        template_path,\n        threshold=0.8,\n        use_gray=True,\n        show_value=False,\n        show_position=True,\n        show_only_true_rect=False,\n        ms=2000,",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
+        "documentation": {}
+    },
+    {
+        "label": "format_similarity_summary",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
+        "peekOfCode": "def format_similarity_summary(history, name=None, gap_seconds=1.0):\n    \"\"\"Return a compact average/range/gap line suitable for the PokeCon log.\"\"\"\n    summary = history.summary(name=name, gap_seconds=gap_seconds)\n    if not summary[\"count\"]:\n        return \"{}: no similarity samples\".format(name or \"all\")\n    return (\"{}: count={} average={:.4f} min={:.4f} max={:.4f} gaps={}\".format(\n        name or \"all\", summary[\"count\"], summary[\"average\"], summary[\"minimum\"],\n        summary[\"maximum\"], len(summary[\"gaps\"])))\ndef log_similarity_summary(history, name=None, gap_seconds=1.0):\n    \"\"\"Print and return the current continuous-monitoring summary.\"\"\"",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
+        "documentation": {}
+    },
+    {
+        "label": "log_similarity_summary",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
+        "peekOfCode": "def log_similarity_summary(history, name=None, gap_seconds=1.0):\n    \"\"\"Print and return the current continuous-monitoring summary.\"\"\"\n    text = format_similarity_summary(history, name=name, gap_seconds=gap_seconds)\n    print(text)\n    return text\ndef render_similarity_graph(samples, width=640, height=180, name=None):\n    \"\"\"Render a score/threshold graph as a BGR frame for preview or recording.\"\"\"\n    rows = [row for row in samples if name is None or row.get(\"name\") == name]\n    canvas = np.zeros((max(80, int(height)), max(160, int(width)), 3), dtype=np.uint8)\n    canvas[:] = (28, 28, 28)",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
+        "documentation": {}
+    },
+    {
+        "label": "render_similarity_graph",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
+        "peekOfCode": "def render_similarity_graph(samples, width=640, height=180, name=None):\n    \"\"\"Render a score/threshold graph as a BGR frame for preview or recording.\"\"\"\n    rows = [row for row in samples if name is None or row.get(\"name\") == name]\n    canvas = np.zeros((max(80, int(height)), max(160, int(width)), 3), dtype=np.uint8)\n    canvas[:] = (28, 28, 28)\n    left, top, right, bottom = 45, 15, canvas.shape[1] - 12, canvas.shape[0] - 25\n    cv2.rectangle(canvas, (left, top), (right, bottom), (90, 90, 90), 1)\n    cv2.putText(canvas, \"1.0\", (5, top + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (210, 210, 210), 1)\n    cv2.putText(canvas, \"0.0\", (5, bottom + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (210, 210, 210), 1)\n    if rows:",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
+        "documentation": {}
+    },
+    {
+        "label": "compose_monitor_frame",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
+        "peekOfCode": "def compose_monitor_frame(video_frame, graph_frame, log_lines=None, output_width=None):\n    \"\"\"Combine camera video, similarity graph and log text into one recording frame.\"\"\"\n    video = video_frame.copy()\n    width = int(output_width or video.shape[1])\n    if video.shape[1] != width:\n        video = cv2.resize(video, (width, int(video.shape[0] * width / video.shape[1])))\n    graph = graph_frame\n    if graph.shape[1] != width:\n        graph = cv2.resize(graph, (width, int(graph.shape[0] * width / graph.shape[1])))\n    log_lines = list(log_lines or [])",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.LocalFunction.ImageDetection",
         "documentation": {}
     },
     {

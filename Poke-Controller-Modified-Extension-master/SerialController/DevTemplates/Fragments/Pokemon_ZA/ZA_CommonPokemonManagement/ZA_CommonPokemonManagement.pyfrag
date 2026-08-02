@@ -1,0 +1,574 @@
+def ZA_common_skill_change_function(self,selectpokemonnum,target1,target2,machine=0):
+    if self.ZA_common_skill_change_current_state == "COMMON_SKILL_CHANGE_POKEMON_SELECT":
+        self.ZA_common_skill_change_current_state = self.ZA_common_skill_change_pokemon_select(selectnum=selectpokemonnum)
+    elif self.ZA_common_skill_change_current_state == "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET1":
+        self.ZA_common_skill_change_current_state = self.ZA_common_skill_change_skill_window_chtarget1(target1=target1,machine=machine)
+    elif self.ZA_common_skill_change_current_state == "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET2":
+        self.ZA_common_skill_change_current_state = self.ZA_common_skill_change_skill_window_chtarget2(target2=target2)
+    else:
+        self.ZA_common_skill_change_current_state = self.ZA_STATE_COMMON_SKILL_CHANGE_FUNCTION[self.ZA_common_skill_change_current_state]()
+
+    return self.ZA_common_skill_change_current_state
+
+def ZA_common_skill_change_start(self):
+    return "COMMON_SKILL_CHANGE_START_CHECK"
+
+def ZA_common_skill_change_start_check(self):
+    if self.ZA_check_picture==1:
+        if self.image_check("POKEMON_ZA_X_MENU_OPEN"):
+            print("POKEMON_ZA_X_MENU_OPEN")
+        if self.image_check("POKEMON_ZA_SIDE_SELECT_X_MENU_W"):
+            print("POKEMON_ZA_SIDE_SELECT_X_MENU_W")
+        if self.image_check("POKEMON_ZA_DOWN_SELECT_X_MENU_W"):
+            print("POKEMON_ZA_DOWN_SELECT_X_MENU_W")
+        if self.image_check("POKEMON_ZA_POKEMON_MENU_X_MENU_W"):
+            print("POKEMON_ZA_POKEMON_MENU_X_MENU_W")
+        if self.image_check("POKEMON_ZA_POKEMON_MENU_X_MENU_W_SELECT_SKILL"):
+            print("POKEMON_ZA_POKEMON_MENU_X_MENU_W_SELECT_SKILL")
+        if self.image_check("POKEMON_ZA_SKILL_PAGE_WINDOW"):
+            print("POKEMON_ZA_SKILL_PAGE_WINDOW")
+        if self.image_check("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_Y"):
+            print("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_Y")
+        if self.image_check("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_X"):
+            print("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_X")
+        if self.image_check("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_A"):
+            print("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_A")
+        if self.image_check("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_B"):
+            print("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_B")
+        self.wait(2.0)
+    else:
+        if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W"):
+            self.pressRep(Button.X, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+            self.wait(1.0)
+        elif self.image_check("POKEMON_ZA_X_MENU_OPEN"):
+            self.wait(1.0)
+            return "COMMON_SKILL_CHANGE_POKEMON_SELECT"
+        elif self.image_check("POKEMON_ZA_HELP_MARKER"):
+            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+            self.wait(1.0)
+
+    return "COMMON_SKILL_CHANGE_START_CHECK"
+
+def ZA_common_skill_change_pokemon_select(self,selectnum):
+    if self.image_check("POKEMON_ZA_X_MENU_OPEN"):
+        if self.image_check("POKEMON_ZA_SIDE_SELECT_X_MENU_W"):
+            self.wait(0.5)
+            for i in range(selectnum):
+                self.ZA_etc_sendCommand("Lbutton_right")
+                self.wait(0.5)
+            self.wait(0.5)
+            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+            self.wait(0.5)
+            return "COMMON_SKILL_CHANGE_SKILL_WINDOW_OPEN"
+        elif self.image_check("POKEMON_ZA_POKEMON_MENU_X_MENU_W"):
+            for i in range(7):
+                self.ZA_etc_sendCommand("Lbutton_left")
+            self.wait(0.5)
+    return "COMMON_SKILL_CHANGE_POKEMON_SELECT"
+
+def ZA_common_skill_change_skill_window_open(self):
+    if self.image_check("POKEMON_ZA_X_MENU_OPEN"):
+        if self.image_check("POKEMON_ZA_POKEMON_MENU_X_MENU_W"):
+            for i in range(2):
+                self.ZA_etc_sendCommand("Lbutton_down")
+                self.wait(0.3)
+        elif self.image_check("POKEMON_ZA_POKEMON_MENU_X_MENU_W_SELECT_SKILL"): 
+            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+            self.wait(0.5)
+            return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET1"
+    return "COMMON_SKILL_CHANGE_SKILL_WINDOW_OPEN"
+
+def ZA_common_skill_change_skill_window_chtarget1(self,target1,machine):
+    if self.image_check("POKEMON_ZA_SKILL_PAGE_WINDOW"):
+        if self.image_check("POKEMON_ZA_SIDE_SELECT_X_MENU_W"):
+            if target1 == "X":
+                self.ZA_etc_sendCommand("Lbutton_right")
+                self.wait(0.5)
+                self.ZA_etc_sendCommand("Lbutton_up")
+            elif target1 == "Y":
+                self.ZA_etc_sendCommand("Lbutton_right")
+            elif target1 == "A":
+                self.ZA_etc_sendCommand("Lbutton_right")
+                self.wait(0.5)
+                self.ZA_etc_sendCommand("Lbutton_right")
+            elif target1 == "B":
+                self.ZA_etc_sendCommand("Lbutton_right")
+                self.wait(0.5)
+                self.ZA_etc_sendCommand("Lbutton_down")
+            else:
+                if machine==1:
+                    self.pressRep(Button.ZR, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                    self.wait(0.3)
+                for i in range(target1):
+                    self.ZA_etc_sendCommand("Lbutton_down")
+                    self.wait(0.3)
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                self.wait(0.5)
+                return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET2"
+        if self.image_check("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_Y"):
+            if target1 == "X":
+                self.ZA_etc_sendCommand("Lbutton_up")
+            elif target1 == "Y":
+                self.pressRep(Button.Y, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                self.wait(0.5)
+                return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET2"
+            elif target1 == "A":
+                self.ZA_etc_sendCommand("Lbutton_right")
+            elif target1 == "B":
+                self.ZA_etc_sendCommand("Lbutton_down")
+            #else:
+            #TOPCHECKが必要なため省略
+        if self.image_check("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_X"):
+            if target1 == "X":
+                self.pressRep(Button.Y, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                self.wait(0.5)
+                return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET2"
+            elif target1 == "Y":
+                self.ZA_etc_sendCommand("Lbutton_left")
+            elif target1 == "A":
+                self.ZA_etc_sendCommand("Lbutton_right")
+            elif target1 == "B":
+                self.ZA_etc_sendCommand("Lbutton_down")
+            #else:
+            #TOPCHECKが必要なため省略
+        if self.image_check("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_A"):
+            if target1 == "X":
+                self.ZA_etc_sendCommand("Lbutton_up")
+            elif target1 == "Y":
+                self.ZA_etc_sendCommand("Lbutton_left")
+            elif target1 == "A":
+                self.pressRep(Button.Y, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                self.wait(0.5)
+                return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET2"
+            elif target1 == "B":
+                self.ZA_etc_sendCommand("Lbutton_down")
+            #else:
+            #TOPCHECKが必要なため省略
+        if self.image_check("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_B"):
+            if target1 == "X":
+                self.ZA_etc_sendCommand("Lbutton_up")
+            elif target1 == "Y":
+                self.ZA_etc_sendCommand("Lbutton_left")
+            elif target1 == "A":
+                self.ZA_etc_sendCommand("Lbutton_right")
+            elif target1 == "B":
+                self.pressRep(Button.Y, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                self.wait(0.5)
+                return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET2"
+            #else:
+            #TOPCHECKが必要なため省略
+    self.wait(0.3)
+    return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET1"
+
+def ZA_common_skill_change_skill_window_chtarget2(self,target2):
+    if self.image_check("POKEMON_ZA_SKILL_PAGE_WINDOW"):
+        if self.image_check("POKEMON_ZA_SIDE_SELECT_X_MENU_W"):
+            if target2 == "X":
+                self.ZA_etc_sendCommand("Lbutton_right")
+                self.wait(0.5)
+                self.ZA_etc_sendCommand("Lbutton_up")
+            elif target2 == "Y":
+                self.ZA_etc_sendCommand("Lbutton_right")
+            elif target2 == "A":
+                self.ZA_etc_sendCommand("Lbutton_right")
+                self.wait(0.5)
+                self.ZA_etc_sendCommand("Lbutton_right")
+            elif target2 == "B":
+                self.ZA_etc_sendCommand("Lbutton_right")
+                self.wait(0.5)
+                self.ZA_etc_sendCommand("Lbutton_down")
+        if self.image_check("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_Y"):
+            if target2 == "X":
+                self.ZA_etc_sendCommand("Lbutton_up")
+            elif target2 == "Y":
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                self.wait(0.5)
+                return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CLOSE"
+            elif target2 == "A":
+                self.ZA_etc_sendCommand("Lbutton_right")
+            elif target2 == "B":
+                self.ZA_etc_sendCommand("Lbutton_down")
+        if self.image_check("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_X"):
+            if target2 == "X":
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                self.wait(0.5)
+                return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CLOSE"
+            elif target2 == "Y":
+                self.ZA_etc_sendCommand("Lbutton_left")
+            elif target2 == "A":
+                self.ZA_etc_sendCommand("Lbutton_right")
+            elif target2 == "B":
+                self.ZA_etc_sendCommand("Lbutton_down")
+        if self.image_check("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_A"):
+            if target2 == "X":
+                self.ZA_etc_sendCommand("Lbutton_up")
+            elif target2 == "Y":
+                self.ZA_etc_sendCommand("Lbutton_left")
+            elif target2 == "A":
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                self.wait(0.5)
+                return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CLOSE"
+            elif target2 == "B":
+                self.ZA_etc_sendCommand("Lbutton_down")
+        if self.image_check("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_B"):
+            if target2 == "X":
+                self.ZA_etc_sendCommand("Lbutton_up")
+            elif target2 == "Y":
+                self.ZA_etc_sendCommand("Lbutton_left")
+            elif target2 == "A":
+                self.ZA_etc_sendCommand("Lbutton_right")
+            elif target2 == "B":
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                self.wait(0.5)
+                return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CLOSE"
+    self.wait(0.3)
+    return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET2"
+
+def ZA_common_skill_change_skill_window_close(self):
+    while True:
+        self.pressRep(Button.B, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+        if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W"):
+            return "COMMON_SKILL_CHANGE_END"
+    return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CLOSE"
+
+def ZA_common_skill_change_end(self):
+    return "COMMON_SKILL_CHANGE_START"
+
+def ZA_common_skill_change_false(self):
+    return "COMMON_SKILL_CHANGE_START"
+
+def ZA_common_box_change_function(self,target1,target2,target1_high=0,target2_high=0):
+    if self.ZA_common_box_change_current_state == "COMMON_BOX_CHANGE_START":
+        ret = self.ZA_common_skill_change_start()
+        if ret == "COMMON_SKILL_CHANGE_START_CHECK":
+            self.ZA_common_box_change_current_state = "COMMON_BOX_CHANGE_START_CHECK"
+        else:
+            self.ZA_common_box_change_current_state = "COMMON_BOX_CHANGE_START"
+    elif self.ZA_common_box_change_current_state == "COMMON_BOX_CHANGE_START_CHECK":
+        ret = self.ZA_common_skill_change_start_check()
+        if ret == "COMMON_SKILL_CHANGE_POKEMON_SELECT":
+            self.ZA_common_box_change_current_state = "COMMON_BOX_CHANGE_BOX_OPEN"
+        else:
+            self.ZA_common_box_change_current_state = "COMMON_BOX_CHANGE_START_CHECK"     
+    else:
+        if self.ZA_common_box_change_current_state == "COMMON_BOX_CHANGE_BOX_TARGET1":
+            self.ZA_common_box_change_current_state = self.ZA_common_box_change_box_target1(target1,target1_high)   
+        elif self.ZA_common_box_change_current_state == "COMMON_BOX_CHANGE_BOX_TARGET2":
+            self.ZA_common_box_change_current_state = self.ZA_common_box_change_box_target2(target2-target1,target2_high - target1_high)
+        else:
+            self.ZA_common_box_change_current_state = self.ZA_STATE_COMMON_BOX_CHANGE_FUNCTION[self.ZA_common_box_change_current_state]()
+
+    return self.ZA_common_box_change_current_state
+
+def ZA_common_box_change_box_open(self):
+    if self.image_check("POKEMON_ZA_X_MENU_OPEN"):
+        if self.image_check("POKEMON_ZA_SIDE_SELECT_X_MENU_W"):
+            self.wait(0.5)
+            if self.image_check("POKEMON_ZA_SIDE_SELECT_TOP_MAP"):
+                self.wait(0.5)
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                return "COMMON_BOX_CHANGE_BOX_TARGET1"
+            self.wait(0.5)
+            self.ZA_etc_sendCommand("Lbutton_up")
+            self.wait(0.5)
+        elif self.image_check("POKEMON_ZA_POKEMON_MENU_X_MENU_W"):
+            for i in range(7):
+                self.ZA_etc_sendCommand("Lbutton_left")
+            self.wait(0.5)
+    return "COMMON_BOX_CHANGE_BOX_OPEN"
+
+def ZA_common_box_change_box_target1(self,target1,target1_high=0):
+    #BOX 1:1が開始点と判定させる
+    if self.image_check("POKEMON_ZA_BOX_WINDOW"):
+        self.wait(1.0)
+        if target1 > 0:
+            for i in range(target1):
+                self.ZA_etc_sendCommand("Lbutton_right")
+                self.wait(1.0)
+        elif target1 < 0:
+            for i in range(-(target1)):
+                self.ZA_etc_sendCommand("Lbutton_left")
+                self.wait(1.0)
+                
+        if target1_high > 0:
+            for i in range(target1_high1):
+                self.ZA_etc_sendCommand("Lbutton_down")
+                self.wait(1.0)
+        elif target1_high < 0:
+            for i in range(-(target1_high)):
+                self.ZA_etc_sendCommand("Lbutton_up")
+                self.wait(1.0)
+        self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+        self.wait(1.0) 
+        return "COMMON_BOX_CHANGE_BOX_TARGET1_SELECT"        
+    return "COMMON_BOX_CHANGE_BOX_TARGET1"
+
+def ZA_common_box_change_box_target1_select(self):
+    if self.image_check("POKEMON_ZA_BOX_WINDOW"):
+        self.wait(1.0)
+        if self.image_check("POKEMON_ZA_BOX_MENU"):
+            self.wait(1.0)
+            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+            return "COMMON_BOX_CHANGE_BOX_TARGET2"
+        else:
+            #フォロー
+            self.wait(1.0)
+            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+            self.wait(1.0)
+    return "COMMON_BOX_CHANGE_BOX_TARGET1_SELECT"
+
+def ZA_common_box_change_box_target2(self,target_sub,target_sub_high=0):
+    if self.image_check("POKEMON_ZA_BOX_WINDOW"):
+        self.wait(1.0)
+        if target_sub > 0:
+            for i in range(target_sub):
+                self.ZA_etc_sendCommand("Lbutton_right")
+                self.wait(1.0)
+        elif target_sub < 0:
+            for i in range(-(target_sub)):
+                self.ZA_etc_sendCommand("Lbutton_left")
+                self.wait(1.0)
+                
+        if target_sub_high > 0:
+            for i in range(target_sub_high):
+                self.ZA_etc_sendCommand("Lbutton_down")
+                self.wait(1.0)
+        elif target_sub_high < 0:
+            for i in range(-(target_sub_high)):
+                self.ZA_etc_sendCommand("Lbutton_up")
+                self.wait(1.0)
+             
+        self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)   
+        return "COMMON_BOX_CHANGE_SKILL_WINDOW_CLOSE"
+    return "COMMON_BOX_CHANGE_BOX_TARGET2"
+
+def ZA_common_box_change_window_close(self):
+    if self.image_check("POKEMON_ZA_BOX_WINDOW"):
+        self.pressRep(Button.B, repeat=50, duration=0.15, wait=0.5, interval=0.1)
+        return "COMMON_BOX_CHANGE_END"
+    return "COMMON_BOX_CHANGE_SKILL_WINDOW_CLOSE"
+
+def ZA_common_box_change_end(self):
+    return "COMMON_BOX_CHANGE_START"
+
+def ZA_common_item_give_function(self,selectnum,target1,target2):
+    if self.ZA_common_item_give_current_state == "COMMON_ITEM_GIVE_START":
+        ret = self.ZA_common_skill_change_start()
+        if ret == "COMMON_SKILL_CHANGE_START_CHECK":
+            self.ZA_common_item_give_current_state = "COMMON_ITEM_GIVE_START_CHECK"
+        else:
+            self.ZA_common_item_give_current_state = "COMMON_ITEM_GIVE_START"
+    elif self.ZA_common_item_give_current_state == "COMMON_ITEM_GIVE_START_CHECK":
+        ret = self.ZA_common_skill_change_start_check()
+        if ret == "COMMON_SKILL_CHANGE_POKEMON_SELECT":
+            self.ZA_common_item_give_current_state = "COMMON_ITEM_GIVE_POKEMON_SELECT"
+        else:
+            self.ZA_common_item_give_current_state = "COMMON_ITEM_GIVE_START_CHECK" 
+    elif self.ZA_common_item_give_current_state == "COMMON_ITEM_GIVE_POKEMON_SELECT":
+        ret = self.ZA_common_skill_change_pokemon_select(selectnum)
+        if ret == "COMMON_SKILL_CHANGE_SKILL_WINDOW_OPEN":
+            self.ZA_common_item_give_current_state = "COMMON_ITEM_GIVE_WINDOW_OPEN"
+        else:
+            self.ZA_common_item_give_current_state = "COMMON_ITEM_GIVE_POKEMON_SELECT"        
+    else:
+        if self.ZA_common_item_give_current_state == "COMMON_ITEM_GIVE_TARGET_SIDE":
+            self.ZA_common_item_give_current_state = self.ZA_common_item_give_target_side(target1)   
+        elif self.ZA_common_item_give_current_state == "COMMON_ITEM_GIVE_TARGET_HIGH":
+            self.ZA_common_item_give_current_state = self.ZA_common_item_give_target_high(target2)
+        else:
+            self.ZA_common_item_give_current_state = self.ZA_STATE_COMMON_ITEM_GIVE_FUNCTION[self.ZA_common_item_give_current_state]()
+
+    return self.ZA_common_item_give_current_state
+
+def ZA_common_item_give_window_open(self):
+    if self.image_check("POKEMON_ZA_X_MENU_OPEN"):
+        if self.image_check("POKEMON_ZA_POKEMON_MENU_X_MENU_W"):
+            for i in range(2):
+                self.ZA_etc_sendCommand("Lbutton_up")
+                self.wait(0.5)
+            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+            self.wait(0.5)
+            return "COMMON_ITEM_GIVE_TARGET_SIDE"
+    return "COMMON_ITEM_GIVE_WINDOW_OPEN"
+
+def ZA_common_item_give_target_side(self,target1):
+    if self.image_check("POKEMON_ZA_ITEM_WINDOW"):
+        for i in range(target1):
+            self.keys.input(Button.R)
+            self.wait(0.15)
+            self.keys.inputEnd(Button.R)
+            self.wait(0.5)
+        return "COMMON_ITEM_GIVE_TARGET_HIGH"
+    return "COMMON_ITEM_GIVE_TARGET_SIDE"
+
+def ZA_common_item_give_target_high(self,target2,use=1):
+    if self.image_check("POKEMON_ZA_ITEM_WINDOW"):
+        for i in range(target2):
+            self.ZA_etc_sendCommand("Lbutton_down")
+            self.wait(0.5)
+        if use==1:
+            self.pressRep(Button.A, repeat=3, duration=0.15, wait=1.0, interval=1.0)
+        return "COMMON_ITEM_GIVE_WINDOW_CLOSE" 
+    return "COMMON_ITEM_GIVE_TARGET_HIGH"
+
+def ZA_common_item_give_window_close(self):
+    self.pressRep(Button.B, repeat=50, duration=0.15, wait=0.5, interval=0.1)
+    return "COMMON_ITEM_GIVE_END"
+
+def ZA_common_item_give_end(self):
+    return "COMMON_ITEM_GIVE_START"
+
+def ZA_common_evolution_function(self,selectnum):
+    if self.ZA_common_evolution_current_state == "COMMON_EVOLUTION_START":
+        ret = self.ZA_common_skill_change_start()
+        if ret == "COMMON_SKILL_CHANGE_START_CHECK":
+            self.ZA_common_evolution_current_state = "COMMON_EVOLUTION_START_CHECK"
+        else:
+            self.ZA_common_evolution_current_state = "COMMON_EVOLUTION_START"
+    elif self.ZA_common_evolution_current_state == "COMMON_EVOLUTION_START_CHECK":
+        ret = self.ZA_common_skill_change_start_check()
+        if ret == "COMMON_SKILL_CHANGE_POKEMON_SELECT":
+            self.ZA_common_evolution_current_state = "COMMON_EVOLUTION_POKEMON_SELECT"
+        else:
+            self.ZA_common_evolution_current_state = "COMMON_EVOLUTION_START_CHECK" 
+    elif self.ZA_common_evolution_current_state == "COMMON_EVOLUTION_POKEMON_SELECT":
+        ret = self.ZA_common_skill_change_pokemon_select(selectnum)
+        if ret == "COMMON_SKILL_CHANGE_SKILL_WINDOW_OPEN":
+            self.ZA_common_evolution_current_state = "COMMON_EVOLUTION_EXEC"
+        else:
+            self.ZA_common_evolution_current_state = "COMMON_EVOLUTION_POKEMON_SELECT"        
+
+    else:
+        self.ZA_common_evolution_current_state = self.ZA_STATE_COMMON_EVOLUTION_FUNCTION[self.ZA_common_evolution_current_state]()
+
+    return self.ZA_common_evolution_current_state
+
+def ZA_common_evolution_exec(self):
+    if self.image_check("POKEMON_ZA_X_MENU_OPEN"):
+        if self.ZA_renda_button(rendabutton="B",
+                             endpicture="POKEMON_ZA_TEXT_BLACK_COMMENT",
+                             not_endpicture="POKEMON_ZA_ZA_ROYALE",
+                             sub_button="A",sub_picture="POKEMON_ZA_TEXT_BLACK_COMMENT",
+                             sub2_button="A",sub2_picture="POKEMON_ZA_2_SELECT",
+                             sub3_button="A",sub3_picture="POKEMON_ZA_3_SELECT",
+                             sub4_button="A",sub4_picture="POKEMON_ZA_4_SELECT",
+                             sub5_button="A",sub5_picture="POKEMON_ZA_HELP_MARKER",
+                             sub6_button="A",sub6_picture="POKEMON_ZA_MORNING",
+                             sub7_button="A",sub7_picture="POKEMON_ZA_NIGHT"):
+            return "COMMON_EVOLUTION_LOOP"
+    return "COMMON_EVOLUTION_EXEC"
+
+def ZA_common_evolution_loop(self):
+    if self.ZA_renda_button(rendabutton="B",
+                        endpicture="POKEMON_ZA_FIELD_W",
+                        endpicture2="POKEMON_ZA_FIELD_BACK_W",
+                        not_endpicture="POKEMON_ZA_ZA_ROYALE"):
+        return "COMMON_EVOLUTION_END"
+    return "COMMON_EVOLUTION_LOOP"
+
+def ZA_common_evolution_end(self):
+    return "COMMON_EVOLUTION_START"
+
+def ZA_common_item_use_function(self,target1,target2=-1,item_pic="RETURN_TRUE",use_target=1,up10=0,up1=-1):
+    if self.ZA_common_item_use_current_state == "COMMON_ITEM_USE_START":
+        ret = self.ZA_common_skill_change_start()
+        if ret == "COMMON_SKILL_CHANGE_START_CHECK":
+            self.ZA_common_item_use_current_state = "COMMON_ITEM_USE_START_CHECK"
+        else:
+            self.ZA_common_item_use_current_state = "COMMON_ITEM_USE_START"
+    elif self.ZA_common_item_use_current_state == "COMMON_ITEM_USE_START_CHECK":
+        ret = self.ZA_common_skill_change_start_check()
+        if ret == "COMMON_SKILL_CHANGE_POKEMON_SELECT":
+            self.ZA_common_item_use_current_state = "COMMON_ITEM_USE_WINDOW_OPEN"
+        else:
+            self.ZA_common_item_use_current_state = "COMMON_ITEM_USE_START_CHECK"
+
+    elif self.ZA_common_item_use_current_state == "COMMON_ITEM_USE_TARGET_SIDE":
+        self.ZA_common_item_use_current_state = self.ZA_common_item_use_target_side(target1=target1) 
+    elif self.ZA_common_item_use_current_state == "COMMON_ITEM_USE_TARGET_HIGH":
+        self.ZA_common_item_use_current_state = self.ZA_common_item_use_target_high(target2=target2,item_pic=item_pic,use_target=use_target,up10=up10,up1=up1) 
+    else:
+        self.ZA_common_item_use_current_state = self.ZA_STATE_COMMON_ITEM_USE_FUNCTION[self.ZA_common_item_use_current_state]()
+
+    return self.ZA_common_item_use_current_state
+
+def ZA_common_item_use_window_open(self):
+    if self.image_check("POKEMON_ZA_X_MENU_OPEN"):
+        if self.image_check("POKEMON_ZA_SIDE_SELECT_X_MENU_W"):
+            self.wait(0.5)
+            self.ZA_etc_sendCommand("Lbutton_down")
+            self.wait(0.5)
+            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+            self.wait(0.5)
+            return "COMMON_ITEM_USE_TARGET_SIDE"
+        elif self.image_check("POKEMON_ZA_POKEMON_MENU_X_MENU_W"):
+            for i in range(7):
+                self.ZA_etc_sendCommand("Lbutton_left")
+            self.wait(0.5)
+    return "COMMON_ITEM_USE_WINDOW_OPEN"
+
+def ZA_common_item_use_target_side(self,target1):
+    ret = self.ZA_common_item_give_target_side(target1=target1)
+    if ret == "COMMON_ITEM_GIVE_TARGET_SIDE":
+        self.ZA_common_item_use_current_state = "COMMON_ITEM_USE_TARGET_SIDE"
+    else:
+        self.ZA_common_item_use_current_state = "COMMON_ITEM_USE_TARGET_HIGH"
+    return self.ZA_common_item_use_current_state
+
+def ZA_common_item_use_target_high(self,target2,item_pic="RETURN_TRUE",use_target=1,up10=0,up1=-1):
+    if target2 >=0:
+        ret = self.ZA_common_item_give_target_high(target2=target2)
+        if (ret == "COMMON_ITEM_GIVE_WINDOW_CLOSE"):
+            self.ZA_common_item_use_current_state = "COMMON_ITEM_USE_WINDOW_CLOSE"
+        else:
+            self.ZA_common_item_use_current_state = "COMMON_ITEM_USE_TARGET_SIDE"
+    else:
+        for i in range(30):
+            if i == 0:
+                ret = self.ZA_common_item_give_target_high(target2=0,use=0)
+            else:
+                ret = self.ZA_common_item_give_target_high(target2=1,use=0)
+                
+            self.wait(1.0)
+            if self.image_check(item_pic) and (ret == "COMMON_ITEM_GIVE_WINDOW_CLOSE"):
+                self.ZA_common_item_use_current_state = "COMMON_ITEM_USE_WINDOW_CLOSE"
+                self.wait(2.0)
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                self.wait(2.0)
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                self.wait(2.0)
+                for i in range(use_target-1):
+                    self.ZA_etc_sendCommand("Lbutton_right")
+                    self.wait(2.0)
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                self.wait(2.0)
+
+                for i in range(up10):
+                    self.ZA_etc_sendCommand("Lbutton_right")
+                    self.wait(1.0)
+                if up1 < 0:
+                    self.ZA_etc_sendCommand("Lbutton_down")
+                    self.wait(1.0)
+                else:
+                    for i in range(up1):
+                        self.ZA_etc_sendCommand("Lbutton_up")
+                        self.wait(1.0)
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                self.wait(2.0)
+                break
+            else:
+                self.ZA_common_item_use_current_state = "COMMON_ITEM_USE_TARGET_SIDE"
+
+    return self.ZA_common_item_use_current_state
+
+def ZA_common_item_use_window_close(self):
+    if self.ZA_renda_button(rendabutton="B",
+                        endpicture="POKEMON_ZA_FIELD_W",
+                        endpicture2="POKEMON_ZA_FIELD_BACK_W",
+                        not_endpicture="POKEMON_ZA_ZA_ROYALE",
+                        sub_button="A",sub_picture="POKEMON_ZA_TEXT_BLACK_COMMENT",):
+        return "COMMON_ITEM_USE_END"
+    return "COMMON_ITEM_GIVE_WINDOW_CLOSE"
+
+def ZA_common_item_use_end(self):
+    return "COMMON_ITEM_USE_START"

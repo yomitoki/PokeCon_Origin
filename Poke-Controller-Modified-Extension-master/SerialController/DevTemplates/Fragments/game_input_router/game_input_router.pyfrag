@@ -1,0 +1,119 @@
+def activate_game_window(self, title_text):
+    """タイトルの部分一致でゲーム画面を探して最前面へ移動する。"""
+    user32 = ctypes.windll.user32
+    matches = []
+    title_text = str(title_text).strip().lower()
+    if not title_text:
+        raise ValueError("GAME_WINDOW_TITLEを指定してください。")
+
+    callback_type = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+
+    def collect_window(hwnd, _):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+        length = user32.GetWindowTextLengthW(hwnd)
+        if length <= 0:
+            return True
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buffer, length + 1)
+        if title_text in buffer.value.lower():
+            matches.append((hwnd, buffer.value))
+        return True
+
+    callback = callback_type(collect_window)
+    user32.EnumWindows(callback, 0)
+    if not matches:
+        raise RuntimeError("対象ゲーム画面が見つかりません: " + str(title_text))
+
+    hwnd, matched_title = matches[0]
+    user32.ShowWindow(hwnd, 9)
+    if not user32.SetForegroundWindow(hwnd):
+        raise RuntimeError("ゲーム画面を最前面にできません: " + matched_title)
+    self.game_window_handle = hwnd
+    self.game_window_title = matched_title
+    return hwnd
+
+
+def select_game_input_profile(self, profile_index=0):
+    """使用するゲーム別キー割り当てを番号で切り替える。0=Steam例、1=PS4例。"""
+    profile_index = int(profile_index)
+    if profile_index < 0 or profile_index >= len(self.game_input_profiles):
+        raise ValueError(
+            "ゲーム入力プロファイル番号が範囲外です: {} (0～{})".format(
+                profile_index, len(self.game_input_profiles) - 1
+            )
+        )
+    self.game_input_profile_index = profile_index
+    self.game_input_map = self.game_input_profiles[profile_index]
+
+
+def set_game_input_mapping(self, controller_input, *keyboard_keys):
+    """現在のプロファイルへ割り当てを追加・変更する。キーは最大5個。"""
+    keys = [str(key) for key in keyboard_keys if key is not None and str(key) != '']
+    if not keys:
+        raise ValueError("割り当てるキーボードキーを1個以上指定してください。")
+    if len(keys) > 5:
+        raise ValueError("同時入力へ割り当てられるキーボードキーは最大5個です。")
+    self.game_input_map[str(controller_input)] = keys
+
+
+def game_input(self, controller_input, duration=0.1, wait=0.1):
+    """コントローラー名をSteam等のキー入力またはSwitch入力へ振り分ける。
+
+    使用例:
+        self.game_input('Lbutton_down')
+        self.game_input('A')
+
+    INPUT_TARGETがswitchならPokeCon標準のSwitch入力を使用する。
+    steam、ps4、keyboardなら選択中プロファイルの最大5キーを同時入力する。
+    """
+    target = str(self.game_input_target).strip().lower()
+    input_name = str(controller_input)
+
+    if target == 'switch':
+        switch_inputs = {
+            'Lbutton_up': Hat.TOP,
+            'Lbutton_down': Hat.BTM,
+            'Lbutton_left': Hat.LEFT,
+            'Lbutton_right': Hat.RIGHT,
+            'A': Button.A,
+            'B': Button.B,
+            'X': Button.X,
+            'Y': Button.Y,
+            'L': Button.L,
+            'R': Button.R,
+            'ZL': Button.ZL,
+            'ZR': Button.ZR,
+            'PLUS': Button.PLUS,
+            'MINUS': Button.MINUS,
+            'HOME': Button.HOME,
+            'CAPTURE': Button.CAPTURE,
+        }
+        if input_name not in switch_inputs:
+            raise ValueError("未対応のSwitch入力名です: " + input_name)
+        self.press(switch_inputs[input_name], duration=duration, wait=wait)
+        return
+
+    if target not in ('steam', 'ps4', 'keyboard'):
+        raise ValueError("未対応の入力先です: " + str(self.game_input_target))
+
+    if input_name not in self.game_input_map:
+        raise ValueError(
+            "プロファイル{}に入力名がありません: {}".format(
+                self.game_input_profile_index, input_name
+            )
+        )
+
+    keys = list(self.game_input_map[input_name])
+    if len(keys) > 5:
+        raise ValueError("同時入力へ割り当てられるキーボードキーは最大5個です。")
+    padded_keys = keys + [''] * (5 - len(keys))
+    self.steam_keyboard_press(
+        padded_keys[0],
+        padded_keys[1],
+        padded_keys[2],
+        padded_keys[3],
+        padded_keys[4],
+        duration=duration,
+        wait=wait,
+    )

@@ -3,6 +3,7 @@
 """Data and composition helpers for the Dev Studio sample library."""
 from __future__ import print_function
 
+import ast
 import json
 import os
 
@@ -122,19 +123,52 @@ def load_fragment(fragment_root, fragment_id):
 
 
 def compose_preview(fragment_root, data, list_name):
-    imports, variables, bodies, included = [], [], [], []
+    imports, variables, initializers, bodies, included = [], [], [], [], []
     for member in resolve_members(data, list_name):
         metadata, body, _, _ = load_fragment(fragment_root, member["id"])
         imports.extend(metadata.get("imports", []))
         variables.extend(metadata.get("class_variables", []))
+        initializer = metadata.get("initializer", "")
+        if str(initializer).strip():
+            initializers.append(str(initializer).rstrip())
         bodies.append(body.rstrip())
         included.append(metadata.get("name", member["id"]))
     return {
         "imports": list(dict.fromkeys(imports)),
         "class_variables": list(dict.fromkeys(variables)),
+        "initializers": initializers,
         "bodies": bodies,
         "included": included,
+        "image_targets": image_targets_from_bodies(bodies),
     }
+
+
+def image_targets_from_bodies(bodies):
+    """Return literal image_check target names used by sample functions."""
+    targets = []
+    for body in bodies:
+        try:
+            tree = ast.parse(body)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not node.args:
+                continue
+            function = node.func
+            is_image_check = ((isinstance(function, ast.Attribute) and function.attr == "image_check") or
+                              (isinstance(function, ast.Name) and function.id == "image_check"))
+            if not is_image_check:
+                continue
+            argument = node.args[0]
+            if isinstance(argument, ast.Str):
+                name = argument.s
+            elif isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+                name = argument.value
+            else:
+                continue
+            if name not in targets:
+                targets.append(name)
+    return targets
 
 
 def detect_conflicts(source, preview):

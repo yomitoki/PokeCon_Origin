@@ -1,0 +1,20 @@
+def ZA_run_state_machine_step(self):
+    """Run one non-blocking transition and return True at ZA_END."""
+    if self.ZA_current_state == 'ZA_END':
+        return True
+    self.checkIfAlive()
+    self.ZA_current_state = self.ZA_STATE_FUNCTION[self.ZA_current_state]()
+    return self.ZA_current_state == 'ZA_END'
+
+
+def ZA_state_start(self):
+    return 'ZA_WAIT'
+
+
+def ZA_state_wait(self):
+    self.wait(0.1)
+    return 'ZA_END'
+
+
+def ZA_state_end(self):
+    return 'ZA_END'
