@@ -19,6 +19,8 @@ class CaptureRecorder:
         self.video = None
         self.audio = None
         self.audio_stream = None
+        self.process_audio = None
+        self.process_audio_gain = 1.0
         self.active = False
         self.last_detection = 0.0
         self.last_check = 0.0
@@ -29,9 +31,18 @@ class CaptureRecorder:
         self.minimum_duration = 0.0
         self.last_score = None
         self.last_scores = []
+        # Immutable snapshots consumed by the recording compositor.  Keeping
+        # this data outside Tk lets the video overlay be drawn without taking
+        # a screenshot of the GUI or querying widgets from a worker thread.
+        self.last_detection_details = []
+        self.last_detection_checked_at = 0.0
         self.last_found = False
         self.last_roi = (0, 0, 0, 0)
         self.lock = threading.Lock()
+        self.frame_lock = threading.Lock()
+        self.writer_thread = None
+        self.writer_stop = None
+        self.latest_frame = None
         # Final MP4 encoding runs after capture has stopped.  Keep an explicit
         # count so the window can avoid being destroyed while ffmpeg still has
         # the recording files open.
@@ -59,14 +70,55 @@ class CaptureRecorder:
         # MP4 uses the rate that was actually captured.
         self.started_at = time.monotonic()
         self.requested_fps = max(1.0, float(fps))
+        self.latest_frame = frame.copy()
+        self.writer_stop = threading.Event()
+        self.process_audio_gain = 1.0
         if cleanup_rules is not None:
             self.cleanup_rules = list(cleanup_rules)
             self.minimum_duration = max(0.0, float(minimum_duration))
         self.active = True
+        # MJPEG encoding used to run in Tk's frame callback and throttled both
+        # capture and UI updates. Keep a constant video timeline on a writer
+        # thread, repeating the latest captured frame when capture is slower.
+        self.writer_thread = threading.Thread(target=self._video_writer_loop, daemon=True)
+        self.writer_thread.start()
         if audio_device:
             self._start_audio(audio_device, audio_gain_percent)
 
+    def _video_writer_loop(self):
+        interval = 1.0 / self.requested_fps
+        next_frame_at = self.started_at
+        while self.writer_stop is not None and not self.writer_stop.is_set():
+            delay = next_frame_at - time.monotonic()
+            if delay > 0:
+                self.writer_stop.wait(min(delay, 0.05))
+                continue
+            with self.frame_lock:
+                frame = self.latest_frame
+            if frame is not None and self.video is not None:
+                self.video.write(frame)
+                self.frames_written += 1
+            next_frame_at += interval
+
     def _start_audio(self, device, gain_percent=100):
+        if str(device).startswith("選択ゲーム音声 [PID:"):
+            try:
+                self.process_audio_gain = max(0.0, min(float(gain_percent) / 100.0, 4.0))
+                process_id = int(str(device).split("[PID:", 1)[1].split("]", 1)[0])
+                helper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                      "Tools", "ApplicationLoopback.exe")
+                if not os.path.isfile(helper):
+                    raise FileNotFoundError("ApplicationLoopback.exe is missing")
+                creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                self.process_audio = subprocess.Popen(
+                    [helper, str(process_id), "includetree", os.path.abspath(self.wav_path)],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, creationflags=creation_flags)
+                return
+            except Exception as error:
+                self.process_audio = None
+                print("[RECORDING] Process audio capture failed: {}".format(error))
+                return
         try:
             import sounddevice as sd
             info = sd.query_devices(int(str(device).split(":", 1)[0]))
@@ -96,18 +148,39 @@ class CaptureRecorder:
                 self.audio = None
 
     def add_frame(self, frame):
-        if self.active and self.video:
-            self.video.write(frame)
-            self.frames_written += 1
+        if self.active and frame is not None:
+            with self.frame_lock:
+                self.latest_frame = frame.copy()
 
     def stop(self):
         if not self.active:
             return None
+        stopped_at = time.monotonic()
         self.active = False
+        if self.writer_stop:
+            self.writer_stop.set()
+        if self.writer_thread:
+            self.writer_thread.join(timeout=5)
+        self.writer_thread = None
+        self.writer_stop = None
         if self.audio_stream:
             self.audio_stream.stop()
             self.audio_stream.close()
             self.audio_stream = None
+        if self.process_audio:
+            process = self.process_audio
+            self.process_audio = None
+            try:
+                if process.stdin:
+                    process.stdin.write("\n")
+                    process.stdin.flush()
+                process.wait(timeout=8)
+            except Exception:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except Exception:
+                    process.kill()
         if self.audio:
             self.audio.close()
             self.audio = None
@@ -118,14 +191,19 @@ class CaptureRecorder:
             print("[RECORDING] No video frames were received; keeping audio file only.")
             return self.wav_path if os.path.isfile(self.wav_path) else None
         video_path, wav_path, mp4_path = self.video_path, self.wav_path, self.mp4_path
-        elapsed = max(0.001, time.monotonic() - self.started_at)
+        # Do not include process-audio shutdown/WAV finalization in captured
+        # video time. Including it made the measured FPS too low and stretched
+        # the final video relative to audio.
+        elapsed = max(0.001, stopped_at - self.started_at)
         actual_fps = max(1.0, self.frames_written / elapsed)
         # Re-encoding can take seconds.  Never wait for it in the Tk/capture
         # thread: recording is already stopped and the UI may continue.
         with self.lock:
             self._finalizing_count += 1
+        process_audio_gain = self.process_audio_gain
         threading.Thread(target=self._finalize_worker,
-                         args=(video_path, wav_path, mp4_path, actual_fps, elapsed), daemon=True).start()
+                         args=(video_path, wav_path, mp4_path, actual_fps, elapsed,
+                               process_audio_gain), daemon=True).start()
         print("[RECORDING] Finalizing MP4 in background ({:.2f} captured FPS): {}".format(actual_fps, mp4_path))
         return mp4_path
 
@@ -134,14 +212,17 @@ class CaptureRecorder:
         with self.lock:
             return self._finalizing_count > 0
 
-    def _finalize_worker(self, video_path, wav_path, mp4_path, actual_fps, elapsed):
+    def _finalize_worker(self, video_path, wav_path, mp4_path, actual_fps, elapsed,
+                         process_audio_gain=1.0):
         try:
-            self._finalize(video_path, wav_path, mp4_path, actual_fps, elapsed)
+            self._finalize(video_path, wav_path, mp4_path, actual_fps, elapsed,
+                           process_audio_gain)
         finally:
             with self.lock:
                 self._finalizing_count = max(0, self._finalizing_count - 1)
 
-    def _finalize(self, video_path, wav_path, mp4_path, actual_fps, elapsed):
+    def _finalize(self, video_path, wav_path, mp4_path, actual_fps, elapsed,
+                  process_audio_gain=1.0):
         reason = self._discard_reason(video_path, elapsed)
         if reason:
             session_dir = os.path.dirname(video_path)
@@ -149,7 +230,8 @@ class CaptureRecorder:
             # ``session_dir`` is always the timestamp folder created by start.
             shutil.rmtree(session_dir, ignore_errors=True)
             return None
-        return self._mux(video_path, wav_path, mp4_path, actual_fps)
+        return self._mux(video_path, wav_path, mp4_path, actual_fps,
+                         process_audio_gain)
 
     def _discard_reason(self, video_path, elapsed):
         if self.minimum_duration and elapsed < self.minimum_duration:
@@ -185,7 +267,8 @@ class CaptureRecorder:
                 return "discard image {} detected in {:.1f}% of sampled frames".format(pos + 1, percent)
         return None
 
-    def _mux(self, video_path, wav_path, mp4_path, actual_fps):
+    def _mux(self, video_path, wav_path, mp4_path, actual_fps,
+             process_audio_gain=1.0):
         ffmpeg = shutil.which("ffmpeg")
         if not ffmpeg:
             try:
@@ -204,8 +287,10 @@ class CaptureRecorder:
             # frames per second makes the video play about 1.5x too fast.
             ffmpeg, "-y", "-r", "{:.3f}".format(actual_fps), "-i", video_path, "-i", wav_path,
             "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264", "-pix_fmt", "yuv420p",
-            "-c:a", "aac", "-shortest", "-movflags", "+faststart", mp4_path,
         ]
+        if abs(float(process_audio_gain) - 1.0) > 0.001:
+            command.extend(["-filter:a", "volume={:.4f}".format(process_audio_gain)])
+        command.extend(["-c:a", "aac", "-shortest", "-movflags", "+faststart", mp4_path])
         completed = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
         if completed.returncode == 0 and os.path.isfile(mp4_path):
             print("[RECORDING] MP4 finalized: " + mp4_path)
@@ -244,11 +329,18 @@ class CaptureRecorder:
         """Check only a small ROI at a controlled interval to keep CPU low."""
         now = time.monotonic()
         rules = self.trigger_rules or ([{"image": self.template, "threshold": threshold}] if self.template is not None else [])
-        if not rules or now - self.last_check < interval:
+        if not rules:
+            self.last_scores = []
+            self.last_detection_details = []
+            self.last_score = None
+            self.last_found = False
+            return None
+        if now - self.last_check < interval:
             if allow_start and self.active and now - self.last_detection > release_seconds:
                 return self.stop()
             return None
         self.last_check = now
+        self.last_detection_checked_at = now
         x, y, width, height = roi
         if width <= 0 or height <= 0:
             height, width = frame.shape[:2]
@@ -256,16 +348,33 @@ class CaptureRecorder:
         self.last_roi = (x, y, width, height)
         image = frame[y : y + height, x : x + width] if width > 0 and height > 0 else frame
         self.last_scores = []
+        self.last_detection_details = []
         found = True
-        for rule in rules:
+        for index, rule in enumerate(rules):
             template = rule["image"]
+            rule_threshold = float(rule.get("threshold", threshold))
+            location = None
             if image.shape[0] < template.shape[0] or image.shape[1] < template.shape[1]:
                 score = None
             else:
-                _, score, _, _ = cv2.minMaxLoc(cv2.matchTemplate(image, template, cv2.TM_CCOEFF_NORMED))
+                _, score, _, max_location = cv2.minMaxLoc(
+                    cv2.matchTemplate(image, template, cv2.TM_CCOEFF_NORMED)
+                )
                 score = float(score)
+                location = (
+                    x + int(max_location[0]), y + int(max_location[1]),
+                    int(template.shape[1]), int(template.shape[0]),
+                )
             self.last_scores.append(score)
-            if score is None or score < float(rule.get("threshold", threshold)):
+            self.last_detection_details.append({
+                "name": os.path.basename(rule.get("path", "")) or "template {}".format(index + 1),
+                "path": rule.get("path", ""),
+                "score": score,
+                "threshold": rule_threshold,
+                "matched": score is not None and score >= rule_threshold,
+                "rect": location,
+            })
+            if score is None or score < rule_threshold:
                 found = False
         self.last_score = min((score for score in self.last_scores if score is not None), default=None)
         self.last_found = found

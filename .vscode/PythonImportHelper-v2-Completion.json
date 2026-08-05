@@ -32,7 +32,7 @@
         "documentation": {}
     },
     {
-        "label": "print_function",
+        "label": "annotations",
         "importPath": "__future__",
         "description": "__future__",
         "isExtraImport": true,
@@ -73,6 +73,38 @@
     },
     {
         "label": "print_function",
+        "importPath": "__future__",
+        "description": "__future__",
+        "isExtraImport": true,
+        "detail": "__future__",
+        "documentation": {}
+    },
+    {
+        "label": "print_function",
+        "importPath": "__future__",
+        "description": "__future__",
+        "isExtraImport": true,
+        "detail": "__future__",
+        "documentation": {}
+    },
+    {
+        "label": "annotations",
+        "importPath": "__future__",
+        "description": "__future__",
+        "isExtraImport": true,
+        "detail": "__future__",
+        "documentation": {}
+    },
+    {
+        "label": "annotations",
+        "importPath": "__future__",
+        "description": "__future__",
+        "isExtraImport": true,
+        "detail": "__future__",
+        "documentation": {}
+    },
+    {
+        "label": "annotations",
         "importPath": "__future__",
         "description": "__future__",
         "isExtraImport": true,
@@ -751,6 +783,14 @@
         "documentation": {}
     },
     {
+        "label": "ImageProcPythonCommand",
+        "importPath": "Commands.PythonCommandBase",
+        "description": "Commands.PythonCommandBase",
+        "isExtraImport": true,
+        "detail": "Commands.PythonCommandBase",
+        "documentation": {}
+    },
+    {
         "label": "PythonCommand",
         "importPath": "Commands.PythonCommandBase",
         "description": "Commands.PythonCommandBase",
@@ -1311,6 +1351,24 @@
         "documentation": {}
     },
     {
+        "label": "builtins",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "builtins",
+        "description": "builtins",
+        "detail": "builtins",
+        "documentation": {}
+    },
+    {
+        "label": "keyword",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "keyword",
+        "description": "keyword",
+        "detail": "keyword",
+        "documentation": {}
+    },
+    {
         "label": "pprint",
         "kind": 6,
         "isExtraImport": true,
@@ -1440,6 +1498,38 @@
     },
     {
         "label": "messagebox",
+        "importPath": "tkinter",
+        "description": "tkinter",
+        "isExtraImport": true,
+        "detail": "tkinter",
+        "documentation": {}
+    },
+    {
+        "label": "filedialog",
+        "importPath": "tkinter",
+        "description": "tkinter",
+        "isExtraImport": true,
+        "detail": "tkinter",
+        "documentation": {}
+    },
+    {
+        "label": "messagebox",
+        "importPath": "tkinter",
+        "description": "tkinter",
+        "isExtraImport": true,
+        "detail": "tkinter",
+        "documentation": {}
+    },
+    {
+        "label": "simpledialog",
+        "importPath": "tkinter",
+        "description": "tkinter",
+        "isExtraImport": true,
+        "detail": "tkinter",
+        "documentation": {}
+    },
+    {
+        "label": "ttk",
         "importPath": "tkinter",
         "description": "tkinter",
         "isExtraImport": true,
@@ -1607,6 +1697,14 @@
         "documentation": {}
     },
     {
+        "label": "CompletionEngine",
+        "importPath": "CompletionEngine",
+        "description": "CompletionEngine",
+        "isExtraImport": true,
+        "detail": "CompletionEngine",
+        "documentation": {}
+    },
+    {
         "label": "McuCommand",
         "importPath": "Commands.McuCommandBase",
         "description": "Commands.McuCommandBase",
@@ -1768,6 +1866,22 @@
     },
     {
         "label": "TYPE_CHECKING",
+        "importPath": "typing",
+        "description": "typing",
+        "isExtraImport": true,
+        "detail": "typing",
+        "documentation": {}
+    },
+    {
+        "label": "Dict",
+        "importPath": "typing",
+        "description": "typing",
+        "isExtraImport": true,
+        "detail": "typing",
+        "documentation": {}
+    },
+    {
+        "label": "Any",
         "importPath": "typing",
         "description": "typing",
         "isExtraImport": true,
@@ -1960,6 +2074,14 @@
         "isExtraImport": true,
         "importPath": "datetime",
         "description": "datetime",
+        "detail": "datetime",
+        "documentation": {}
+    },
+    {
+        "label": "datetime",
+        "importPath": "datetime",
+        "description": "datetime",
+        "isExtraImport": true,
         "detail": "datetime",
         "documentation": {}
     },
@@ -2972,7 +3094,31 @@
         "documentation": {}
     },
     {
+        "label": "Image",
+        "importPath": "PIL",
+        "description": "PIL",
+        "isExtraImport": true,
+        "detail": "PIL",
+        "documentation": {}
+    },
+    {
+        "label": "ImageTk",
+        "importPath": "PIL",
+        "description": "PIL",
+        "isExtraImport": true,
+        "detail": "PIL",
+        "documentation": {}
+    },
+    {
         "label": "ImageDraw",
+        "importPath": "PIL",
+        "description": "PIL",
+        "isExtraImport": true,
+        "detail": "PIL",
+        "documentation": {}
+    },
+    {
+        "label": "ImageFont",
         "importPath": "PIL",
         "description": "PIL",
         "isExtraImport": true,
@@ -3118,6 +3264,14 @@
         "importPath": "webbrowser",
         "description": "webbrowser",
         "detail": "webbrowser",
+        "documentation": {}
+    },
+    {
+        "label": "ThreadPoolExecutor",
+        "importPath": "concurrent.futures",
+        "description": "concurrent.futures",
+        "isExtraImport": true,
+        "detail": "concurrent.futures",
         "documentation": {}
     },
     {
@@ -3287,11 +3441,51 @@
         "documentation": {}
     },
     {
+        "label": "ImageAnalysisAssist",
+        "importPath": "ImageAnalysisAssist",
+        "description": "ImageAnalysisAssist",
+        "isExtraImport": true,
+        "detail": "ImageAnalysisAssist",
+        "documentation": {}
+    },
+    {
+        "label": "ObjectDetectionAssistWindow",
+        "importPath": "ObjectDetectionAssist",
+        "description": "ObjectDetectionAssist",
+        "isExtraImport": true,
+        "detail": "ObjectDetectionAssist",
+        "documentation": {}
+    },
+    {
         "label": "CaptureRecorder",
         "importPath": "Recording",
         "description": "Recording",
         "isExtraImport": true,
         "detail": "Recording",
+        "documentation": {}
+    },
+    {
+        "label": "StableRuleEvaluator",
+        "importPath": "AutomationTriggers",
+        "description": "AutomationTriggers",
+        "isExtraImport": true,
+        "detail": "AutomationTriggers",
+        "documentation": {}
+    },
+    {
+        "label": "resolve_command_value",
+        "importPath": "AutomationTriggers",
+        "description": "AutomationTriggers",
+        "isExtraImport": true,
+        "detail": "AutomationTriggers",
+        "documentation": {}
+    },
+    {
+        "label": "command_scope_matches",
+        "importPath": "AutomationTriggers",
+        "description": "AutomationTriggers",
+        "isExtraImport": true,
+        "detail": "AutomationTriggers",
         "documentation": {}
     },
     {
@@ -3702,6 +3896,51 @@
         "description": "Poke-Controller-Modified-Extension-master.DevStudio.CommandBuilder",
         "peekOfCode": "INVALID_IDENTIFIER = re.compile(r'[^0-9A-Za-z_]')\ndef folder_segment(value):\n    value = value.strip()\n    if not value or value in (\".\", \"..\") or INVALID_SEGMENT.search(value):\n        raise ValueError(\"Tag/folder cannot contain \\\\ / : * ? \\\" < > |\")\n    return value\ndef python_identifier(value):\n    value = INVALID_IDENTIFIER.sub(\"_\", value.strip())\n    value = value.strip(\"_\") or \"PokeConCommand\"\n    if value[0].isdigit():",
         "detail": "Poke-Controller-Modified-Extension-master.DevStudio.CommandBuilder",
+        "documentation": {}
+    },
+    {
+        "label": "CompletionEngine",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.CompletionEngine",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.CompletionEngine",
+        "peekOfCode": "class CompletionEngine:\n    \"\"\"Build and filter completion candidates for the current source.\"\"\"\n    IMAGE_TARGET_FUNCTIONS = (\"image_check\",)\n    IMAGE_SHORT_PATH_FUNCTIONS = (\n        \"isContainTemplate\", \"isContainTemplate_max\", \"image_detection_scale15\"\n    )\n    IMAGE_RAW_PATH_FUNCTIONS = (\"detect_image\",)\n    def __init__(self, root_dir_getter):\n        self._root_dir_getter = root_dir_getter\n        self._image_stamp = None",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.CompletionEngine",
+        "documentation": {}
+    },
+    {
+        "label": "_IDENTIFIER_RE",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.CompletionEngine",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.CompletionEngine",
+        "peekOfCode": "_IDENTIFIER_RE = re.compile(r\"[A-Za-z_]\\w*\")\n_TOKEN_AT_END_RE = re.compile(r\"[A-Za-z_]\\w*$\")\n_SOURCE_NAMES_RE = re.compile(\n    r\"(?m)^\\s*(?:async\\s+)?(?:def|class)\\s+([A-Za-z_]\\w*)|\"\n    r\"(?m)^\\s*([A-Za-z_]\\w*)\\s*(?::[^=\\n]+)?=|\"\n    r\"\\bself\\.([A-Za-z_]\\w*)\"\n)\n_METHOD_START_RE = re.compile(r\"^ {4}def\\s+([A-Za-z_]\\w*)\\s*(.*)$\")\nclass CompletionEngine:\n    \"\"\"Build and filter completion candidates for the current source.\"\"\"",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.CompletionEngine",
+        "documentation": {}
+    },
+    {
+        "label": "_TOKEN_AT_END_RE",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.CompletionEngine",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.CompletionEngine",
+        "peekOfCode": "_TOKEN_AT_END_RE = re.compile(r\"[A-Za-z_]\\w*$\")\n_SOURCE_NAMES_RE = re.compile(\n    r\"(?m)^\\s*(?:async\\s+)?(?:def|class)\\s+([A-Za-z_]\\w*)|\"\n    r\"(?m)^\\s*([A-Za-z_]\\w*)\\s*(?::[^=\\n]+)?=|\"\n    r\"\\bself\\.([A-Za-z_]\\w*)\"\n)\n_METHOD_START_RE = re.compile(r\"^ {4}def\\s+([A-Za-z_]\\w*)\\s*(.*)$\")\nclass CompletionEngine:\n    \"\"\"Build and filter completion candidates for the current source.\"\"\"\n    IMAGE_TARGET_FUNCTIONS = (\"image_check\",)",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.CompletionEngine",
+        "documentation": {}
+    },
+    {
+        "label": "_SOURCE_NAMES_RE",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.CompletionEngine",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.CompletionEngine",
+        "peekOfCode": "_SOURCE_NAMES_RE = re.compile(\n    r\"(?m)^\\s*(?:async\\s+)?(?:def|class)\\s+([A-Za-z_]\\w*)|\"\n    r\"(?m)^\\s*([A-Za-z_]\\w*)\\s*(?::[^=\\n]+)?=|\"\n    r\"\\bself\\.([A-Za-z_]\\w*)\"\n)\n_METHOD_START_RE = re.compile(r\"^ {4}def\\s+([A-Za-z_]\\w*)\\s*(.*)$\")\nclass CompletionEngine:\n    \"\"\"Build and filter completion candidates for the current source.\"\"\"\n    IMAGE_TARGET_FUNCTIONS = (\"image_check\",)\n    IMAGE_SHORT_PATH_FUNCTIONS = (",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.CompletionEngine",
+        "documentation": {}
+    },
+    {
+        "label": "_METHOD_START_RE",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.CompletionEngine",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.CompletionEngine",
+        "peekOfCode": "_METHOD_START_RE = re.compile(r\"^ {4}def\\s+([A-Za-z_]\\w*)\\s*(.*)$\")\nclass CompletionEngine:\n    \"\"\"Build and filter completion candidates for the current source.\"\"\"\n    IMAGE_TARGET_FUNCTIONS = (\"image_check\",)\n    IMAGE_SHORT_PATH_FUNCTIONS = (\n        \"isContainTemplate\", \"isContainTemplate_max\", \"image_detection_scale15\"\n    )\n    IMAGE_RAW_PATH_FUNCTIONS = (\"detect_image\",)\n    def __init__(self, root_dir_getter):\n        self._root_dir_getter = root_dir_getter",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.CompletionEngine",
         "documentation": {}
     },
     {
@@ -4879,7 +5118,7 @@
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.Commands.ProController",
         "description": "Poke-Controller-Modified-Extension-master.SerialController.Commands.ProController",
-        "peekOfCode": "class ProController:\n    flag_procon = False\n    def __init__(self):\n        self.axis_dict = {\n            0: \"L-X\",\n            1: \"L-Y\",\n            2: \"R-X\",\n            3: \"R-Y\",\n            4: \"ZL\",\n            5: \"ZR\",",
+        "peekOfCode": "class ProController:\n    flag_procon = False\n    ACTIVITY_NOTIFICATION_IDLE_SECONDS = 10 * 60\n    def __init__(self, joystick_index=0, input_enabled_event=None, activity_callback=None,\n                 state_callback=None):\n        self.joystick_index = max(0, int(joystick_index))\n        self.input_enabled_event = input_enabled_event\n        self.activity_callback = activity_callback\n        self.state_callback = state_callback\n        self.last_activity_at = None",
         "detail": "Poke-Controller-Modified-Extension-master.SerialController.Commands.ProController",
         "documentation": {}
     },
@@ -4933,7 +5172,7 @@
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.Commands.PythonSampleCommand",
         "description": "Poke-Controller-Modified-Extension-master.SerialController.Commands.PythonSampleCommand",
-        "peekOfCode": "class PythonSampleCommand(PythonCommand):\n    SAMPLE_LIST = \"\"\n    INCLUDED_SAMPLES = []\n    def __init__(self, camera=None, gui=None):\n        super(PythonSampleCommand, self).__init__()\n        self.camera = camera\n        self.gui = gui",
+        "peekOfCode": "class PythonSampleCommand(ImageProcPythonCommand):\n    SAMPLE_LIST = \"\"\n    INCLUDED_SAMPLES = []\n    def __init__(self, camera=None, gui=None):\n        super(PythonSampleCommand, self).__init__(camera, gui)",
         "detail": "Poke-Controller-Modified-Extension-master.SerialController.Commands.PythonSampleCommand",
         "documentation": {}
     },
@@ -5181,6 +5420,15 @@
         "documentation": {}
     },
     {
+        "label": "RecoveryCommandSample",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.CommandsAssist.RecoveryCommandSample",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.CommandsAssist.RecoveryCommandSample",
+        "peekOfCode": "class RecoveryCommandSample(PythonCommand):\n    NAME = \"Recovery sample (no operation)\"\n    TAGS = [\"@CommandsAssist\"]\n    def do(self):\n        # Add recovery inputs here.  Long loops must call checkIfAlive().\n        self.checkIfAlive()",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.CommandsAssist.RecoveryCommandSample",
+        "documentation": {}
+    },
+    {
         "label": "ForceStopSafePattern",
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.DevTemplates.PythonCommands.ForceStopSafePattern",
@@ -5284,8 +5532,35 @@
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.AudioMonitor",
         "description": "Poke-Controller-Modified-Extension-master.SerialController.AudioMonitor",
-        "peekOfCode": "class AudioMonitor:\n    def __init__(self):\n        self.input_stream = None\n        self.output_stream = None\n        self.buffer = deque()\n        self.buffer_lock = threading.Lock()\n    @staticmethod\n    def devices(kind=\"input\"):\n        try:\n            import sounddevice as sd",
+        "peekOfCode": "class AudioMonitor:\n    def __init__(self):\n        self.input_stream = None\n        self.output_stream = None\n        self.buffer = deque()\n        self.buffer_lock = threading.Lock()\n        self.process_loopback = False\n    @staticmethod\n    def devices(kind=\"input\"):\n        try:",
         "detail": "Poke-Controller-Modified-Extension-master.SerialController.AudioMonitor",
+        "documentation": {}
+    },
+    {
+        "label": "StableRuleEvaluator",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.AutomationTriggers",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.AutomationTriggers",
+        "peekOfCode": "class StableRuleEvaluator:\n    def __init__(self):\n        self.states = {}\n    def reset(self):\n        self.states.clear()\n    def clear_rule(self, rule_id):\n        self.states.pop(str(rule_id), None)\n    def evaluate(self, rule, command, command_name=\"\", now=None):\n        \"\"\"Return a compact result dict for one value-stable/unchanged rule.\"\"\"\n        now = time.monotonic() if now is None else float(now)",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.AutomationTriggers",
+        "documentation": {}
+    },
+    {
+        "label": "resolve_command_value",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.AutomationTriggers",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.AutomationTriggers",
+        "peekOfCode": "def resolve_command_value(command, requested_name):\n    \"\"\"Return ``(found, value, actual_attribute)`` with common state aliases.\"\"\"\n    if command is None:\n        return False, None, \"\"\n    name = str(requested_name or \"\").strip()\n    candidates = [name]\n    upper = name.upper()\n    if upper == \"STATE_MAIN_FUNCTION\":\n        candidates.extend((\"main_current_state\", \"za_infi_main_current_state\"))\n    story = re.fullmatch(r\"STATE_(\\d+)_STORY_FUNCTION\", upper)",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.AutomationTriggers",
+        "documentation": {}
+    },
+    {
+        "label": "command_scope_matches",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.AutomationTriggers",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.AutomationTriggers",
+        "peekOfCode": "def command_scope_matches(rule, command_name):\n    scope = str(rule.get(\"command\", \"\") or \"\").strip()\n    return not scope or scope in (\"すべて\", \"All commands\", \"*\") or scope == str(command_name or \"\")\nclass StableRuleEvaluator:\n    def __init__(self):\n        self.states = {}\n    def reset(self):\n        self.states.clear()\n    def clear_rule(self, rule_id):\n        self.states.pop(str(rule_id), None)",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.AutomationTriggers",
         "documentation": {}
     },
     {
@@ -5293,7 +5568,7 @@
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.Camera",
         "description": "Poke-Controller-Modified-Extension-master.SerialController.Camera",
-        "peekOfCode": "class Camera:\n    def __init__(self, fps: int = 45):\n        self.camera = None\n        self.capture_size = (1280, 720)\n        # self.capture_size = (1920, 1080)\n        self.capture_dir = \"Captures\"\n        self.fps = int(fps)\n        self._logger = getLogger(__name__)\n        self._logger.addHandler(NullHandler())\n        self._logger.setLevel(DEBUG)",
+        "peekOfCode": "class Camera:\n    def __init__(self, fps: int = 45):\n        self.camera = None\n        self.capture_size = (1280, 720)\n        self.capture_dir = \"Captures\"\n        self.fps = int(fps)\n        self.window_capture_backend = \"WindowCapture\"\n        self._logger = getLogger(__name__)\n        self._logger.addHandler(NullHandler())\n        self._logger.setLevel(DEBUG)",
         "detail": "Poke-Controller-Modified-Extension-master.SerialController.Camera",
         "documentation": {}
     },
@@ -5311,7 +5586,7 @@
         "kind": 5,
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.Camera",
         "description": "Poke-Controller-Modified-Extension-master.SerialController.Camera",
-        "peekOfCode": "CAPTURE_DIR = \"./Captures/\"\ndef _get_save_filespec(filename: str) -> str:\n    \"\"\"\n    画像ファイルの保存パスを取得する。\n    入力が絶対パスの場合は、`CAPTURE_DIR`につなげずに返す。\n    Args:\n        filename (str): 保存名／保存パス\n    Returns:\n        str: _description_\n    \"\"\"",
+        "peekOfCode": "CAPTURE_DIR = \"./Captures/\"\ndef _get_save_filespec(filename: str) -> str:\n    \"\"\"\n    画像ファイルの保存パスを取得する。\n    \"\"\"\n    if os.path.isabs(filename):\n        return filename\n    else:\n        return os.path.join(CAPTURE_DIR, filename)\nclass Camera:",
         "detail": "Poke-Controller-Modified-Extension-master.SerialController.Camera",
         "documentation": {}
     },
@@ -5496,6 +5771,15 @@
         "documentation": {}
     },
     {
+        "label": "ImageAnalysisAssist",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.ImageAnalysisAssist",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.ImageAnalysisAssist",
+        "peekOfCode": "class ImageAnalysisAssist:\n    def __init__(self, serial_root, result_callback, interval=2.0, max_candidates=10):\n        self.serial_root = serial_root\n        self.profile_path = os.path.join(serial_root, \"Template\", \"image_detection_profiles.json\")\n        self.result_callback = result_callback\n        self.interval = float(interval)\n        self.max_candidates = max(3, min(20, int(max_candidates)))\n        self.enabled = False\n        self.busy = False\n        self.last_submit = 0.0",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.ImageAnalysisAssist",
+        "documentation": {}
+    },
+    {
         "label": "ImageProcessing",
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.ImageProcessing",
@@ -5610,6 +5894,24 @@
         "description": "Poke-Controller-Modified-Extension-master.SerialController.Menubar",
         "peekOfCode": "class PokeController_Menubar(tk.Menu):\n    def __init__(self, master, **kw):\n        self._logger = getLogger(__name__)\n        self._logger.addHandler(NullHandler())\n        self._logger.setLevel(DEBUG)\n        self._logger.propagate = True\n        self.master = master\n        self.pokeconname = self.master.pokeconname\n        self.pokeconversion = self.master.pokeconversion\n        self.root = self.master.root",
         "detail": "Poke-Controller-Modified-Extension-master.SerialController.Menubar",
+        "documentation": {}
+    },
+    {
+        "label": "ObjectDetectionAssistWindow",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.ObjectDetectionAssist",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.ObjectDetectionAssist",
+        "peekOfCode": "class ObjectDetectionAssistWindow:\n    \"\"\"Toplevel used to prepare and exercise multi-view object templates.\"\"\"\n    PREVIEW_SIZE = (720, 405)\n    DETECT_INTERVAL_MS = 500\n    def __init__(self, parent, frame_getter, initial_search_roi=None, on_close=None,\n                 title=\"物体検知アシスト\"):\n        self.parent = parent\n        self.camera_getter = frame_getter\n        self.on_close = on_close\n        self.window = tk.Toplevel(parent)",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.ObjectDetectionAssist",
+        "documentation": {}
+    },
+    {
+        "label": "ObjectDetectionAssist",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.ObjectDetectionAssist",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.ObjectDetectionAssist",
+        "peekOfCode": "ObjectDetectionAssist = ObjectDetectionAssistWindow",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.ObjectDetectionAssist",
         "documentation": {}
     },
     {
@@ -5779,7 +6081,7 @@
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.Recording",
         "description": "Poke-Controller-Modified-Extension-master.SerialController.Recording",
-        "peekOfCode": "class CaptureRecorder:\n    def __init__(self, output_dir=\"Recordings\"):\n        self.output_dir = output_dir\n        self.video = None\n        self.audio = None\n        self.audio_stream = None\n        self.active = False\n        self.last_detection = 0.0\n        self.last_check = 0.0\n        self.template = None",
+        "peekOfCode": "class CaptureRecorder:\n    def __init__(self, output_dir=\"Recordings\"):\n        self.output_dir = output_dir\n        self.video = None\n        self.audio = None\n        self.audio_stream = None\n        self.process_audio = None\n        self.process_audio_gain = 1.0\n        self.active = False\n        self.last_detection = 0.0",
         "detail": "Poke-Controller-Modified-Extension-master.SerialController.Recording",
         "documentation": {}
     },
@@ -5878,7 +6180,7 @@
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.Window",
         "description": "Poke-Controller-Modified-Extension-master.SerialController.Window",
-        "peekOfCode": "class PokeControllerApp:\n    def __init__(self, master=None, profile=\"default\"):\n        self._logger = getLogger(__name__)\n        self._logger.addHandler(NullHandler())\n        self._logger.setLevel(DEBUG)\n        self._logger.propagate = True\n        self._logger.debug(f\"User Profile Name: '{profile}'\")\n        self.root = master\n        self.root.title(f\"{Constant.NAME} ver.{Constant.VERSION} (profile: {args.profile})\")\n        # self.root.resizable(0, 0)",
+        "peekOfCode": "class PokeControllerApp:\n    def __init__(self, master=None, profile=\"default\"):\n        self._logger = getLogger(__name__)\n        self._logger.addHandler(NullHandler())\n        self._logger.setLevel(DEBUG)\n        self._logger.propagate = True\n        self._logger.debug(f\"User Profile Name: '{profile}'\")\n        self.root = master\n        self._main_thread = threading.current_thread()\n        self._gui_action_queue = queue.Queue()",
         "detail": "Poke-Controller-Modified-Extension-master.SerialController.Window",
         "documentation": {}
     },
@@ -5896,7 +6198,7 @@
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.Window",
         "description": "Poke-Controller-Modified-Extension-master.SerialController.Window",
-        "peekOfCode": "class StdoutRedirector(object):\n    \"\"\"\n    標準出力をtextウィジェットにリダイレクトするクラス\n    重いので止めました →# update_idletasks()で出力のたびに随時更新(従来はfor loopのときなどにまとめて出力されることがあった)\n    \"\"\"\n    def __init__(self, text_widget):\n        self.text_space = text_widget\n    def write(self, string):\n        self.text_space.configure(state=\"normal\")\n        self.text_space.insert(\"end\", string)",
+        "peekOfCode": "class StdoutRedirector(object):\n    \"\"\"\n    標準出力をtextウィジェットにリダイレクトするクラス\n    重いので止めました →# update_idletasks()で出力のたびに随時更新(従来はfor loopのときなどにまとめて出力されることがあった)\n    \"\"\"\n    def __init__(self, text_widget):\n        self.text_space = text_widget\n        self._buffer = []\n        self._buffer_lock = threading.Lock()\n        self._closed = False",
         "detail": "Poke-Controller-Modified-Extension-master.SerialController.Window",
         "documentation": {}
     },

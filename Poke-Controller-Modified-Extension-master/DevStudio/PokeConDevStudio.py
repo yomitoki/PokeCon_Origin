@@ -41,6 +41,7 @@ from ImageDetectionLibrary import (folder_tags as image_folder_tags,
 from ImageDetectionSync import (compare_settings as compare_image_detection_settings,
                                 parse_source_settings as parse_source_image_detection_settings,
                                 update_library_from_source)
+from CompletionEngine import CompletionEngine
 
 
 PYTHON_SUFFIXES = (".py", ".pyfrag")
@@ -162,6 +163,14 @@ class DevStudio(tk.Tk):
         self.active_editor_tab = None
         self._switching_editor_tab = False
         self.ui_state = self.load_ui_state()
+        self.completion_mode = tk.StringVar(value=self.ui_state.get("completion_mode", "右タブ"))
+        self.completion_query = tk.StringVar(value=self.ui_state.get("completion_query", ""))
+        self.completion_tag = tk.StringVar(value=self.ui_state.get("completion_tag", ""))
+        self.completion_engine = CompletionEngine(lambda: self.root_dir.get())
+        self.completion_candidates = []
+        self.completion_analysis = None
+        self.completion_popup = None
+        self.completion_popup_list = None
         self.background_queue = queue.Queue()
         self.background_tasks = set()
         self.find_text = tk.StringVar()
@@ -319,7 +328,10 @@ class DevStudio(tk.Tk):
                 documents.append(document)
         state = {"left_visible": self.left_panel_visible, "right_visible": self.right_panel_visible,
                  "left_tab": self.left_tabs.index(self.left_tabs.select()), "right_tab": self.right_tabs.index(self.right_tabs.select()),
-                 "active_path": self.current_path, "documents": documents}
+                 "active_path": self.current_path, "documents": documents,
+                 "completion_mode": self.completion_mode.get(),
+                 "completion_query": self.completion_query.get(),
+                 "completion_tag": self.completion_tag.get()}
         try:
             state["sash0"] = self.body.sashpos(0)
             state["sash1"] = self.body.sashpos(1)
@@ -394,6 +406,12 @@ class DevStudio(tk.Tk):
         ttk.Entry(edit_tools, textvariable=self.replace_text, width=16).pack(side="left", padx=(7, 2))
         ttk.Button(edit_tools, text="Replace", command=self.replace_one).pack(side="left")
         ttk.Button(edit_tools, text="All", command=self.replace_all).pack(side="left", padx=2)
+        ttk.Label(edit_tools, text="  補完:").pack(side="left")
+        completion_mode = ttk.Combobox(
+            edit_tools, state="readonly", width=10, textvariable=self.completion_mode,
+            values=("エディタ内", "右タブ", "無効"))
+        completion_mode.pack(side="left", padx=2)
+        completion_mode.bind("<<ComboboxSelected>>", self.on_completion_mode_changed)
         self.right_panel_button = ttk.Button(edit_tools, text="Hide right", command=self.toggle_right_panel)
         self.right_panel_button.pack(side="right")
         self.workspace_tabs = ttk.Notebook(self)
@@ -516,9 +534,12 @@ class DevStudio(tk.Tk):
         self.right_tabs.pack(fill="both", expand=True)
         image_targets_tab = ttk.Frame(self.right_tabs)
         step_hierarchy_tab = ttk.Frame(self.right_tabs)
+        completion_tab = ttk.Frame(self.right_tabs)
         self.right_tabs.add(image_targets_tab, text="Image detection")
         self.right_tabs.add(step_hierarchy_tab, text="Step hierarchy")
+        self.right_tabs.add(completion_tab, text="Completion")
         self.step_hierarchy_tab = step_hierarchy_tab
+        self.completion_tab = completion_tab
         self.right_tabs.bind("<<NotebookTabChanged>>", self.on_right_tool_tab_changed)
         source_tab_bar = ttk.Frame(center)
         source_tab_bar.pack(fill="x")
@@ -542,7 +563,9 @@ class DevStudio(tk.Tk):
         editor_scroll.pack(fill="y", side="right")
         self.editor.configure(yscrollcommand=lambda first, last: self._sync_editor_scroll(editor_scroll, first, last))
         self.editor.bind("<<Modified>>", self.editor_modified)
-        self.editor.bind("<KeyRelease>", lambda event: self.update_editor_view())
+        self.editor.bind("<KeyRelease>", self.on_editor_key_release)
+        self.editor.bind("<ButtonRelease-1>", lambda event: self.debounce(
+            "editor_completion_click", 80, self.refresh_completion))
         self.editor.bind("<Control-s>", lambda event: (self.save_current(), "break"))
         self.bind_text_undo_redo(self.editor)
         self.editor.bind("<F5>", lambda event: (self.check_syntax(), "break"))
@@ -560,6 +583,12 @@ class DevStudio(tk.Tk):
             ttk.Button(editor_actions, text="VS Codeで現在行を開く",
                        command=self.open_current_in_vscode).pack(side="left", padx=4)
         self.editor.bind("<Control-Alt-i>", lambda event: (self.open_image_detection_at_cursor(), "break"))
+        self.editor.bind("<Control-space>", self.show_completion_now)
+        self.editor.bind("<Escape>", self.completion_escape)
+        self.editor.bind("<Down>", self.completion_down)
+        self.editor.bind("<Up>", self.completion_up)
+        self.editor.bind("<Return>", self.completion_accept_key)
+        self.editor.bind("<Tab>", self.completion_accept_key)
         todo_frame = ttk.Labelframe(center, text="TODO / 改修予定（ソースファイル別）")
         todo_frame.pack(fill="x", pady=(5, 0))
         todo_top = ttk.Frame(todo_frame); todo_top.pack(fill="x", padx=3, pady=(3, 0))
@@ -577,6 +606,7 @@ class DevStudio(tk.Tk):
         self.bind_text_undo_redo(self.todo_editor)
         self._build_image_targets_tab(image_targets_tab)
         self._build_step_hierarchy_tab(step_hierarchy_tab)
+        self._build_completion_tab(completion_tab)
         self._build_sample_functions_tab(sample_functions_workspace)
         self._build_sample_lists_tab(sample_lists_workspace)
         self._build_sample_program_tab(sample_program_workspace)
@@ -607,6 +637,246 @@ class DevStudio(tk.Tk):
             self.body.add(self.right_panel)
             self.right_panel_visible = True
             self.right_panel_button.configure(text="Hide right")
+
+    def _build_completion_tab(self, parent):
+        filters = ttk.Frame(parent)
+        filters.pack(fill="x", padx=6, pady=6)
+        ttk.Label(filters, text="検索:").grid(column=0, row=0, sticky="w")
+        query = ttk.Entry(filters, textvariable=self.completion_query)
+        query.grid(column=1, row=0, padx=3, sticky="ew")
+        ttk.Label(filters, text="画像タグ:").grid(column=0, row=1, sticky="w", pady=(4, 0))
+        self.completion_tag_combo = ttk.Combobox(
+            filters, textvariable=self.completion_tag, values=("",), width=22)
+        self.completion_tag_combo.grid(column=1, row=1, padx=3, pady=(4, 0), sticky="ew")
+        ttk.Button(filters, text="再読込", command=lambda: self.refresh_completion(True)).grid(
+            column=2, row=0, rowspan=2, padx=(3, 0), sticky="ns")
+        filters.columnconfigure(1, weight=1)
+        self.completion_query.trace_add(
+            "write", lambda *args: self.debounce("completion_query", 150, self.refresh_completion))
+        self.completion_tag.trace_add(
+            "write", lambda *args: self.debounce("completion_tag", 150, self.refresh_completion))
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill="both", expand=True, padx=6)
+        self.completion_tree = ttk.Treeview(
+            tree_frame, columns=("kind", "tags"), show="tree headings", selectmode="browse")
+        self.completion_tree.heading("#0", text="候補")
+        self.completion_tree.heading("kind", text="種類")
+        self.completion_tree.heading("tags", text="タグ")
+        self.completion_tree.column("#0", width=210, stretch=True)
+        self.completion_tree.column("kind", width=75, stretch=False)
+        self.completion_tree.column("tags", width=130, stretch=True)
+        self.completion_tree.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.completion_tree.yview)
+        scroll.pack(side="right", fill="y")
+        self.completion_tree.configure(yscrollcommand=scroll.set)
+        self.completion_tree.bind("<<TreeviewSelect>>", self.show_selected_completion_detail)
+        self.completion_tree.bind("<Double-1>", self.insert_selected_completion)
+        self.completion_tree.bind("<Return>", self.insert_selected_completion)
+        self.completion_detail = tk.StringVar(value="Ctrl+Spaceで現在位置の候補を表示します。")
+        ttk.Label(parent, textvariable=self.completion_detail, wraplength=290, justify="left").pack(
+            fill="x", padx=6, pady=5)
+        ttk.Button(parent, text="選択候補をエディタへ反映",
+                   command=self.insert_selected_completion).pack(fill="x", padx=6, pady=(0, 6))
+
+    def on_completion_mode_changed(self, event=None):
+        self.hide_completion_popup()
+        if self.completion_mode.get() == "右タブ":
+            if not self.right_panel_visible:
+                self.toggle_right_panel()
+            self.right_tabs.select(self.completion_tab)
+            self.refresh_completion()
+        self.editor.focus_set()
+
+    def on_editor_key_release(self, event=None):
+        self.update_editor_view()
+        if event is not None and event.keysym in (
+                "Up", "Down", "Return", "Tab", "Escape", "Shift_L", "Shift_R",
+                "Control_L", "Control_R", "Alt_L", "Alt_R"):
+            return
+        if self.completion_mode.get() != "無効":
+            self.debounce("editor_completion", 140, self.refresh_completion)
+
+    def show_completion_now(self, event=None):
+        if self.completion_mode.get() == "無効":
+            return "break"
+        self.refresh_completion(explicit=True)
+        return "break"
+
+    def refresh_completion(self, explicit=False):
+        if not hasattr(self, "completion_tree") or self.completion_mode.get() == "無効":
+            self.hide_completion_popup()
+            return
+        source = self.editor.get("1.0", "end-1c")
+        count = self.editor.count("1.0", "insert", "chars")
+        cursor_offset = int(count[0]) if count else 0
+        try:
+            analysis = self.completion_engine.suggest(
+                source, cursor_offset,
+                query=self.completion_query.get() if self.completion_mode.get() == "右タブ" else "",
+                tag=self.completion_tag.get(), limit=100)
+        except (OSError, ValueError, TypeError) as error:
+            self.completion_detail.set("補完候補を読み込めません: {}".format(error))
+            self.hide_completion_popup()
+            return
+        self.completion_analysis = analysis
+        self.completion_candidates = list(analysis.get("candidates", []))
+        tags = sorted(
+            {str(tag) for item in self.completion_candidates for tag in item.get("tags", [])}
+            | set(self.completion_engine.image_tags()), key=str.lower)
+        current_tag = self.completion_tag.get()
+        self.completion_tag_combo.configure(values=("",) + tuple(tags))
+        if current_tag and current_tag not in tags:
+            self.completion_tag_combo.configure(values=("", current_tag) + tuple(tags))
+
+        self.completion_tree.delete(*self.completion_tree.get_children())
+        for index, item in enumerate(self.completion_candidates):
+            self.completion_tree.insert(
+                "", "end", iid="completion_{}".format(index), text=item.get("label", item.get("insert", "")),
+                values=(item.get("kind", ""), ", ".join(item.get("tags", []))))
+        if self.completion_candidates:
+            self.completion_tree.selection_set("completion_0")
+            self.show_selected_completion_detail()
+        else:
+            self.completion_detail.set("候補はありません。")
+
+        if self.completion_mode.get() == "エディタ内":
+            prefix = analysis.get("prefix", "")
+            context = analysis.get("context", "normal")
+            if self.completion_candidates and (explicit or prefix or context != "normal"):
+                self.show_completion_popup()
+            else:
+                self.hide_completion_popup()
+
+    def show_selected_completion_detail(self, event=None):
+        selection = self.completion_tree.selection()
+        if not selection:
+            return
+        try:
+            index = int(selection[0].split("_", 1)[1])
+            item = self.completion_candidates[index]
+        except (ValueError, IndexError):
+            return
+        self.completion_detail.set(item.get("detail", item.get("insert", "")))
+
+    def insert_selected_completion(self, event=None):
+        selection = self.completion_tree.selection()
+        if not selection:
+            return "break" if event is not None else None
+        try:
+            index = int(selection[0].split("_", 1)[1])
+            self.apply_completion(self.completion_candidates[index])
+        except (ValueError, IndexError):
+            pass
+        return "break" if event is not None else None
+
+    def _ensure_completion_popup(self):
+        if self.completion_popup is not None:
+            try:
+                if self.completion_popup.winfo_exists():
+                    return
+            except tk.TclError:
+                pass
+        self.completion_popup = tk.Toplevel(self)
+        self.completion_popup.overrideredirect(True)
+        self.completion_popup.attributes("-topmost", True)
+        self.completion_popup_list = tk.Listbox(
+            self.completion_popup, height=10, width=52, exportselection=False,
+            background="#252526", foreground="#dddddd", selectbackground="#094771")
+        self.completion_popup_list.pack(fill="both", expand=True)
+        self.completion_popup_list.bind("<Double-1>", self.completion_accept_key)
+        self.completion_popup_list.bind("<ButtonRelease-1>", lambda event: self.editor.focus_set())
+
+    def show_completion_popup(self):
+        self._ensure_completion_popup()
+        self.completion_popup_list.delete(0, "end")
+        for item in self.completion_candidates[:20]:
+            self.completion_popup_list.insert(
+                "end", "{}  [{}]".format(item.get("label", item.get("insert", "")), item.get("kind", "")))
+        if not self.completion_popup_list.size():
+            self.hide_completion_popup()
+            return
+        self.completion_popup_list.selection_set(0)
+        bbox = self.editor.bbox("insert")
+        if bbox is None:
+            self.hide_completion_popup()
+            return
+        x = self.editor.winfo_rootx() + bbox[0]
+        y = self.editor.winfo_rooty() + bbox[1] + bbox[3] + 2
+        self.completion_popup.geometry("+{}+{}".format(x, y))
+        self.completion_popup.deiconify()
+        self.completion_popup.lift()
+        self.editor.focus_set()
+
+    def hide_completion_popup(self):
+        if self.completion_popup is not None:
+            try: self.completion_popup.withdraw()
+            except tk.TclError: pass
+
+    def completion_popup_visible(self):
+        try:
+            return bool(self.completion_popup and self.completion_popup.winfo_viewable()
+                        and self.completion_popup_list.size())
+        except tk.TclError:
+            return False
+
+    def completion_down(self, event=None):
+        if not self.completion_popup_visible():
+            return None
+        current = self.completion_popup_list.curselection()
+        index = min(self.completion_popup_list.size() - 1, (current[0] + 1) if current else 0)
+        self.completion_popup_list.selection_clear(0, "end")
+        self.completion_popup_list.selection_set(index)
+        self.completion_popup_list.see(index)
+        return "break"
+
+    def completion_up(self, event=None):
+        if not self.completion_popup_visible():
+            return None
+        current = self.completion_popup_list.curselection()
+        index = max(0, (current[0] - 1) if current else 0)
+        self.completion_popup_list.selection_clear(0, "end")
+        self.completion_popup_list.selection_set(index)
+        self.completion_popup_list.see(index)
+        return "break"
+
+    def completion_escape(self, event=None):
+        if not self.completion_popup_visible():
+            return None
+        self.hide_completion_popup()
+        return "break"
+
+    def completion_accept_key(self, event=None):
+        if not self.completion_popup_visible():
+            return None
+        selection = self.completion_popup_list.curselection()
+        index = selection[0] if selection else 0
+        if 0 <= index < min(20, len(self.completion_candidates)):
+            self.apply_completion(self.completion_candidates[index])
+        return "break"
+
+    def apply_completion(self, candidate):
+        source = self.editor.get("1.0", "end-1c")
+        current_count = self.editor.count("1.0", "insert", "chars")
+        current_offset = int(current_count[0]) if current_count else 0
+        # Recalculate only the lightweight cursor context so a mouse move made
+        # after the candidate list was built cannot replace an old location.
+        analysis = self.completion_engine.analyze(source, current_offset)
+        start_offset = int(analysis.get("replace_start", 0))
+        cursor_offset = current_offset
+        start_offset = max(0, min(start_offset, cursor_offset))
+        start = "1.0+{}c".format(start_offset)
+        try: self.editor.edit_separator()
+        except tk.TclError: pass
+        self.editor.delete(start, "insert")
+        self.editor.insert(start, candidate.get("insert", ""))
+        self.editor.mark_set("insert", "{}+{}c".format(start, len(candidate.get("insert", ""))))
+        try: self.editor.edit_separator()
+        except tk.TclError: pass
+        self.editor.see("insert")
+        self.editor.focus_set()
+        self.hide_completion_popup()
+        self.update_editor_view()
 
     def _build_step_hierarchy_tab(self, parent):
         self.step_source_mode = "generated"
@@ -654,6 +924,8 @@ class DevStudio(tk.Tk):
     def on_right_tool_tab_changed(self, event=None):
         if self.right_tabs.select() == str(self.step_hierarchy_tab):
             self.load_steps_from_editor(silent=True)
+        elif self.right_tabs.select() == str(self.completion_tab):
+            self.refresh_completion()
 
     def add_step_item(self, parent):
         label = self.step_entry.get().strip()
@@ -1091,6 +1363,8 @@ class DevStudio(tk.Tk):
         self.image_library_crop = tk.StringVar(value="0,0,0,0")
         self.image_library_gray = tk.BooleanVar(value=True)
         self.image_library_show_value = tk.BooleanVar(value=False)
+        self.image_library_match_color = tk.StringVar(value="blue")
+        self.image_library_no_match_color = tk.StringVar(value="red")
         self.image_library_target_operator = tk.StringVar(value="OR")
         self.image_library_list_name = tk.StringVar(value="new_image_set")
         self.image_library_list_description = tk.StringVar()
@@ -1121,10 +1395,15 @@ class DevStudio(tk.Tk):
         flags = ttk.Frame(form); flags.grid(column=1, row=5, sticky="w")
         ttk.Checkbutton(flags, text="グレースケール", variable=self.image_library_gray).pack(side="left")
         ttk.Checkbutton(flags, text="類似度をログ出力", variable=self.image_library_show_value).pack(side="left", padx=8)
-        ttk.Label(form, text="複数画像の判定:").grid(column=0, row=6, padx=4, pady=3, sticky="w")
+        colors = ttk.Frame(form); colors.grid(column=1, columnspan=2, row=6, sticky="w")
+        ttk.Label(colors, text="一致色:").pack(side="left")
+        ttk.Entry(colors, textvariable=self.image_library_match_color, width=10).pack(side="left", padx=2)
+        ttk.Label(colors, text="不一致色:").pack(side="left", padx=(8, 0))
+        ttk.Entry(colors, textvariable=self.image_library_no_match_color, width=10).pack(side="left", padx=2)
+        ttk.Label(form, text="複数画像の判定:").grid(column=0, row=7, padx=4, pady=3, sticky="w")
         ttk.Combobox(form, textvariable=self.image_library_target_operator, state="readonly",
-                     values=("OR", "AND"), width=8).grid(column=1, row=6, padx=4, sticky="w")
-        buttons = ttk.Frame(form); buttons.grid(column=1, columnspan=2, row=7, sticky="e", pady=4)
+                     values=("OR", "AND"), width=8).grid(column=1, row=7, padx=4, sticky="w")
+        buttons = ttk.Frame(form); buttons.grid(column=1, columnspan=2, row=8, sticky="e", pady=4)
         ttk.Button(buttons, text="＋別パターンとして保存", command=self.save_image_library_variant).pack(side="left", padx=2)
         ttk.Button(buttons, text="選択パターンを上書き", command=self.overwrite_image_library_variant).pack(side="left", padx=2)
         ttk.Button(buttons, text="選択パターンを削除", command=self.delete_image_library_variant).pack(side="left", padx=2)
@@ -2739,7 +3018,10 @@ class DevStudio(tk.Tk):
         tags = image_folder_tags(self.template_root(), os.path.abspath(path))
         return name, {"template_path": portable, "threshold": threshold, "use_gray": bool(self.image_library_gray.get()),
                       "show_value": bool(self.image_library_show_value.get()), "show_position": True,
-                      "show_only_true_rect": False, "ms": 2000, "crop": crop}, tags
+                      "show_only_true_rect": False, "ms": 2000,
+                      "match_color": self.image_library_match_color.get().strip() or "blue",
+                      "no_match_color": self.image_library_no_match_color.get().strip() or "red",
+                      "crop": crop}, tags
 
     def save_image_library_variant(self):
         try:
@@ -2861,6 +3143,8 @@ class DevStudio(tk.Tk):
         self.image_library_target_operator.set(target.get("operator", "OR"))
         self.image_library_threshold.set(variant.get("threshold", 0.8)); self.image_library_crop.set(",".join(map(str, variant.get("crop", [0,0,0,0]))))
         self.image_library_gray.set(bool(variant.get("use_gray", True))); self.image_library_show_value.set(bool(variant.get("show_value", False)))
+        self.image_library_match_color.set(variant.get("match_color", "blue"))
+        self.image_library_no_match_color.set(variant.get("no_match_color", "red"))
 
     def refresh_image_library_workspace(self, select=None):
         if not hasattr(self, "image_library_tree"): return
@@ -3263,6 +3547,7 @@ class DevStudio(tk.Tk):
         return tab_id
 
     def load_editor_document(self, tab_id, line=None):
+        self.hide_completion_popup()
         if hasattr(self, "todo_editor"):
             self.save_current_todo(silent=True)
         document = self.editor_documents[tab_id]
@@ -3279,6 +3564,8 @@ class DevStudio(tk.Tk):
         self.load_current_todo()
         if self.find_text.get():
             self.debounce("editor_find_count", 120, self.refresh_find_count)
+        if self.completion_mode.get() == "右タブ":
+            self.debounce("editor_completion_tab", 80, self.refresh_completion)
 
     def todo_storage_path(self):
         return os.path.join(os.path.dirname(__file__), "source_todos.json")

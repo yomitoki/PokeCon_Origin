@@ -89,6 +89,8 @@ def detect_image(
         show_only_true_rect=False,
         ms=2000,
         crop=None,
+        match_color="blue",
+        no_match_color="red",
         history=None):
     """Return match details while remaining independent of PokeCon base APIs."""
     frame = _command_frame(command)
@@ -113,7 +115,7 @@ def detect_image(
     if history is not None:
         history.add(name, score, threshold, matched)
     if show_position and hasattr(command, "displayRectangle") and (matched or not show_only_true_rect):
-        color = ["blue", "orange"] if matched else ["red", "orange"]
+        color = [str(match_color), "orange"] if matched else [str(no_match_color), "orange"]
         command.displayRectangle(
             absolute_location,
             int(template.shape[1]),
@@ -124,7 +126,7 @@ def detect_image(
             crop=[],
         )
     elif show_position and getattr(command, "gui", None) is not None and (matched or not show_only_true_rect):
-        outline = "blue" if matched else "red"
+        outline = str(match_color) if matched else str(no_match_color)
         command.gui.ImgRect(
             absolute_location[0],
             absolute_location[1],
@@ -134,7 +136,7 @@ def detect_image(
             tag=str(time.perf_counter()),
             ms=int(ms),
         )
-    return {
+    detail = {
         "name": str(name),
         "matched": matched,
         "score": float(score),
@@ -143,6 +145,15 @@ def detect_image(
         "template_size": (int(template.shape[1]), int(template.shape[0])),
         "timestamp": time.time(),
     }
+    event_callback = getattr(command, "image_detection_event", None)
+    if callable(event_callback):
+        try:
+            event_callback(detail)
+        except Exception:
+            # Detection itself must never fail because an optional recorder
+            # consumer has already closed or is unavailable.
+            pass
+    return detail
 
 
 def format_similarity_summary(history, name=None, gap_seconds=1.0):

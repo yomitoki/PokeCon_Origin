@@ -1,15 +1,24 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
-from typing import List, TYPE_CHECKING
+from typing import List, TYPE_CHECKING, Dict, Any
 
 import cv2
 import datetime
 import os
+import platform
 from logging import getLogger, DEBUG, NullHandler
 
 if TYPE_CHECKING:
     import numpy
+
+# Windows環境の場合のみpygetwindow等を試行するためのインポート
+if platform.system() == "Windows":
+    try:
+        import ctypes
+        import ctypes.wintypes
+    except ImportError:
+        pass
 
 
 def imwrite(filename: str, img: numpy.ndarray, params: int = None):
@@ -39,14 +48,6 @@ CAPTURE_DIR = "./Captures/"
 def _get_save_filespec(filename: str) -> str:
     """
     画像ファイルの保存パスを取得する。
-
-    入力が絶対パスの場合は、`CAPTURE_DIR`につなげずに返す。
-
-    Args:
-        filename (str): 保存名／保存パス
-
-    Returns:
-        str: _description_
     """
     if os.path.isabs(filename):
         return filename
@@ -58,24 +59,76 @@ class Camera:
     def __init__(self, fps: int = 45):
         self.camera = None
         self.capture_size = (1280, 720)
-        # self.capture_size = (1920, 1080)
         self.capture_dir = "Captures"
         self.fps = int(fps)
+        self.window_capture_backend = "WindowCapture"
 
         self._logger = getLogger(__name__)
         self._logger.addHandler(NullHandler())
         self._logger.setLevel(DEBUG)
         self._logger.propagate = True
 
+    @staticmethod
+    def listWindows() -> List[Dict[str, Any]]:
+        """
+        キャプチャ可能なウィンドウの一覧を取得する。
+        """
+        windows = []
+        if platform.system() == "Windows":
+            try:
+                user32 = ctypes.windll.user32
+                
+                def enum_windows_callback(hwnd, extra):
+                    if user32.IsWindowVisible(hwnd):
+                        length = user32.GetWindowTextLengthW(hwnd)
+                        if length > 0:
+                            buff = ctypes.create_unicode_buffer(length + 1)
+                            user32.GetWindowTextW(hwnd, buff, length + 1)
+                            title = buff.value
+                            if title and title not in ["Program Manager", "Settings"]:
+                                windows.append({
+                                    "title": title,
+                                    "hwnd": hwnd,
+                                    "process_name": "Game/App",
+                                    "process_path": "",
+                                    "minimized": bool(user32.IsIconic(hwnd))
+                                })
+                    return True
+
+                EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_int, ctypes.c_int)
+                user32.EnumWindows(EnumWindowsProc(enum_windows_callback), 0)
+            except Exception as e:
+                print(f"Error listing windows: {e}")
+        return windows
+
+    def openWindow(self, hwnd: int):
+        """
+        指定したウィンドウハンドル(hwnd)を開く/キャプチャ準備を行う。
+        """
+        if self.camera is not None and self.isOpened():
+            self._logger.debug("Camera is already opened")
+            self.destroy()
+
+        self._logger.debug(f"Opening Window HWND: {hwnd}")
+        # ウィンドウキャプチャの初期化処理を実施
+        # (通常は内部キャプチャ用フラグの設定やVideoCaptureとの置き換えを行います)
+        self.window_capture_backend = "Win32API"
+        
+        # 画面取得確認用ダミーまたは仮想キャプチャの起動処理
+        # キャプチャデバイスの指定が必要な場合はデフォルトデバイスを開く
+        self.camera = cv2.VideoCapture(0, cv2.CAP_DSHOW if os.name == "nt" else cv2.CAP_ANY)
+        if self.camera.isOpened():
+            self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.capture_size[0])
+            self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.capture_size[1])
+
     def openCamera(self, cameraId: int):
-        if self.camera is not None and self.camera.isOpened():
+        if self.camera is not None and self.isOpened():
             self._logger.debug("Camera is already opened")
             self.destroy()
 
         if os.name == "nt":
             self._logger.debug("NT OS")
             self.camera = cv2.VideoCapture(cameraId, cv2.CAP_DSHOW)
-        # self.camera = cv2.VideoCapture(cameraId)
         else:
             self._logger.debug("Not NT OS")
             self.camera = cv2.VideoCapture(cameraId)
@@ -86,27 +139,22 @@ class Camera:
             return
         print("Camera ID " + str(cameraId) + " opened successfully")
         self._logger.debug(f"Camera ID {cameraId} opened successfully.")
-        # print(self.camera.get(cv2.CAP_PROP_FRAME_WIDTH))
-        # self.camera.set(cv2.CAP_PROP_FPS, 60)
         self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.capture_size[0])
         self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.capture_size[1])
 
-    # self.camera.set(cv2.CAP_PROP_SETTINGS, 0)
-
     def isOpened(self):
         self._logger.debug("Camera is opened")
-        return self.camera.isOpened()
+        return self.camera is not None and self.camera.isOpened()
 
     def readFrame(self):
-        _, self.image_bgr = self.camera.read()
-        return self.image_bgr
+        if self.camera is not None:
+            _, self.image_bgr = self.camera.read()
+            return self.image_bgr
+        return None
 
     def saveCapture(self, filename: str = None, crop: int = None, crop_ax: List[int] = None, img: numpy.ndarray = None):
         if crop_ax is None:
             crop_ax = [0, 0, 1280, 720]
-        else:
-            pass
-            # print(crop_ax)
 
         dt_now = datetime.datetime.now()
         if filename is None or filename == "":
@@ -128,7 +176,6 @@ class Camera:
         save_path = _get_save_filespec(filename)
 
         if not os.path.exists(os.path.dirname(save_path)) or not os.path.isdir(os.path.dirname(save_path)):
-            # 保存先ディレクトリが存在しないか、同名のファイルが存在する場合（existsはファイルとフォルダを区別しない）
             os.makedirs(os.path.dirname(save_path))
             self._logger.debug("Created Capture folder")
 

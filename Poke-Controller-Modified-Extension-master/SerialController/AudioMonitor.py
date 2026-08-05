@@ -12,6 +12,7 @@ class AudioMonitor:
         self.output_stream = None
         self.buffer = deque()
         self.buffer_lock = threading.Lock()
+        self.process_loopback = False
 
     @staticmethod
     def devices(kind="input"):
@@ -26,6 +27,12 @@ class AudioMonitor:
         """Start input -> speaker monitoring. ``blocksize=0`` requests the
         lowest stable latency supported by the selected audio driver."""
         self.stop()
+        if str(input_device).startswith("選択ゲーム音声 [PID:"):
+            # The selected game is already rendered by Windows. Replaying its
+            # process loopback here would produce doubled audio; recording is
+            # handled independently by CaptureRecorder.
+            self.process_loopback = True
+            return
         import sounddevice as sd
         input_index = int(str(input_device).split(":", 1)[0])
         # None means the Windows default playback device.  This is normally
@@ -95,5 +102,6 @@ class AudioMonitor:
                 stream.close()
         self.input_stream = None
         self.output_stream = None
+        self.process_loopback = False
         with self.buffer_lock:
             self.buffer.clear()

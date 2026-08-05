@@ -1,0 +1,118 @@
+def image_detection_scale15(
+    self,
+    template_path_list,
+    mask_path_list=None,
+    threshold: float = 0.78,
+    crop=None,
+    use_gray: bool = False,
+    show_value: bool = False,
+    show_position: bool = True,
+):
+    """Detect one of several views at 85%, 100%, or 115% scale.
+
+    ``template_path_list`` and ``mask_path_list`` use paths relative to
+    ``SerialController/Template``.  For example, files saved by Object
+    Detection Assist can be passed as ``ObjectAssist/sheep/sample_01.png``.
+
+    Example::
+
+        result = self.image_detection_scale15(
+            ["ObjectAssist/sheep/sample_01.png",
+             "ObjectAssist/sheep/sample_02.png"],
+            ["ObjectAssist/sheep/sample_01_mask.png",
+             "ObjectAssist/sheep/sample_02_mask.png"],
+            threshold=0.78,
+            crop=[0, 0, 1280, 720],
+        )
+        if result["matched"]:
+            print("sheep detected", result["scale"])
+
+    The return value is a dictionary.  ``matched`` is the final OR decision;
+    ``template_index`` identifies the original direction sample and ``scale``
+    identifies the winning size.  Resized images are cached until a source
+    image or mask is modified.
+    """
+    paths = [str(path) for path in template_path_list]
+    if not paths:
+        raise ValueError("template_path_list must contain at least one image.")
+    masks = [] if mask_path_list is None else [str(path) for path in mask_path_list]
+    if masks and len(masks) != len(paths):
+        raise ValueError("mask_path_list must be empty or match template_path_list length.")
+    threshold = float(threshold)
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("threshold must be between 0.0 and 1.0.")
+
+    scales = (0.85, 1.0, 1.15)
+    resolved_templates = [self.get_filespec(path, mode="t") for path in paths]
+    resolved_masks = [self.get_filespec(path, mode="t") for path in masks]
+    source_files = resolved_templates + resolved_masks
+    try:
+        file_state = tuple((path, os.path.getmtime(path)) for path in source_files)
+    except OSError as error:
+        raise FileNotFoundError("Image detection file was not found: {}".format(error))
+
+    cache = getattr(self, "_image_detection_scale15_cache", None)
+    if not isinstance(cache, dict):
+        cache = {}
+        self._image_detection_scale15_cache = cache
+    cache_key = (file_state, scales)
+    cached = cache.get(cache_key)
+    if cached is None:
+        scaled_templates = []
+        scaled_masks = []
+        variant_map = []
+        for template_index, template_path in enumerate(resolved_templates):
+            self.checkIfAlive()
+            template = getImage(template_path, mode="color")
+            if template is None:
+                raise ValueError("Could not read template: " + template_path)
+            mask = None
+            if resolved_masks:
+                mask = getImage(resolved_masks[template_index], mode="binary")
+                if mask is None:
+                    raise ValueError("Could not read mask: " + resolved_masks[template_index])
+                if mask.shape[:2] != template.shape[:2]:
+                    raise ValueError("Template and mask sizes differ: " + paths[template_index])
+
+            height, width = template.shape[:2]
+            for scale in scales:
+                scaled_width = max(3, int(round(width * scale)))
+                scaled_height = max(3, int(round(height * scale)))
+                interpolation = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_LINEAR
+                scaled_templates.append(cv2.resize(
+                    template, (scaled_width, scaled_height), interpolation=interpolation))
+                if mask is not None:
+                    scaled_masks.append(cv2.resize(
+                        mask, (scaled_width, scaled_height), interpolation=cv2.INTER_NEAREST))
+                variant_map.append((template_index, scale))
+
+        # Keep only the current source state so editing sample images does not
+        # leave old image arrays in memory.
+        cache.clear()
+        cache[cache_key] = (scaled_templates, scaled_masks, variant_map)
+        cached = cache[cache_key]
+
+    scaled_templates, scaled_masks, variant_map = cached
+    best_index, scores, judges = self.isContainTemplate_max(
+        scaled_templates,
+        mask_path_list=scaled_masks,
+        threshold=threshold,
+        use_gray=use_gray,
+        show_value=show_value,
+        show_position=show_position,
+        crop=[] if crop is None else crop,
+    )
+    matched = any(judges)
+    if 0 <= best_index < len(variant_map):
+        template_index, best_scale = variant_map[best_index]
+    else:
+        template_index, best_scale = -1, 1.0
+    best_score = scores[best_index] if 0 <= best_index < len(scores) else 0.0
+    return {
+        "matched": matched,
+        "best_score": float(best_score),
+        "template_index": template_index,
+        "scale": best_scale,
+        "scores": scores,
+        "judges": judges,
+    }

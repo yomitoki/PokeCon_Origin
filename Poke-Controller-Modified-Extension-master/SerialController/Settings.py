@@ -29,6 +29,9 @@ class GuiSettings:
 
         # default
         self.camera_id = tk.IntVar(value=self.setting["General Setting"].getint("camera_id"))
+        self.video_source = self.setting.get("General Setting", "video_source", fallback="Capture device")
+        self.window_title = self.setting.get("General Setting", "window_title", fallback="")
+        self.window_process = self.setting.get("General Setting", "window_process", fallback="")
         self.com_port = tk.IntVar(value=self.setting["General Setting"].getint("com_port"))
         self.com_port_name = tk.StringVar(value=self.setting["General Setting"].get("com_port_name"))
         self.baud_rate = tk.IntVar(value=self.setting["General Setting"].getint("baud_rate"))
@@ -126,8 +129,8 @@ class GuiSettings:
             self.pos_dialogue_buttons = self.setting["Output"]["dialogue_buttons_position"]
         except Exception:
             self.pos_dialogue_buttons = "2"
-        self.panel_left_top = self.setting["Output"].get("panel_left_top", "Disabled")
-        self.panel_left_bottom = self.setting["Output"].get("panel_left_bottom", "Disabled")
+        self.panel_left_top = self.setting["Output"].get("panel_left_top", "Log: Output#3")
+        self.panel_left_bottom = self.setting["Output"].get("panel_left_bottom", "Log: Output#4")
         self.panel_right_top = self.setting["Output"].get("panel_right_top", "Log: Output#1")
         self.panel_right_bottom = self.setting["Output"].get("panel_right_bottom", "Log: Output#2")
         self.panel_ratio = self.setting["Output"].get("panel_ratio", "50")
@@ -145,7 +148,16 @@ class GuiSettings:
         self.audio_filter_camera = self.setting.getboolean("Audio", "filter_camera", fallback=False)
         self.audio_auto_start = self.setting.getboolean("Audio", "auto_start", fallback=False)
         self.vision_mode = self.setting.get("Analysis", "vision_mode", fallback="default")
+        self.image_assist_enabled = self.setting.getboolean("Analysis", "image_assist_enabled", fallback=False)
+        self.image_assist_output = self.setting.get("Analysis", "image_assist_output", fallback="Output#2")
+        self.image_assist_game_tag = self.setting.get("Analysis", "image_assist_game_tag", fallback="すべて")
+        self.image_assist_console_tag = self.setting.get("Analysis", "image_assist_console_tag", fallback="すべて")
+        self.image_assist_filter_mode = self.setting.get("Analysis", "image_assist_filter_mode", fallback="AND")
+        self.image_assist_max_candidates = self.setting.get("Analysis", "image_assist_max_candidates", fallback="10")
+        self.pc_gamepad_input_enabled = self.setting.getboolean(
+            "Analysis", "pc_gamepad_input_enabled", fallback=False)
         self.record_mode = self.setting.get("Recording", "mode", fallback="Manual")
+        self.record_output_dir = self.setting.get("Recording", "output_dir", fallback="")
         self.record_template_path = self.setting.get("Recording", "template_path", fallback="")
         self.record_threshold = self.setting.get("Recording", "threshold", fallback="0.9")
         self.record_interval = self.setting.get("Recording", "interval", fallback="0.5")
@@ -159,14 +171,33 @@ class GuiSettings:
         self.record_variable_name = self.setting.get("Recording", "variable_name", fallback="current_step")
         self.record_variable_start = self.setting.get("Recording", "variable_start", fallback="")
         self.record_variable_stop = self.setting.get("Recording", "variable_stop", fallback="")
+        self.record_variable_rules = self.setting.get("Recording", "variable_rules", fallback="[]")
         self.area_capture_roi = self.setting.get("Area Capture", "roi", fallback="0,0,0,0")
         self.area_capture_output_target = self.setting.get("Area Capture", "output_target", fallback="Output#1")
         self.area_capture_background = self.setting.get("Area Capture", "background", fallback="#ffffff")
         self.area_capture_active = self.setting.getboolean("Area Capture", "active", fallback=True)
+        self.area_capture_detection_scope = self.setting.get(
+            "Area Capture", "detection_scope", fallback="取得範囲内")
+        self.area_capture_detection_output = self.setting.get(
+            "Area Capture", "detection_output", fallback="Output#2")
+        self.area_capture_detection_roi = self.setting.get(
+            "Area Capture", "detection_roi", fallback="0,0,0,0")
+        self.area_capture_detection_threshold = self.setting.get(
+            "Area Capture", "detection_threshold", fallback="0.85")
+        self.area_capture_detection_gray = self.setting.getboolean(
+            "Area Capture", "detection_gray", fallback=True)
+        self.area_capture_match_color = self.setting.get(
+            "Area Capture", "match_color", fallback="#00c853")
+        self.area_capture_no_match_color = self.setting.get(
+            "Area Capture", "no_match_color", fallback="#ff9800")
         self.command_watch_enabled = self.setting.getboolean("Command Watch", "enabled", fallback=False)
         self.command_watch_command = self.setting.get("Command Watch", "command", fallback="")
         self.command_watch_target = self.setting.get("Command Watch", "target", fallback="Output#1")
         self.command_watch_variables = self.setting.get("Command Watch", "variables", fallback="")
+        self.commands_assist_enabled = self.setting.getboolean("Commands Assist", "enabled", fallback=False)
+        self.commands_assist_recovery_command = self.setting.get(
+            "Commands Assist", "recovery_command", fallback="")
+        self.commands_assist_rules = self.setting.get("Commands Assist", "rules", fallback="[]")
 
     def load(self):
         if os.path.isfile(self.SETTING_PATH):
@@ -177,6 +208,9 @@ class GuiSettings:
         # default
         self.setting["General Setting"] = {
             "camera_id": 0,
+            "video_source": "Capture device",
+            "window_title": "",
+            "window_process": "",
             "com_port": 0,
             "com_port_name": "",
             "baud_rate": 9600,
@@ -272,8 +306,8 @@ class GuiSettings:
             "widget_mode": "ALL (default)",
             "software_controller_position": "2",
             "dialogue_buttons_position": "2",
-            "panel_left_top": "Disabled",
-            "panel_left_bottom": "Disabled",
+            "panel_left_top": "Log: Output#3",
+            "panel_left_bottom": "Log: Output#4",
             "panel_right_top": "Log: Output#1",
             "panel_right_bottom": "Log: Output#2",
             "panel_ratio": "50",
@@ -286,14 +320,32 @@ class GuiSettings:
             "show_software_controller": True,
         }
         self.setting["Audio"] = {"input_device": "", "gain": "100", "filter_camera": False, "auto_start": False}
-        self.setting["Analysis"] = {"vision_mode": "default"}
+        self.setting["Analysis"] = {
+            "vision_mode": "default",
+            "image_assist_enabled": False,
+            "image_assist_output": "Output#2",
+            "image_assist_game_tag": "すべて",
+            "image_assist_console_tag": "すべて",
+            "image_assist_filter_mode": "AND",
+            "image_assist_max_candidates": "10",
+            "pc_gamepad_input_enabled": False,
+        }
         self.setting["Recording"] = {
-            "mode": "Manual", "template_path": "", "threshold": "0.9",
+            "mode": "Manual", "output_dir": "", "template_path": "", "threshold": "0.9",
             "interval": "0.5", "release_seconds": "1.0", "roi": "0,0,0,0", "debug": False,
             "trigger_rules": "[]", "cleanup_rules": "[]", "minimum_duration": "0",
+            "variable_command": "", "variable_name": "current_step",
+            "variable_start": "", "variable_stop": "", "variable_rules": "[]",
         }
-        self.setting["Area Capture"] = {"roi": "0,0,0,0", "output_target": "Output#1", "background": "#ffffff", "active": True}
+        self.setting["Area Capture"] = {
+            "roi": "0,0,0,0", "output_target": "Output#1", "background": "#ffffff", "active": True,
+            "detection_scope": "取得範囲内", "detection_output": "Output#2",
+            "detection_roi": "0,0,0,0",
+            "detection_threshold": "0.85", "detection_gray": True,
+            "match_color": "#00c853", "no_match_color": "#ff9800",
+        }
         self.setting["Command Watch"] = {"enabled": False, "command": "", "target": "Output#1", "variables": ""}
+        self.setting["Commands Assist"] = {"enabled": False, "recovery_command": "", "rules": "[]"}
         with open(self.SETTING_PATH, "w", encoding="utf-8") as file:
             self.setting.write(file)
         os.chmod(path=self.SETTING_PATH, mode=0o777)
@@ -303,6 +355,9 @@ class GuiSettings:
 
         self.setting["General Setting"] = {
             "camera_id": self.camera_id.get(),
+            "video_source": self.video_source,
+            "window_title": self.window_title,
+            "window_process": self.window_process,
             "com_port": self.com_port.get(),
             "com_port_name": self.com_port_name.get(),
             "baud_rate": self.baud_rate.get(),
@@ -383,9 +438,19 @@ class GuiSettings:
             "filter_camera": self.audio_filter_camera,
             "auto_start": self.audio_auto_start,
         }
-        self.setting["Analysis"] = {"vision_mode": self.vision_mode}
+        self.setting["Analysis"] = {
+            "vision_mode": self.vision_mode,
+            "image_assist_enabled": self.image_assist_enabled,
+            "image_assist_output": self.image_assist_output,
+            "image_assist_game_tag": self.image_assist_game_tag,
+            "image_assist_console_tag": self.image_assist_console_tag,
+            "image_assist_filter_mode": self.image_assist_filter_mode,
+            "image_assist_max_candidates": self.image_assist_max_candidates,
+            "pc_gamepad_input_enabled": self.pc_gamepad_input_enabled,
+        }
         self.setting["Recording"] = {
             "mode": self.record_mode,
+            "output_dir": self.record_output_dir,
             "template_path": self.record_template_path,
             "threshold": self.record_threshold,
             "interval": self.record_interval,
@@ -399,10 +464,26 @@ class GuiSettings:
             "variable_name": self.record_variable_name,
             "variable_start": self.record_variable_start,
             "variable_stop": self.record_variable_stop,
+            "variable_rules": self.record_variable_rules,
         }
-        self.setting["Area Capture"] = {"roi": self.area_capture_roi, "output_target": self.area_capture_output_target, "background": self.area_capture_background, "active": self.area_capture_active}
+        self.setting["Area Capture"] = {
+            "roi": self.area_capture_roi, "output_target": self.area_capture_output_target,
+            "background": self.area_capture_background, "active": self.area_capture_active,
+            "detection_scope": self.area_capture_detection_scope,
+            "detection_output": self.area_capture_detection_output,
+            "detection_roi": self.area_capture_detection_roi,
+            "detection_threshold": self.area_capture_detection_threshold,
+            "detection_gray": self.area_capture_detection_gray,
+            "match_color": self.area_capture_match_color,
+            "no_match_color": self.area_capture_no_match_color,
+        }
         self.setting["Command Watch"] = {"enabled": self.command_watch_enabled, "command": self.command_watch_command,
                                          "target": self.command_watch_target, "variables": self.command_watch_variables}
+        self.setting["Commands Assist"] = {
+            "enabled": self.commands_assist_enabled,
+            "recovery_command": self.commands_assist_recovery_command,
+            "rules": self.commands_assist_rules,
+        }
 
         target_path = path or self.SETTING_PATH
         os.makedirs(os.path.dirname(target_path), exist_ok=True)
