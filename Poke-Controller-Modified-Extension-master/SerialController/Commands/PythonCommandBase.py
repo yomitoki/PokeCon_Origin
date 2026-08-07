@@ -57,6 +57,12 @@ class PythonCommand(CommandBase.Command):
         self.keys = None
         self.thread = None
         self.alive = True
+        # CommandsAssist can pause one command without freezing replacement
+        # commands that use the same process-wide Command.isPause flag.
+        self.pause_requested = False
+        # A Step-debug worker may use the initialized command while its main
+        # thread is intentionally paused at the state-function boundary.
+        self._pause_bypass_threads = set()
         self.postProcess = None
         self.Line = Line_Notify()
         self.Discord = Discord_Notify()
@@ -69,11 +75,7 @@ class PythonCommand(CommandBase.Command):
 
         def inner(self, *args, **kwargs):
             func(self, *args, **kwargs)
-            if self.isPause:
-                self.show_var()
-            while self.isPause:
-                sleep(0.5)
-                self.checkIfAlive()
+            self.checkIfAlive()
 
         return inner
 
@@ -107,6 +109,7 @@ class PythonCommand(CommandBase.Command):
             "Line",
             "Discord",
             "_logger",
+            "_pause_bypass_threads",
             "camera",
             "gui",
             "ImgProc",
@@ -189,6 +192,7 @@ class PythonCommand(CommandBase.Command):
         自動化スクリプトをスレッドに割り当てて実行します。
         """
         self.alive = True
+        self.pause_requested = False
         self.socket0.alive = True
         self.mqtt0.alive = True
         self.postProcess = postProcess
@@ -272,9 +276,9 @@ class PythonCommand(CommandBase.Command):
         """
         指定時間待機する。
         """
-        current_time = time.perf_counter()
-        while time.perf_counter() < current_time + wait:
-            pass
+        # The old busy loop monopolized the interpreter and made Software-
+        # Controller input visibly lag while a command was running.
+        self._interruptible_sleep(wait)
         self.checkIfAlive()
 
     # do nothing at wait time(s)
@@ -283,19 +287,44 @@ class PythonCommand(CommandBase.Command):
         """
         指定時間待機する。
         """
-        if float(wait) > 0.1:
-            sleep(wait)
-        else:
-            current_time = time.perf_counter()
-            while time.perf_counter() < current_time + wait:
-                pass
+        self._interruptible_sleep(wait)
         self.checkIfAlive()
+
+    def _interruptible_sleep(self, seconds: float):
+        """Yield the GIL while retaining prompt pause/stop checkpoints."""
+        deadline = time.perf_counter() + max(0.0, float(seconds))
+        while self.alive:
+            remaining = deadline - time.perf_counter()
+            if remaining <= 0:
+                return
+            sleep(min(remaining, 0.01))
+
+    def request_pause(self):
+        self.pause_requested = True
+
+    def resume(self):
+        self.pause_requested = False
+
+    def begin_pause_bypass(self):
+        self._pause_bypass_threads.add(threading.get_ident())
+
+    def end_pause_bypass(self):
+        self._pause_bypass_threads.discard(threading.get_ident())
 
     def checkIfAlive(self):
         """
         Aliveフラグの状態を確認する。
         AliveフラグがFalseなら終了処理を行う。
         """
+        showed_variables = False
+        bypass_pause = threading.get_ident() in self._pause_bypass_threads
+        while self.alive and (self.isPause or self.pause_requested) and not bypass_pause:
+            if not showed_variables:
+                self.show_var()
+                showed_variables = True
+            # A short sleeping checkpoint keeps manual controller and camera
+            # threads responsive; no interpreter/GIL spin is required.
+            sleep(0.02)
         if not self.alive:
             self.keys.end()
             self.keys = None

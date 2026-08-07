@@ -143,6 +143,14 @@ class GuiSettings:
         self.right_panel_count = self.setting["Output"].get("right_panel_count", "2")
         self.side_width_balance = self.setting["Output"].get("side_width_balance", "50")
         self.show_software_controller = self.setting["Output"].getboolean("show_software_controller", True)
+        self.quick_actions_left_position = self.setting["Output"].get(
+            "quick_actions_left_position", "上")
+        self.quick_actions_right_position = self.setting["Output"].get(
+            "quick_actions_right_position", "上")
+        self.quick_actions_left_items = self.setting["Output"].get(
+            "quick_actions_left_items", "[]")
+        self.quick_actions_right_items = self.setting["Output"].get(
+            "quick_actions_right_items", "[]")
         self.audio_input = self.setting.get("Audio", "input_device", fallback="")
         self.audio_gain = self.setting.get("Audio", "gain", fallback="100")
         self.audio_filter_camera = self.setting.getboolean("Audio", "filter_camera", fallback=False)
@@ -154,6 +162,9 @@ class GuiSettings:
         self.image_assist_console_tag = self.setting.get("Analysis", "image_assist_console_tag", fallback="すべて")
         self.image_assist_filter_mode = self.setting.get("Analysis", "image_assist_filter_mode", fallback="AND")
         self.image_assist_max_candidates = self.setting.get("Analysis", "image_assist_max_candidates", fallback="10")
+        self.analysis_rules_enabled = self.setting.getboolean(
+            "Analysis", "rules_enabled", fallback=True)
+        self.analysis_rules = self.setting.get("Analysis", "rules", fallback="[]")
         self.pc_gamepad_input_enabled = self.setting.getboolean(
             "Analysis", "pc_gamepad_input_enabled", fallback=False)
         self.record_mode = self.setting.get("Recording", "mode", fallback="Manual")
@@ -167,6 +178,9 @@ class GuiSettings:
         self.record_trigger_rules = self.setting.get("Recording", "trigger_rules", fallback="[]")
         self.record_cleanup_rules = self.setting.get("Recording", "cleanup_rules", fallback="[]")
         self.record_minimum_duration = self.setting.get("Recording", "minimum_duration", fallback="0")
+        self.record_min_free_gb = self.setting.getfloat("Recording", "min_free_gb", fallback=5.0)
+        self.record_max_disk_usage_percent = self.setting.getfloat(
+            "Recording", "max_disk_usage_percent", fallback=95.0)
         self.record_variable_command = self.setting.get("Recording", "variable_command", fallback="")
         self.record_variable_name = self.setting.get("Recording", "variable_name", fallback="current_step")
         self.record_variable_start = self.setting.get("Recording", "variable_start", fallback="")
@@ -318,6 +332,10 @@ class GuiSettings:
             "right_panel_count": "2",
             "side_width_balance": "50",
             "show_software_controller": True,
+            "quick_actions_left_position": "上",
+            "quick_actions_right_position": "上",
+            "quick_actions_left_items": "[]",
+            "quick_actions_right_items": "[]",
         }
         self.setting["Audio"] = {"input_device": "", "gain": "100", "filter_camera": False, "auto_start": False}
         self.setting["Analysis"] = {
@@ -328,12 +346,15 @@ class GuiSettings:
             "image_assist_console_tag": "すべて",
             "image_assist_filter_mode": "AND",
             "image_assist_max_candidates": "10",
+            "rules_enabled": True,
+            "rules": "[]",
             "pc_gamepad_input_enabled": False,
         }
         self.setting["Recording"] = {
             "mode": "Manual", "output_dir": "", "template_path": "", "threshold": "0.9",
             "interval": "0.5", "release_seconds": "1.0", "roi": "0,0,0,0", "debug": False,
             "trigger_rules": "[]", "cleanup_rules": "[]", "minimum_duration": "0",
+            "min_free_gb": "5.0", "max_disk_usage_percent": "95.0",
             "variable_command": "", "variable_name": "current_step",
             "variable_start": "", "variable_stop": "", "variable_rules": "[]",
         }
@@ -431,6 +452,10 @@ class GuiSettings:
             "right_panel_count": self.right_panel_count,
             "side_width_balance": self.side_width_balance,
             "show_software_controller": self.show_software_controller,
+            "quick_actions_left_position": self.quick_actions_left_position,
+            "quick_actions_right_position": self.quick_actions_right_position,
+            "quick_actions_left_items": self.quick_actions_left_items,
+            "quick_actions_right_items": self.quick_actions_right_items,
         }
         self.setting["Audio"] = {
             "input_device": self.audio_input,
@@ -446,6 +471,8 @@ class GuiSettings:
             "image_assist_console_tag": self.image_assist_console_tag,
             "image_assist_filter_mode": self.image_assist_filter_mode,
             "image_assist_max_candidates": self.image_assist_max_candidates,
+            "rules_enabled": self.analysis_rules_enabled,
+            "rules": str(self.analysis_rules).replace("%", "%%"),
             "pc_gamepad_input_enabled": self.pc_gamepad_input_enabled,
         }
         self.setting["Recording"] = {
@@ -460,6 +487,8 @@ class GuiSettings:
             "trigger_rules": self.record_trigger_rules,
             "cleanup_rules": self.record_cleanup_rules,
             "minimum_duration": self.record_minimum_duration,
+            "min_free_gb": self.record_min_free_gb,
+            "max_disk_usage_percent": self.record_max_disk_usage_percent,
             "variable_command": self.record_variable_command,
             "variable_name": self.record_variable_name,
             "variable_start": self.record_variable_start,

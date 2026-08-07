@@ -328,6 +328,46 @@
         "documentation": {}
     },
     {
+        "label": "annotations",
+        "importPath": "__future__",
+        "description": "__future__",
+        "isExtraImport": true,
+        "detail": "__future__",
+        "documentation": {}
+    },
+    {
+        "label": "print_function",
+        "importPath": "__future__",
+        "description": "__future__",
+        "isExtraImport": true,
+        "detail": "__future__",
+        "documentation": {}
+    },
+    {
+        "label": "annotations",
+        "importPath": "__future__",
+        "description": "__future__",
+        "isExtraImport": true,
+        "detail": "__future__",
+        "documentation": {}
+    },
+    {
+        "label": "annotations",
+        "importPath": "__future__",
+        "description": "__future__",
+        "isExtraImport": true,
+        "detail": "__future__",
+        "documentation": {}
+    },
+    {
+        "label": "annotations",
+        "importPath": "__future__",
+        "description": "__future__",
+        "isExtraImport": true,
+        "detail": "__future__",
+        "documentation": {}
+    },
+    {
         "label": "ast",
         "kind": 6,
         "isExtraImport": true,
@@ -1545,6 +1585,15 @@
         "documentation": {}
     },
     {
+        "label": "tkinter.font",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "tkinter.font",
+        "description": "tkinter.font",
+        "detail": "tkinter.font",
+        "documentation": {}
+    },
+    {
         "label": "command_path",
         "importPath": "CommandBuilder",
         "description": "CommandBuilder",
@@ -1666,6 +1715,38 @@
     },
     {
         "label": "update_source",
+        "importPath": "SampleFunctionSync",
+        "description": "SampleFunctionSync",
+        "isExtraImport": true,
+        "detail": "SampleFunctionSync",
+        "documentation": {}
+    },
+    {
+        "label": "propagate_functions",
+        "importPath": "SampleFunctionSync",
+        "description": "SampleFunctionSync",
+        "isExtraImport": true,
+        "detail": "SampleFunctionSync",
+        "documentation": {}
+    },
+    {
+        "label": "replace_class_functions",
+        "importPath": "SampleFunctionSync",
+        "description": "SampleFunctionSync",
+        "isExtraImport": true,
+        "detail": "SampleFunctionSync",
+        "documentation": {}
+    },
+    {
+        "label": "function_records",
+        "importPath": "SampleFunctionSync",
+        "description": "SampleFunctionSync",
+        "isExtraImport": true,
+        "detail": "SampleFunctionSync",
+        "documentation": {}
+    },
+    {
+        "label": "replace_class_functions",
         "importPath": "SampleFunctionSync",
         "description": "SampleFunctionSync",
         "isExtraImport": true,
@@ -2771,6 +2852,14 @@
         "documentation": {}
     },
     {
+        "label": "namedtuple",
+        "importPath": "collections",
+        "description": "collections",
+        "isExtraImport": true,
+        "detail": "collections",
+        "documentation": {}
+    },
+    {
         "label": "CommandBase",
         "importPath": "Commands",
         "description": "Commands",
@@ -3449,11 +3538,51 @@
         "documentation": {}
     },
     {
+        "label": "AnalysisRuleEngine",
+        "importPath": "AnalysisRules",
+        "description": "AnalysisRules",
+        "isExtraImport": true,
+        "detail": "AnalysisRules",
+        "documentation": {}
+    },
+    {
+        "label": "ANALYSIS_TYPES",
+        "importPath": "AnalysisRules",
+        "description": "AnalysisRules",
+        "isExtraImport": true,
+        "detail": "AnalysisRules",
+        "documentation": {}
+    },
+    {
+        "label": "CONDITION_TYPES",
+        "importPath": "AnalysisRules",
+        "description": "AnalysisRules",
+        "isExtraImport": true,
+        "detail": "AnalysisRules",
+        "documentation": {}
+    },
+    {
         "label": "ObjectDetectionAssistWindow",
         "importPath": "ObjectDetectionAssist",
         "description": "ObjectDetectionAssist",
         "isExtraImport": true,
         "detail": "ObjectDetectionAssist",
+        "documentation": {}
+    },
+    {
+        "label": "disk_space_violations",
+        "importPath": "DiskSpaceGuard",
+        "description": "DiskSpaceGuard",
+        "isExtraImport": true,
+        "detail": "DiskSpaceGuard",
+        "documentation": {}
+    },
+    {
+        "label": "disk_space_violations",
+        "importPath": "DiskSpaceGuard",
+        "description": "DiskSpaceGuard",
+        "isExtraImport": true,
+        "detail": "DiskSpaceGuard",
         "documentation": {}
     },
     {
@@ -3473,6 +3602,14 @@
         "documentation": {}
     },
     {
+        "label": "discover_state_values",
+        "importPath": "AutomationTriggers",
+        "description": "AutomationTriggers",
+        "isExtraImport": true,
+        "detail": "AutomationTriggers",
+        "documentation": {}
+    },
+    {
         "label": "resolve_command_value",
         "importPath": "AutomationTriggers",
         "description": "AutomationTriggers",
@@ -3481,11 +3618,195 @@
         "documentation": {}
     },
     {
-        "label": "command_scope_matches",
+        "label": "StableRuleEvaluator",
         "importPath": "AutomationTriggers",
         "description": "AutomationTriggers",
         "isExtraImport": true,
         "detail": "AutomationTriggers",
+        "documentation": {}
+    },
+    {
+        "label": "discover_state_values",
+        "importPath": "AutomationTriggers",
+        "description": "AutomationTriggers",
+        "isExtraImport": true,
+        "detail": "AutomationTriggers",
+        "documentation": {}
+    },
+    {
+        "label": "resolve_command_value",
+        "importPath": "AutomationTriggers",
+        "description": "AutomationTriggers",
+        "isExtraImport": true,
+        "detail": "AutomationTriggers",
+        "documentation": {}
+    },
+    {
+        "label": "rotate_log_range",
+        "importPath": "ControllerInputLog",
+        "description": "ControllerInputLog",
+        "isExtraImport": true,
+        "detail": "ControllerInputLog",
+        "documentation": {}
+    },
+    {
+        "label": "python_replacement_body",
+        "importPath": "ControllerInputLog",
+        "description": "ControllerInputLog",
+        "isExtraImport": true,
+        "detail": "ControllerInputLog",
+        "documentation": {}
+    },
+    {
+        "label": "replay_recording",
+        "importPath": "ControllerInputLog",
+        "description": "ControllerInputLog",
+        "isExtraImport": true,
+        "detail": "ControllerInputLog",
+        "documentation": {}
+    },
+    {
+        "label": "python_replacement_body",
+        "importPath": "ControllerInputLog",
+        "description": "ControllerInputLog",
+        "isExtraImport": true,
+        "detail": "ControllerInputLog",
+        "documentation": {}
+    },
+    {
+        "label": "replay_recording",
+        "importPath": "ControllerInputLog",
+        "description": "ControllerInputLog",
+        "isExtraImport": true,
+        "detail": "ControllerInputLog",
+        "documentation": {}
+    },
+    {
+        "label": "rotate_log_range",
+        "importPath": "ControllerInputLog",
+        "description": "ControllerInputLog",
+        "isExtraImport": true,
+        "detail": "ControllerInputLog",
+        "documentation": {}
+    },
+    {
+        "label": "rotate_serial_message",
+        "importPath": "ControllerInputLog",
+        "description": "ControllerInputLog",
+        "isExtraImport": true,
+        "detail": "ControllerInputLog",
+        "documentation": {}
+    },
+    {
+        "label": "extract_step_method",
+        "importPath": "StepDebugAssist",
+        "description": "StepDebugAssist",
+        "isExtraImport": true,
+        "detail": "StepDebugAssist",
+        "documentation": {}
+    },
+    {
+        "label": "execute_operation",
+        "importPath": "StepDebugAssist",
+        "description": "StepDebugAssist",
+        "isExtraImport": true,
+        "detail": "StepDebugAssist",
+        "documentation": {}
+    },
+    {
+        "label": "validate_operation_code",
+        "importPath": "StepDebugAssist",
+        "description": "StepDebugAssist",
+        "isExtraImport": true,
+        "detail": "StepDebugAssist",
+        "documentation": {}
+    },
+    {
+        "label": "extract_step_method",
+        "importPath": "StepDebugAssist",
+        "description": "StepDebugAssist",
+        "isExtraImport": true,
+        "detail": "StepDebugAssist",
+        "documentation": {}
+    },
+    {
+        "label": "execute_operation",
+        "importPath": "StepDebugAssist",
+        "description": "StepDebugAssist",
+        "isExtraImport": true,
+        "detail": "StepDebugAssist",
+        "documentation": {}
+    },
+    {
+        "label": "ACTION_BY_ID",
+        "importPath": "QuickActions",
+        "description": "QuickActions",
+        "isExtraImport": true,
+        "detail": "QuickActions",
+        "documentation": {}
+    },
+    {
+        "label": "ACTION_DEFINITIONS",
+        "importPath": "QuickActions",
+        "description": "QuickActions",
+        "isExtraImport": true,
+        "detail": "QuickActions",
+        "documentation": {}
+    },
+    {
+        "label": "POSITIONS",
+        "importPath": "QuickActions",
+        "description": "QuickActions",
+        "isExtraImport": true,
+        "detail": "QuickActions",
+        "documentation": {}
+    },
+    {
+        "label": "encode_action_ids",
+        "importPath": "QuickActions",
+        "description": "QuickActions",
+        "isExtraImport": true,
+        "detail": "QuickActions",
+        "documentation": {}
+    },
+    {
+        "label": "normalize_action_ids",
+        "importPath": "QuickActions",
+        "description": "QuickActions",
+        "isExtraImport": true,
+        "detail": "QuickActions",
+        "documentation": {}
+    },
+    {
+        "label": "normalize_position",
+        "importPath": "QuickActions",
+        "description": "QuickActions",
+        "isExtraImport": true,
+        "detail": "QuickActions",
+        "documentation": {}
+    },
+    {
+        "label": "ACTION_BY_ID",
+        "importPath": "QuickActions",
+        "description": "QuickActions",
+        "isExtraImport": true,
+        "detail": "QuickActions",
+        "documentation": {}
+    },
+    {
+        "label": "normalize_action_ids",
+        "importPath": "QuickActions",
+        "description": "QuickActions",
+        "isExtraImport": true,
+        "detail": "QuickActions",
+        "documentation": {}
+    },
+    {
+        "label": "normalize_position",
+        "importPath": "QuickActions",
+        "description": "QuickActions",
+        "isExtraImport": true,
+        "detail": "QuickActions",
         "documentation": {}
     },
     {
@@ -3527,6 +3848,15 @@
         "description": "Commands.CommandBase",
         "isExtraImport": true,
         "detail": "Commands.CommandBase",
+        "documentation": {}
+    },
+    {
+        "label": "unittest",
+        "kind": 6,
+        "isExtraImport": true,
+        "importPath": "unittest",
+        "description": "unittest",
+        "detail": "unittest",
         "documentation": {}
     },
     {
@@ -4065,7 +4395,7 @@
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
         "description": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
-        "peekOfCode": "class DevStudio(tk.Tk):\n    def __init__(self, initial_root):\n        tk.Tk.__init__(self)\n        self.title(\"PokeCon Dev Studio\")\n        self.geometry(\"1280x780\")\n        self.minsize(900, 560)\n        self.root_dir = tk.StringVar(value=os.path.abspath(initial_root))\n        self.search_text = tk.StringVar()\n        self.tag_text = tk.StringVar()\n        self.files = []",
+        "peekOfCode": "class DevStudio(tk.Tk):\n    def __init__(self, initial_root):\n        tk.Tk.__init__(self)\n        self.code_font = tkfont.Font(self, family=\"Consolas\", size=10)\n        self.code_tabs = (self.code_font.measure(\"    \"),)\n        self.title(\"PokeCon Dev Studio\")\n        self.geometry(\"1280x780\")\n        self.minsize(900, 560)\n        self.root_dir = tk.StringVar(value=os.path.abspath(initial_root))\n        self.search_text = tk.StringVar()",
         "detail": "Poke-Controller-Modified-Extension-master.DevStudio.PokeConDevStudio",
         "documentation": {}
     },
@@ -4142,6 +4472,15 @@
         "documentation": {}
     },
     {
+        "label": "function_records",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "peekOfCode": "def function_records(source, class_only=False):\n    \"\"\"Public read-only function catalog used by replacement pickers.\"\"\"\n    return _function_records(source, class_only=class_only)\ndef scan_folder(fragment_root, folder):\n    root, folder = os.path.abspath(fragment_root), os.path.abspath(folder)\n    if os.path.commonpath([root, folder]) != root:\n        raise ValueError(\"サンプル関数ライブラリ配下のフォルダーを選択してください。\")\n    found = {}\n    for directory, _, names in os.walk(folder):\n        for filename in sorted(names):",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "documentation": {}
+    },
+    {
         "label": "scan_folder",
         "kind": 2,
         "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
@@ -4165,6 +4504,24 @@
         "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
         "description": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
         "peekOfCode": "def update_source(source, comparisons, names):\n    selected = set(names)\n    records = _function_records(source, class_only=True)\n    tree = ast.parse(source)\n    command = next(node for node in tree.body if isinstance(node, ast.ClassDef))\n    lines = source.splitlines(True)\n    replacements, additions = [], []\n    for item in comparisons:\n        if item[\"name\"] not in selected or item[\"status\"] == \"duplicate\":\n            continue",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "documentation": {}
+    },
+    {
+        "label": "replace_class_functions",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "peekOfCode": "def replace_class_functions(source, function_texts):\n    \"\"\"Replace existing command-class methods from ``name -> function text``.\"\"\"\n    records = _function_records(source, class_only=True)\n    lines = source.splitlines(True)\n    replacements = []\n    for name, function_text in function_texts.items():\n        if name not in records:\n            continue\n        # Replacement code may be obtained from a differently named specified\n        # function. Preserve the selected target method name at the call sites.",
+        "detail": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "documentation": {}
+    },
+    {
+        "label": "propagate_functions",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "description": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
+        "peekOfCode": "def propagate_functions(paths, function_texts):\n    \"\"\"Apply sample/specified functions to every existing same-name method.\"\"\"\n    changed = []\n    for path in paths:\n        try:\n            with open(path, \"r\", encoding=\"utf-8\") as stream:\n                source = stream.read()\n            encoding = \"utf-8\"\n        except UnicodeDecodeError:\n            with open(path, \"r\", encoding=\"cp932\") as stream:",
         "detail": "Poke-Controller-Modified-Extension-master.DevStudio.SampleFunctionSync",
         "documentation": {}
     },
@@ -5181,7 +5538,7 @@
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.Commands.Sender",
         "description": "Poke-Controller-Modified-Extension-master.SerialController.Commands.Sender",
-        "peekOfCode": "class Sender:\n    def __init__(self, is_show_serial: tk.BooleanVar, if_print: bool = True):\n        self.ser = None\n        self.is_show_serial = is_show_serial\n        self._logger = getLogger(__name__)\n        self._logger.addHandler(NullHandler())\n        self._logger.setLevel(DEBUG)\n        self._logger.propagate = True\n        self.before = None\n        self.L_holding = False",
+        "peekOfCode": "class Sender:\n    def __init__(self, is_show_serial: tk.BooleanVar, if_print: bool = True):\n        self.ser = None\n        # Commands and manual controllers can write concurrently.  Serialize\n        # complete packets so a manual input is never interleaved with a\n        # command packet at the byte-stream level.\n        self.write_lock = threading.RLock()\n        self.is_show_serial = is_show_serial\n        self._logger = getLogger(__name__)\n        self._logger.addHandler(NullHandler())",
         "detail": "Poke-Controller-Modified-Extension-master.SerialController.Commands.Sender",
         "documentation": {}
     },
@@ -5424,7 +5781,7 @@
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.CommandsAssist.RecoveryCommandSample",
         "description": "Poke-Controller-Modified-Extension-master.SerialController.CommandsAssist.RecoveryCommandSample",
-        "peekOfCode": "class RecoveryCommandSample(PythonCommand):\n    NAME = \"Recovery sample (no operation)\"\n    TAGS = [\"@CommandsAssist\"]\n    def do(self):\n        # Add recovery inputs here.  Long loops must call checkIfAlive().\n        self.checkIfAlive()",
+        "peekOfCode": "class RecoveryCommandSample(PythonCommand):\n    NAME = \"Recovery sample (no operation)\"\n    TAGS = [\"@CommandsAssist\"]\n    def do(self):\n        # Add replacement inputs here. Long loops must call checkIfAlive().\n        self.checkIfAlive()",
         "detail": "Poke-Controller-Modified-Extension-master.SerialController.CommandsAssist.RecoveryCommandSample",
         "documentation": {}
     },
@@ -5528,6 +5885,42 @@
         "documentation": {}
     },
     {
+        "label": "AnalysisRuleEngine",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.AnalysisRules",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.AnalysisRules",
+        "peekOfCode": "class AnalysisRuleEngine:\n    def __init__(self, result_callback):\n        self.result_callback = result_callback\n        self.busy = False\n        self.last_runs = {}\n        self.template_cache = {}\n        self.previous_regions = {}\n        self.lock = threading.Lock()\n    def reset(self):\n        with self.lock:",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.AnalysisRules",
+        "documentation": {}
+    },
+    {
+        "label": "parse_roi",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.AnalysisRules",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.AnalysisRules",
+        "peekOfCode": "def parse_roi(value, frame_shape):\n    \"\"\"Return a clipped x/y/w/h ROI; zero width/height means full frame.\"\"\"\n    frame_height, frame_width = frame_shape[:2]\n    try:\n        x, y, width, height = [int(part.strip()) for part in str(value).split(\",\")]\n    except (TypeError, ValueError):\n        return 0, 0, frame_width, frame_height\n    if width <= 0 or height <= 0:\n        return 0, 0, frame_width, frame_height\n    x, y = max(0, x), max(0, y)",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.AnalysisRules",
+        "documentation": {}
+    },
+    {
+        "label": "ANALYSIS_TYPES",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.AnalysisRules",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.AnalysisRules",
+        "peekOfCode": "ANALYSIS_TYPES = {\n    \"hp_bar\": \"HPバー（%）\",\n    \"number_ocr\": \"数値OCR\",\n    \"text_ocr\": \"文字OCR\",\n    \"image_match\": \"画像一致\",\n    \"state\": \"範囲状態\",\n}\nCONDITION_TYPES = {\n    \"always\": \"常時\",\n    \"image\": \"画像一致時\",",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.AnalysisRules",
+        "documentation": {}
+    },
+    {
+        "label": "CONDITION_TYPES",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.AnalysisRules",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.AnalysisRules",
+        "peekOfCode": "CONDITION_TYPES = {\n    \"always\": \"常時\",\n    \"image\": \"画像一致時\",\n    \"step\": \"Step値一致時\",\n}\ndef parse_roi(value, frame_shape):\n    \"\"\"Return a clipped x/y/w/h ROI; zero width/height means full frame.\"\"\"\n    frame_height, frame_width = frame_shape[:2]\n    try:\n        x, y, width, height = [int(part.strip()) for part in str(value).split(\",\")]",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.AnalysisRules",
+        "documentation": {}
+    },
+    {
         "label": "AudioMonitor",
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.AudioMonitor",
@@ -5542,6 +5935,15 @@
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.AutomationTriggers",
         "description": "Poke-Controller-Modified-Extension-master.SerialController.AutomationTriggers",
         "peekOfCode": "class StableRuleEvaluator:\n    def __init__(self):\n        self.states = {}\n    def reset(self):\n        self.states.clear()\n    def clear_rule(self, rule_id):\n        self.states.pop(str(rule_id), None)\n    def evaluate(self, rule, command, command_name=\"\", now=None):\n        \"\"\"Return a compact result dict for one value-stable/unchanged rule.\"\"\"\n        now = time.monotonic() if now is None else float(now)",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.AutomationTriggers",
+        "documentation": {}
+    },
+    {
+        "label": "discover_state_values",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.AutomationTriggers",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.AutomationTriggers",
+        "peekOfCode": "def discover_state_values(source, variable_name):\n    \"\"\"Extract selectable state-table keys from Python source text.\"\"\"\n    target = str(variable_name or \"\").strip().upper()\n    wanted_names = {target}\n    if target in (\"STEP\", \"CURRENT_STEP\"):\n        wanted_names.update((\"STEP_LABELS\", \"STEPS\"))\n    found = set()\n    tree = ast.parse(str(source))\n    for node in ast.walk(tree):\n        if not isinstance(node, (ast.Assign, ast.AnnAssign)):",
         "detail": "Poke-Controller-Modified-Extension-master.SerialController.AutomationTriggers",
         "documentation": {}
     },
@@ -5645,6 +6047,51 @@
         "documentation": {}
     },
     {
+        "label": "split_record_line",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.ControllerInputLog",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.ControllerInputLog",
+        "peekOfCode": "def split_record_line(line):\n    \"\"\"Return ``(timestamp, serial_message)`` for one controller log line.\"\"\"\n    text = str(line).rstrip(\"\\r\\n\")\n    timestamp, separator, message = text.partition(\",\")\n    if not separator or not message.strip():\n        raise ValueError(\"controller log line must be '<timestamp>,<serial message>'\")\n    datetime.datetime.fromisoformat(timestamp.strip())\n    return timestamp.strip(), message.strip()\ndef _rotate_pair(x, y, degrees, center=128):\n    radians = math.radians(float(degrees))",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.ControllerInputLog",
+        "documentation": {}
+    },
+    {
+        "label": "rotate_serial_message",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.ControllerInputLog",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.ControllerInputLog",
+        "peekOfCode": "def rotate_serial_message(message, degrees, sticks=\"both\"):\n    \"\"\"Rotate every encoded stick vector in one PokeCon serial message.\"\"\"\n    parts = str(message).split()\n    if len(parts) < 2:\n        raise ValueError(\"invalid serial message\")\n    buttons = int(parts[0], 16)\n    position = 2\n    values = list(parts)\n    if buttons & 0x2:\n        if len(values) < position + 2:",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.ControllerInputLog",
+        "documentation": {}
+    },
+    {
+        "label": "rotate_log_range",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.ControllerInputLog",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.ControllerInputLog",
+        "peekOfCode": "def rotate_log_range(lines, start_line, end_line, degrees, sticks=\"both\"):\n    \"\"\"Rotate an inclusive one-based range, leaving non-stick rows intact.\"\"\"\n    result = list(lines)\n    start = max(1, int(start_line))\n    end = min(len(result), int(end_line))\n    if end < start:\n        raise ValueError(\"end line must be greater than or equal to start line\")\n    for index in range(start - 1, end):\n        timestamp, message = split_record_line(result[index])\n        result[index] = timestamp + \",\" + rotate_serial_message(message, degrees, sticks) + \"\\n\"",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.ControllerInputLog",
+        "documentation": {}
+    },
+    {
+        "label": "python_replacement_body",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.ControllerInputLog",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.ControllerInputLog",
+        "peekOfCode": "def python_replacement_body(lines):\n    \"\"\"Generate a direct_serial call that preserves recorded relative timing.\"\"\"\n    parsed = [split_record_line(line) for line in lines if str(line).strip()]\n    if not parsed:\n        return \"# Controller recording is empty.\\n\"\n    timestamps = [datetime.datetime.fromisoformat(item[0]) for item in parsed]\n    waits = [0.0]\n    waits.extend(max(0.0, (timestamps[index] - timestamps[index - 1]).total_seconds())\n                 for index in range(1, len(timestamps)))\n    commands = [item[1] for item in parsed]",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.ControllerInputLog",
+        "documentation": {}
+    },
+    {
+        "label": "replay_recording",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.ControllerInputLog",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.ControllerInputLog",
+        "peekOfCode": "def replay_recording(lines, sender, should_continue=None):\n    \"\"\"Replay a registered log through a Sender while preserving timing.\"\"\"\n    parsed = [split_record_line(line) for line in lines if str(line).strip()]\n    previous = None\n    for timestamp_text, message in parsed:\n        if should_continue is not None and not should_continue():\n            return False\n        timestamp = datetime.datetime.fromisoformat(timestamp_text)\n        if previous is not None:\n            delay = max(0.0, (timestamp - previous).total_seconds())",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.ControllerInputLog",
+        "documentation": {}
+    },
+    {
         "label": "Discord_Notify",
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.DiscordNotify",
@@ -5660,6 +6107,15 @@
         "description": "Poke-Controller-Modified-Extension-master.SerialController.DiscordNotify",
         "peekOfCode": "def convert_bgr_to_bytes(image_bgr):\n    \"\"\"\n    BGRの画像をbyte形式に変換する\n    \"\"\"\n    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)\n    image = Image.fromarray(image_rgb)\n    png = io.BytesIO()  # 空のio.BytesIOオブジェクトを用意\n    image.save(png, format=\"png\")  # 空のio.BytesIOオブジェクトにpngファイルとして書き込み\n    b_frame = png.getvalue()  # io.BytesIOオブジェクトをbytes形式で読みとり\n    return b_frame",
         "detail": "Poke-Controller-Modified-Extension-master.SerialController.DiscordNotify",
+        "documentation": {}
+    },
+    {
+        "label": "disk_space_violations",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.DiskSpaceGuard",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.DiskSpaceGuard",
+        "peekOfCode": "def disk_space_violations(paths, min_free_gb=5.0, max_usage_percent=95.0,\n                          usage_provider=shutil.disk_usage):\n    \"\"\"Return threshold violations for the unique drives containing *paths*.\n    Recording folders do not have to exist yet; the nearest existing parent\n    is used. A query error is a violation because recording without a reliable\n    capacity check is unsafe.\n    \"\"\"\n    min_free_gb = max(0.0, float(min_free_gb))\n    max_usage_percent = min(100.0, max(0.0, float(max_usage_percent)))\n    drives = {}",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.DiskSpaceGuard",
         "documentation": {}
     },
     {
@@ -6077,6 +6533,60 @@
         "documentation": {}
     },
     {
+        "label": "normalize_position",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "peekOfCode": "def normalize_position(value, default=\"上\"):\n    return value if value in POSITIONS else default\ndef normalize_action_ids(value):\n    \"\"\"Return unique, known IDs from a list or its JSON representation.\"\"\"\n    if isinstance(value, str):\n        try:\n            value = json.loads(value)\n        except (TypeError, ValueError, json.JSONDecodeError):\n            value = []\n    if not isinstance(value, (list, tuple)):",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "documentation": {}
+    },
+    {
+        "label": "normalize_action_ids",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "peekOfCode": "def normalize_action_ids(value):\n    \"\"\"Return unique, known IDs from a list or its JSON representation.\"\"\"\n    if isinstance(value, str):\n        try:\n            value = json.loads(value)\n        except (TypeError, ValueError, json.JSONDecodeError):\n            value = []\n    if not isinstance(value, (list, tuple)):\n        return []\n    result = []",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "documentation": {}
+    },
+    {
+        "label": "encode_action_ids",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "peekOfCode": "def encode_action_ids(value):\n    return json.dumps(normalize_action_ids(value), ensure_ascii=False)",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "documentation": {}
+    },
+    {
+        "label": "POSITIONS",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "peekOfCode": "POSITIONS = (\"上\", \"下\", \"非表示\")\n# Targets are resolved lazily by Window.PokeControllerApp.  This keeps the\n# registry independent from tkinter and makes saved action IDs stable even if\n# the original tab layout changes.\nACTION_DEFINITIONS = (\n    {\"id\": \"commands.start_stop\", \"tab\": \"Commands\", \"label\": \"開始／停止\", \"kind\": \"button\",\n     \"widget\": \"start_top_button\"},\n    {\"id\": \"commands.pause_resume\", \"tab\": \"Commands\", \"label\": \"一時停止／再開\", \"kind\": \"button\",\n     \"widget\": \"pause_button\"},\n    {\"id\": \"commands.force_stop\", \"tab\": \"Commands\", \"label\": \"強制停止\", \"kind\": \"button\",",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "documentation": {}
+    },
+    {
+        "label": "ACTION_DEFINITIONS",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "peekOfCode": "ACTION_DEFINITIONS = (\n    {\"id\": \"commands.start_stop\", \"tab\": \"Commands\", \"label\": \"開始／停止\", \"kind\": \"button\",\n     \"widget\": \"start_top_button\"},\n    {\"id\": \"commands.pause_resume\", \"tab\": \"Commands\", \"label\": \"一時停止／再開\", \"kind\": \"button\",\n     \"widget\": \"pause_button\"},\n    {\"id\": \"commands.force_stop\", \"tab\": \"Commands\", \"label\": \"強制停止\", \"kind\": \"button\",\n     \"widget\": \"force_stop_button\"},\n    {\"id\": \"commands.reload\", \"tab\": \"Commands\", \"label\": \"Commands再読込\", \"kind\": \"button\",\n     \"widget\": \"reload_command_button\"},\n    {\"id\": \"commands.controller\", \"tab\": \"Commands\", \"label\": \"コントローラー\", \"kind\": \"button\",",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "documentation": {}
+    },
+    {
+        "label": "ACTION_BY_ID",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "peekOfCode": "ACTION_BY_ID = {item[\"id\"]: item for item in ACTION_DEFINITIONS}\ndef normalize_position(value, default=\"上\"):\n    return value if value in POSITIONS else default\ndef normalize_action_ids(value):\n    \"\"\"Return unique, known IDs from a list or its JSON representation.\"\"\"\n    if isinstance(value, str):\n        try:\n            value = json.loads(value)\n        except (TypeError, ValueError, json.JSONDecodeError):\n            value = []",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.QuickActions",
+        "documentation": {}
+    },
+    {
         "label": "CaptureRecorder",
         "kind": 6,
         "importPath": "Poke-Controller-Modified-Extension-master.SerialController.Recording",
@@ -6092,6 +6602,33 @@
         "description": "Poke-Controller-Modified-Extension-master.SerialController.Settings",
         "peekOfCode": "class GuiSettings:\n    SETTING_PATH = os.path.join(os.path.dirname(__file__), \"profiles\", \"default\", \"settings.ini\")\n    def __init__(self):\n        self._logger = getLogger(__name__)\n        self.setting = configparser.ConfigParser()\n        self.setting.optionxform = str\n        # print(\"isExistConfig =\", os.path.exists(self.SETTING_PATH))\n        if not os.path.exists(self.SETTING_PATH):\n            self._logger.debug(\"Setting file does not exists.\")\n            self.generate()",
         "detail": "Poke-Controller-Modified-Extension-master.SerialController.Settings",
+        "documentation": {}
+    },
+    {
+        "label": "extract_step_method",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.StepDebugAssist",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.StepDebugAssist",
+        "peekOfCode": "def extract_step_method(method):\n    \"\"\"Return source operations and literal next-state candidates for a method.\"\"\"\n    source, first_line = inspect.getsourcelines(method)\n    dedented = textwrap.dedent(\"\".join(source))\n    tree = ast.parse(dedented)\n    function = next((node for node in tree.body\n                     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))), None)\n    if function is None:\n        raise ValueError(\"関数の処理を取得できません。\")\n    lines = dedented.splitlines(True)",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.StepDebugAssist",
+        "documentation": {}
+    },
+    {
+        "label": "validate_operation_code",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.StepDebugAssist",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.StepDebugAssist",
+        "peekOfCode": "def validate_operation_code(code):\n    value = textwrap.dedent(str(code or \"\")).strip()\n    if not value:\n        raise ValueError(\"実行する処理が空です。\")\n    wrapped = \"def __step_debug_validate(self):\\n\" + textwrap.indent(value, \"    \") + \"\\n\"\n    compile(wrapped, \"<step-debug-replacement>\", \"exec\")\n    return value\ndef execute_operation(command, method, code):\n    \"\"\"Execute one operation without changing the command source file.\"\"\"\n    value = validate_operation_code(code)",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.StepDebugAssist",
+        "documentation": {}
+    },
+    {
+        "label": "execute_operation",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.SerialController.StepDebugAssist",
+        "description": "Poke-Controller-Modified-Extension-master.SerialController.StepDebugAssist",
+        "peekOfCode": "def execute_operation(command, method, code):\n    \"\"\"Execute one operation without changing the command source file.\"\"\"\n    value = validate_operation_code(code)\n    namespace = dict(getattr(method, \"__globals__\", {}))\n    wrapped = \"def __step_debug_operation(self):\\n\" + textwrap.indent(value, \"    \") + \"\\n\"\n    exec(compile(wrapped, \"<step-debug-operation>\", \"exec\"), namespace, namespace)\n    return namespace[\"__step_debug_operation\"](command)",
+        "detail": "Poke-Controller-Modified-Extension-master.SerialController.StepDebugAssist",
         "documentation": {}
     },
     {
@@ -6209,6 +6746,114 @@
         "description": "Poke-Controller-Modified-Extension-master.SerialController.Window",
         "peekOfCode": "addpath = dirname(dirname(dirname(abspath(__file__))))  # SerialControllerフォルダのパス\nsys.path.append(addpath)\nclass PokeControllerApp:\n    def __init__(self, master=None, profile=\"default\"):\n        self._logger = getLogger(__name__)\n        self._logger.addHandler(NullHandler())\n        self._logger.setLevel(DEBUG)\n        self._logger.propagate = True\n        self._logger.debug(f\"User Profile Name: '{profile}'\")\n        self.root = master",
         "detail": "Poke-Controller-Modified-Extension-master.SerialController.Window",
+        "documentation": {}
+    },
+    {
+        "label": "_StepDebugSample",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "description": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "peekOfCode": "class _StepDebugSample:\n    def __init__(self):\n        self.ready = True\n        self.values = []\n    def sample_step(self):\n        self.values.append(\"first\")\n        if self.ready:\n            self.values.append(\"conditional\")\n        return \"NEXT_STEP\"\nclass StepDebugAssistTests(unittest.TestCase):",
+        "detail": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "documentation": {}
+    },
+    {
+        "label": "StepDebugAssistTests",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "description": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "peekOfCode": "class StepDebugAssistTests(unittest.TestCase):\n    def test_method_is_split_and_literal_next_step_is_found(self):\n        sample = _StepDebugSample()\n        info = extract_step_method(sample.sample_step)\n        self.assertEqual(info[\"next_states\"], [\"NEXT_STEP\"])\n        self.assertEqual(len(info[\"operations\"]), 2)\n        self.assertIn(\"IF\", info[\"operations\"][1][\"context\"])\n    def test_single_operation_executes_without_calling_whole_method(self):\n        sample = _StepDebugSample()\n        info = extract_step_method(sample.sample_step)",
+        "detail": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "documentation": {}
+    },
+    {
+        "label": "QuickActionsTests",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "description": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "peekOfCode": "class QuickActionsTests(unittest.TestCase):\n    def test_saved_actions_are_deduplicated_and_unknown_ids_are_removed(self):\n        saved = '[\"camera.capture\", \"missing\", \"camera.capture\", \"recording.toggle\"]'\n        self.assertEqual(\n            normalize_action_ids(saved),\n            [\"camera.capture\", \"recording.toggle\"],\n        )\n        self.assertIn(\"commands.start_stop\", ACTION_BY_ID)\n        self.assertEqual(ACTION_BY_ID[\"recording.toggle\"][\"textvariable\"], \"record_button_text\")\n    def test_invalid_position_falls_back_to_top(self):",
+        "detail": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "documentation": {}
+    },
+    {
+        "label": "FunctionReplacementTests",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "description": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "peekOfCode": "class FunctionReplacementTests(unittest.TestCase):\n    def test_selected_function_can_replace_multiple_differently_named_methods(self):\n        source = '''\nclass Command:\n    def first_target(self):\n        return \"old-1\"\n    def second_target(self):\n        return \"old-2\"\n    def untouched(self):\n        return \"keep\"",
+        "detail": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "documentation": {}
+    },
+    {
+        "label": "Command",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "description": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "peekOfCode": "class Command:\n    def first_target(self):\n        return \"old-1\"\n    def second_target(self):\n        return \"old-2\"\n    def untouched(self):\n        return \"keep\"\n'''\n        replacement = '''\ndef sample_function(self):",
+        "detail": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "documentation": {}
+    },
+    {
+        "label": "TriggerTests",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "description": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "peekOfCode": "class TriggerTests(unittest.TestCase):\n    def test_state_table_values_are_available_for_search(self):\n        source = \"\"\"\nclass Command:\n    def __init__(self):\n        self.STATE_1_STORY_FUNCTION = {\n            '1_STORY_OUT_HOTEL_Z_72': self.step_72,\n            '1_STORY_OUT_HOTEL_Z_75': self.step_75,\n        }\n\"\"\"",
+        "detail": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "documentation": {}
+    },
+    {
+        "label": "Command",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "description": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "peekOfCode": "class Command:\n    def __init__(self):\n        self.STATE_1_STORY_FUNCTION = {\n            '1_STORY_OUT_HOTEL_Z_72': self.step_72,\n            '1_STORY_OUT_HOTEL_Z_75': self.step_75,\n        }\n\"\"\"\n        self.assertEqual(\n            discover_state_values(source, \"STATE_1_STORY_FUNCTION\"),\n            [\"1_STORY_OUT_HOTEL_Z_72\", \"1_STORY_OUT_HOTEL_Z_75\"],",
+        "detail": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "documentation": {}
+    },
+    {
+        "label": "ControllerLogTests",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "description": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "peekOfCode": "class ControllerLogTests(unittest.TestCase):\n    def test_rotate_left_stick_range_by_ninety_degrees(self):\n        # 0x0002 means that the left-stick coordinate pair follows the hat.\n        rotated = rotate_serial_message(\"0x0002 8 ff 80\", 90, \"left\")\n        self.assertEqual(rotated, \"0x0002 8 80 ff\")\n        lines = [\"2026-08-07 12:00:00.000000,0x0002 8 ff 80\\n\"]\n        self.assertEqual(rotate_log_range(lines, 1, 1, 90)[0].split(\",\", 1)[1].strip(),\n                         \"0x0002 8 80 ff\")\n    def test_generate_replacement_preserves_relative_timing(self):\n        first = datetime.datetime(2026, 8, 7, 12, 0, 0)",
+        "detail": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "documentation": {}
+    },
+    {
+        "label": "RecordingDiskGuardTests",
+        "kind": 6,
+        "importPath": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "description": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "peekOfCode": "class RecordingDiskGuardTests(unittest.TestCase):\n    def test_same_drive_is_checked_once_and_thresholds_are_reported(self):\n        usage_type = namedtuple(\"usage\", \"total used free\")\n        gib = 1024 ** 3\n        calls = []\n        def nearly_full(path):\n            calls.append(path)\n            return usage_type(100 * gib, 96 * gib, 4 * gib)\n        violations = disk_space_violations(\n            ((\"tool\", SERIAL_CONTROLLER), (\"output\", os.path.dirname(SERIAL_CONTROLLER))),",
+        "detail": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "documentation": {}
+    },
+    {
+        "label": "sample_function",
+        "kind": 2,
+        "importPath": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "description": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "peekOfCode": "def sample_function(self):\n    value = \"replacement\"\n    return value\n'''\n        updated = replace_class_functions(\n            source,\n            {\"first_target\": replacement, \"second_target\": replacement},\n        )\n        compile(updated, \"<replacement-test>\", \"exec\")\n        self.assertIn(\"def first_target(self):\", updated)",
+        "detail": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "documentation": {}
+    },
+    {
+        "label": "SERIAL_CONTROLLER",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "description": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "peekOfCode": "SERIAL_CONTROLLER = os.path.abspath(os.path.join(os.path.dirname(__file__), \"..\", \"SerialController\"))\nif SERIAL_CONTROLLER not in sys.path:\n    sys.path.insert(0, SERIAL_CONTROLLER)\nDEV_STUDIO = os.path.abspath(os.path.join(os.path.dirname(__file__), \"..\", \"DevStudio\"))\nif DEV_STUDIO not in sys.path:\n    sys.path.insert(0, DEV_STUDIO)\nfrom AutomationTriggers import StableRuleEvaluator, discover_state_values, resolve_command_value\nfrom ControllerInputLog import (python_replacement_body, replay_recording,\n                                rotate_log_range, rotate_serial_message)\nfrom DiskSpaceGuard import disk_space_violations",
+        "detail": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "documentation": {}
+    },
+    {
+        "label": "DEV_STUDIO",
+        "kind": 5,
+        "importPath": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "description": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
+        "peekOfCode": "DEV_STUDIO = os.path.abspath(os.path.join(os.path.dirname(__file__), \"..\", \"DevStudio\"))\nif DEV_STUDIO not in sys.path:\n    sys.path.insert(0, DEV_STUDIO)\nfrom AutomationTriggers import StableRuleEvaluator, discover_state_values, resolve_command_value\nfrom ControllerInputLog import (python_replacement_body, replay_recording,\n                                rotate_log_range, rotate_serial_message)\nfrom DiskSpaceGuard import disk_space_violations\nfrom SampleFunctionSync import replace_class_functions\nfrom StepDebugAssist import extract_step_method, execute_operation\nfrom QuickActions import ACTION_BY_ID, normalize_action_ids, normalize_position",
+        "detail": "Poke-Controller-Modified-Extension-master.tests.test_automation_features",
         "documentation": {}
     }
 ]

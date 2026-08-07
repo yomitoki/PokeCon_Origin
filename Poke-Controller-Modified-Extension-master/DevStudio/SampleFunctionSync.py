@@ -5,6 +5,7 @@ from __future__ import print_function
 
 import ast
 import os
+import re
 import textwrap
 
 
@@ -40,6 +41,11 @@ def _function_records(source, class_only=False):
         result[node.name] = {"name": node.name, "start": start, "end": end,
                              "text": textwrap.dedent(raw).rstrip() + "\n", "normalized": normalized}
     return result
+
+
+def function_records(source, class_only=False):
+    """Public read-only function catalog used by replacement pickers."""
+    return _function_records(source, class_only=class_only)
 
 
 def scan_folder(fragment_root, folder):
@@ -104,6 +110,62 @@ def update_source(source, comparisons, names):
     updated = "".join(lines)
     ast.parse(updated)
     return updated
+
+
+def replace_class_functions(source, function_texts):
+    """Replace existing command-class methods from ``name -> function text``."""
+    records = _function_records(source, class_only=True)
+    lines = source.splitlines(True)
+    replacements = []
+    for name, function_text in function_texts.items():
+        if name not in records:
+            continue
+        # Replacement code may be obtained from a differently named specified
+        # function. Preserve the selected target method name at the call sites.
+        renamed = function_text
+        renamed = re.sub(
+            r"(?m)^(\s*(?:async\s+)?def\s+)[A-Za-z_]\w*",
+            lambda match: match.group(1) + name, renamed, count=1)
+        block = textwrap.indent(textwrap.dedent(renamed).rstrip(), "    ") + "\n"
+        record = records[name]
+        replacements.append((record["start"], record["end"], block))
+    for start, end, block in sorted(replacements, reverse=True):
+        lines[start:end] = [block]
+    updated = "".join(lines)
+    ast.parse(updated)
+    return updated
+
+
+def propagate_functions(paths, function_texts):
+    """Apply sample/specified functions to every existing same-name method."""
+    changed = []
+    for path in paths:
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                source = stream.read()
+            encoding = "utf-8"
+        except UnicodeDecodeError:
+            with open(path, "r", encoding="cp932") as stream:
+                source = stream.read()
+            encoding = "cp932"
+        except OSError:
+            continue
+        try:
+            records = _function_records(source, class_only=True)
+        except (SyntaxError, ValueError):
+            continue
+        applicable = {name: text for name, text in function_texts.items() if name in records}
+        if not applicable:
+            continue
+        updated = replace_class_functions(source, applicable)
+        if updated == source:
+            continue
+        temporary = path + ".function-replace.tmp"
+        with open(temporary, "w", encoding=encoding, newline="\n") as stream:
+            stream.write(updated)
+        os.replace(temporary, path)
+        changed.append(path)
+    return changed
 
 
 def update_fragments(source, comparisons, names):

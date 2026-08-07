@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""CommandsAssist recovery command example.
+"""CommandsAssist replacement command example.
 
 Copy this file in the same folder, rename the class/NAME, and implement only
-the recovery operation.  Returning from do() is treated as normal completion;
-PokeCon then starts the interrupted command again.
+the replacement operation. Returning from do() is treated as normal completion;
+PokeCon then resumes the interrupted command at its current Step checkpoint.
 """
 from Commands.PythonCommandBase import PythonCommand
 
@@ -14,6 +14,5 @@ class RecoveryCommandSample(PythonCommand):
     TAGS = ["@CommandsAssist"]
 
     def do(self):
-        # Add recovery inputs here.  Long loops must call checkIfAlive().
+        # Add replacement inputs here. Long loops must call checkIfAlive().
         self.checkIfAlive()
-

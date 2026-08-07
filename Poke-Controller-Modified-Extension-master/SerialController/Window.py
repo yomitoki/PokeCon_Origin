@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import datetime
+import inspect
 import sys
 import os
 import re
@@ -38,9 +39,15 @@ from GuiAssets import CaptureArea, ControllerGUI
 from VisionAutomation import VisionAutomation
 from AudioMonitor import AudioMonitor
 from ImageAnalysisAssist import ImageAnalysisAssist
+from AnalysisRules import AnalysisRuleEngine, ANALYSIS_TYPES, CONDITION_TYPES
 from ObjectDetectionAssist import ObjectDetectionAssistWindow
+from DiskSpaceGuard import disk_space_violations
 from Recording import CaptureRecorder
-from AutomationTriggers import StableRuleEvaluator, resolve_command_value, command_scope_matches
+from AutomationTriggers import StableRuleEvaluator, discover_state_values, resolve_command_value
+from ControllerInputLog import rotate_log_range, python_replacement_body, replay_recording
+from StepDebugAssist import extract_step_method, execute_operation, validate_operation_code
+from QuickActions import (ACTION_BY_ID, ACTION_DEFINITIONS, POSITIONS,
+                          encode_action_ids, normalize_action_ids, normalize_position)
 from PIL import Image, ImageTk, ImageDraw, ImageFont
 from KeyConfig import PokeKeycon
 from Keyboard import SwitchKeyboardController
@@ -101,6 +108,9 @@ class PokeControllerApp:
         # Template mode is an armed detector.  It must not create a file
         # until the configured image is actually found.
         self.record_armed = False
+        self._record_disk_last_check = 0.0
+        self._record_disk_last_ok = True
+        self._record_disk_violation_key = None
         self._last_vision_text = ""
         self.Line = None
         self.Discord = None
@@ -112,7 +122,15 @@ class PokeControllerApp:
         self._initial_serial_open_thread = None
         self._defer_serial_open = True
         self._commands_loaded = False
+        self._state_value_cache = {}
         self._pending_startup_snapshot = None
+        self.quick_actions_left_position = tk.StringVar(value="上")
+        self.quick_actions_right_position = tk.StringVar(value="上")
+        self.quick_actions_left_items = []
+        self.quick_actions_right_items = []
+        self._quick_actions_window = None
+        self._quick_action_proxy_buttons = []
+        self._quick_action_sync_after = None
 
         self.pokeconname = Constant.NAME
         self.pokeconversion = Constant.VERSION
@@ -325,6 +343,12 @@ class PokeControllerApp:
         ttk.Button(self.vision_lf, text="Reload rules", command=self.reload_vision_rules).grid(column=1, row=0, padx=5, pady=5)
         ttk.Label(self.vision_lf, text="Template detection / HP bar → Output#2 (no key input)").grid(column=2, row=0, padx=5, pady=5)
         self.vision_lf.grid(column=0, padx=5, pady=5, sticky="ew")
+        self.analysis_rules_enabled = tk.BooleanVar(value=True)
+        self.analysis_rules = []
+        self.analysis_rule_status = tk.StringVar(value="解析ルールなし")
+        self.analysis_rule_results = {}
+        self._pending_analysis_roi_rule_id = None
+        self._build_analysis_rules_ui()
         # self.camera_f.configure(height='200', width='200')    # removed
         self.controller_nb.add(self.camera_tab, padding="0", sticky="nsew", text="Camera")
         self.area_capture_tab, self.area_capture_f = self._create_scrollable_tab()
@@ -445,10 +469,20 @@ class PokeControllerApp:
         self.record_mode = tk.StringVar(value="Manual")
         ttk.Radiobutton(self.recording_lf, text="Manual", value="Manual", variable=self.record_mode).grid(column=0, row=0, padx=5, pady=5)
         ttk.Radiobutton(self.recording_lf, text="Template segments", value="Template", variable=self.record_mode).grid(column=1, row=0, padx=5, pady=5)
-        ttk.Radiobutton(self.recording_lf, text="Command variable segments", value="Variable", variable=self.record_mode).grid(column=2, row=0, padx=5, pady=5)
-        self.record_button = ttk.Button(self.recording_lf, text="Start recording", command=self.toggle_recording)
+        ttk.Radiobutton(self.recording_lf, text="Step / command variable segments", value="Variable",
+                        variable=self.record_mode).grid(column=2, row=0, padx=5, pady=5)
+        self.record_button_text = tk.StringVar(value="○ 録画開始")
+        self.recording_state_text = tk.StringVar(value="○ 録画停止中")
+        self._recording_ui_state = None
+        self.record_button = ttk.Button(
+            self.recording_lf, textvariable=self.record_button_text, command=self.toggle_recording)
         self.record_button.grid(column=3, row=0, padx=5, pady=5)
         ttk.Button(self.recording_lf, text="Output layout...", command=self.open_recording_output_layout).grid(column=4, row=0, padx=5, pady=5)
+        self.recording_state_label = tk.Label(
+            self.recording_lf, textvariable=self.recording_state_text,
+            anchor="w", fg="#555555")
+        self.recording_state_label.grid(column=5, row=0, padx=(10, 5), pady=5, sticky="w")
+        self.root.after(200, self._poll_recording_ui_state)
         self.record_output_mode = tk.StringVar(value="Video only")
         self.record_output_logs = tk.StringVar(value="Output#1")
         self.record_output_guide = tk.BooleanVar(value=False)
@@ -536,6 +570,20 @@ class PokeControllerApp:
         ttk.Label(self.recording_lf, text="空欄の場合は従来どおり Recordings フォルダへ保存します。",
                   foreground="#555555").grid(
                       column=1, columnspan=7, row=8, padx=2, pady=(0, 4), sticky="w")
+        self.record_min_free_gb = tk.DoubleVar(value=5.0)
+        self.record_max_disk_usage_percent = tk.DoubleVar(value=95.0)
+        ttk.Label(self.recording_lf, text="容量監視: 最小空き容量").grid(
+            column=0, row=9, padx=(5, 2), pady=(2, 5), sticky="w")
+        ttk.Spinbox(self.recording_lf, from_=0, to=10000, increment=1,
+                    textvariable=self.record_min_free_gb, width=7).grid(
+                        column=1, row=9, padx=2, pady=(2, 5), sticky="w")
+        ttk.Label(self.recording_lf, text="GB / 最大使用率").grid(
+            column=2, row=9, padx=(5, 2), pady=(2, 5), sticky="w")
+        ttk.Spinbox(self.recording_lf, from_=1, to=100, increment=1,
+                    textvariable=self.record_max_disk_usage_percent, width=6).grid(
+                        column=3, row=9, padx=2, pady=(2, 5), sticky="w")
+        ttk.Label(self.recording_lf, text="%（ツール・録画保存先ドライブ）").grid(
+            column=4, columnspan=4, row=9, padx=2, pady=(2, 5), sticky="w")
         self.recording_lf.pack(fill="x", padx=5, pady=5)
         self.controller_nb.add(self.recording_tab, padding="0", sticky="nsew", text="Recording")
         self._build_input_set_tab()
@@ -670,6 +718,9 @@ class PokeControllerApp:
         self.pc_gamepad_cb.grid(column=1, columnspan=2, padx=5, pady=5, row=2, sticky="ew")
         ttk.Button(self.hardware_lf, text="再検索", command=self.refresh_pc_gamepads).grid(
             column=3, padx=5, pady=5, row=2)
+        ttk.Button(self.hardware_lf, text="コントローラー記録ライブラリ…",
+                   command=self.open_controller_log_editor).grid(
+                       column=0, columnspan=4, padx=5, pady=(0, 5), row=3, sticky="w")
         self.refresh_pc_gamepads()
         self.hardware_lf.configure(height="200", text="Hardware", width="200")
         self.hardware_lf.grid(column="0", padx="5", row="1", sticky="ew")
@@ -932,18 +983,22 @@ class PokeControllerApp:
         self.side_width_balance = tk.IntVar(value=50)
         self.panel_ratio = tk.IntVar(value=50)
         self.right_panel_ratio = tk.IntVar(value=50)
+        self._panel_adjuster_update_after = None
         self.size_adjuster_label = ttk.Label(self.outputs_size_adjuster_lf, text="Left / right width")
         self.size_adjuster_scale = ttk.Scale(self.outputs_size_adjuster_lf, from_=20, to=80,
                                               orient="horizontal", variable=self.side_width_balance,
-                                              command=lambda *_: self.apply_panel_assignment())
+                                              command=self.schedule_panel_adjuster_update)
         self.panel_split_label = ttk.Label(self.panel_split_adjuster_lf, text="Left: top / bottom")
         self.panel_split_scale = ttk.Scale(self.panel_split_adjuster_lf, from_=10, to=90,
                                             orient="horizontal", variable=self.panel_ratio,
-                                            command=lambda *_: self.apply_panel_assignment())
+                                            command=self.schedule_panel_adjuster_update)
         self.right_panel_split_label = ttk.Label(self.panel_split_adjuster_lf, text="Right: top / bottom")
         self.right_panel_split_scale = ttk.Scale(self.panel_split_adjuster_lf, from_=10, to=90,
                                                   orient="horizontal", variable=self.right_panel_ratio,
-                                                  command=lambda *_: self.apply_panel_assignment())
+                                                  command=self.schedule_panel_adjuster_update)
+        for adjuster in (self.size_adjuster_scale, self.panel_split_scale,
+                         self.right_panel_split_scale):
+            adjuster.bind("<ButtonRelease-1>", self.flush_panel_adjuster_update, add="+")
         self.outputs_size_adjuster_lf.configure(text="Size Adjuster")
         self.outputs_size_adjuster_lf.grid(column="0", padx="5", pady="5", row="0", sticky="ew")
         self.panel_split_adjuster_lf.grid(column="1", padx="5", pady="5", row="0", sticky="ew")
@@ -989,6 +1044,9 @@ class PokeControllerApp:
         ttk.Button(self.othres_outputs_lf, text="Side panels...", command=self.open_side_panel_settings).grid(
             column=4, row=0, padx=5, pady=5, sticky="ew"
         )
+        ttk.Button(self.othres_outputs_lf, text="Quick actions...", command=self.open_quick_actions_settings).grid(
+            column=5, row=0, padx=5, pady=5, sticky="ew"
+        )
         self.panel_assignment_lf = ttk.Labelframe(self.othres_outputs_lf, text="Side panel layout / content")
         self.panel_layout = tk.StringVar(value="Four panels (left/right, top/bottom)")  # legacy setting
         self.panel_sides = tk.StringVar(value="Both sides")
@@ -1028,8 +1086,12 @@ class PokeControllerApp:
             combo.bind("<<ComboboxSelected>>", self.apply_panel_assignment)
             self.panel_slots[slot] = value
         ttk.Label(self.panel_assignment_lf, text="Top / bottom ratio").grid(column=2, row=1, padx=5)
-        ttk.Scale(self.panel_assignment_lf, from_=10, to=90, variable=self.panel_ratio,
-                  command=self.apply_panel_assignment).grid(column=2, row=1, rowspan=3, padx=5, sticky="ns")
+        self.panel_assignment_ratio_scale = ttk.Scale(
+            self.panel_assignment_lf, from_=10, to=90, variable=self.panel_ratio,
+            command=self.schedule_panel_adjuster_update)
+        self.panel_assignment_ratio_scale.grid(column=2, row=1, rowspan=3, padx=5, sticky="ns")
+        self.panel_assignment_ratio_scale.bind(
+            "<ButtonRelease-1>", self.flush_panel_adjuster_update, add="+")
         self.panel_assignment_lf.grid(column=0, columnspan=3, padx=5, pady=5, row=2, sticky="ew")
         self.othres_outputs_lf.configure(height="200", text="Outputs/Dialogue Settings", width="200")
         self.othres_outputs_lf.grid(column="0", padx="5", row="1", sticky="ew")
@@ -1167,6 +1229,14 @@ class PokeControllerApp:
         self.left_bottom_panel.pack(expand=True, fill="both", side="top")
         self.left_output_area_f.grid(column="0", padx="5", pady="5", row="0", rowspan="2", sticky="nsew")
         self.output_area_f.grid(column="2", padx="5", pady="5", row="0", rowspan="2", sticky="nsew")
+        self.quick_actions_left_frame = ttk.LabelFrame(
+            self.left_output_area_f, text="クイックアクション")
+        self.quick_actions_left_content = ttk.Frame(self.quick_actions_left_frame)
+        self.quick_actions_left_content.pack(fill="x", padx=3, pady=2)
+        self.quick_actions_right_frame = ttk.LabelFrame(
+            self.output_area_f, text="クイックアクション")
+        self.quick_actions_right_content = ttk.Frame(self.quick_actions_right_frame)
+        self.quick_actions_right_content.pack(fill="x", padx=3, pady=2)
         self.panel_widgets = {
             "left_top": (self.left_top_panel, self.left_top_image, self.left_top_text),
             "left_bottom": (self.left_bottom_panel, self.left_bottom_image, self.left_bottom_text),
@@ -1528,6 +1598,14 @@ class PokeControllerApp:
         self.right_panel_count.set(self.settings.right_panel_count)
         self.side_width_balance.set(self.settings.side_width_balance)
         self.show_software_controller.set(self.settings.show_software_controller)
+        self.quick_actions_left_position.set(normalize_position(
+            self.settings.quick_actions_left_position))
+        self.quick_actions_right_position.set(normalize_position(
+            self.settings.quick_actions_right_position))
+        self.quick_actions_left_items = normalize_action_ids(
+            self.settings.quick_actions_left_items)
+        self.quick_actions_right_items = normalize_action_ids(
+            self.settings.quick_actions_right_items)
         self.video_source.set(self.settings.video_source)
         self.saved_window_title = self.settings.window_title
         self.saved_window_process = self.settings.window_process
@@ -1546,6 +1624,13 @@ class PokeControllerApp:
                 max(3, min(20, int(self.settings.image_assist_max_candidates))))
         except (TypeError, ValueError):
             self.image_assist_max_candidates.set(10)
+        self.analysis_rules_enabled.set(self.settings.analysis_rules_enabled)
+        try:
+            loaded_analysis_rules = json.loads(self.settings.analysis_rules)
+            self.analysis_rules = loaded_analysis_rules if isinstance(loaded_analysis_rules, list) else []
+        except (TypeError, ValueError):
+            self.analysis_rules = []
+        self._refresh_analysis_rule_list()
         # This permission is intentionally session-only.  Restoring an enabled
         # state can forward a gamepad to the Switch before the user notices.
         self.pc_gamepad_input_enabled.set(False)
@@ -1559,6 +1644,8 @@ class PokeControllerApp:
         self.record_roi.set(self.settings.record_roi)
         self.record_debug.set(self.settings.record_debug)
         self.record_minimum_duration.set(self.settings.record_minimum_duration)
+        self.record_min_free_gb.set(self.settings.record_min_free_gb)
+        self.record_max_disk_usage_percent.set(self.settings.record_max_disk_usage_percent)
         self.record_variable_command.set(self.settings.record_variable_command)
         self.record_variable_name.set(self.settings.record_variable_name)
         self.record_variable_start.set(self.settings.record_variable_start)
@@ -1593,6 +1680,7 @@ class PokeControllerApp:
             self.commands_assist_rules = json.loads(self.settings.commands_assist_rules)
         except (TypeError, ValueError):
             self.commands_assist_rules = []
+        self.step_debug_rules = self._read_step_debug_rules()
         self._refresh_commands_assist_rule_list()
         self.configure_recording_rules()
         self.refresh_recording_presets()
@@ -1741,6 +1829,7 @@ class PokeControllerApp:
         self.image_analysis_assist = ImageAnalysisAssist(
             os.path.dirname(os.path.abspath(__file__)), self._queue_image_assist_results,
             max_candidates=self.image_assist_max_candidates.get())
+        self.analysis_rule_engine = AnalysisRuleEngine(self._queue_analysis_rule_results)
         self.toggle_image_analysis_assist()
         self.toggle_pc_gamepad_input()
         self.root.after(1000, self.preview_area_capture)
@@ -1768,6 +1857,7 @@ class PokeControllerApp:
         # self.keys_software_controller = UnitCommand
         self.keys_software_controller = KeyPress(self.ser)
         self._software_controller_queue = queue.Queue()
+        self._software_controller_paused_command = None
         self._software_controller_thread = threading.Thread(
             target=self._software_controller_loop, daemon=True, name="SoftwareControllerSender")
         self._software_controller_thread.start()
@@ -3131,7 +3221,7 @@ class PokeControllerApp:
 
     def _build_commands_assist_tab(self):
         self.commands_assist_tab, self.commands_assist_f = self._create_scrollable_tab()
-        box = ttk.Labelframe(self.commands_assist_f, text="停止検知・復旧コマンド")
+        box = ttk.Labelframe(self.commands_assist_f, text="Step条件・一時停止・処理置換")
         box.pack(fill="both", expand=True, padx=5, pady=5)
         self.commands_assist_enabled = tk.BooleanVar(value=False)
         self.commands_assist_recovery_command = tk.StringVar()
@@ -3142,11 +3232,16 @@ class PokeControllerApp:
         self._commands_assist_triggered_rule = None
         self._commands_assist_suppressed_rule_id = None
         self._commands_assist_recovery_done = False
+        # The selected profile path is finalized later during startup.
+        self.step_debug_rules = []
+        self._step_debug_session = None
+        self._step_debug_pending_session = None
+        self._step_debug_window = None
         ttk.Checkbutton(box, text="有効 (OR条件を0.25秒間隔で監視)",
                         variable=self.commands_assist_enabled,
                         command=self._reset_commands_assist_monitor).grid(
                             column=0, row=0, padx=5, pady=4, sticky="w")
-        ttk.Label(box, text="実行する復旧コマンド:").grid(column=1, row=0, padx=(10, 3), pady=4, sticky="e")
+        ttk.Label(box, text="既定の置換コマンド:").grid(column=1, row=0, padx=(10, 3), pady=4, sticky="e")
         self.commands_assist_command_cb = ttk.Combobox(
             box, state="readonly", width=42, textvariable=self.commands_assist_recovery_command)
         self.commands_assist_command_cb.grid(column=2, row=0, padx=3, pady=4, sticky="ew")
@@ -3159,18 +3254,550 @@ class PokeControllerApp:
         ttk.Button(actions, text="追加", command=self.add_commands_assist_rule).pack(fill="x", pady=1)
         ttk.Button(actions, text="編集", command=self.edit_commands_assist_rule).pack(fill="x", pady=1)
         ttk.Button(actions, text="削除", command=self.delete_commands_assist_rule).pack(fill="x", pady=1)
+        ttk.Button(actions, text="関数置換…", command=self.open_function_replacements).pack(
+            fill="x", pady=(8, 1))
+        ttk.Button(actions, text="かんたんStepデバッグ…", command=self.open_step_debug_assist).pack(
+            fill="x", pady=(2, 1))
+        self.commands_assist_resume_button = ttk.Button(
+            actions, text="一時停止を再開", command=self.resume_commands_assist, state="disabled")
+        self.commands_assist_resume_button.pack(fill="x", pady=(2, 1))
         ttk.Label(box, textvariable=self.commands_assist_status).grid(
             column=0, columnspan=4, row=2, padx=5, pady=(2, 0), sticky="w")
-        ttk.Label(box, text="注: 復旧コマンドはPythonCommandです。do()からreturnした時点を正常終了として再開します。",
+        ttk.Label(box, text="置換コマンドはPythonCommandです。完了後、元コマンドを同じStep位置から再開します。",
                   foreground="#555555").grid(column=0, columnspan=4, row=3, padx=5, pady=(1, 5), sticky="w")
         box.columnconfigure(2, weight=1)
         box.rowconfigure(1, weight=1)
         self.controller_nb.add(self.commands_assist_tab, padding="0", sticky="nsew", text="CommandsAssist")
         self.refresh_commands_assist_commands()
         self.root.after(250, self._commands_assist_tick)
+        self.root.after(100, self._poll_step_debug_session)
 
     def _commands_assist_dir(self):
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), "CommandsAssist")
+
+    def _step_debug_rules_path(self):
+        return os.path.join(os.path.dirname(Settings.GuiSettings.SETTING_PATH), "step_debug_rules.json")
+
+    def _read_step_debug_rules(self):
+        try:
+            with open(self._step_debug_rules_path(), "r", encoding="utf-8") as stream:
+                data = json.load(stream)
+            return data if isinstance(data, list) else []
+        except (OSError, ValueError):
+            return []
+
+    def _write_step_debug_rules(self):
+        path = self._step_debug_rules_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temporary = path + ".tmp"
+        with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(self.step_debug_rules, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+        os.replace(temporary, path)
+
+    @staticmethod
+    def _step_debug_rule_text(rule):
+        enabled = "有効" if rule.get("enabled", True) else "無効"
+        follow = " / 次Stepも停止" if rule.get("auto_follow", True) else ""
+        replacements = len(rule.get("replacements", {}))
+        return "[{}] {} / {} :: {} / 一時置換{}{}".format(
+            enabled, rule.get("command") or "すべて", rule.get("variable", ""),
+            rule.get("state", ""), replacements, follow)
+
+    def _edit_step_debug_rule_dialog(self, parent, initial=None):
+        initial = dict(initial or {})
+        dialog = tk.Toplevel(parent)
+        dialog.title("停止地点の設定")
+        dialog.transient(parent); dialog.grab_set(); dialog.geometry("760x570")
+        command = tk.StringVar(value=initial.get("command") or (
+            self.py_name.get() if self.py_name.get() in self._command_names_for_rules() else "すべて"))
+        variable = tk.StringVar(value=initial.get("variable", "STATE_1_STORY_FUNCTION"))
+        search = tk.StringVar()
+        manual = tk.StringVar(value=initial.get("state", ""))
+        enabled = tk.BooleanVar(value=bool(initial.get("enabled", True)))
+        auto_follow = tk.BooleanVar(value=bool(initial.get("auto_follow", True)))
+        auto_open = tk.BooleanVar(value=bool(initial.get("auto_open", True)))
+        result = {}
+        ttk.Label(dialog, text="1. 実行するCommands").grid(column=0, row=0, padx=8, pady=5, sticky="e")
+        command_combo = ttk.Combobox(dialog, state="readonly", textvariable=command,
+                                     values=self._command_names_for_rules(), width=55)
+        command_combo.grid(column=1, row=0, padx=8, pady=5, sticky="ew")
+        ttk.Label(dialog, text="2. 状態変数").grid(column=0, row=1, padx=8, pady=5, sticky="e")
+        ttk.Entry(dialog, textvariable=variable).grid(column=1, row=1, padx=8, pady=5, sticky="ew")
+        ttk.Label(dialog, text="3. Step名を検索").grid(column=0, row=2, padx=8, pady=5, sticky="e")
+        ttk.Entry(dialog, textvariable=search).grid(column=1, row=2, padx=8, pady=5, sticky="ew")
+        states = tk.Listbox(dialog, selectmode="browse", exportselection=False, height=15)
+        states.grid(column=0, columnspan=2, row=3, padx=8, pady=5, sticky="nsew")
+        ttk.Label(dialog, text="一覧にない場合は直接入力").grid(column=0, row=4, padx=8, pady=5, sticky="e")
+        ttk.Entry(dialog, textvariable=manual).grid(column=1, row=4, padx=8, pady=5, sticky="ew")
+        choices = ttk.Frame(dialog); choices.grid(column=0, columnspan=2, row=5, padx=8, pady=4, sticky="w")
+        ttk.Checkbutton(choices, text="この停止地点を有効にする", variable=enabled).pack(side="left", padx=4)
+        ttk.Checkbutton(choices, text="次Stepも続けて停止", variable=auto_follow).pack(side="left", padx=12)
+        ttk.Checkbutton(choices, text="停止時に画面を自動表示", variable=auto_open).pack(side="left", padx=12)
+
+        def refresh_states(*_args):
+            values = self._state_value_candidates(command.get(), variable.get())
+            needle = search.get().strip().casefold()
+            states.delete(0, "end")
+            for value in values:
+                if not needle or needle in value.casefold():
+                    states.insert("end", value)
+
+        def select_state(_event=None):
+            selected = states.curselection()
+            if selected:
+                manual.set(states.get(selected[0]))
+
+        def accept():
+            state = manual.get().strip()
+            if not state:
+                tkmsg.showwarning("Stepデバッグ", "停止するStepを1つ選んでください。", parent=dialog); return
+            result.update(initial)
+            result.update({
+                "id": initial.get("id", str(time.time_ns())), "enabled": enabled.get(),
+                "command": command.get(), "variable": variable.get().strip(), "state": state,
+                "auto_follow": auto_follow.get(), "auto_open": auto_open.get(),
+                "replacements": dict(initial.get("replacements", {})),
+            })
+            dialog.destroy()
+
+        command_combo.bind("<<ComboboxSelected>>", refresh_states)
+        states.bind("<<ListboxSelect>>", select_state)
+        search.trace_add("write", refresh_states); variable.trace_add("write", refresh_states)
+        buttons = ttk.Frame(dialog); buttons.grid(column=0, columnspan=2, row=6, padx=8, pady=8, sticky="e")
+        ttk.Button(buttons, text="この停止地点を保存", command=accept).pack(side="left", padx=3)
+        ttk.Button(buttons, text="キャンセル", command=dialog.destroy).pack(side="left", padx=3)
+        dialog.columnconfigure(1, weight=1); dialog.rowconfigure(3, weight=1)
+        refresh_states(); dialog.wait_window()
+        return result or None
+
+    def open_step_debug_assist(self):
+        if self._step_debug_window is not None:
+            try:
+                if self._step_debug_window.winfo_exists():
+                    self._step_debug_window.deiconify(); self._step_debug_window.lift()
+                    self._refresh_step_debug_window(); return
+            except tk.TclError:
+                pass
+        dialog = tk.Toplevel(self.root)
+        self._step_debug_window = dialog
+        dialog.title("かんたんStepデバッグ")
+        dialog.geometry("1180x820"); dialog.transient(self.root)
+        guide = ttk.Labelframe(dialog, text="この順で使います（迷ったら上から順番）")
+        guide.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(guide, text=(
+            "① 停止地点を追加  →  ② CommandsをStart  →  ③ 停止後、上から1個ずつ実行／修正  "
+            "→  ④ 問題なければ次Stepへ\n"
+            "調整中の置換は別ファイルに保存します。元のPythonソースは自動で書き換えません。"),
+                  justify="left", foreground="#174a7e").pack(anchor="w", padx=8, pady=6)
+        ttk.Button(guide, text="詳しい使い方を開く", command=self.open_step_debug_guide).pack(anchor="e", padx=8, pady=(0, 6))
+        setup = ttk.Labelframe(dialog, text="① 停止地点（複数登録できます）")
+        setup.pack(fill="x", padx=8, pady=4)
+        self.step_debug_rule_list = tk.Listbox(setup, height=5, exportselection=False)
+        self.step_debug_rule_list.pack(side="left", fill="both", expand=True, padx=5, pady=5)
+        setup_buttons = ttk.Frame(setup); setup_buttons.pack(side="right", fill="y", padx=5, pady=5)
+
+        def add_rule():
+            value = self._edit_step_debug_rule_dialog(dialog)
+            if value:
+                self.step_debug_rules.append(value); self._write_step_debug_rules(); self._refresh_step_debug_window()
+
+        def edit_rule():
+            selected = self.step_debug_rule_list.curselection()
+            if not selected: return
+            value = self._edit_step_debug_rule_dialog(dialog, self.step_debug_rules[selected[0]])
+            if value:
+                self.step_debug_rules[selected[0]] = value; self._write_step_debug_rules(); self._refresh_step_debug_window()
+
+        def toggle_rule():
+            selected = self.step_debug_rule_list.curselection()
+            if not selected: return
+            rule = self.step_debug_rules[selected[0]]; rule["enabled"] = not rule.get("enabled", True)
+            self._write_step_debug_rules(); self._refresh_step_debug_window()
+
+        def delete_rule():
+            selected = self.step_debug_rule_list.curselection()
+            if not selected: return
+            rule = self.step_debug_rules[selected[0]]
+            if tkmsg.askyesno("Stepデバッグ", "{} を削除しますか？".format(rule.get("state", "")), parent=dialog):
+                del self.step_debug_rules[selected[0]]; self._write_step_debug_rules(); self._refresh_step_debug_window()
+
+        ttk.Button(setup_buttons, text="停止地点を追加", command=add_rule).pack(fill="x", pady=2)
+        ttk.Button(setup_buttons, text="編集", command=edit_rule).pack(fill="x", pady=2)
+        ttk.Button(setup_buttons, text="有効／無効", command=toggle_rule).pack(fill="x", pady=2)
+        ttk.Button(setup_buttons, text="削除", command=delete_rule).pack(fill="x", pady=2)
+        live = ttk.Labelframe(dialog, text="③ 停止中の関数を1個ずつ調整")
+        live.pack(fill="both", expand=True, padx=8, pady=4)
+        self.step_debug_live_status = tk.StringVar(value="まだ停止していません。停止地点を保存し、CommandsをStartしてください。")
+        ttk.Label(live, textvariable=self.step_debug_live_status, foreground="#9a4e00").pack(anchor="w", padx=6, pady=4)
+        self.step_debug_operation_tree = ttk.Treeview(
+            live, columns=("status", "line", "context", "replacement"), show="tree headings", selectmode="browse")
+        for column, label, width in (("#0", "処理", 470), ("status", "状態", 80),
+                                     ("line", "行", 60), ("context", "条件内", 300),
+                                     ("replacement", "一時置換", 140)):
+            self.step_debug_operation_tree.heading(column, text=label)
+            self.step_debug_operation_tree.column(column, width=width)
+        self.step_debug_operation_tree.pack(fill="both", expand=True, padx=6, pady=4)
+        controls1 = ttk.Frame(live); controls1.pack(fill="x", padx=6, pady=3)
+        ttk.Button(controls1, text="選んだ1個を実行", command=self.execute_selected_step_debug_operation).pack(side="left", padx=3)
+        ttk.Button(controls1, text="選んだところまで実行", command=self.execute_step_debug_until_selected).pack(side="left", padx=3)
+        ttk.Button(controls1, text="選んだ処理を修正", command=self.edit_step_debug_operation).pack(side="left", padx=12)
+        ttk.Button(controls1, text="PC操作記録で置換", command=self.replace_step_debug_with_recording).pack(side="left", padx=3)
+        ttk.Button(controls1, text="今からPC操作を記録", command=self.record_step_debug_operation_now).pack(side="left", padx=3)
+        ttk.Button(controls1, text="置換を戻す", command=self.clear_step_debug_replacement).pack(side="left", padx=3)
+        controls2 = ttk.Frame(live); controls2.pack(fill="x", padx=6, pady=(3, 7))
+        ttk.Label(controls2, text="次のStep:").pack(side="left")
+        self.step_debug_next_state = tk.StringVar()
+        self.step_debug_next_combo = ttk.Combobox(controls2, textvariable=self.step_debug_next_state, width=42)
+        self.step_debug_next_combo.pack(side="left", padx=4)
+        ttk.Button(controls2, text="④ 次Stepへ進む（元関数は実行しない）",
+                   command=self.finish_step_debug_next).pack(side="left", padx=6)
+        ttk.Button(controls2, text="元関数を最初から実行",
+                   command=self.finish_step_debug_original).pack(side="left", padx=6)
+        ttk.Button(controls2, text="記録ライブラリを開く", command=self.open_controller_log_editor).pack(side="right", padx=3)
+        self.step_debug_rule_list.bind("<Double-1>", lambda _event: edit_rule())
+        dialog.protocol("WM_DELETE_WINDOW", lambda: (setattr(self, "_step_debug_window", None), dialog.destroy()))
+        self._refresh_step_debug_window()
+
+    def open_step_debug_guide(self):
+        path = os.path.join(self._commands_assist_dir(), "STEP_DEBUG_GUIDE.md")
+        try:
+            with open(path, "r", encoding="utf-8") as stream: content = stream.read()
+        except OSError as error:
+            tkmsg.showerror("Stepデバッグ", str(error), parent=self._step_debug_window or self.root); return
+        dialog = tk.Toplevel(self._step_debug_window or self.root)
+        dialog.title("Stepデバッグアシスト - 詳しい使い方")
+        dialog.geometry("850x680"); dialog.transient(self._step_debug_window or self.root)
+        viewer = tk.Text(dialog, wrap="word", padx=12, pady=10)
+        viewer.pack(fill="both", expand=True); viewer.insert("1.0", content); viewer.configure(state="disabled")
+        ttk.Button(dialog, text="閉じる", command=dialog.destroy).pack(pady=7)
+
+    def _refresh_step_debug_window(self):
+        dialog = self._step_debug_window
+        try:
+            if dialog is None or not dialog.winfo_exists(): return
+        except tk.TclError:
+            return
+        self.step_debug_rule_list.delete(0, "end")
+        for rule in self.step_debug_rules:
+            self.step_debug_rule_list.insert("end", self._step_debug_rule_text(rule))
+        tree = self.step_debug_operation_tree
+        tree.delete(*tree.get_children())
+        session = self._step_debug_session
+        if not session:
+            self.step_debug_live_status.set("まだ停止していません。停止地点を保存し、CommandsをStartしてください。")
+            self.step_debug_next_combo.configure(values=())
+            return
+        info, rule = session["info"], session["rule"]
+        self.step_debug_live_status.set("停止中: {} :: {}  →  {}()  （元ソースは未変更）".format(
+            session["variable"], session["state"], info["name"]))
+        replacements = rule.get("replacements", {})
+        for index, operation in enumerate(info["operations"]):
+            replacement = replacements.get(operation["id"], {})
+            replacement_label = "コード" if replacement.get("type") == "code" else (
+                "記録: " + replacement.get("recording", "") if replacement.get("type") == "recording" else "-")
+            status = "実行済" if index in session["executed"] else "未実行"
+            context = operation["context"] or "-"
+            if operation.get("uses_names"):
+                context += " / 単独実行注意: " + ", ".join(operation["uses_names"])
+            iid = tree.insert("", "end", text="{}. {}".format(index + 1, operation["summary"]),
+                              values=(status, operation["line"], context, replacement_label))
+            session.setdefault("tree_indices", {})[iid] = index
+        values = info["next_states"] or list(getattr(session["command"], session["variable"], {}).keys())
+        self.step_debug_next_combo.configure(values=values)
+        if self.step_debug_next_state.get() not in values:
+            recommended = next((value for value in values if value != session["state"]), None)
+            self.step_debug_next_state.set(recommended or (values[0] if values else ""))
+
+    def _selected_step_debug_index(self):
+        if not self._step_debug_session or not hasattr(self, "step_debug_operation_tree"): return None
+        selected = self.step_debug_operation_tree.selection()
+        return self._step_debug_session.get("tree_indices", {}).get(selected[0]) if selected else None
+
+    def _step_debug_replacement(self, session, operation):
+        return session["rule"].get("replacements", {}).get(operation["id"], {})
+
+    def _run_step_debug_operations(self, indices):
+        session = self._step_debug_session
+        if not session or session.get("busy"):
+            return
+        operations = session["info"]["operations"]
+        indices = [index for index in indices if 0 <= index < len(operations)]
+        if not indices: return
+        session["busy"] = True
+        self.step_debug_live_status.set("選択処理を実行中です。操作完了まで待ってください。")
+
+        def worker():
+            for index in indices:
+                operation = operations[index]
+                replacement = self._step_debug_replacement(session, operation)
+                if replacement.get("type") == "recording":
+                    item = self._read_controller_recordings().get(replacement.get("recording", ""))
+                    if not item:
+                        raise ValueError("コントローラー記録が見つかりません: " + replacement.get("recording", ""))
+                    replay_recording(item.get("lines", []), self.ser,
+                                     should_continue=lambda: session is self._step_debug_session)
+                else:
+                    code = replacement.get("code") if replacement.get("type") == "code" else operation["code"]
+                    command = session["command"]
+                    if hasattr(command, "begin_pause_bypass"): command.begin_pause_bypass()
+                    try:
+                        execute_operation(command, session["method"], code)
+                    finally:
+                        if hasattr(command, "end_pause_bypass"): command.end_pause_bypass()
+                session["executed"].add(index)
+
+        def completed(error=None):
+            session["busy"] = False
+            if error:
+                tkmsg.showerror("Stepデバッグ", "実行できませんでした:\n{}".format(error), parent=self._step_debug_window or self.root)
+            self._refresh_step_debug_window()
+
+        def run():
+            try: worker()
+            except Exception as error: self.root.after(0, completed, error)
+            else: self.root.after(0, completed)
+        threading.Thread(target=run, daemon=True, name="StepDebugOperation").start()
+
+    def execute_selected_step_debug_operation(self):
+        index = self._selected_step_debug_index()
+        if index is None:
+            tkmsg.showinfo("Stepデバッグ", "実行する処理を1つ選んでください。", parent=self._step_debug_window); return
+        self._run_step_debug_operations([index])
+
+    def execute_step_debug_until_selected(self):
+        index = self._selected_step_debug_index()
+        if index is None:
+            tkmsg.showinfo("Stepデバッグ", "最後に実行する処理を選んでください。", parent=self._step_debug_window); return
+        session = self._step_debug_session
+        self._run_step_debug_operations([value for value in range(index + 1) if value not in session["executed"]])
+
+    def edit_step_debug_operation(self):
+        session, index = self._step_debug_session, self._selected_step_debug_index()
+        if not session or index is None:
+            tkmsg.showinfo("Stepデバッグ", "修正する処理を1つ選んでください。", parent=self._step_debug_window); return
+        operation = session["info"]["operations"][index]
+        current = self._step_debug_replacement(session, operation)
+        popup = tk.Toplevel(self._step_debug_window); popup.title("一時置換の編集")
+        popup.transient(self._step_debug_window); popup.grab_set(); popup.geometry("850x470")
+        ttk.Label(popup, text="この調整は別設定に保存されます。元のPythonソースは変更しません。",
+                  foreground="#174a7e").pack(anchor="w", padx=8, pady=6)
+        editor = tk.Text(popup, wrap="none", undo=True, font=("Consolas", 10), tabs=(32,))
+        editor.pack(fill="both", expand=True, padx=8, pady=5)
+        editor.insert("1.0", current.get("code", operation["code"]) if current.get("type") != "recording" else operation["code"])
+
+        def save():
+            try: code = validate_operation_code(editor.get("1.0", "end-1c"))
+            except (SyntaxError, ValueError) as error:
+                tkmsg.showwarning("Stepデバッグ", str(error), parent=popup); return
+            session["rule"].setdefault("replacements", {})[operation["id"]] = {"type": "code", "code": code}
+            self._write_step_debug_rules(); popup.destroy(); self._refresh_step_debug_window()
+        buttons = ttk.Frame(popup); buttons.pack(fill="x", padx=8, pady=7)
+        ttk.Button(buttons, text="一時置換として保存", command=save).pack(side="right", padx=3)
+        ttk.Button(buttons, text="キャンセル", command=popup.destroy).pack(side="right", padx=3)
+
+    def replace_step_debug_with_recording(self):
+        session, index = self._step_debug_session, self._selected_step_debug_index()
+        if not session or index is None:
+            tkmsg.showinfo("Stepデバッグ", "置換する処理を1つ選んでください。", parent=self._step_debug_window); return
+        names = sorted(self._read_controller_recordings(), key=str.casefold)
+        if not names:
+            tkmsg.showinfo("PC操作記録", "登録済み記録がありません。\n「記録ライブラリを開く」から記録ファイルを登録してください。",
+                           parent=self._step_debug_window); return
+        popup = tk.Toplevel(self._step_debug_window); popup.title("PC操作記録で置換")
+        popup.transient(self._step_debug_window); popup.grab_set(); popup.geometry("620x440")
+        search = tk.StringVar(); ttk.Label(popup, text="記録名を検索:").pack(anchor="w", padx=8, pady=(8, 2))
+        ttk.Entry(popup, textvariable=search).pack(fill="x", padx=8)
+        listing = tk.Listbox(popup, exportselection=False); listing.pack(fill="both", expand=True, padx=8, pady=6)
+        visible = []
+        def refresh(*_args):
+            visible[:] = [name for name in names if search.get().strip().casefold() in name.casefold()]
+            listing.delete(0, "end")
+            for name in visible: listing.insert("end", name)
+        def accept():
+            selected = listing.curselection()
+            if not selected: return
+            operation = session["info"]["operations"][index]
+            session["rule"].setdefault("replacements", {})[operation["id"]] = {
+                "type": "recording", "recording": visible[selected[0]]}
+            self._write_step_debug_rules(); popup.destroy(); self._refresh_step_debug_window()
+        search.trace_add("write", refresh); refresh()
+        buttons = ttk.Frame(popup); buttons.pack(fill="x", padx=8, pady=7)
+        ttk.Button(buttons, text="この記録で置換", command=accept).pack(side="right", padx=3)
+        ttk.Button(buttons, text="キャンセル", command=popup.destroy).pack(side="right", padx=3)
+
+    def record_step_debug_operation_now(self):
+        """Record a live PC-gamepad correction and attach it to one operation."""
+        from tkinter import simpledialog
+        session, index = self._step_debug_session, self._selected_step_debug_index()
+        if not session or index is None:
+            tkmsg.showinfo("Stepデバッグ", "PC操作で置換する処理を1つ選んでください。",
+                           parent=self._step_debug_window); return
+        if self.pro_controller_thread is not None and self.pro_controller_thread.is_alive():
+            tkmsg.showwarning("PC操作記録", "すでにPCゲームパッド入力が実行中です。",
+                              parent=self._step_debug_window); return
+        self.refresh_pc_gamepads()
+        if not self.pc_gamepad.get():
+            tkmsg.showwarning("PC操作記録", "PCゲームパッドが見つかりません。",
+                              parent=self._step_debug_window); return
+        if not tkmsg.askyesno(
+                "PC操作記録",
+                "PCゲームパッドからSwitchへの入力を許可し、今からの操作を記録します。\n"
+                "最初にスティックとボタンをすべて離してください。\n\n開始しますか？",
+                parent=self._step_debug_window): return
+        os.makedirs("Controller_Log", exist_ok=True)
+        self.is_record_Pro_Controller.set(True)
+        self.record_Pro_Controller()
+        self.pc_gamepad_input_enabled.set(True)
+        self.toggle_pc_gamepad_input()
+        self.is_use_Pro_Controller.set(True)
+        self.mode_change_Pro_Controller()
+        if not self.is_use_Pro_Controller.get():
+            return
+        popup = tk.Toplevel(self._step_debug_window)
+        popup.title("PC操作を記録中")
+        popup.transient(self._step_debug_window); popup.grab_set(); popup.geometry("560x230")
+        status = tk.StringVar(value="ニュートラル確認後、ゲームパッドで問題箇所を操作してください。")
+        ttk.Label(popup, text="● 記録中", foreground="#b00020", font=("TkDefaultFont", 13, "bold")).pack(pady=(18, 8))
+        ttk.Label(popup, textvariable=status, wraplength=520, justify="left").pack(padx=12, pady=5)
+        stop_button = ttk.Button(popup, text="操作完了－記録を停止してこの処理に登録")
+        stop_button.pack(pady=16)
+        state = {"stopping": False, "filename": ""}
+
+        def finish_registration(attempt=0):
+            if self.pro_controller_thread is not None and self.pro_controller_thread.is_alive() and attempt < 100:
+                popup.after(100, finish_registration, attempt + 1); return
+            filename = state["filename"] or str(getattr(self.procon, "filename", "") or "")
+            path = os.path.abspath(filename) if filename else ""
+            if not path or not os.path.isfile(path):
+                status.set("記録ファイルを取得できませんでした。記録ライブラリからファイルを登録できます。")
+                stop_button.configure(state="disabled"); return
+            try:
+                with open(path, "r", encoding="utf-8") as stream: lines = stream.readlines()
+                python_replacement_body(lines)
+            except (OSError, ValueError) as error:
+                status.set("記録を登録できません: {}".format(error)); return
+            default_name = "{}_{}_{}".format(session["state"], index + 1, time.strftime("%Y%m%d_%H%M%S"))
+            name = simpledialog.askstring("PC操作記録", "保存名:", initialvalue=default_name, parent=popup)
+            if not name or not name.strip():
+                status.set("保存名が入力されていません。記録ファイル自体は残っています。"); return
+            name = name.strip(); data = self._read_controller_recordings()
+            if name in data and not tkmsg.askyesno("PC操作記録", "同名の記録を更新しますか？", parent=popup): return
+            data[name] = {"source_path": path, "lines": lines}; self._write_controller_recordings(data)
+            operation = session["info"]["operations"][index]
+            session["rule"].setdefault("replacements", {})[operation["id"]] = {
+                "type": "recording", "recording": name}
+            self._write_step_debug_rules(); popup.destroy(); self._refresh_step_debug_window()
+
+        def stop_recording():
+            if state["stopping"]: return
+            state["stopping"] = True; stop_button.configure(state="disabled")
+            state["filename"] = str(getattr(self.procon, "filename", "") or "")
+            status.set("記録を終了して保存中です…")
+            ProController.flag_procon = False
+            self.is_use_Pro_Controller.set(False)
+            self.mode_change_Pro_Controller()
+            popup.after(100, finish_registration)
+
+        stop_button.configure(command=stop_recording)
+        popup.protocol("WM_DELETE_WINDOW", stop_recording)
+
+    def clear_step_debug_replacement(self):
+        session, index = self._step_debug_session, self._selected_step_debug_index()
+        if not session or index is None: return
+        operation = session["info"]["operations"][index]
+        session["rule"].setdefault("replacements", {}).pop(operation["id"], None)
+        self._write_step_debug_rules(); self._refresh_step_debug_window()
+
+    def finish_step_debug_next(self):
+        session = self._step_debug_session
+        if not session or session.get("busy"): return
+        next_state = self.step_debug_next_state.get().strip()
+        if not next_state:
+            tkmsg.showwarning("Stepデバッグ", "次のStepを選んでください。", parent=self._step_debug_window); return
+        if not tkmsg.askyesno("Stepデバッグ", "元関数は実行せず、次Step「{}」へ進みますか？".format(next_state), parent=self._step_debug_window): return
+        if session["rule"].get("auto_follow", True):
+            session["command"].__dict__.setdefault("_step_debug_follow_rules", {})[session["variable"]] = session["rule"]["id"]
+        session["action"] = "next"; session["result"] = next_state; session["event"].set()
+        self._step_debug_session = None; self._refresh_step_debug_window()
+
+    def finish_step_debug_original(self):
+        session = self._step_debug_session
+        if not session or session.get("busy"): return
+        if not tkmsg.askyesno("Stepデバッグ", "元の関数を最初から通常実行しますか？\n手動で試した操作と重複する可能性があります。",
+                              parent=self._step_debug_window): return
+        session["command"].__dict__.setdefault("_step_debug_follow_rules", {}).pop(session["variable"], None)
+        session["action"] = "original"; session["event"].set()
+        self._step_debug_session = None; self._refresh_step_debug_window()
+
+    def _matching_step_debug_rule(self, command, variable, state):
+        command_name = getattr(command, "NAME", "")
+        for rule in self.step_debug_rules:
+            if (rule.get("enabled", True) and rule.get("variable") == variable
+                    and rule.get("state") == state
+                    and rule.get("command") in ("", "すべて", command_name)):
+                return rule
+        follow_id = getattr(command, "_step_debug_follow_rules", {}).get(variable)
+        if follow_id:
+            return next((rule for rule in self.step_debug_rules if str(rule.get("id")) == str(follow_id)), None)
+        return None
+
+    def _install_step_debug_wrappers(self, command):
+        command_name = getattr(command, "NAME", "")
+        variables = {rule.get("variable") for rule in self.step_debug_rules
+                     if rule.get("enabled", True) and rule.get("command") in ("", "すべて", command_name)}
+        command._step_debug_follow_rules = {}
+        command._step_debug_originals = {}
+        for variable in variables:
+            mapping = getattr(command, variable, None)
+            if not isinstance(mapping, dict): continue
+            for state, original in list(mapping.items()):
+                if not callable(original): continue
+                command._step_debug_originals[(variable, state)] = original
+                def wrapper(_original=original, _variable=variable, _state=state):
+                    rule = self._matching_step_debug_rule(command, _variable, _state)
+                    if not rule:
+                        return _original()
+                    return self._enter_step_debug_session(command, _variable, _state, _original, rule)
+                mapping[state] = wrapper
+
+    def _enter_step_debug_session(self, command, variable, state, method, rule):
+        try:
+            info = extract_step_method(method)
+        except Exception as error:
+            self._logger.warning("Step debug extraction failed: %s", error)
+            return method()
+        session = {
+            "command": command, "variable": variable, "state": state, "method": method,
+            "rule": rule, "info": info, "event": threading.Event(), "action": None,
+            "result": None, "executed": set(), "busy": False, "tree_indices": {},
+        }
+        self._step_debug_pending_session = session
+        while command.alive and not session["event"].wait(0.05):
+            pass
+        if not command.alive:
+            return state
+        if session.get("action") == "next":
+            return session.get("result")
+        return method()
+
+    def _poll_step_debug_session(self):
+        try:
+            pending = self._step_debug_pending_session
+            if pending is not None and pending is not self._step_debug_session:
+                self._step_debug_pending_session = None
+                self._step_debug_session = pending
+                if hasattr(self, "step_debug_next_state"):
+                    self.step_debug_next_state.set("")
+                self.commands_assist_status.set("Stepデバッグ停止中: {} :: {}".format(
+                    pending["variable"], pending["state"]))
+                if pending["rule"].get("auto_open", True):
+                    self.open_step_debug_assist()
+                else:
+                    self._refresh_step_debug_window()
+        except (tk.TclError, RuntimeError):
+            return
+        self.root.after(100, self._poll_step_debug_session)
 
     def refresh_commands_assist_commands(self):
         os.makedirs(self._commands_assist_dir(), exist_ok=True)
@@ -3195,7 +3822,14 @@ class PokeControllerApp:
             condition = "{} が変化しない".format(rule.get("variable", "STEP"))
         else:
             condition = "{} == {}".format(rule.get("variable", ""), rule.get("value", ""))
-        return "[{}] {} / {:.1f}秒".format(scope, condition, seconds)
+        action = rule.get("action", "replace")
+        if action == "pause":
+            action_text = "一時停止"
+        elif rule.get("replacement_type") == "controller_recording":
+            action_text = "記録置換: {}".format(rule.get("controller_recording", ""))
+        else:
+            action_text = "置換: {}".format(rule.get("replacement_command") or "選択中コマンド")
+        return "[{}] {} / {:.1f}秒 / {}".format(scope, condition, seconds, action_text)
 
     def _refresh_commands_assist_rule_list(self):
         self.commands_assist_rule_list.delete(0, "end")
@@ -3205,6 +3839,47 @@ class PokeControllerApp:
     def _command_names_for_rules(self):
         return ["すべて"] + list(dict.fromkeys(
             list(getattr(self, "py_cb_all", [])) + list(getattr(self, "sample_py_cb_all", []))))
+
+    def _state_value_candidates(self, command_name, variable_name):
+        """Find state/Step strings from command dictionaries without running a command."""
+        classes = list(getattr(self, "py_classes", [])) + list(getattr(self, "sample_py_classes", []))
+        if command_name not in ("", "すべて", "All commands", "*"):
+            classes = [cls for cls in classes if getattr(cls, "NAME", "") == command_name]
+        target = str(variable_name or "").strip()
+        values = set()
+        for command_class in classes:
+            try:
+                path = inspect.getsourcefile(command_class)
+                if not path or not os.path.isfile(path):
+                    continue
+                cache_key = (os.path.abspath(path), os.path.getmtime(path), target.upper())
+                cached = self._state_value_cache.get(cache_key)
+                if cached is not None:
+                    values.update(cached)
+                    continue
+                with open(path, "r", encoding="utf-8-sig") as stream:
+                    source = stream.read()
+                found = set(discover_state_values(source, target))
+                self._state_value_cache[cache_key] = tuple(sorted(found))
+                values.update(found)
+            except (OSError, SyntaxError, TypeError):
+                continue
+        command = getattr(self, "cur_command", None)
+        if command is not None:
+            table = getattr(command, target, None)
+            if isinstance(table, dict):
+                values.update(str(key) for key in table)
+        return sorted(values, key=str.casefold)
+
+    def _bind_state_value_search(self, combo, value_var, command_var, variable_var):
+        """Turn an editable Combobox into a filtered state-name picker."""
+        def refresh(event=None):
+            all_values = self._state_value_candidates(command_var.get(), variable_var.get())
+            typed = value_var.get().strip().casefold()
+            combo.configure(values=[value for value in all_values if not typed or typed in value.casefold()])
+        combo.bind("<FocusIn>", refresh, add="+")
+        combo.bind("<KeyRelease>", refresh, add="+")
+        return combo
 
     def _edit_automation_rule_dialog(self, title, initial=None, include_kind=True):
         initial = dict(initial or {})
@@ -3217,7 +3892,12 @@ class PokeControllerApp:
         variable = tk.StringVar(value=initial.get("variable", "STATE_1_STORY_FUNCTION"))
         value = tk.StringVar(value=initial.get("value", "1_STORY_OUT_HOTEL_Z_75"))
         seconds = tk.DoubleVar(value=initial.get("seconds", 0.0))
+        action = tk.StringVar(value=initial.get("action", "pause"))
+        replacement = tk.StringVar(value=initial.get(
+            "replacement_command", self.commands_assist_recovery_command.get()))
         result = {}
+        value_combo = ttk.Combobox(dialog, width=46, state="normal", textvariable=value)
+        self._bind_state_value_search(value_combo, value, command, variable)
         row = 0
         for label, widget in (
                 ("対象Commands:", ttk.Combobox(dialog, state="readonly", width=46,
@@ -3225,9 +3905,16 @@ class PokeControllerApp:
                 ("条件:", ttk.Combobox(dialog, state="readonly", width=24,
                                        values=("value_stable", "unchanged"), textvariable=kind)),
                 ("変数/Step:", ttk.Entry(dialog, width=48, textvariable=variable)),
-                ("一致値:", ttk.Entry(dialog, width=48, textvariable=value)),
+                ("一致値（入力・検索可）:", value_combo),
                 ("継続秒:", ttk.Spinbox(dialog, from_=0, to=86400, increment=0.5,
-                                        width=10, textvariable=seconds))):
+                                        width=10, textvariable=seconds)),
+                ("成立時の処理:", ttk.Combobox(
+                    dialog, state="readonly", width=24, values=("pause", "replace"),
+                    textvariable=action)),
+                ("置換コマンド:", ttk.Combobox(
+                    dialog, state="readonly", width=46,
+                    values=[cls.NAME for cls in getattr(self, "commands_assist_classes", [])],
+                    textvariable=replacement))):
             if label == "条件:" and not include_kind:
                 continue
             ttk.Label(dialog, text=label).grid(column=0, row=row, padx=7, pady=4, sticky="e")
@@ -3240,7 +3927,9 @@ class PokeControllerApp:
             result.update({"id": initial.get("id") or str(time.time_ns()),
                            "command": command.get(), "kind": kind.get(),
                            "variable": variable.get().strip(), "value": value.get(),
-                           "seconds": max(0.0, float(seconds.get()))})
+                           "seconds": max(0.0, float(seconds.get())),
+                           "action": action.get(),
+                           "replacement_command": replacement.get()})
             dialog.destroy()
         buttons = ttk.Frame(dialog)
         buttons.grid(column=0, columnspan=2, row=row, padx=7, pady=8, sticky="e")
@@ -3275,6 +3964,190 @@ class PokeControllerApp:
             self._refresh_commands_assist_rule_list()
             self._commands_assist_evaluator.reset()
 
+    def open_function_replacements(self):
+        """Bulk-map multiple state functions to independently editable replacements."""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("関数置換マッピング")
+        dialog.transient(self.root)
+        dialog.geometry("1000x520")
+        listing = tk.Listbox(dialog, exportselection=False)
+        listing.pack(fill="both", expand=True, padx=8, pady=8)
+        visible_rules = []
+
+        def refresh():
+            visible_rules[:] = [(index, rule) for index, rule in enumerate(self.commands_assist_rules)
+                                if rule.get("function_replacement")]
+            listing.delete(0, "end")
+            for _, rule in visible_rules:
+                listing.insert("end", self._automation_rule_text(rule))
+
+        def replacement_values(kind):
+            if kind == "controller_recording":
+                return sorted(self._read_controller_recordings(), key=str.casefold)
+            return [cls.NAME for cls in getattr(self, "commands_assist_classes", [])]
+
+        def add_many():
+            popup = tk.Toplevel(dialog)
+            popup.title("複数関数を置換へ追加")
+            popup.transient(dialog)
+            popup.grab_set()
+            default_command = self.py_name.get() if self.py_name.get() in self._command_names_for_rules() else "すべて"
+            scope = tk.StringVar(value=default_command)
+            variable = tk.StringVar(value="STATE_1_STORY_FUNCTION")
+            search = tk.StringVar()
+            manual_state = tk.StringVar()
+            kind = tk.StringVar(value="commands_assist_command")
+            replacement = tk.StringVar()
+            ttk.Label(popup, text="対象Commands:").grid(column=0, row=0, padx=6, pady=4, sticky="e")
+            scope_combo = ttk.Combobox(popup, state="readonly", width=62,
+                                       values=self._command_names_for_rules(), textvariable=scope)
+            scope_combo.grid(column=1, columnspan=2, row=0, padx=6, pady=4, sticky="ew")
+            ttk.Label(popup, text="状態変数:").grid(column=0, row=1, padx=6, pady=4, sticky="e")
+            ttk.Entry(popup, width=64, textvariable=variable).grid(
+                column=1, columnspan=2, row=1, padx=6, pady=4, sticky="ew")
+            ttk.Label(popup, text="関数名検索:").grid(column=0, row=2, padx=6, pady=4, sticky="e")
+            ttk.Entry(popup, width=64, textvariable=search).grid(
+                column=1, columnspan=2, row=2, padx=6, pady=4, sticky="ew")
+            states = tk.Listbox(popup, selectmode="extended", exportselection=False, height=13, width=88)
+            states.grid(column=0, columnspan=3, row=3, padx=6, pady=5, sticky="nsew")
+            ttk.Label(popup, text="一覧にない関数名を直接追加:").grid(
+                column=0, row=4, padx=6, pady=4, sticky="e")
+            ttk.Entry(popup, width=64, textvariable=manual_state).grid(
+                column=1, columnspan=2, row=4, padx=6, pady=4, sticky="ew")
+            ttk.Label(popup, text="置換元:").grid(column=0, row=5, padx=6, pady=4, sticky="e")
+            kind_combo = ttk.Combobox(
+                popup, state="readonly", width=26,
+                values=("commands_assist_command", "controller_recording"), textvariable=kind)
+            kind_combo.grid(column=1, row=5, padx=6, pady=4, sticky="w")
+            replacement_combo = ttk.Combobox(popup, state="readonly", width=58, textvariable=replacement)
+            replacement_combo.grid(column=1, columnspan=2, row=6, padx=6, pady=4, sticky="ew")
+            ttk.Label(popup, text="置換後の処理:").grid(column=0, row=6, padx=6, pady=4, sticky="e")
+
+            def refresh_states(*args):
+                candidates = self._state_value_candidates(scope.get(), variable.get())
+                needle = search.get().strip().casefold()
+                states.delete(0, "end")
+                for value in candidates:
+                    if not needle or needle in value.casefold():
+                        states.insert("end", value)
+
+            def refresh_replacements(*args):
+                values = replacement_values(kind.get())
+                replacement_combo.configure(values=values)
+                if replacement.get() not in values:
+                    replacement.set(values[0] if values else "")
+
+            search.trace_add("write", refresh_states)
+            variable.trace_add("write", refresh_states)
+            scope_combo.bind("<<ComboboxSelected>>", refresh_states)
+            kind_combo.bind("<<ComboboxSelected>>", refresh_replacements)
+            refresh_states()
+            refresh_replacements()
+
+            def accept():
+                selected_states = [states.get(index) for index in states.curselection()]
+                if manual_state.get().strip():
+                    selected_states.append(manual_state.get().strip())
+                selected_states = list(dict.fromkeys(selected_states))
+                if not selected_states or not replacement.get():
+                    tkmsg.showwarning("関数置換", "1つ以上の関数と置換後の処理を選択してください。", parent=popup)
+                    return
+                for offset, state in enumerate(selected_states):
+                    rule = {
+                        "id": str(time.time_ns() + offset), "function_replacement": True,
+                        "command": scope.get(), "kind": "value_stable",
+                        "variable": variable.get().strip(), "value": state, "seconds": 0.0,
+                        "action": "replace", "replacement_type": kind.get(),
+                        "replacement_command": replacement.get() if kind.get() == "commands_assist_command" else "",
+                        "controller_recording": replacement.get() if kind.get() == "controller_recording" else "",
+                    }
+                    existing = next((index for index, item in enumerate(self.commands_assist_rules)
+                                     if item.get("function_replacement")
+                                     and item.get("command") == rule["command"]
+                                     and item.get("variable") == rule["variable"]
+                                     and item.get("value") == state), None)
+                    if existing is None:
+                        self.commands_assist_rules.append(rule)
+                    else:
+                        rule["id"] = self.commands_assist_rules[existing].get("id", rule["id"])
+                        self.commands_assist_rules[existing] = rule
+                self._commands_assist_evaluator.reset()
+                self._refresh_commands_assist_rule_list()
+                refresh()
+                popup.destroy()
+
+            buttons = ttk.Frame(popup)
+            buttons.grid(column=0, columnspan=3, row=7, padx=6, pady=8, sticky="e")
+            ttk.Button(buttons, text="選択した関数を登録", command=accept).pack(side="left", padx=3)
+            ttk.Button(buttons, text="キャンセル", command=popup.destroy).pack(side="left", padx=3)
+            popup.columnconfigure(1, weight=1)
+            popup.rowconfigure(3, weight=1)
+
+        def edit_selected():
+            selected = listing.curselection()
+            if not selected:
+                return
+            global_index, rule = visible_rules[selected[0]]
+            popup = tk.Toplevel(dialog)
+            popup.title("置換後の処理を変更: " + str(rule.get("value", "")))
+            popup.transient(dialog)
+            popup.grab_set()
+            kind = tk.StringVar(value=rule.get("replacement_type", "commands_assist_command"))
+            current = rule.get("controller_recording", "") if kind.get() == "controller_recording" \
+                else rule.get("replacement_command", "")
+            replacement = tk.StringVar(value=current)
+            ttk.Label(popup, text="関数:").grid(column=0, row=0, padx=7, pady=5, sticky="e")
+            ttk.Label(popup, text=rule.get("value", "")).grid(column=1, row=0, padx=7, pady=5, sticky="w")
+            kind_combo = ttk.Combobox(popup, state="readonly", width=28, textvariable=kind,
+                                      values=("commands_assist_command", "controller_recording"))
+            kind_combo.grid(column=1, row=1, padx=7, pady=5, sticky="ew")
+            ttk.Label(popup, text="置換元:").grid(column=0, row=1, padx=7, pady=5, sticky="e")
+            replacement_combo = ttk.Combobox(popup, state="readonly", width=56, textvariable=replacement)
+            replacement_combo.grid(column=1, row=2, padx=7, pady=5, sticky="ew")
+            ttk.Label(popup, text="置換後の処理:").grid(column=0, row=2, padx=7, pady=5, sticky="e")
+            def update_values(event=None):
+                values = replacement_values(kind.get())
+                replacement_combo.configure(values=values)
+                if replacement.get() not in values:
+                    replacement.set(values[0] if values else "")
+            kind_combo.bind("<<ComboboxSelected>>", update_values)
+            update_values()
+            def accept():
+                if not replacement.get():
+                    return
+                updated = dict(rule)
+                updated.update({"replacement_type": kind.get(),
+                                "replacement_command": replacement.get() if kind.get() == "commands_assist_command" else "",
+                                "controller_recording": replacement.get() if kind.get() == "controller_recording" else ""})
+                self.commands_assist_rules[global_index] = updated
+                self._refresh_commands_assist_rule_list()
+                self._commands_assist_evaluator.reset()
+                refresh()
+                popup.destroy()
+            ttk.Button(popup, text="更新", command=accept).grid(column=1, row=3, padx=7, pady=8, sticky="e")
+            popup.columnconfigure(1, weight=1)
+
+        def delete_selected():
+            selected = listing.curselection()
+            if not selected:
+                return
+            global_index, rule = visible_rules[selected[0]]
+            if not tkmsg.askyesno("関数置換", "{} の置換設定を削除しますか？".format(rule.get("value", "")), parent=dialog):
+                return
+            del self.commands_assist_rules[global_index]
+            self._refresh_commands_assist_rule_list()
+            self._commands_assist_evaluator.reset()
+            refresh()
+
+        actions = ttk.Frame(dialog)
+        actions.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(actions, text="複数関数を追加…", command=add_many).pack(side="left", padx=3)
+        ttk.Button(actions, text="選択した置換処理を編集", command=edit_selected).pack(side="left", padx=3)
+        ttk.Button(actions, text="削除", command=delete_selected).pack(side="right", padx=3)
+        ttk.Button(actions, text="閉じる", command=dialog.destroy).pack(side="right", padx=3)
+        listing.bind("<Double-1>", lambda event: edit_selected())
+        refresh()
+
     def open_recording_variable_rules(self):
         """Edit paired start/end rules; each pair may target one or all commands."""
         dialog = tk.Toplevel(self.root)
@@ -3285,11 +4158,15 @@ class PokeControllerApp:
         rule_list.grid(column=0, columnspan=4, row=0, padx=8, pady=7, sticky="nsew")
 
         def text_for(rule):
-            return "[{}] {} == {} ({:.1f}秒)  →  {} == {} ({:.1f}秒)".format(
+            discard = " / 破棄: {} ({:.1f}秒)".format(
+                rule.get("discard_value", ""), float(rule.get("discard_seconds", 0) or 0)) \
+                if rule.get("discard_value") else ""
+            followup = " / 終了後CommandsAssist" if rule.get("assist_rule_id") else ""
+            return "[{}] {} == {} ({:.1f}秒)  →  {} == {} ({:.1f}秒){}{}".format(
                 rule.get("command") or "すべて", rule.get("variable", ""),
                 rule.get("start_value", ""), float(rule.get("start_seconds", 0) or 0),
                 rule.get("variable", ""), rule.get("stop_value", ""),
-                float(rule.get("stop_seconds", 0) or 0))
+                float(rule.get("stop_seconds", 0) or 0), discard, followup)
 
         def refresh():
             rule_list.delete(0, "end")
@@ -3304,18 +4181,35 @@ class PokeControllerApp:
             popup.grab_set()
             scope = tk.StringVar(value=initial.get("command", "すべて"))
             variable = tk.StringVar(value=initial.get("variable", "STATE_1_STORY_FUNCTION"))
-            start_value = tk.StringVar(value=initial.get("start_value", "1_STORY_OUT_HOTEL_Z_75"))
+            start_value = tk.StringVar(value=initial.get("start_value", "1_STORY_OUT_HOTEL_Z_72"))
             start_seconds = tk.DoubleVar(value=initial.get("start_seconds", 0.0))
             stop_value = tk.StringVar(value=initial.get("stop_value", "1_STORY_OUT_HOTEL_Z_75"))
             stop_seconds = tk.DoubleVar(value=initial.get("stop_seconds", 1.0))
+            discard_value = tk.StringVar(value=initial.get("discard_value", "1_STORY_OUT_HOTEL_Z_76"))
+            discard_seconds = tk.DoubleVar(value=initial.get("discard_seconds", 0.0))
+            assist_labels = ["なし"] + [self._automation_rule_text(rule) for rule in self.commands_assist_rules]
+            assist_ids = [""] + [str(rule.get("id", "")) for rule in self.commands_assist_rules]
+            current_assist_id = str(initial.get("assist_rule_id", ""))
+            assist_index = assist_ids.index(current_assist_id) if current_assist_id in assist_ids else 0
+            assist_rule = tk.StringVar(value=assist_labels[assist_index])
             result = {}
+            start_combo = ttk.Combobox(popup, textvariable=start_value, width=74, state="normal")
+            stop_combo = ttk.Combobox(popup, textvariable=stop_value, width=74, state="normal")
+            discard_combo = ttk.Combobox(popup, textvariable=discard_value, width=74, state="normal")
+            for combo, value_var in ((start_combo, start_value), (stop_combo, stop_value),
+                                     (discard_combo, discard_value)):
+                self._bind_state_value_search(combo, value_var, scope, variable)
             fields = [
                 ("対象Commands:", ttk.Combobox(popup, state="readonly", values=self._command_names_for_rules(), textvariable=scope, width=48)),
                 ("変数:", ttk.Entry(popup, textvariable=variable, width=50)),
-                ("開始値:", ttk.Entry(popup, textvariable=start_value, width=50)),
+                ("開始値（入力・検索可）:", start_combo),
                 ("開始値の継続秒:", ttk.Spinbox(popup, from_=0, to=86400, increment=0.5, textvariable=start_seconds, width=10)),
-                ("終了値:", ttk.Entry(popup, textvariable=stop_value, width=50)),
+                ("終了値（入力・検索可）:", stop_combo),
                 ("終了値の継続秒:", ttk.Spinbox(popup, from_=0, to=86400, increment=0.5, textvariable=stop_seconds, width=10)),
+                ("録画破棄値（入力・検索可）:", discard_combo),
+                ("破棄値の継続秒:", ttk.Spinbox(popup, from_=0, to=86400, increment=0.5, textvariable=discard_seconds, width=10)),
+                ("正常終了後:", ttk.Combobox(popup, state="readonly", values=assist_labels,
+                                               textvariable=assist_rule, width=76)),
             ]
             for row, (label, widget) in enumerate(fields):
                 ttk.Label(popup, text=label).grid(column=0, row=row, padx=7, pady=4, sticky="e")
@@ -3327,7 +4221,11 @@ class PokeControllerApp:
                 result.update({"id": initial.get("id") or str(time.time_ns()),
                                "command": scope.get(), "variable": variable.get().strip(),
                                "start_value": start_value.get(), "start_seconds": max(0.0, float(start_seconds.get())),
-                               "stop_value": stop_value.get(), "stop_seconds": max(0.0, float(stop_seconds.get()))})
+                               "stop_value": stop_value.get(), "stop_seconds": max(0.0, float(stop_seconds.get())),
+                               "discard_value": discard_value.get(),
+                               "discard_seconds": max(0.0, float(discard_seconds.get())),
+                               "assist_rule_id": assist_ids[assist_labels.index(assist_rule.get())]
+                               if assist_rule.get() in assist_labels else ""})
                 popup.destroy()
             buttons = ttk.Frame(popup)
             buttons.grid(column=0, columnspan=2, row=len(fields), padx=7, pady=8, sticky="e")
@@ -3361,7 +4259,7 @@ class PokeControllerApp:
         ttk.Button(dialog, text="編集", command=change).grid(column=1, row=1, padx=4, pady=6)
         ttk.Button(dialog, text="削除", command=delete).grid(column=2, row=1, padx=4, pady=6)
         ttk.Button(dialog, text="閉じる", command=dialog.destroy).grid(column=3, row=1, padx=4, pady=6)
-        ttk.Label(dialog, text="開始は各条件のOR。録画開始後は、その開始条件と同じ組の終了条件だけを監視します。").grid(
+        ttk.Label(dialog, text="開始は各条件のOR。開始後は同じ組の終了・破棄条件を監視し、正常終了時だけCommandsAssistへ接続できます。").grid(
             column=0, columnspan=4, row=2, padx=8, pady=(0, 7), sticky="w")
         dialog.columnconfigure(0, weight=1)
         dialog.rowconfigure(0, weight=1)
@@ -3379,9 +4277,17 @@ class PokeControllerApp:
                 self._finish_commands_assist()
             command = getattr(self, "cur_command", None)
             running = command is not None and self.start_button["text"] == "Stop"
-            if self.commands_assist_enabled.get() and not self._commands_assist_busy and running:
+            if (self.commands_assist_enabled.get() and not self._commands_assist_busy and running
+                    and self._step_debug_session is None
+                    and self._step_debug_pending_session is None):
                 command_name = getattr(command, "NAME", "")
                 for rule in self.commands_assist_rules:
+                    # An exact Step-debug breakpoint stops at the function
+                    # boundary and therefore takes precedence over the older
+                    # polling pause for the same state.
+                    if self._matching_step_debug_rule(
+                            command, rule.get("variable", ""), rule.get("value", "")):
+                        continue
                     result = self._commands_assist_evaluator.evaluate(rule, command, command_name)
                     rule_id = str(rule.get("id"))
                     if rule_id == self._commands_assist_suppressed_rule_id:
@@ -3399,44 +4305,63 @@ class PokeControllerApp:
         self.root.after(250, self._commands_assist_tick)
 
     def _begin_commands_assist(self, rule, result):
-        if not self.commands_assist_recovery_command.get():
-            self.commands_assist_status.set("復旧コマンドが未設定です。")
-            return
         self._commands_assist_busy = True
         self._commands_assist_triggered_rule = rule
-        self._commands_assist_restart_recording = bool(self.recorder.active)
         self._commands_assist_original_command = getattr(self, "cur_command", None)
         self._commands_assist_original_name = getattr(self._commands_assist_original_command, "NAME", "")
-        self.commands_assist_status.set("条件成立: {} / 元コマンドを停止中".format(
-            self._automation_rule_text(rule)))
-        if self.recorder.active:
-            self.recorder.stop()
-        try:
-            self._commands_assist_original_command.end(self.ser)
-        except Exception as error:
-            self._logger.warning("CommandsAssist stop failed: %s", error)
-        self.root.after(100, lambda: self._wait_commands_assist_stop(time.monotonic()))
-
-    def _wait_commands_assist_stop(self, started):
         command = self._commands_assist_original_command
-        thread = getattr(command, "thread", None)
-        if thread is not None and thread.is_alive() and time.monotonic() - started < 10.0:
-            self.root.after(100, lambda: self._wait_commands_assist_stop(started))
-            return
-        if thread is not None and thread.is_alive():
-            self.commands_assist_status.set("停止要求が10秒以内に完了しませんでした。")
+        if command is None:
             self._commands_assist_busy = False
             return
-        selected = self.commands_assist_recovery_command.get()
+        if self._software_controller_paused_command is command:
+            # The condition pause takes ownership; releasing a manual button
+            # must not accidentally resume this Step.
+            self._software_controller_paused_command = None
+        if hasattr(command, "request_pause"):
+            command.request_pause()
+        else:
+            command.pause_requested = True
+        action = rule.get("action", "replace")
+        self.commands_assist_resume_button["state"] = "normal"
+        if action == "pause":
+            self._commands_assist_busy = False
+            self.commands_assist_status.set("条件成立: {} / Step位置で一時停止中".format(
+                self._automation_rule_text(rule)))
+            return
+        if rule.get("replacement_type") == "controller_recording":
+            recording_name = rule.get("controller_recording", "")
+            item = self._read_controller_recordings().get(recording_name)
+            if not item:
+                self._commands_assist_busy = False
+                self.commands_assist_status.set(
+                    "コントローラー記録「{}」が見つかりません（元コマンドは一時停止中）。".format(recording_name))
+                return
+            self._commands_assist_recovery_done = False
+            self.commands_assist_status.set("元コマンドを一時停止 / 記録置換を再生中: " + recording_name)
+            def replay_worker():
+                try:
+                    replay_recording(item.get("lines", []), self.ser,
+                                     should_continue=lambda: self._commands_assist_busy)
+                except Exception as error:
+                    self._logger.warning("Controller recording replacement failed: %s", error)
+                finally:
+                    self._commands_assist_recovery_done = True
+            threading.Thread(target=replay_worker, daemon=True,
+                             name="ControllerRecordingReplacement").start()
+            return
+        selected = rule.get("replacement_command") or self.commands_assist_recovery_command.get()
         matches = [cls for cls in self.commands_assist_classes if cls.NAME == selected]
         if not matches:
-            self.commands_assist_status.set("復旧コマンドを再読込してください。")
             self._commands_assist_busy = False
+            self.commands_assist_status.set("置換コマンドを選択して再読込してください（元コマンドは一時停止中）。")
             return
         recovery = matches[0]()
+        # A replacement must run even if the toolbar's global Pause is on.
+        recovery.isPause = False
+        recovery.pause_requested = False
         self._commands_assist_recovery = recovery
         self._commands_assist_recovery_done = False
-        self.commands_assist_status.set("復旧コマンド実行中: " + selected)
+        self.commands_assist_status.set("元コマンドを一時停止 / 置換処理実行中: " + selected)
         def run_recovery():
             try:
                 recovery.alive = True
@@ -3447,41 +4372,31 @@ class PokeControllerApp:
                         recovery.keys.end()
                 except Exception:
                     pass
-                # Tk is touched only by the 4 Hz GUI poller.
                 self._commands_assist_recovery_done = True
-        recovery.thread = threading.Thread(target=run_recovery, daemon=True, name="CommandsAssistRecovery")
+        recovery.thread = threading.Thread(target=run_recovery, daemon=True, name="CommandsAssistReplacement")
         recovery.thread.start()
 
     def _finish_commands_assist(self):
-        self.commands_assist_status.set("元コマンドを再実行中")
-        self.stopPlayPost()
-        if not self._select_command_by_name(self._commands_assist_original_name):
-            self._commands_assist_busy = False
-            self.commands_assist_status.set("元コマンドが再読込後の一覧に見つかりません。")
-            return
-        self.startPlay()
-        if self._commands_assist_restart_recording:
-            frame = getattr(getattr(self, "camera", None), "image_bgr", None)
-            if frame is not None and not self.recorder.active:
-                self.recorder.start(frame, self.fps.get(), self.audio_input.get(), self.audio_gain.get())
+        command = getattr(self, "_commands_assist_original_command", None)
+        if command is not None:
+            if hasattr(command, "resume"):
+                command.resume()
+            else:
+                command.pause_requested = False
         self._commands_assist_busy = False
-        self.commands_assist_status.set("再開完了（録画は新しいファイル）")
+        self.commands_assist_resume_button["state"] = "disabled"
+        self.commands_assist_status.set("置換処理完了 / 同じStep位置から再開")
 
-    def _select_command_by_name(self, name):
-        candidates = (
-            (getattr(self, "py_cb_all", []), self.py_name, "Python Command"),
-            (getattr(self, "sample_py_cb_all", []), self.sample_py_name, "Python Sample Command"),
-            ([command_class.NAME for command_class in getattr(self, "mcu_classes", [])], self.mcu_name, "Mcu Command"),
-        )
-        for values, variable, tab_name in candidates:
-            if name not in values:
-                continue
-            variable.set(name)
-            for tab_id in self.command_nb.tabs():
-                if self.command_nb.tab(tab_id, "text") == tab_name:
-                    self.command_nb.select(tab_id)
-                    return True
-        return False
+    def resume_commands_assist(self):
+        command = getattr(self, "_commands_assist_original_command", None) or getattr(self, "cur_command", None)
+        if command is not None:
+            if hasattr(command, "resume"):
+                command.resume()
+            else:
+                command.pause_requested = False
+        self._commands_assist_busy = False
+        self.commands_assist_resume_button["state"] = "disabled"
+        self.commands_assist_status.set("手動再開しました。")
 
     def _resize_input_set_content(self, event):
         self.input_set_canvas.itemconfigure(self.input_set_canvas_window, width=max(1, event.width))
@@ -3980,6 +4895,207 @@ class PokeControllerApp:
     def record_Pro_Controller(self):
         self.flag_record = self.is_record_Pro_Controller.get()
 
+    def open_controller_log_editor(self):
+        """Manage multiple reusable PC-controller recordings."""
+        from tkinter import filedialog, simpledialog
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title("コントローラー記録ライブラリ")
+        dialog.transient(self.root)
+        dialog.geometry("820x430")
+        listing = tk.Listbox(dialog, exportselection=False)
+        listing.pack(fill="both", expand=True, padx=8, pady=8)
+
+        def selected_name():
+            selected = listing.curselection()
+            return listing.get(selected[0]).split("  |  ", 1)[0] if selected else ""
+
+        def refresh():
+            listing.delete(0, "end")
+            for name, item in sorted(self._read_controller_recordings().items(), key=lambda pair: pair[0].casefold()):
+                listing.insert("end", "{}  |  {}行  |  {}".format(
+                    name, len(item.get("lines", [])), item.get("source_path", "")))
+
+        def register_file():
+            initial_dir = os.path.abspath(getattr(self, "ControllerLogDir", "Controller_Log"))
+            path = filedialog.askopenfilename(
+                title="PCコントローラー記録を登録", initialdir=initial_dir,
+                filetypes=[("Controller log", "*.txt"), ("All files", "*.*")], parent=dialog)
+            if not path:
+                return
+            try:
+                with open(path, "r", encoding="utf-8") as stream:
+                    lines = stream.readlines()
+                python_replacement_body(lines)
+            except (OSError, ValueError) as error:
+                tkmsg.showerror("コントローラー記録", str(error), parent=dialog)
+                return
+            name = simpledialog.askstring(
+                "コントローラー記録", "登録名:", initialvalue=os.path.splitext(os.path.basename(path))[0],
+                parent=dialog)
+            if not name or not name.strip():
+                return
+            name = name.strip()
+            data = self._read_controller_recordings()
+            if name in data and not tkmsg.askyesno("コントローラー記録", "同名の登録を更新しますか？", parent=dialog):
+                return
+            data[name] = {"source_path": os.path.abspath(path), "lines": lines}
+            self._write_controller_recordings(data)
+            refresh()
+
+        def edit_selected():
+            name = selected_name()
+            item = self._read_controller_recordings().get(name)
+            if item:
+                self._show_controller_recording_editor(name, item, refresh)
+
+        def delete_selected():
+            name = selected_name()
+            linked = [rule for rule in self.commands_assist_rules
+                      if rule.get("replacement_type") == "controller_recording"
+                      and rule.get("controller_recording") == name]
+            detail = "\nこの記録を使う関数置換{}件も削除します。".format(len(linked)) if linked else ""
+            if not name or not tkmsg.askyesno(
+                    "コントローラー記録", "「{}」を削除しますか？{}".format(name, detail), parent=dialog):
+                return
+            data = self._read_controller_recordings()
+            data.pop(name, None)
+            self._write_controller_recordings(data)
+            if linked:
+                self.commands_assist_rules = [
+                    rule for rule in self.commands_assist_rules
+                    if not (rule.get("replacement_type") == "controller_recording"
+                            and rule.get("controller_recording") == name)]
+                self._refresh_commands_assist_rule_list()
+                self._commands_assist_evaluator.reset()
+            refresh()
+
+        def copy_selected():
+            name = selected_name()
+            item = self._read_controller_recordings().get(name)
+            if not item:
+                return
+            try:
+                body = python_replacement_body(item.get("lines", []))
+            except ValueError as error:
+                tkmsg.showwarning("置換処理", str(error), parent=dialog)
+                return
+            self.root.clipboard_clear()
+            self.root.clipboard_append(body)
+            self.commands_assist_status.set("登録「{}」の置換処理コードをコピーしました。".format(name))
+
+        actions = ttk.Frame(dialog)
+        actions.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(actions, text="ファイルを登録", command=register_file).pack(side="left", padx=3)
+        ttk.Button(actions, text="角度・範囲を編集", command=edit_selected).pack(side="left", padx=3)
+        ttk.Button(actions, text="置換コードをコピー", command=copy_selected).pack(side="left", padx=3)
+        ttk.Button(actions, text="削除", command=delete_selected).pack(side="right", padx=3)
+        ttk.Button(actions, text="閉じる", command=dialog.destroy).pack(side="right", padx=3)
+        listing.bind("<Double-1>", lambda event: edit_selected())
+        refresh()
+
+    def _controller_recordings_path(self):
+        return os.path.join(os.path.dirname(Settings.GuiSettings.SETTING_PATH), "controller_recordings.json")
+
+    def _read_controller_recordings(self):
+        try:
+            with open(self._controller_recordings_path(), "r", encoding="utf-8") as stream:
+                data = json.load(stream)
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _write_controller_recordings(self, data):
+        path = self._controller_recordings_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        temporary = path + ".tmp"
+        with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+        os.replace(temporary, path)
+
+    def _show_controller_recording_editor(self, name, item, refresh_callback=None):
+        from tkinter import filedialog
+        lines = list(item.get("lines", []))
+        dialog = tk.Toplevel(self.root)
+        dialog.title("コントローラー記録編集: " + name)
+        dialog.transient(self.root)
+        dialog.geometry("980x620")
+        controls = ttk.Frame(dialog)
+        controls.pack(fill="x", padx=7, pady=7)
+        start_line = tk.IntVar(value=1)
+        end_line = tk.IntVar(value=max(1, len(lines)))
+        degrees = tk.DoubleVar(value=0.0)
+        sticks = tk.StringVar(value="both")
+        for label, variable, width in (("開始行", start_line, 7), ("終了行", end_line, 7),
+                                       ("角度差(度)", degrees, 8)):
+            ttk.Label(controls, text=label).pack(side="left", padx=(4, 2))
+            ttk.Entry(controls, textvariable=variable, width=width).pack(side="left")
+        ttk.Label(controls, text="対象スティック").pack(side="left", padx=(12, 2))
+        ttk.Combobox(controls, state="readonly", width=8, textvariable=sticks,
+                     values=("both", "left", "right")).pack(side="left")
+        editor = tk.Text(dialog, wrap="none", font=("Consolas", 10), tabs=(32,))
+        editor.pack(fill="both", expand=True, padx=7, pady=(0, 7))
+        editor.insert("1.0", "".join(lines))
+
+        def current_lines():
+            content = editor.get("1.0", "end-1c")
+            return content.splitlines(True)
+
+        def apply_angle():
+            try:
+                changed = rotate_log_range(current_lines(), start_line.get(), end_line.get(),
+                                           degrees.get(), sticks.get())
+            except (ValueError, TypeError) as error:
+                tkmsg.showwarning("角度一括補正", str(error), parent=dialog)
+                return
+            editor.delete("1.0", "end")
+            editor.insert("1.0", "".join(changed))
+
+        def save_as():
+            target = filedialog.asksaveasfilename(
+                title="補正済みコントローラー記録を保存", initialfile=name + ".txt",
+                defaultextension=".txt", filetypes=[("Controller log", "*.txt")], parent=dialog)
+            if not target:
+                return
+            try:
+                with open(target, "w", encoding="utf-8", newline="\n") as stream:
+                    stream.write("".join(current_lines()))
+            except OSError as error:
+                tkmsg.showerror("コントローラー記録", str(error), parent=dialog)
+
+        def save_registration():
+            try:
+                new_lines = current_lines()
+                python_replacement_body(new_lines)
+            except ValueError as error:
+                tkmsg.showwarning("コントローラー記録", str(error), parent=dialog)
+                return
+            data = self._read_controller_recordings()
+            if name not in data:
+                tkmsg.showwarning("コントローラー記録", "登録が削除されています。", parent=dialog)
+                return
+            data[name]["lines"] = new_lines
+            self._write_controller_recordings(data)
+            if refresh_callback:
+                refresh_callback()
+            self.commands_assist_status.set("コントローラー記録「{}」を更新しました。".format(name))
+
+        def copy_replacement():
+            try:
+                body = python_replacement_body(current_lines())
+            except ValueError as error:
+                tkmsg.showwarning("置換処理", str(error), parent=dialog)
+                return
+            self.root.clipboard_clear()
+            self.root.clipboard_append(body)
+            self.commands_assist_status.set("コントローラー記録から置換処理コードをクリップボードへコピーしました。")
+
+        ttk.Button(controls, text="範囲へ角度差を反映", command=apply_angle).pack(side="left", padx=8)
+        ttk.Button(controls, text="登録を更新", command=save_registration).pack(side="right", padx=3)
+        ttk.Button(controls, text="別名保存", command=save_as).pack(side="right", padx=3)
+        ttk.Button(controls, text="置換処理コードをコピー", command=copy_replacement).pack(side="right", padx=3)
+
     # def createGetFromHomeWindow(self):
     #     if self.poke_treeview is not None:
     #         self.poke_treeview.focus_force()
@@ -4450,6 +5566,7 @@ class PokeControllerApp:
         Command.cur_command_name = self.cur_command.NAME
         self._logger.info(self.start_button["text"] + " " + self.cur_command.NAME)
         started_command = self.cur_command
+        self._install_step_debug_wrappers(self.cur_command)
         self.cur_command.start(self.ser, lambda: self.stopPlayPost(started_command))
 
         self.start_button["text"] = "Stop"
@@ -4487,6 +5604,7 @@ class PokeControllerApp:
             self._logger.info(self.start_button["text"] + " " + self.cur_command.NAME)
             Command.cur_command_name = self.cur_command.NAME
             started_command = self.cur_command
+            self._install_step_debug_wrappers(self.cur_command)
             self.cur_command.start(self.ser, lambda: self.stopPlayPost(started_command))
 
             self.start_button["text"] = "Stop"
@@ -4729,6 +5847,14 @@ class PokeControllerApp:
             self.settings.right_panel_count = self.right_panel_count.get()
             self.settings.side_width_balance = self.side_width_balance.get()
             self.settings.show_software_controller = self.show_software_controller.get()
+            self.settings.quick_actions_left_position = normalize_position(
+                self.quick_actions_left_position.get())
+            self.settings.quick_actions_right_position = normalize_position(
+                self.quick_actions_right_position.get())
+            self.settings.quick_actions_left_items = encode_action_ids(
+                self.quick_actions_left_items)
+            self.settings.quick_actions_right_items = encode_action_ids(
+                self.quick_actions_right_items)
             self.settings.video_source = self.video_source.get()
             self.settings.window_title, self.settings.window_process = self._selected_window_identity()
             self.settings.audio_input = self.audio_input.get()
@@ -4742,6 +5868,8 @@ class PokeControllerApp:
             self.settings.image_assist_console_tag = self.image_assist_console_tag.get()
             self.settings.image_assist_filter_mode = self.image_assist_filter_mode.get()
             self.settings.image_assist_max_candidates = self.image_assist_max_candidates.get()
+            self.settings.analysis_rules_enabled = self.analysis_rules_enabled.get()
+            self.settings.analysis_rules = json.dumps(self.analysis_rules, ensure_ascii=False)
             # Input authorization is session-only and must start disabled.
             self.settings.pc_gamepad_input_enabled = False
             self.settings.record_mode = self.record_mode.get()
@@ -4755,6 +5883,8 @@ class PokeControllerApp:
             self.settings.record_trigger_rules = json.dumps(self.record_trigger_rules)
             self.settings.record_cleanup_rules = json.dumps(self.record_cleanup_rules)
             self.settings.record_minimum_duration = self.record_minimum_duration.get()
+            self.settings.record_min_free_gb = self.record_min_free_gb.get()
+            self.settings.record_max_disk_usage_percent = self.record_max_disk_usage_percent.get()
             self.settings.record_variable_command = self.record_variable_command.get()
             self.settings.record_variable_name = self.record_variable_name.get()
             self.settings.record_variable_start = self.record_variable_start.get()
@@ -4799,6 +5929,265 @@ class PokeControllerApp:
     def loadSettings(self):
         self.settings = Settings.GuiSettings()
         self.settings.load()
+
+    def _quick_actions_snapshot(self):
+        return {
+            "left": {
+                "position": normalize_position(self.quick_actions_left_position.get()),
+                "items": normalize_action_ids(self.quick_actions_left_items),
+            },
+            "right": {
+                "position": normalize_position(self.quick_actions_right_position.get()),
+                "items": normalize_action_ids(self.quick_actions_right_items),
+            },
+        }
+
+    def _apply_quick_actions_snapshot(self, snapshot, refresh=True):
+        if not isinstance(snapshot, dict):
+            return
+        for side, position_var in (("left", self.quick_actions_left_position),
+                                   ("right", self.quick_actions_right_position)):
+            saved = snapshot.get(side, {})
+            if not isinstance(saved, dict):
+                continue
+            position_var.set(normalize_position(saved.get("position", position_var.get())))
+            setattr(self, "quick_actions_{}_items".format(side),
+                    normalize_action_ids(saved.get("items", [])))
+        if refresh and hasattr(self, "panel_widgets"):
+            self.apply_panel_assignment()
+
+    def _invoke_quick_action(self, action_id):
+        definition = ACTION_BY_ID.get(action_id)
+        if not definition:
+            return
+        try:
+            widget_name = definition.get("widget")
+            if widget_name:
+                widget = getattr(self, widget_name, None)
+                if widget is not None:
+                    widget.invoke()
+            else:
+                callback = getattr(self, definition.get("command", ""), None)
+                if callable(callback):
+                    callback()
+        except Exception as error:
+            self._logger.warning("Quick action failed (%s): %s", action_id, error)
+            tkmsg.showwarning("クイックアクション", "操作を実行できませんでした。\n{}".format(error), parent=self.root)
+
+    def _quick_check_changed(self, command_name):
+        callback = getattr(self, command_name, None)
+        if callable(callback):
+            # Some callbacks rebuild this bar.  Run after the checkbutton has
+            # completed its own state transition so destroying the proxy is safe.
+            self.root.after_idle(callback)
+
+    def _render_quick_action_bar(self, side):
+        content = getattr(self, "quick_actions_{}_content".format(side))
+        for child in content.winfo_children():
+            child.destroy()
+        items = normalize_action_ids(getattr(self, "quick_actions_{}_items".format(side)))
+        setattr(self, "quick_actions_{}_items".format(side), items)
+
+        settings_button = ttk.Button(content, text="＋ クイック設定…", command=self.open_quick_actions_settings)
+        settings_button.grid(column=0, row=0, padx=2, pady=2, sticky="ew")
+        for index, action_id in enumerate(items, start=1):
+            definition = ACTION_BY_ID[action_id]
+            row, column = divmod(index, 3)
+            if definition["kind"] == "check":
+                variable = getattr(self, definition.get("variable", ""), None)
+                if variable is None:
+                    continue
+                command_name = definition.get("command")
+                command = ((lambda name=command_name: self._quick_check_changed(name))
+                           if command_name else None)
+                control = ttk.Checkbutton(
+                    content, text=definition["label"], variable=variable, command=command)
+            else:
+                options = {
+                    "text": definition["label"],
+                    "command": lambda selected=action_id: self._invoke_quick_action(selected),
+                }
+                textvariable = getattr(self, definition.get("textvariable", ""), None)
+                if textvariable is not None:
+                    options["textvariable"] = textvariable
+                control = ttk.Button(content, **options)
+                target = getattr(self, definition.get("widget", ""), None)
+                if target is not None:
+                    self._quick_action_proxy_buttons.append((control, target))
+            control.grid(column=column, row=row, padx=2, pady=2, sticky="ew")
+        for column in range(3):
+            content.columnconfigure(column, weight=1)
+
+    def _render_quick_action_bars(self):
+        self._quick_action_proxy_buttons = []
+        self._render_quick_action_bar("left")
+        self._render_quick_action_bar("right")
+        if self._quick_action_sync_after is None:
+            self._quick_action_sync_after = self.root.after(300, self._sync_quick_action_proxy_states)
+
+    def _sync_quick_action_proxy_states(self):
+        self._quick_action_sync_after = None
+        try:
+            for proxy, target in tuple(self._quick_action_proxy_buttons):
+                if proxy.winfo_exists() and target.winfo_exists():
+                    proxy.configure(state=target.cget("state"))
+            self._quick_action_sync_after = self.root.after(300, self._sync_quick_action_proxy_states)
+        except tk.TclError:
+            pass
+
+    def open_quick_actions_settings(self):
+        existing = self._quick_actions_window
+        if existing is not None and existing.winfo_exists():
+            existing.deiconify()
+            existing.lift()
+            existing.focus_force()
+            return
+
+        dialog = tk.Toplevel(self.root)
+        self._quick_actions_window = dialog
+        dialog.title("クイックアクション設定")
+        dialog.geometry("900x650")
+        dialog.minsize(760, 520)
+        dialog.transient(self.root)
+
+        ttk.Label(
+            dialog,
+            text="よく使う操作だけを左右のログ付近へ登録します。元タブの操作と状態は共通です。",
+            wraplength=840, justify="left",
+        ).pack(fill="x", padx=10, pady=(10, 5))
+
+        working = {
+            "left": list(self.quick_actions_left_items),
+            "right": list(self.quick_actions_right_items),
+        }
+        left_position = tk.StringVar(value=normalize_position(self.quick_actions_left_position.get()))
+        right_position = tk.StringVar(value=normalize_position(self.quick_actions_right_position.get()))
+        position_box = ttk.LabelFrame(dialog, text="表示位置")
+        position_box.pack(fill="x", padx=10, pady=5)
+        ttk.Label(position_box, text="左ログ:").grid(column=0, row=0, padx=(8, 3), pady=5)
+        ttk.Combobox(position_box, state="readonly", width=10, values=POSITIONS,
+                     textvariable=left_position).grid(column=1, row=0, padx=3, pady=5)
+        ttk.Label(position_box, text="右ログ:").grid(column=2, row=0, padx=(18, 3), pady=5)
+        ttk.Combobox(position_box, state="readonly", width=10, values=POSITIONS,
+                     textvariable=right_position).grid(column=3, row=0, padx=3, pady=5)
+        ttk.Label(position_box, text="※ 非表示にしても Otherタブの「Quick actions...」から再設定できます。",
+                  foreground="#505050").grid(column=4, row=0, padx=12, pady=5, sticky="w")
+
+        available_box = ttk.LabelFrame(dialog, text="追加できる操作（検索可能）")
+        available_box.pack(fill="both", expand=True, padx=10, pady=5)
+        search = tk.StringVar()
+        ttk.Label(available_box, text="検索:").pack(side="top", anchor="w", padx=6, pady=(5, 0))
+        search_entry = ttk.Entry(available_box, textvariable=search)
+        search_entry.pack(fill="x", padx=6, pady=(2, 5))
+        available = ttk.Treeview(
+            available_box, columns=("tab", "label", "kind"), show="headings", height=8,
+            selectmode="browse")
+        available.heading("tab", text="元のタブ")
+        available.heading("label", text="操作")
+        available.heading("kind", text="種類")
+        available.column("tab", width=150, stretch=False)
+        available.column("label", width=430)
+        available.column("kind", width=80, stretch=False)
+        available.pack(fill="both", expand=True, padx=6, pady=(0, 5))
+
+        selected_box = ttk.Frame(dialog)
+        selected_box.pack(fill="both", expand=True, padx=10, pady=5)
+        side_trees = {}
+
+        def refresh_available(*_):
+            query = search.get().strip().casefold()
+            available.delete(*available.get_children())
+            for definition in ACTION_DEFINITIONS:
+                haystack = "{} {} {}".format(
+                    definition["tab"], definition["label"], definition["kind"]).casefold()
+                if query and query not in haystack:
+                    continue
+                available.insert("", "end", iid=definition["id"], values=(
+                    definition["tab"], definition["label"],
+                    "チェック" if definition["kind"] == "check" else "ボタン"))
+
+        def refresh_side(side):
+            tree = side_trees[side]
+            tree.delete(*tree.get_children())
+            for action_id in working[side]:
+                definition = ACTION_BY_ID[action_id]
+                tree.insert("", "end", iid=action_id,
+                            values=(definition["tab"], definition["label"]))
+
+        def add_to(side):
+            selected = available.selection()
+            if not selected:
+                return
+            action_id = selected[0]
+            if action_id not in working[side]:
+                working[side].append(action_id)
+                refresh_side(side)
+
+        def remove_from(side):
+            tree = side_trees[side]
+            selected = tree.selection()
+            if selected and selected[0] in working[side]:
+                working[side].remove(selected[0])
+                refresh_side(side)
+
+        def move(side, offset):
+            tree = side_trees[side]
+            selected = tree.selection()
+            if not selected:
+                return
+            action_id = selected[0]
+            index = working[side].index(action_id)
+            new_index = max(0, min(len(working[side]) - 1, index + offset))
+            if new_index == index:
+                return
+            working[side].insert(new_index, working[side].pop(index))
+            refresh_side(side)
+            tree.selection_set(action_id)
+            tree.see(action_id)
+
+        for column, (side, title) in enumerate((("left", "左側に登録"), ("right", "右側に登録"))):
+            box = ttk.LabelFrame(selected_box, text=title)
+            box.grid(column=column, row=0, padx=(0, 5) if column == 0 else (5, 0), sticky="nsew")
+            controls = ttk.Frame(box)
+            controls.pack(fill="x", padx=5, pady=4)
+            ttk.Button(controls, text="選択した操作を追加", command=lambda value=side: add_to(value)).pack(side="left", padx=2)
+            ttk.Button(controls, text="削除", command=lambda value=side: remove_from(value)).pack(side="left", padx=2)
+            ttk.Button(controls, text="↑", width=3, command=lambda value=side: move(value, -1)).pack(side="right", padx=2)
+            ttk.Button(controls, text="↓", width=3, command=lambda value=side: move(value, 1)).pack(side="right", padx=2)
+            tree = ttk.Treeview(box, columns=("tab", "label"), show="headings", height=7, selectmode="browse")
+            tree.heading("tab", text="タブ")
+            tree.heading("label", text="操作")
+            tree.column("tab", width=120, stretch=False)
+            tree.column("label", width=250)
+            tree.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+            side_trees[side] = tree
+            selected_box.columnconfigure(column, weight=1)
+        selected_box.rowconfigure(0, weight=1)
+
+        def apply_changes(close=False):
+            self.quick_actions_left_position.set(normalize_position(left_position.get()))
+            self.quick_actions_right_position.set(normalize_position(right_position.get()))
+            self.quick_actions_left_items = normalize_action_ids(working["left"])
+            self.quick_actions_right_items = normalize_action_ids(working["right"])
+            self.apply_panel_assignment()
+            if close:
+                close_dialog()
+
+        def close_dialog():
+            self._quick_actions_window = None
+            dialog.destroy()
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=10, pady=(4, 10))
+        ttk.Button(buttons, text="反映", command=apply_changes).pack(side="right", padx=3)
+        ttk.Button(buttons, text="反映して閉じる", command=lambda: apply_changes(True)).pack(side="right", padx=3)
+        ttk.Button(buttons, text="キャンセル", command=close_dialog).pack(side="right", padx=3)
+        dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+        search.trace_add("write", refresh_available)
+        refresh_available()
+        refresh_side("left")
+        refresh_side("right")
+        search_entry.focus_set()
 
     def ReloadCommandWithF5(self, *event):
         self.reloadCommands()
@@ -4964,17 +6353,81 @@ class PokeControllerApp:
 
     def receive_output_region(self, image_bgr, rect):
         """Display the persistent red selection in the currently selected output."""
+        pending_rule_id = getattr(self, "_pending_analysis_roi_rule_id", None)
+        if pending_rule_id is not None:
+            rule = next((item for item in self.analysis_rules
+                         if str(item.get("id", "")) == pending_rule_id), None)
+            self._pending_analysis_roi_rule_id = None
+            if rule is not None:
+                rule["roi"] = "{},{},{},{}".format(*rect)
+                self._refresh_analysis_rule_list()
+                self.analysis_rule_status.set("ROIを設定しました: " + rule["roi"])
+                self.controller_nb.select(self.analysis_tab)
+            return
         if hasattr(self, "area_capture_roi"):
             self.area_capture_roi.set("{},{},{},{}".format(*rect))
             self.area_capture_status.set("Selected ROI: {},{},{},{}".format(*rect))
         self.preview_area_capture()
         print(f"Output crop: x={rect[0]}, y={rect[1]}, w={rect[2]}, h={rect[3]}")
 
+    def schedule_panel_adjuster_update(self, *event):
+        """Throttle Adjuster motion and keep heavy panel rebuilding out of drags."""
+        if self._panel_adjuster_update_after is None:
+            self._panel_adjuster_update_after = self.root.after(
+                33, self._apply_panel_adjuster_geometry)
+
+    def flush_panel_adjuster_update(self, *event):
+        """Apply the final slider position immediately when dragging finishes."""
+        pending = self._panel_adjuster_update_after
+        self._panel_adjuster_update_after = None
+        if pending is not None:
+            try:
+                self.root.after_cancel(pending)
+            except tk.TclError:
+                return
+        self._apply_panel_adjuster_geometry()
+
+    def _apply_panel_adjuster_geometry(self):
+        """Update only grid weights and panel heights (no content reparenting)."""
+        self._panel_adjuster_update_after = None
+        if not hasattr(self, "panel_widgets"):
+            return
+        sides = self.panel_sides.get()
+        show_left = sides in ("Both sides", "Left side only")
+        show_right = sides in ("Both sides", "Right side only")
+        show_right_host = show_right or self.show_software_controller.get()
+        if show_left and show_right:
+            left_weight = max(1, self.side_width_balance.get())
+            self.main_frame.columnconfigure(0, weight=left_weight)
+            self.main_frame.columnconfigure(2, weight=max(1, 100 - left_weight))
+        else:
+            self.main_frame.columnconfigure(0, weight=2 if show_left else 0)
+            self.main_frame.columnconfigure(2, weight=2 if show_right_host else 0)
+
+        total_height = max(240, int(getattr(getattr(self, "preview", None), "show_height", 360)))
+
+        def resize_pair(slot_names, ratio):
+            top_height = int(total_height * ratio.get() / 100)
+            for name, height in zip(slot_names, (top_height, total_height - top_height)):
+                self.panel_widgets[name][0].configure(height=max(40, height))
+
+        if show_left and self.left_panel_count.get() == "2":
+            resize_pair(("left_top", "left_bottom"), self.panel_ratio)
+        if show_right and self.right_panel_count.get() == "2":
+            resize_pair(("right_top", "right_bottom"), self.right_panel_ratio)
+
     def apply_panel_assignment(self, *event):
         """Reflect assignment in titles and expose it to command scripts.
 
         Output#1 through Output#4 can each be assigned to one of the four slots.
         """
+        pending = getattr(self, "_panel_adjuster_update_after", None)
+        if pending is not None:
+            try:
+                self.root.after_cancel(pending)
+            except tk.TclError:
+                pass
+            self._panel_adjuster_update_after = None
         slots = {name: value.get() for name, value in self.panel_slots.items()}
         output_1_slot = next((name for name, value in slots.items() if value == "Log: Output#1"), "unassigned")
         output_2_slot = next((name for name, value in slots.items() if value == "Log: Output#2"), "unassigned")
@@ -4993,6 +6446,9 @@ class PokeControllerApp:
         else:
             self.text_area_2 = self.base_text_areas[1]
         self.softcon_frame.pack_forget()
+        self.quick_actions_left_frame.pack_forget()
+        self.quick_actions_right_frame.pack_forget()
+        self._render_quick_action_bars()
         sides = self.panel_sides.get()
         show_left = sides in ("Both sides", "Left side only")
         show_right = sides in ("Both sides", "Right side only")
@@ -5029,16 +6485,29 @@ class PokeControllerApp:
                 panel.configure(height=max(40, height))
                 panel.pack_propagate(False)
                 panel.pack(expand=False, fill="both", side="top")
+        left_quick = normalize_position(self.quick_actions_left_position.get())
+        right_quick = normalize_position(self.quick_actions_right_position.get())
+        if show_left and left_quick == "上":
+            self.quick_actions_left_frame.pack(fill="x", padx=0, pady=(0, 3), side="top")
+        if show_left and left_quick == "下":
+            self.quick_actions_left_frame.pack(fill="x", padx=0, pady=(3, 0), side="bottom")
         if show_left:
             pack_side(("left_top",) if self.left_panel_count.get() == "1" else ("left_top", "left_bottom"),
                       self.panel_ratio)
+
+        # Pack the fixed top/bottom tools before the log panels so their
+        # placement remains stable when the panel split adjuster is moved.
+        if show_right and right_quick == "上":
+            self.quick_actions_right_frame.pack(fill="x", padx=0, pady=(0, 3), side="top")
         if show_controller and self.pos_software_controller.get() == "1":
             self.softcon_frame.pack(expand=False, fill="x", padx=0, pady=0, side="top")
+        if show_right and right_quick == "下":
+            self.quick_actions_right_frame.pack(fill="x", padx=0, pady=(3, 0), side="bottom")
+        if show_controller and self.pos_software_controller.get() == "2":
+            self.softcon_frame.pack(expand=False, fill="x", padx=0, pady=0, side="bottom")
         if show_right:
             pack_side(("right_top",) if self.right_panel_count.get() == "1" else ("right_top", "right_bottom"),
                       self.right_panel_ratio)
-        if show_controller and self.pos_software_controller.get() == "2":
-            self.softcon_frame.pack(expand=False, fill="x", padx=0, pady=0, side="bottom")
         # Rebind the stdout proxy after a log destination is moved.
         if hasattr(self, "stdout_destination"):
             self.refresh_log_controls()
@@ -5130,6 +6599,335 @@ class PokeControllerApp:
         target.configure(image=tk_image, text="")
         target.image = tk_image  # prevent Tk from garbage-collecting the image
 
+    def _build_analysis_rules_ui(self):
+        box = ttk.Labelframe(self.analysis_f, text="解析ルール（項目ごとに有効／無効）")
+        box.grid(column=0, padx=5, pady=5, sticky="nsew")
+        ttk.Checkbutton(
+            box, text="有効な解析ルールを周期実行", variable=self.analysis_rules_enabled,
+            command=self._analysis_rules_master_changed,
+        ).grid(column=0, row=0, padx=5, pady=4, sticky="w")
+        ttk.Label(box, textvariable=self.analysis_rule_status).grid(
+            column=1, columnspan=2, row=0, padx=5, pady=4, sticky="w")
+        self.analysis_rule_list = tk.Listbox(box, height=11, exportselection=False)
+        self.analysis_rule_list.grid(column=0, columnspan=2, row=1, padx=5, pady=5, sticky="nsew")
+        self.analysis_rule_list.bind("<Double-Button-1>", lambda *_: self.edit_analysis_rule())
+        actions = ttk.Frame(box)
+        actions.grid(column=2, row=1, padx=5, pady=5, sticky="ns")
+        for label, command in (
+                ("追加…", self.add_analysis_rule),
+                ("編集…", self.edit_analysis_rule),
+                ("有効／無効", self.toggle_analysis_rule),
+                ("矩形ROIを選択", self.select_analysis_rule_roi),
+                ("今すぐ解析", self.run_analysis_rules_now),
+                ("削除", self.delete_analysis_rule)):
+            ttk.Button(actions, text=label, command=command).pack(fill="x", pady=2)
+        ttk.Label(
+            box,
+            text="ROI選択: ルールを選択してボタンを押し、Camera映像上をShift＋ドラッグしてください。",
+            foreground="#555555",
+        ).grid(column=0, columnspan=3, row=2, padx=5, pady=(0, 5), sticky="w")
+        self.analysis_rule_result_text = tk.Text(box, height=8, wrap="word", state="disabled")
+        self.analysis_rule_result_text.grid(
+            column=0, columnspan=3, row=3, padx=5, pady=(0, 5), sticky="nsew")
+        box.columnconfigure(0, weight=1)
+        box.columnconfigure(1, weight=1)
+        box.rowconfigure(1, weight=1)
+        box.rowconfigure(3, weight=1)
+        self.analysis_f.columnconfigure(0, weight=1)
+
+    @staticmethod
+    def _default_analysis_rule():
+        return {
+            "id": str(time.time_ns()), "name": "HP解析", "enabled": True,
+            "type": "hp_bar", "roi": "0,0,0,0", "interval": 1.0,
+            "condition_type": "always", "condition_template": "",
+            "condition_threshold": 0.85, "condition_roi": "0,0,0,0",
+            "condition_command": "すべて", "condition_variable": "STATE_1_STORY_FUNCTION",
+            "condition_value": "", "template_path": "", "threshold": 0.85,
+            "grayscale": True, "ocr_language": "jpn+eng", "ocr_psm": 7,
+            "ocr_scale": 3.0, "ocr_whitelist": "", "ocr_invert": False,
+            "hp_color": "auto", "hp_column_fill": 0.18,
+            "state_change_threshold": 8.0,
+        }
+
+    def _analysis_rule_text(self, rule):
+        enabled = "有効" if rule.get("enabled", True) else "無効"
+        analysis_name = ANALYSIS_TYPES.get(rule.get("type", "state"), rule.get("type", ""))
+        condition = CONDITION_TYPES.get(rule.get("condition_type", "always"), "常時")
+        return "[{}] {} / {} / ROI {} / 条件 {}".format(
+            enabled, rule.get("name", analysis_name), analysis_name,
+            rule.get("roi", "0,0,0,0"), condition)
+
+    def _refresh_analysis_rule_list(self):
+        if not hasattr(self, "analysis_rule_list"):
+            return
+        selected = self.analysis_rule_list.curselection()
+        index = selected[0] if selected else None
+        self.analysis_rule_list.delete(0, "end")
+        for rule in self.analysis_rules:
+            self.analysis_rule_list.insert("end", self._analysis_rule_text(rule))
+        if index is not None and index < len(self.analysis_rules):
+            self.analysis_rule_list.selection_set(index)
+        enabled_count = sum(bool(rule.get("enabled", True)) for rule in self.analysis_rules)
+        self.analysis_rule_status.set("登録{}件 / 有効{}件".format(len(self.analysis_rules), enabled_count))
+
+    def _selected_analysis_rule_index(self):
+        selected = self.analysis_rule_list.curselection()
+        return selected[0] if selected and selected[0] < len(self.analysis_rules) else None
+
+    def _edit_analysis_rule_dialog(self, initial=None):
+        from tkinter import filedialog
+        rule = self._default_analysis_rule()
+        rule.update(dict(initial or {}))
+        dialog = tk.Toplevel(self.root)
+        dialog.title("解析ルール設定")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        result = {}
+        name = tk.StringVar(value=rule.get("name", ""))
+        enabled = tk.BooleanVar(value=bool(rule.get("enabled", True)))
+        type_label = tk.StringVar(value=ANALYSIS_TYPES.get(rule.get("type"), "範囲状態"))
+        roi = tk.StringVar(value=rule.get("roi", "0,0,0,0"))
+        interval = tk.DoubleVar(value=rule.get("interval", 1.0))
+        condition_label = tk.StringVar(value=CONDITION_TYPES.get(rule.get("condition_type"), "常時"))
+        condition_template = tk.StringVar(value=rule.get("condition_template", ""))
+        condition_threshold = tk.DoubleVar(value=rule.get("condition_threshold", 0.85))
+        condition_roi = tk.StringVar(value=rule.get("condition_roi", "0,0,0,0"))
+        condition_command = tk.StringVar(value=rule.get("condition_command", "すべて"))
+        condition_variable = tk.StringVar(value=rule.get("condition_variable", "STATE_1_STORY_FUNCTION"))
+        condition_value = tk.StringVar(value=rule.get("condition_value", ""))
+        template_path = tk.StringVar(value=rule.get("template_path", ""))
+        threshold = tk.DoubleVar(value=rule.get("threshold", 0.85))
+        grayscale = tk.BooleanVar(value=bool(rule.get("grayscale", True)))
+        ocr_language = tk.StringVar(value=rule.get("ocr_language", "jpn+eng"))
+        ocr_psm = tk.IntVar(value=rule.get("ocr_psm", 7))
+        ocr_scale = tk.DoubleVar(value=rule.get("ocr_scale", 3.0))
+        ocr_whitelist = tk.StringVar(value=rule.get("ocr_whitelist", ""))
+        ocr_invert = tk.BooleanVar(value=bool(rule.get("ocr_invert", False)))
+        hp_color = tk.StringVar(value=rule.get("hp_color", "auto"))
+        state_change = tk.DoubleVar(value=rule.get("state_change_threshold", 8.0))
+
+        def row(label, widget, number):
+            ttk.Label(dialog, text=label).grid(column=0, row=number, padx=7, pady=3, sticky="e")
+            widget.grid(column=1, row=number, padx=7, pady=3, sticky="ew")
+
+        row("名前:", ttk.Entry(dialog, textvariable=name, width=58), 0)
+        ttk.Checkbutton(dialog, text="この解析を有効にする", variable=enabled).grid(
+            column=1, row=1, padx=7, pady=3, sticky="w")
+        row("解析種別:", ttk.Combobox(dialog, state="readonly", values=tuple(ANALYSIS_TYPES.values()),
+                                      textvariable=type_label, width=30), 2)
+        row("解析ROI x,y,w,h:", ttk.Entry(dialog, textvariable=roi), 3)
+        row("実行間隔（秒）:", ttk.Spinbox(dialog, from_=0.25, to=3600, increment=0.25,
+                                           textvariable=interval, width=10), 4)
+        row("実行条件:", ttk.Combobox(dialog, state="readonly", values=tuple(CONDITION_TYPES.values()),
+                                      textvariable=condition_label, width=30), 5)
+        condition_image_frame = ttk.Frame(dialog)
+        ttk.Entry(condition_image_frame, textvariable=condition_template, width=45).pack(side="left", fill="x", expand=True)
+        ttk.Button(condition_image_frame, text="参照…", command=lambda: condition_template.set(
+            filedialog.askopenfilename(parent=dialog, filetypes=[("画像", "*.png;*.jpg;*.jpeg;*.bmp")])
+            or condition_template.get())).pack(side="left", padx=3)
+        row("条件画像:", condition_image_frame, 6)
+        row("条件画像 閾値:", ttk.Spinbox(dialog, from_=0, to=1, increment=0.01,
+                                          textvariable=condition_threshold, width=10), 7)
+        row("条件画像ROI:", ttk.Entry(dialog, textvariable=condition_roi), 8)
+        try:
+            command_values = self._command_names_for_rules()
+        except Exception:
+            command_values = ["すべて"]
+        row("条件Commands:", ttk.Combobox(dialog, state="readonly", values=command_values,
+                                           textvariable=condition_command), 9)
+        row("条件Step／変数:", ttk.Entry(dialog, textvariable=condition_variable), 10)
+        value_combo = ttk.Combobox(dialog, state="normal", textvariable=condition_value, width=56)
+        self._bind_state_value_search(value_combo, condition_value, condition_command, condition_variable)
+        row("条件一致値:", value_combo, 11)
+        template_frame = ttk.Frame(dialog)
+        ttk.Entry(template_frame, textvariable=template_path, width=45).pack(side="left", fill="x", expand=True)
+        ttk.Button(template_frame, text="参照…", command=lambda: template_path.set(
+            filedialog.askopenfilename(parent=dialog, filetypes=[("画像", "*.png;*.jpg;*.jpeg;*.bmp")])
+            or template_path.get())).pack(side="left", padx=3)
+        row("解析用比較画像:", template_frame, 12)
+        row("画像一致 閾値:", ttk.Spinbox(dialog, from_=0, to=1, increment=0.01,
+                                          textvariable=threshold, width=10), 13)
+        options = ttk.Frame(dialog)
+        ttk.Checkbutton(options, text="グレースケール", variable=grayscale).pack(side="left")
+        ttk.Checkbutton(options, text="OCR白黒反転", variable=ocr_invert).pack(side="left", padx=8)
+        row("画像／OCR:", options, 14)
+        ocr_options = ttk.Frame(dialog)
+        ttk.Label(ocr_options, text="言語").pack(side="left")
+        ttk.Entry(ocr_options, textvariable=ocr_language, width=10).pack(side="left", padx=2)
+        ttk.Label(ocr_options, text="PSM").pack(side="left", padx=(8, 1))
+        ttk.Spinbox(ocr_options, from_=3, to=13, textvariable=ocr_psm, width=4).pack(side="left")
+        ttk.Label(ocr_options, text="拡大").pack(side="left", padx=(8, 1))
+        ttk.Spinbox(ocr_options, from_=1, to=8, increment=0.5, textvariable=ocr_scale, width=5).pack(side="left")
+        row("OCR設定:", ocr_options, 15)
+        row("OCR許可文字:", ttk.Entry(dialog, textvariable=ocr_whitelist), 16)
+        hp_state = ttk.Frame(dialog)
+        ttk.Label(hp_state, text="HP色").pack(side="left")
+        ttk.Combobox(hp_state, state="readonly", values=("auto", "green", "red", "white"),
+                     textvariable=hp_color, width=8).pack(side="left", padx=2)
+        ttk.Label(hp_state, text="状態変化閾値%").pack(side="left", padx=(10, 2))
+        ttk.Spinbox(hp_state, from_=0, to=100, increment=1, textvariable=state_change,
+                    width=6).pack(side="left")
+        row("HP／状態設定:", hp_state, 17)
+
+        def accept():
+            try:
+                for roi_value in (roi.get(), condition_roi.get()):
+                    if len([int(value.strip()) for value in roi_value.split(",")]) != 4:
+                        raise ValueError
+                reverse_types = {label: key for key, label in ANALYSIS_TYPES.items()}
+                reverse_conditions = {label: key for key, label in CONDITION_TYPES.items()}
+                result.update(rule)
+                result.update({
+                    "name": name.get().strip() or type_label.get(), "enabled": enabled.get(),
+                    "type": reverse_types[type_label.get()], "roi": roi.get(),
+                    "interval": max(0.25, float(interval.get())),
+                    "condition_type": reverse_conditions[condition_label.get()],
+                    "condition_template": condition_template.get(),
+                    "condition_threshold": float(condition_threshold.get()),
+                    "condition_roi": condition_roi.get(), "condition_command": condition_command.get(),
+                    "condition_variable": condition_variable.get().strip(),
+                    "condition_value": condition_value.get(), "template_path": template_path.get(),
+                    "threshold": float(threshold.get()), "grayscale": grayscale.get(),
+                    "ocr_language": ocr_language.get().strip() or "jpn+eng", "ocr_psm": int(ocr_psm.get()),
+                    "ocr_scale": float(ocr_scale.get()), "ocr_whitelist": ocr_whitelist.get(),
+                    "ocr_invert": ocr_invert.get(), "hp_color": hp_color.get(),
+                    "state_change_threshold": float(state_change.get()),
+                })
+            except (KeyError, TypeError, ValueError, tk.TclError):
+                tkmsg.showwarning("解析ルール", "ROIと数値設定を確認してください。", parent=dialog)
+                return
+            dialog.destroy()
+
+        buttons = ttk.Frame(dialog)
+        buttons.grid(column=0, columnspan=2, row=18, padx=7, pady=8, sticky="e")
+        ttk.Button(buttons, text="保存", command=accept).pack(side="left", padx=3)
+        ttk.Button(buttons, text="キャンセル", command=dialog.destroy).pack(side="left", padx=3)
+        dialog.columnconfigure(1, weight=1)
+        self.root.wait_window(dialog)
+        return result or None
+
+    def add_analysis_rule(self):
+        rule = self._edit_analysis_rule_dialog()
+        if rule:
+            self.analysis_rules.append(rule)
+            self._refresh_analysis_rule_list()
+            if hasattr(self, "analysis_rule_engine"):
+                self.analysis_rule_engine.reset()
+
+    def edit_analysis_rule(self):
+        index = self._selected_analysis_rule_index()
+        if index is None:
+            return
+        rule = self._edit_analysis_rule_dialog(self.analysis_rules[index])
+        if rule:
+            self.analysis_rules[index] = rule
+            self._refresh_analysis_rule_list()
+            if hasattr(self, "analysis_rule_engine"):
+                self.analysis_rule_engine.reset()
+
+    def toggle_analysis_rule(self):
+        index = self._selected_analysis_rule_index()
+        if index is None:
+            return
+        self.analysis_rules[index]["enabled"] = not self.analysis_rules[index].get("enabled", True)
+        self._refresh_analysis_rule_list()
+        self._show_analysis_rule_results([])
+
+    def delete_analysis_rule(self):
+        index = self._selected_analysis_rule_index()
+        if index is None:
+            return
+        if tkmsg.askyesno("解析ルール", "選択した解析ルールを削除しますか？"):
+            del self.analysis_rules[index]
+            self._refresh_analysis_rule_list()
+            self._show_analysis_rule_results([])
+
+    def select_analysis_rule_roi(self):
+        index = self._selected_analysis_rule_index()
+        if index is None:
+            tkmsg.showwarning("解析ROI", "解析ルールを選択してください。")
+            return
+        self._pending_analysis_roi_rule_id = str(self.analysis_rules[index].get("id", ""))
+        self.analysis_rule_status.set("Camera映像上をShift＋ドラッグして矩形ROIを選択してください。")
+        self.controller_nb.select(self.camera_tab)
+
+    def _analysis_rules_master_changed(self):
+        if not self.analysis_rules_enabled.get():
+            self.preview.delete("AnalysisRules")
+            self.analysis_rule_status.set("解析ルール停止中")
+            self.analysis_rule_result_text.configure(state="normal")
+            self.analysis_rule_result_text.delete("1.0", "end")
+            self.analysis_rule_result_text.configure(state="disabled")
+        else:
+            self._refresh_analysis_rule_list()
+
+    def run_analysis_rules_now(self):
+        frame = getattr(getattr(self, "camera", None), "image_bgr", None)
+        if frame is None or not hasattr(self, "analysis_rule_engine"):
+            tkmsg.showwarning("解析ルール", "映像入力を開始してください。")
+            return
+        self.analysis_rule_engine.submit(
+            frame, self.analysis_rules, self._analysis_rule_context(), force=True)
+
+    def _analysis_rule_context(self):
+        command = getattr(self, "cur_command", None)
+        command_name = getattr(command, "NAME", "") if command is not None else ""
+        values = {}
+        if command is not None:
+            variables = {rule.get("condition_variable", "") for rule in self.analysis_rules
+                         if rule.get("condition_type") == "step"}
+            for variable in variables:
+                found, value, _ = resolve_command_value(command, variable)
+                if found:
+                    values[variable] = value
+        return {"command_name": command_name, "values": values}
+
+    def _queue_analysis_rule_results(self, results):
+        try:
+            self.root.after(0, lambda values=results: self._show_analysis_rule_results(values))
+        except tk.TclError:
+            pass
+
+    def _show_analysis_rule_results(self, results):
+        if not self.analysis_rules_enabled.get():
+            return
+        for item in results:
+            self.analysis_rule_results[str(item.get("id", item.get("name", "")))] = item
+        current_ids = {str(rule.get("id", "")) for rule in self.analysis_rules
+                       if rule.get("enabled", True)}
+        self.analysis_rule_results = {
+            key: value for key, value in self.analysis_rule_results.items() if key in current_ids}
+        ordered = [self.analysis_rule_results[str(rule.get("id", ""))]
+                   for rule in self.analysis_rules if rule.get("enabled", True)
+                   and str(rule.get("id", "")) in self.analysis_rule_results]
+        rows = ["[Analysis rules]"]
+        self.preview.delete("AnalysisRules")
+        ratio_x = self.preview.show_size[0] / self.camera.capture_size[0]
+        ratio_y = self.preview.show_size[1] / self.camera.capture_size[1]
+        for item in ordered:
+            state = "実行" if item.get("passed") else "待機"
+            rows.append("{} [{}] {}".format(item.get("name", "解析"), state, item.get("summary", "")))
+            x, y, width, height = item.get("rect", (0, 0, 0, 0))
+            if width > 0 and height > 0:
+                color = "#00c853" if item.get("passed") else "#888888"
+                self.preview.create_rectangle(
+                    x * ratio_x, y * ratio_y, (x + width) * ratio_x, (y + height) * ratio_y,
+                    outline=color, width=2, dash=(6, 3), tags="AnalysisRules")
+                self.preview.create_text(
+                    x * ratio_x + 3, max(10, y * ratio_y - 8), text=item.get("name", "解析"),
+                    fill=color, anchor="w", tags="AnalysisRules")
+        output_text = "\n".join(rows)
+        latest_values = {item.get("name", str(item.get("id", ""))): item.get("value")
+                         for item in ordered if item.get("passed")}
+        Command.analysis_results = latest_values
+        self.analysis_rule_result_text.configure(state="normal")
+        self.analysis_rule_result_text.delete("1.0", "end")
+        self.analysis_rule_result_text.insert("end", output_text)
+        self.analysis_rule_result_text.configure(state="disabled")
+        self.show_output("Analysis", text=output_text)
+        self.analysis_rule_status.set("解析結果更新: {}件".format(len(ordered)))
+
     def change_vision_mode(self, event=None):
         self.vision.set_mode(self.vision_mode.get())
         print(f"Vision mode: {self.vision_mode.get()}")
@@ -5144,6 +6942,11 @@ class PokeControllerApp:
     def analyse_live_frame(self, frame):
         if hasattr(self, "image_analysis_assist"):
             self.image_analysis_assist.submit(frame)
+        if (getattr(self, "analysis_rules_enabled", None) is not None
+                and self.analysis_rules_enabled.get()
+                and hasattr(self, "analysis_rule_engine")):
+            self.analysis_rule_engine.submit(
+                frame, self.analysis_rules, self._analysis_rule_context())
         try:
             result = self.vision.analyse(frame)
             text = result.to_json()
@@ -5152,7 +6955,9 @@ class PokeControllerApp:
                 and self.image_assist_enabled.get()
                 and self.image_assist_output.get() == "Output#2"
             )
-            if text != self._last_vision_text and not assist_uses_output_2:
+            rule_output_active = self.analysis_rules_enabled.get() and any(
+                rule.get("enabled", True) for rule in self.analysis_rules)
+            if text != self._last_vision_text and not assist_uses_output_2 and not rule_output_active:
                 self._last_vision_text = text
                 self.text_area_2.configure(state="normal")
                 self.text_area_2.delete("1.0", "end")
@@ -5262,8 +7067,17 @@ class PokeControllerApp:
             label = "{}: {}".format(index, item["name"])
             if not is_proposal:
                 label += " {:.1f}%".format(item["score"] * 100)
+            else:
+                label += " 適性{:.0f}%".format(item.get("score", 0.0) * 100)
             self.preview.create_text(x * ratio_x + 3, max(10, y * ratio_y - 8), text=label,
                                      fill=color, anchor="w", tags="ImageAnalysisAssist")
+            if is_proposal:
+                rows.append(
+                    "{}. 識別候補 x={}, y={}, w={}, h={} / 判定適性 {:.0f}% / 他領域類似度 {:.0f}%".format(
+                        index, x, y, width, height,
+                        item.get("score", 0.0) * 100,
+                        max(0.0, item.get("other_similarity", 0.0)) * 100))
+                continue
             if is_proposal:
                 rows.append("{}. 未登録候補  範囲 x={}, y={}, w={}, h={}（物体用の最小範囲を確保）".format(
                     index, x, y, width, height))
@@ -5299,7 +7113,7 @@ class PokeControllerApp:
         self.input_set_canvas.bind("<Configure>", self._resize_input_set_content)
         self._tab_scroll_canvases.append(self.input_set_canvas)
 
-        input_box = ttk.Labelframe(self.input_set_content, text="Camera・Audio・Serial 入力セット")
+        input_box = ttk.Labelframe(self.input_set_content, text="Camera・Audio・Serial・Recording 入力セット")
         input_box.pack(fill="x", padx=6, pady=6)
         ttk.Label(input_box, text="入力セット名:").grid(column=0, row=0, padx=5, pady=5, sticky="w")
         self.input_set_name = tk.StringVar()
@@ -5314,7 +7128,7 @@ class PokeControllerApp:
             column=0, columnspan=2, row=1, padx=5, pady=(0, 4), sticky="w")
         ttk.Label(input_box, text="SerialのDevice Nameが設定済みの場合は自動的に含めます。").grid(
             column=2, columnspan=4, row=1, padx=5, pady=(0, 4), sticky="w")
-        self.input_set_summary = tk.StringVar(value="Camera・Audio・Serialタブの現在値を登録します。")
+        self.input_set_summary = tk.StringVar(value="Camera・Audio・Serial・Recordingタブの現在値を登録します。")
         ttk.Label(input_box, textvariable=self.input_set_summary, anchor="w").grid(
             column=0, columnspan=6, row=2, padx=5, pady=(0, 5), sticky="ew")
         input_box.columnconfigure(1, weight=1)
@@ -5431,6 +7245,15 @@ class PokeControllerApp:
                                 getattr(self.audio_monitor, "process_loopback", None)),
             },
             "serial": self._current_serial_data(),
+            "recording": self._recording_preset_data(),
+            "commands_assist": {
+                "enabled": self.commands_assist_enabled.get(),
+                "recovery_command": self.commands_assist_recovery_command.get(),
+                "rules": list(self.commands_assist_rules),
+                "step_debug_rules": list(self.step_debug_rules),
+            },
+            "controller_recordings": self._read_controller_recordings(),
+            "quick_actions": self._quick_actions_snapshot(),
         }
 
     def _current_serial_data(self):
@@ -5750,6 +7573,25 @@ class PokeControllerApp:
         # from settings.ini instead of treating legacy data as "未設定".
         if apply_serial and "serial" in item:
             self._apply_serial_input_set(item.get("serial", {}))
+        recording = item.get("recording")
+        if isinstance(recording, dict):
+            self._apply_recording_preset_data(recording)
+        assist = item.get("commands_assist")
+        if isinstance(assist, dict):
+            self.commands_assist_enabled.set(bool(assist.get("enabled", False)))
+            self.commands_assist_recovery_command.set(assist.get("recovery_command", ""))
+            self.commands_assist_rules = list(assist.get("rules", []))
+            if isinstance(assist.get("step_debug_rules"), list):
+                self.step_debug_rules = list(assist.get("step_debug_rules", []))
+                self._write_step_debug_rules()
+            self._refresh_commands_assist_rule_list()
+            self._commands_assist_evaluator.reset()
+        saved_recordings = item.get("controller_recordings")
+        if isinstance(saved_recordings, dict):
+            recordings = self._read_controller_recordings()
+            recordings.update(saved_recordings)
+            self._write_controller_recordings(recordings)
+        self._apply_quick_actions_snapshot(item.get("quick_actions"), refresh=True)
 
     def load_input_set(self):
         name = self.input_set_name.get().strip()
@@ -5763,7 +7605,7 @@ class PokeControllerApp:
     def _show_input_set_summary(self, event=None):
         item = self._read_input_sets()["input_sets"].get(self.input_set_name.get().strip())
         if not item:
-            self.input_set_summary.set("Camera・Audio・Serialタブの現在値を登録します。")
+            self.input_set_summary.set("Camera・Audio・Serial・Recordingタブの現在値を登録します。")
             return
         camera, audio, serial = item.get("camera", {}), item.get("audio", {}), item.get("serial", {})
         audio_enabled = audio.get("enabled", bool(audio.get("device_name")))
@@ -5779,8 +7621,13 @@ class PokeControllerApp:
             serial.get("device_name", "設定なし"), serial.get("baud_rate", "-"),
             serial.get("data_format", "-"))
             if serial.get("enabled", bool(serial.get("device_name"))) else "設定なし")
-        self.input_set_summary.set("Camera: {} ({}) / Audio: {} / Serial: {}".format(
-            camera.get("display_name", ""), identity, audio_text, serial_text))
+        recording = item.get("recording", {})
+        recording_text = "{} / {}".format(
+            recording.get("mode", "未設定"), recording.get("output_dir") or "Recordings")
+        self.input_set_summary.set(
+            "Camera: {} ({}) / Audio: {} / Serial: {} / Recording: {} / Controller記録: {}件".format(
+                camera.get("display_name", ""), identity, audio_text, serial_text,
+                recording_text, len(item.get("controller_recordings", {}))))
 
     def _all_tabs_snapshot(self):
         """Return a JSON-safe snapshot without copying frames or runtime objects."""
@@ -5790,9 +7637,11 @@ class PokeControllerApp:
             "audio_input", "audio_gain", "audio_filter_camera", "audio_auto_start",
             "audio_monitor_mode", "vision_mode", "image_assist_enabled", "image_assist_output",
             "image_assist_game_tag", "image_assist_console_tag", "image_assist_filter_mode",
-            "image_assist_max_candidates", "record_mode", "record_output_dir", "record_template_path",
+            "image_assist_max_candidates", "analysis_rules_enabled",
+            "record_mode", "record_output_dir", "record_template_path",
             "record_threshold", "record_interval", "record_release", "record_roi", "record_debug",
-            "record_minimum_duration", "record_output_mode", "record_output_logs",
+            "record_minimum_duration", "record_min_free_gb", "record_max_disk_usage_percent",
+            "record_output_mode", "record_output_logs",
             "record_output_guide", "record_output_value", "record_output_detection",
             "area_capture_roi", "area_capture_output_target", "area_capture_step",
             "area_capture_background", "area_capture_active", "area_capture_detection_scope",
@@ -5828,7 +7677,11 @@ class PokeControllerApp:
                                   "sample": self.sample_py_name.get(), "mcu": self.mcu_name.get()},
             "commands_assist": {"enabled": self.commands_assist_enabled.get(),
                                 "recovery_command": self.commands_assist_recovery_command.get(),
-                                "rules": list(self.commands_assist_rules)},
+                                "rules": list(self.commands_assist_rules),
+                                "step_debug_rules": list(self.step_debug_rules)},
+            "analysis_rules": list(self.analysis_rules),
+            "controller_recordings": self._read_controller_recordings(),
+            "quick_actions": self._quick_actions_snapshot(),
             # Controller forwarding authorization intentionally remains session-only.
             "manual_control": {"hardware_enabled": False, "input_permission": False},
         }
@@ -5858,8 +7711,24 @@ class PokeControllerApp:
         self.commands_assist_enabled.set(bool(assist.get("enabled", False)))
         self.commands_assist_recovery_command.set(assist.get("recovery_command", ""))
         self.commands_assist_rules = list(assist.get("rules", []))
+        if isinstance(assist.get("step_debug_rules"), list):
+            self.step_debug_rules = list(assist.get("step_debug_rules", []))
+            self._write_step_debug_rules()
         self._refresh_commands_assist_rule_list()
         self._commands_assist_evaluator.reset()
+        saved_analysis_rules = snapshot.get("analysis_rules")
+        if isinstance(saved_analysis_rules, list):
+            self.analysis_rules = list(saved_analysis_rules)
+            self.analysis_rule_results = {}
+            self._refresh_analysis_rule_list()
+            if hasattr(self, "analysis_rule_engine"):
+                self.analysis_rule_engine.reset()
+        saved_recordings = snapshot.get("controller_recordings")
+        if isinstance(saved_recordings, dict):
+            recordings = self._read_controller_recordings()
+            recordings.update(saved_recordings)
+            self._write_controller_recordings(recordings)
+        self._apply_quick_actions_snapshot(snapshot.get("quick_actions"), refresh=False)
         self.pc_gamepad_input_enabled.set(False)
         self.is_use_Pro_Controller.set(False)
         if runtime:
@@ -6140,6 +8009,71 @@ class PokeControllerApp:
         selected = self.record_output_dir.get().strip()
         return os.path.abspath(selected) if selected else "Recordings"
 
+    def _recording_disk_thresholds(self):
+        try:
+            min_free_gb = max(0.0, float(self.record_min_free_gb.get()))
+        except (tk.TclError, TypeError, ValueError):
+            min_free_gb = 5.0
+            self.record_min_free_gb.set(min_free_gb)
+        try:
+            max_usage = min(100.0, max(0.0, float(self.record_max_disk_usage_percent.get())))
+        except (tk.TclError, TypeError, ValueError):
+            max_usage = 95.0
+            self.record_max_disk_usage_percent.set(max_usage)
+        return min_free_gb, max_usage
+
+    def _recording_disk_space_ok(self, show_popup=False, force=False):
+        """Check both tool/output drives, caching the result for camera callbacks."""
+        now = time.monotonic()
+        if not force and now - self._record_disk_last_check < 2.0:
+            return self._record_disk_last_ok
+        self._record_disk_last_check = now
+        min_free_gb, max_usage = self._recording_disk_thresholds()
+        violations = disk_space_violations(
+            (("ツール", os.path.dirname(os.path.abspath(__file__))),
+             ("録画保存先", self._effective_record_output_dir())),
+            min_free_gb=min_free_gb,
+            max_usage_percent=max_usage,
+        )
+        self._record_disk_last_ok = not violations
+        violation_key = tuple(
+            (item.get("drive"), item.get("error"), round(item.get("free_gb", -1), 2),
+             round(item.get("used_percent", -1), 1))
+            for item in violations
+        )
+        if violations and show_popup and (force or violation_key != self._record_disk_violation_key):
+            details = []
+            for item in violations:
+                if item.get("error"):
+                    details.append("{}: 容量を取得できません\n{}\n{}".format(
+                        item["label"], item["path"], item["error"]))
+                else:
+                    details.append("{} ({})\n空き {:.2f} GB / 使用率 {:.1f}%".format(
+                        item["label"], item["drive"], item["free_gb"], item["used_percent"]))
+            tkmsg.showerror(
+                "Recording: ドライブ容量不足",
+                "録画を開始または継続できません。\n\n{}\n\n"
+                "設定: 最小空き容量 {:.2f} GB / 最大使用率 {:.1f}%".format(
+                    "\n\n".join(details), min_free_gb, max_usage),
+            )
+        self._record_disk_violation_key = violation_key or None
+        return self._record_disk_last_ok
+
+    def _interrupt_recording_for_disk_space(self):
+        """Finalize a partial recording and disarm automatic recording modes."""
+        was_active = self.recorder.active
+        if was_active:
+            self.recorder.stop()
+        self.record_armed = False
+        self._record_variable_active_rule_id = None
+        self._record_variable_evaluator.reset()
+        self.record_button.configure(text="Start recording")
+        if self.record_mode.get() == "Variable":
+            self.record_variable_status.set("ドライブ容量制限: 録画・監視を中断しました。")
+        message = "ドライブ容量の制限により、{}。".format(
+            "録画を中断しました" if was_active else "録画待機を解除しました")
+        self.show_output("Analysis", text=message)
+
     def _apply_record_output_dir(self):
         """Apply the destination to the next recording without moving active files."""
         self.recorder.output_dir = self._effective_record_output_dir()
@@ -6216,6 +8150,8 @@ class PokeControllerApp:
             "trigger_rules": self.record_trigger_rules,
             "cleanup_rules": self.record_cleanup_rules,
             "minimum_duration": self.record_minimum_duration.get(),
+            "min_free_gb": self.record_min_free_gb.get(),
+            "max_disk_usage_percent": self.record_max_disk_usage_percent.get(),
             "variable_command": self.record_variable_command.get(),
             "variable_name": self.record_variable_name.get(),
             "variable_start": self.record_variable_start.get(),
@@ -6260,6 +8196,8 @@ class PokeControllerApp:
         self.record_trigger_rules = data.get("trigger_rules", [])
         self.record_cleanup_rules = data.get("cleanup_rules", [])
         self.record_minimum_duration.set(data.get("minimum_duration", 0))
+        self.record_min_free_gb.set(data.get("min_free_gb", 5.0))
+        self.record_max_disk_usage_percent.set(data.get("max_disk_usage_percent", 95.0))
         self.record_variable_command.set(data.get("variable_command", ""))
         self.record_variable_name.set(data.get("variable_name", "current_step"))
         self.record_variable_start.set(data.get("variable_start", ""))
@@ -6395,6 +8333,41 @@ class PokeControllerApp:
         self.preview.ImgRect(x, y, x + width, y + height, color, "RecordingDebugROI", 0, flag=False)
         self.preview.ImgText(x, max(18, y + 20), text, "RecordingDebugText", 0, color=color, flag=False)
 
+    def _poll_recording_ui_state(self):
+        """Keep the Recording tab and quick button explicit about live state."""
+        try:
+            if self.recorder.active:
+                state = "recording"
+                button_text = "● 録画中（停止）"
+                status_text = "● 録画中：映像を書き込み中です"
+                color = "#c62828"
+            elif self.record_armed:
+                state = "armed"
+                button_text = "● 監視中（停止）"
+                status_text = "● 録画条件を監視中：条件成立で録画を開始します"
+                color = "#b26a00"
+            elif self.recorder.is_finalizing:
+                state = "finalizing"
+                button_text = "○ 録画開始"
+                status_text = "◐ 録画停止中：MP4を保存処理中です"
+                color = "#1565c0"
+            else:
+                state = "idle"
+                button_text = "○ 録画開始"
+                status_text = "○ 録画停止中"
+                color = "#555555"
+            if state != self._recording_ui_state:
+                self._recording_ui_state = state
+                self.record_button_text.set(button_text)
+                self.recording_state_text.set(status_text)
+                self.recording_state_label.configure(fg=color)
+        except (AttributeError, tk.TclError):
+            return
+        try:
+            self.root.after(150, self._poll_recording_ui_state)
+        except tk.TclError:
+            pass
+
     def toggle_recording(self):
         self.configure_recording_rules()
         if self.record_mode.get() == "Variable":
@@ -6417,6 +8390,8 @@ class PokeControllerApp:
                     "start_value": self.record_variable_start.get(), "start_seconds": 0.0,
                     "stop_value": self.record_variable_stop.get(), "stop_seconds": 0.0,
                 }]
+            if not self._recording_disk_space_ok(show_popup=True, force=True):
+                return
             self.record_armed = True
             self._record_variable_evaluator.reset()
             self._record_variable_active_rule_id = None
@@ -6441,6 +8416,8 @@ class PokeControllerApp:
             if configured_rules != expected_rules:
                 tkmsg.showwarning("Recording", "The template image could not be read.")
                 return
+            if not self._recording_disk_space_ok(show_popup=True, force=True):
+                return
             self.record_armed = True
             self.recorder.last_check = 0.0
             self.record_button.configure(text="Stop monitoring")
@@ -6454,6 +8431,8 @@ class PokeControllerApp:
         frame = getattr(self.camera, "image_bgr", None)
         if frame is None:
             tkmsg.showwarning("Recording", "カメラ映像を開始してから録画してください。")
+            return
+        if not self._recording_disk_space_ok(show_popup=True, force=True):
             return
         self.recorder.start(frame, self.fps.get(), self.audio_input.get(), self.audio_gain.get())
         self.record_button.configure(text="Stop recording")
@@ -6806,6 +8785,9 @@ class PokeControllerApp:
                 self._logger.warning("Recording compositor failed: %s", error)
 
     def process_recording_frame(self, frame):
+        if (self.recorder.active or self.record_armed) and not self._recording_disk_space_ok(show_popup=True):
+            self._interrupt_recording_for_disk_space()
+            return
         if self.record_mode.get() == "Manual":
             if not self.recorder.active:
                 return
@@ -6852,6 +8834,9 @@ class PokeControllerApp:
                                   "seconds": rule.get("start_seconds", 0.0)}
                     result = self._record_variable_evaluator.evaluate(start_rule, command, command_name, now)
                     if result["triggered"]:
+                        if not self._recording_disk_space_ok(show_popup=True, force=True):
+                            self._interrupt_recording_for_disk_space()
+                            return
                         self.recorder.start(frame, self.fps.get(), self.audio_input.get(), self.audio_gain.get())
                         self._record_variable_active_rule_id = str(rule.get("id"))
                         self.record_variable_status.set("Recording: {} == {}".format(
@@ -6862,6 +8847,23 @@ class PokeControllerApp:
                 active = next((rule for rule in self.record_variable_rules
                                if str(rule.get("id")) == self._record_variable_active_rule_id), None)
                 if active is not None:
+                    discard_value = active.get("discard_value", "")
+                    if discard_value:
+                        discard_rule = {"id": str(active.get("id")) + ":discard",
+                                        "command": active.get("command", "すべて"),
+                                        "kind": "value_stable", "variable": active.get("variable", ""),
+                                        "value": discard_value,
+                                        "seconds": active.get("discard_seconds", 0.0)}
+                        discard_result = self._record_variable_evaluator.evaluate(
+                            discard_rule, command, command_name, now)
+                        if discard_result["triggered"]:
+                            self.recorder.stop(discard=True)
+                            self.record_variable_status.set(
+                                "Segment discarded: {} == {}. Waiting for next start.".format(
+                                    active.get("variable", ""), discard_result.get("value")))
+                            self._record_variable_active_rule_id = None
+                            self._record_variable_evaluator.reset()
+                            return
                     stop_rule = {"id": str(active.get("id")) + ":stop",
                                  "command": active.get("command", "すべて"),
                                  "kind": "value_stable", "variable": active.get("variable", ""),
@@ -6874,6 +8876,10 @@ class PokeControllerApp:
                             active.get("variable", ""), result.get("value")))
                         self._record_variable_active_rule_id = None
                         self._record_variable_evaluator.reset()
+                        assist_rule_id = str(active.get("assist_rule_id", ""))
+                        if assist_rule_id:
+                            self.root.after(0, lambda rule_id=assist_rule_id:
+                                            self._run_recording_commands_assist(rule_id))
             return
         if not self.record_armed and not self.record_debug.get():
             return
@@ -6894,6 +8900,19 @@ class PokeControllerApp:
             self.root.after(0, lambda: self.record_button.configure(text="Stop monitoring"))
         elif self.recorder.active:
             self.root.after(0, lambda: self.record_button.configure(text="Stop recording"))
+
+    def _run_recording_commands_assist(self, rule_id):
+        """Run a linked pause/replacement action after a normal segment end."""
+        if self._commands_assist_busy:
+            self.commands_assist_status.set("録画終了後の置換処理は、別の置換処理が実行中のため保留されました。")
+            return
+        rule = next((item for item in self.commands_assist_rules
+                     if str(item.get("id", "")) == str(rule_id)), None)
+        if rule is None:
+            self.commands_assist_status.set("録画条件に紐づくCommandsAssistルールが見つかりません。")
+            return
+        self._commands_assist_suppressed_rule_id = str(rule.get("id", ""))
+        self._begin_commands_assist(rule, {"triggered": True, "source": "recording"})
 
     def _sync_settings_for_preset(self):
         """Copy every UI setting owned by the added tabs into GuiSettings."""
@@ -6926,6 +8945,14 @@ class PokeControllerApp:
         self.settings.right_panel_count = self.right_panel_count.get()
         self.settings.side_width_balance = self.side_width_balance.get()
         self.settings.show_software_controller = self.show_software_controller.get()
+        self.settings.quick_actions_left_position = normalize_position(
+            self.quick_actions_left_position.get())
+        self.settings.quick_actions_right_position = normalize_position(
+            self.quick_actions_right_position.get())
+        self.settings.quick_actions_left_items = encode_action_ids(
+            self.quick_actions_left_items)
+        self.settings.quick_actions_right_items = encode_action_ids(
+            self.quick_actions_right_items)
         self.settings.video_source = self.video_source.get()
         self.settings.window_title, self.settings.window_process = self._selected_window_identity()
         self.settings.audio_input = self.audio_input.get()
@@ -6939,6 +8966,8 @@ class PokeControllerApp:
         self.settings.image_assist_console_tag = self.image_assist_console_tag.get()
         self.settings.image_assist_filter_mode = self.image_assist_filter_mode.get()
         self.settings.image_assist_max_candidates = self.image_assist_max_candidates.get()
+        self.settings.analysis_rules_enabled = self.analysis_rules_enabled.get()
+        self.settings.analysis_rules = json.dumps(self.analysis_rules, ensure_ascii=False)
         # Presets must not silently authorize controller forwarding.
         self.settings.pc_gamepad_input_enabled = False
         self.settings.record_mode = self.record_mode.get()
@@ -6952,6 +8981,8 @@ class PokeControllerApp:
         self.settings.record_trigger_rules = json.dumps(self.record_trigger_rules)
         self.settings.record_cleanup_rules = json.dumps(self.record_cleanup_rules)
         self.settings.record_minimum_duration = self.record_minimum_duration.get()
+        self.settings.record_min_free_gb = self.record_min_free_gb.get()
+        self.settings.record_max_disk_usage_percent = self.record_max_disk_usage_percent.get()
         self.settings.record_variable_command = self.record_variable_command.get()
         self.settings.record_variable_name = self.record_variable_name.get()
         self.settings.record_variable_start = self.record_variable_start.get()
@@ -7251,6 +9282,18 @@ class PokeControllerApp:
     def _queue_software_controller(self, action, buttons):
         """Keep serial I/O out of Tk button press/release callbacks."""
         try:
+            # Manual input temporarily owns the controller.  Pausing at the
+            # command's next 10-20 ms checkpoint prevents its next packet from
+            # immediately overwriting what the user just pressed.
+            if action == "hold":
+                command = getattr(self, "cur_command", None)
+                running = command is not None and self.start_button["text"] == "Stop"
+                if running and not getattr(command, "pause_requested", False):
+                    if hasattr(command, "request_pause"):
+                        command.request_pause()
+                    else:
+                        command.pause_requested = True
+                    self._software_controller_paused_command = command
             self._software_controller_queue.put_nowait((action, buttons))
         except Exception as error:
             self._logger.warning("Software Controller queue failed: %s", error)
@@ -7265,6 +9308,14 @@ class PokeControllerApp:
                     self.keys_software_controller.holdEnd(buttons)
                 elif action == "neutral":
                     self.keys_software_controller.neutral()
+                command = self._software_controller_paused_command
+                if (command is not None and action in ("holdEnd", "neutral")
+                        and not self.keys_software_controller.holdButton):
+                    if hasattr(command, "resume"):
+                        command.resume()
+                    else:
+                        command.pause_requested = False
+                    self._software_controller_paused_command = None
             except Exception as error:
                 self._logger.warning("Software Controller send failed: %s", error)
             finally:

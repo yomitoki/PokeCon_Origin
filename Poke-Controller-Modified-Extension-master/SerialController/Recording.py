@@ -152,7 +152,7 @@ class CaptureRecorder:
             with self.frame_lock:
                 self.latest_frame = frame.copy()
 
-    def stop(self):
+    def stop(self, discard=False):
         if not self.active:
             return None
         stopped_at = time.monotonic()
@@ -187,6 +187,10 @@ class CaptureRecorder:
         if self.video:
             self.video.release()
             self.video = None
+        if discard and not getattr(self, "frames_written", 0):
+            shutil.rmtree(getattr(self, "session_dir", ""), ignore_errors=True)
+            print("[RECORDING] Discarded recording by command-variable rule.")
+            return None
         if not getattr(self, "frames_written", 0):
             print("[RECORDING] No video frames were received; keeping audio file only.")
             return self.wav_path if os.path.isfile(self.wav_path) else None
@@ -203,7 +207,7 @@ class CaptureRecorder:
         process_audio_gain = self.process_audio_gain
         threading.Thread(target=self._finalize_worker,
                          args=(video_path, wav_path, mp4_path, actual_fps, elapsed,
-                               process_audio_gain), daemon=True).start()
+                               process_audio_gain, bool(discard)), daemon=True).start()
         print("[RECORDING] Finalizing MP4 in background ({:.2f} captured FPS): {}".format(actual_fps, mp4_path))
         return mp4_path
 
@@ -213,16 +217,21 @@ class CaptureRecorder:
             return self._finalizing_count > 0
 
     def _finalize_worker(self, video_path, wav_path, mp4_path, actual_fps, elapsed,
-                         process_audio_gain=1.0):
+                         process_audio_gain=1.0, discard=False):
         try:
             self._finalize(video_path, wav_path, mp4_path, actual_fps, elapsed,
-                           process_audio_gain)
+                           process_audio_gain, discard)
         finally:
             with self.lock:
                 self._finalizing_count = max(0, self._finalizing_count - 1)
 
     def _finalize(self, video_path, wav_path, mp4_path, actual_fps, elapsed,
-                  process_audio_gain=1.0):
+                  process_audio_gain=1.0, discard=False):
+        if discard:
+            session_dir = os.path.dirname(video_path)
+            print("[RECORDING] Discarded recording by command-variable rule.")
+            shutil.rmtree(session_dir, ignore_errors=True)
+            return None
         reason = self._discard_reason(video_path, elapsed)
         if reason:
             session_dir = os.path.dirname(video_path)

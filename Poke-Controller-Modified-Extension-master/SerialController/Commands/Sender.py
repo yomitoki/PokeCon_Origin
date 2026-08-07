@@ -7,6 +7,7 @@ import math
 import os
 import time
 import platform
+import threading
 
 import serial
 from logging import getLogger, DEBUG, NullHandler
@@ -18,6 +19,10 @@ if TYPE_CHECKING:
 class Sender:
     def __init__(self, is_show_serial: tk.BooleanVar, if_print: bool = True):
         self.ser = None
+        # Commands and manual controllers can write concurrently.  Serialize
+        # complete packets so a manual input is never interleaved with a
+        # command packet at the byte-stream level.
+        self.write_lock = threading.RLock()
         self.is_show_serial = is_show_serial
 
         self._logger = getLogger(__name__)
@@ -104,7 +109,8 @@ class Sender:
                 output = self.before.split(" ")
                 self.show_input(output)
 
-            self.ser.write((row + "\r\n").encode("utf-8"))
+            with self.write_lock:
+                self.ser.write((row + "\r\n").encode("utf-8"))
             self.time_aft = time.perf_counter()
             self.before = row
         except serial.serialutil.SerialException as e:
@@ -126,7 +132,8 @@ class Sender:
             if self.before is not None and self.before != "end" and is_show:
                 pass
 
-            self.ser.write(values)
+            with self.write_lock:
+                self.ser.write(values)
             self.time_aft = time.perf_counter()
             self.before = values
         except serial.serialutil.SerialException as e:
@@ -143,7 +150,8 @@ class Sender:
 
     def writeRow_wo_perf_counter(self, row: str, is_show: bool = False):
         try:
-            self.ser.write((row + "\r\n").encode("utf-8"))
+            with self.write_lock:
+                self.ser.write((row + "\r\n").encode("utf-8"))
         except serial.serialutil.SerialException as e:
             # エラーはあえてprintでも出す。
             print(e)

@@ -24,6 +24,7 @@ import threading
 import textwrap
 import tokenize
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from CommandBuilder import command_path, folder_segment, python_identifier, template_source
@@ -33,6 +34,9 @@ from SampleProgramLoader import inspect_sample_program
 from SampleFunctionSync import compare_folder as compare_sample_function_folder
 from SampleFunctionSync import update_fragments as update_sample_function_fragments
 from SampleFunctionSync import update_source as update_source_sample_functions
+from SampleFunctionSync import propagate_functions as propagate_sample_functions
+from SampleFunctionSync import replace_class_functions
+from SampleFunctionSync import function_records as sample_sync_function_records
 from ImageDetectionLibrary import (folder_tags as image_folder_tags,
                                    generate_image_check,
                                    load_library as load_image_library,
@@ -146,6 +150,8 @@ class TagPicker(ttk.Frame):
 class DevStudio(tk.Tk):
     def __init__(self, initial_root):
         tk.Tk.__init__(self)
+        self.code_font = tkfont.Font(self, family="Consolas", size=10)
+        self.code_tabs = (self.code_font.measure("    "),)
         self.title("PokeCon Dev Studio")
         self.geometry("1280x780")
         self.minsize(900, 560)
@@ -554,10 +560,12 @@ class DevStudio(tk.Tk):
         editor_box = ttk.Frame(center)
         editor_box.pack(fill="both", expand=True)
         self.line_numbers = tk.Text(editor_box, width=5, padx=3, takefocus=0, state="disabled",
-                                    wrap="none", background="#f0f0f0", foreground="#666666")
+                                    wrap="none", background="#f0f0f0", foreground="#666666",
+                                    font=self.code_font, tabs=self.code_tabs)
         self.line_numbers.pack(fill="y", side="left")
         self.editor = tk.Text(editor_box, wrap="none", undo=True, background="#1e1e1e", foreground="#d4d4d4",
-                              insertbackground="white", selectbackground="#264f78")
+                              insertbackground="white", selectbackground="#264f78",
+                              font=self.code_font, tabs=self.code_tabs)
         self.editor.pack(fill="both", expand=True, side="left")
         editor_scroll = ttk.Scrollbar(editor_box, orient="vertical", command=self._scroll_editor)
         editor_scroll.pack(fill="y", side="right")
@@ -1637,7 +1645,8 @@ class DevStudio(tk.Tk):
         self.fragment_class_vars = tk.Text(form, height=4, undo=True)
         self.fragment_class_vars.grid(column=1, row=4, padx=6, pady=4, sticky="ew")
         ttk.Label(form, text="実行開始時の初期化コード:").grid(column=0, row=5, padx=6, pady=4, sticky="nw")
-        self.fragment_initializer = tk.Text(form, height=5, undo=True, wrap="none", tabs=("4c",))
+        self.fragment_initializer = tk.Text(form, height=5, undo=True, wrap="none",
+                                            font=self.code_font, tabs=self.code_tabs)
         self.fragment_initializer.grid(column=1, row=5, padx=6, pady=4, sticky="ew")
         ttk.Label(form, text="Start後、関数処理より前に実行します。self.xxx = 0 やSteam画面のアクティブ化を記述します。").grid(
             column=2, columnspan=2, row=5, padx=6, pady=4, sticky="nw")
@@ -1648,9 +1657,11 @@ class DevStudio(tk.Tk):
         fragment_editor_frame.grid(column=1, row=6, padx=6, pady=(24, 4), sticky="nsew")
         self.fragment_line_numbers = tk.Text(fragment_editor_frame, width=6, padx=4, takefocus=0, state="disabled",
                                              wrap="none", background="#252526", foreground="#858585",
-                                             selectbackground="#264f78", cursor="arrow")
+                                             selectbackground="#264f78", cursor="arrow",
+                                             font=self.code_font, tabs=self.code_tabs)
         self.fragment_line_numbers.pack(side="left", fill="y")
-        self.fragment_body = tk.Text(fragment_editor_frame, height=20, undo=True, wrap="none", tabs=("4c",))
+        self.fragment_body = tk.Text(fragment_editor_frame, height=20, undo=True, wrap="none",
+                                     font=self.code_font, tabs=self.code_tabs)
         self.fragment_body.insert("1.0", "# @pokedev-fragment: new_fragment\n# Inserted into the selected Step user block.\n")
         fragment_y = ttk.Scrollbar(fragment_editor_frame, orient="vertical", command=self._scroll_fragment_editor)
         fragment_y.pack(side="right", fill="y")
@@ -1810,11 +1821,14 @@ class DevStudio(tk.Tk):
         dialog.geometry("1050x650")
         dialog.transient(self)
         folder_var = tk.StringVar(value=self.fragment_folder.get() or self.fragment_root())
+        search_var = tk.StringVar()
         summary_var = tk.StringVar(value="")
         top = ttk.Frame(dialog); top.pack(fill="x", padx=7, pady=7)
         ttk.Label(top, text="比較フォルダー:").pack(side="left")
         ttk.Entry(top, textvariable=folder_var).pack(side="left", fill="x", expand=True, padx=4)
-        state = {"comparisons": []}
+        ttk.Label(top, text="関数検索:").pack(side="left", padx=(8, 2))
+        ttk.Entry(top, textvariable=search_var, width=24).pack(side="left", padx=2)
+        state = {"comparisons": [], "visible": {}}
         tree = ttk.Treeview(dialog, columns=("status", "path"), show="tree headings", selectmode="extended")
         tree.heading("#0", text="関数名"); tree.heading("status", text="状態"); tree.heading("path", text="サンプル関数ファイル")
         tree.column("#0", width=330); tree.column("status", width=150); tree.column("path", width=520)
@@ -1828,20 +1842,34 @@ class DevStudio(tk.Tk):
             try: return bool(dialog.winfo_exists())
             except tk.TclError: return False
 
+        def populate():
+            if not dialog_alive(): return
+            root = self.fragment_root()
+            needle = search_var.get().strip().casefold()
+            tree.delete(*tree.get_children())
+            state["visible"] = {}
+            counts = {key: 0 for key in status_labels}
+            shown = 0
+            for item in state["comparisons"]:
+                counts[item["status"]] += 1
+                paths = ", ".join(os.path.relpath(value["path"], root) for value in item["fragments"])
+                searchable = "{} {} {}".format(item["name"], paths, status_labels[item["status"]]).casefold()
+                if needle and needle not in searchable:
+                    continue
+                iid = tree.insert("", "end", text=item["name"],
+                                  values=(status_labels[item["status"]], paths), tags=(item["status"],))
+                state["visible"][iid] = item
+                shown += 1
+            summary_var.set("表示{} / 全{}件 / 一致{} / 不一致{} / 未登録{} / 重複{}".format(
+                shown, len(state["comparisons"]), counts["match"], counts["different"],
+                counts["missing_source"], counts["duplicate"]))
+
         def refresh():
             source, root, folder = self.editor.get("1.0", "end-1c"), self.fragment_root(), folder_var.get()
             def completed(comparisons):
                 if not dialog_alive(): return
                 state["comparisons"] = comparisons
-                tree.delete(*tree.get_children())
-                counts = {key: 0 for key in status_labels}
-                for item in comparisons:
-                    counts[item["status"]] += 1
-                    paths = ", ".join(os.path.relpath(value["path"], root) for value in item["fragments"])
-                    iid = tree.insert("", "end", text=item["name"], values=(status_labels[item["status"]], paths), tags=(item["status"],))
-                    if item["status"] != "match": tree.selection_add(iid)
-                summary_var.set("全{}件 / 一致{} / 不一致{} / 未登録{} / 重複{}".format(
-                    len(comparisons), counts["match"], counts["different"], counts["missing_source"], counts["duplicate"]))
+                populate()
             def failed(error):
                 if dialog_alive(): messagebox.showwarning("サンプル関数チェック", str(error), parent=dialog)
             self.run_background("sample_function_check", "サンプル関数を比較中",
@@ -1852,12 +1880,16 @@ class DevStudio(tk.Tk):
             if selected:
                 folder_var.set(selected); self.fragment_folder.set(selected); refresh()
 
-        def mismatch_names(for_source):
-            allowed = ("different", "missing_source") if for_source else ("different",)
-            return [item["name"] for item in state["comparisons"] if item["status"] in allowed]
+        def selected_items():
+            return [state["visible"][iid] for iid in tree.selection() if iid in state["visible"]]
 
-        def library_to_source():
-            names = mismatch_names(True)
+        def mismatch_names(for_source, selected_only=False):
+            allowed = ("different", "missing_source") if for_source else ("different",)
+            source_items = selected_items() if selected_only else state["comparisons"]
+            return [item["name"] for item in source_items if item["status"] in allowed]
+
+        def library_to_source(selected_only=False):
+            names = mismatch_names(True, selected_only)
             if not names:
                 messagebox.showinfo("サンプル関数チェック", "ソースへ反映する不一致はありません。", parent=dialog); return
             if not messagebox.askyesno("サンプル関数 → ソース", "{}件の関数を現在のソースへ反映しますか？".format(len(names)), parent=dialog): return
@@ -1870,8 +1902,8 @@ class DevStudio(tk.Tk):
             self.run_background("sample_to_source", "サンプル関数をソースへ反映中",
                                 lambda: update_source_sample_functions(source, comparisons, names), completed)
 
-        def source_to_library():
-            names = mismatch_names(False)
+        def source_to_library(selected_only=False):
+            names = mismatch_names(False, selected_only)
             if not names:
                 messagebox.showinfo("サンプル関数チェック", "サンプル関数へ反映する不一致はありません。", parent=dialog); return
             if not messagebox.askyesno("ソース → サンプル関数", "{}件のサンプル関数を現在のソース内容で更新しますか？".format(len(names)), parent=dialog): return
@@ -1883,8 +1915,304 @@ class DevStudio(tk.Tk):
             self.run_background("source_to_samples", "ソース内容をサンプル関数へ反映中",
                                 lambda: update_sample_function_fragments(source, comparisons, names), completed)
 
+        def fragment_id_for(item):
+            if len(item.get("fragments", [])) != 1:
+                return None
+            wanted = os.path.abspath(item["fragments"][0]["path"])
+            for catalog_item in self.fragment_catalog():
+                try:
+                    _, _, _, body_path = load_fragment(self.fragment_root(), catalog_item["id"])
+                except (OSError, ValueError, KeyError):
+                    continue
+                if os.path.abspath(body_path) == wanted:
+                    return catalog_item["id"]
+            return None
+
+        def edit_selected():
+            items = selected_items()
+            if len(items) != 1:
+                messagebox.showinfo("関数置換", "編集するサンプル関数を1つ選択してください。", parent=dialog); return
+            fragment_id = fragment_id_for(items[0])
+            if not fragment_id:
+                messagebox.showwarning("関数置換", "サンプル関数の登録情報を特定できません。", parent=dialog); return
+            dialog.destroy()
+            self.load_fragment_for_editing(fragment_id)
+
+        def delete_selected():
+            items = selected_items()
+            if len(items) != 1:
+                messagebox.showinfo("関数置換", "削除するサンプル関数を1つ選択してください。", parent=dialog); return
+            fragment_id = fragment_id_for(items[0])
+            if not fragment_id:
+                messagebox.showwarning("関数置換", "サンプル関数の登録情報を特定できません。", parent=dialog); return
+            if self.delete_fragment(fragment_id):
+                refresh()
+
+        def open_replacement_picker():
+            """Choose one sample/file function and apply it to selected current methods."""
+            picker = tk.Toplevel(dialog)
+            picker.title("関数置換 - 置換元と反映先を選択")
+            picker.geometry("1080x680")
+            picker.transient(dialog)
+            mode_var = tk.StringVar(value="サンプル関数")
+            source_path_var = tk.StringVar(value=self.current_path or "")
+            source_search_var = tk.StringVar()
+            target_search_var = tk.StringVar()
+            propagate_var = tk.BooleanVar(value=False)
+            picker_state = {"sources": {}, "targets": {}, "specified": []}
+
+            source_top = ttk.Frame(picker); source_top.pack(fill="x", padx=8, pady=(8, 3))
+            ttk.Label(source_top, text="置換元:").pack(side="left")
+            mode_combo = ttk.Combobox(source_top, textvariable=mode_var, state="readonly", width=18,
+                                      values=("サンプル関数", "指定Pythonファイル"))
+            mode_combo.pack(side="left", padx=4)
+            source_path_entry = ttk.Entry(source_top, textvariable=source_path_var)
+            source_path_entry.pack(side="left", fill="x", expand=True, padx=4)
+
+            panes = ttk.Panedwindow(picker, orient="horizontal"); panes.pack(fill="both", expand=True, padx=8, pady=5)
+            source_frame = ttk.LabelFrame(panes, text="置換元関数（1つ）")
+            target_frame = ttk.LabelFrame(panes, text="反映先関数（複数選択可）")
+            panes.add(source_frame, weight=1); panes.add(target_frame, weight=1)
+            source_filter = ttk.Frame(source_frame); source_filter.pack(fill="x", padx=5, pady=5)
+            ttk.Label(source_filter, text="検索:").pack(side="left")
+            ttk.Entry(source_filter, textvariable=source_search_var).pack(side="left", fill="x", expand=True, padx=3)
+            source_tree = ttk.Treeview(source_frame, columns=("origin",), show="tree headings", selectmode="browse")
+            source_tree.heading("#0", text="関数名"); source_tree.heading("origin", text="取得元")
+            source_tree.column("#0", width=240); source_tree.column("origin", width=280)
+            source_tree.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+            target_filter = ttk.Frame(target_frame); target_filter.pack(fill="x", padx=5, pady=5)
+            ttk.Label(target_filter, text="検索:").pack(side="left")
+            ttk.Entry(target_filter, textvariable=target_search_var).pack(side="left", fill="x", expand=True, padx=3)
+            target_tree = ttk.Treeview(target_frame, columns=("line",), show="tree headings", selectmode="extended")
+            target_tree.heading("#0", text="関数名"); target_tree.heading("line", text="現在ソースの行")
+            target_tree.column("#0", width=300); target_tree.column("line", width=140)
+            target_tree.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+
+            options = ttk.Frame(picker); options.pack(fill="x", padx=8, pady=3)
+            propagate_check = ttk.Checkbutton(
+                options, text="サンプル関数の場合、プロジェクト内の同名関数の使用箇所すべてへ反映",
+                variable=propagate_var)
+            propagate_check.pack(side="left")
+
+            def read_path_source(path):
+                if path and self.current_path and os.path.abspath(path) == os.path.abspath(self.current_path):
+                    return self.editor.get("1.0", "end-1c")
+                return "".join(self._read_lines(path))
+
+            def load_specified(show_errors=True):
+                path = source_path_var.get().strip()
+                if not path or not os.path.isfile(path):
+                    picker_state["specified"] = []
+                    if show_errors:
+                        messagebox.showwarning("関数置換", "取得元のPythonファイルを選択してください。", parent=picker)
+                    return
+                try:
+                    specified_source = read_path_source(path)
+                    try:
+                        records = sample_sync_function_records(specified_source, class_only=True)
+                    except ValueError:
+                        records = sample_sync_function_records(specified_source, class_only=False)
+                except (SyntaxError, ValueError) as error:
+                    picker_state["specified"] = []
+                    if show_errors:
+                        messagebox.showwarning("関数置換", "指定ファイルの関数を読み込めません:\n{}".format(error), parent=picker)
+                    return
+                picker_state["specified"] = [dict(record, name=name, path=path, kind="specified")
+                                             for name, record in records.items()]
+
+            def populate_sources():
+                source_tree.delete(*source_tree.get_children())
+                picker_state["sources"] = {}
+                needle = source_search_var.get().strip().casefold()
+                if mode_var.get() == "サンプル関数":
+                    values = []
+                    for item in state["comparisons"]:
+                        if item.get("status") == "duplicate" or len(item.get("fragments", [])) != 1:
+                            continue
+                        fragment = item["fragments"][0]
+                        values.append({"name": item["name"], "text": fragment["text"], "path": fragment["path"],
+                                       "kind": "sample", "item": item})
+                else:
+                    values = picker_state["specified"]
+                for value in sorted(values, key=lambda row: row["name"].casefold()):
+                    origin = os.path.relpath(value["path"], self.root_dir.get()) if value.get("path") else ""
+                    if needle and needle not in (value["name"] + " " + origin).casefold():
+                        continue
+                    iid = source_tree.insert("", "end", text=value["name"], values=(origin,))
+                    picker_state["sources"][iid] = value
+
+            def populate_targets():
+                target_tree.delete(*target_tree.get_children())
+                picker_state["targets"] = {}
+                needle = target_search_var.get().strip().casefold()
+                try:
+                    records = sample_sync_function_records(self.editor.get("1.0", "end-1c"), class_only=True)
+                except (SyntaxError, ValueError) as error:
+                    messagebox.showwarning("関数置換", "現在のソースを解析できません:\n{}".format(error), parent=picker)
+                    return
+                for name, record in sorted(records.items(), key=lambda pair: pair[0].casefold()):
+                    if needle and needle not in name.casefold():
+                        continue
+                    iid = target_tree.insert("", "end", text=name, values=(record["start"] + 1,))
+                    picker_state["targets"][iid] = dict(record, name=name)
+
+            def update_mode(*_args):
+                specified = mode_var.get() == "指定Pythonファイル"
+                source_path_entry.configure(state="normal" if specified else "disabled")
+                browse_button.configure(state="normal" if specified else "disabled")
+                reload_button.configure(state="normal" if specified else "disabled")
+                propagate_check.configure(state="disabled" if specified else "normal")
+                if specified:
+                    propagate_var.set(False); load_specified(show_errors=False)
+                populate_sources()
+
+            def choose_source_file():
+                initial = source_path_var.get().strip() or self.root_dir.get()
+                selected = filedialog.askopenfilename(parent=picker,
+                                                      initialdir=os.path.dirname(initial) if os.path.isfile(initial) else initial,
+                                                      filetypes=(("Python", "*.py"), ("すべて", "*.*")))
+                if selected:
+                    source_path_var.set(selected); load_specified(); populate_sources()
+
+            def selected_source():
+                selection = source_tree.selection()
+                return picker_state["sources"].get(selection[0]) if selection else None
+
+            def edit_source():
+                source = selected_source()
+                if not source:
+                    messagebox.showinfo("関数置換", "編集する置換元関数を1つ選択してください。", parent=picker); return
+                if source["kind"] == "sample":
+                    fragment_id = fragment_id_for(source["item"])
+                    if not fragment_id:
+                        messagebox.showwarning("関数置換", "サンプル関数の登録情報を特定できません。", parent=picker); return
+                    picker.destroy(); dialog.destroy(); self.load_fragment_for_editing(fragment_id)
+                    return
+                path, line = source["path"], source["start"] + 1
+                picker.destroy(); dialog.destroy()
+                if self.current_path and os.path.abspath(path) == os.path.abspath(self.current_path):
+                    self.editor.mark_set("insert", "{}.0".format(line)); self.editor.see("{}.0".format(line)); self.editor.focus_set()
+                else:
+                    self.show_file(path, line)
+
+            def delete_source():
+                source = selected_source()
+                if not source or source["kind"] != "sample":
+                    messagebox.showinfo("関数置換", "削除できるサンプル関数を1つ選択してください。", parent=picker); return
+                fragment_id = fragment_id_for(source["item"])
+                if not fragment_id:
+                    messagebox.showwarning("関数置換", "サンプル関数の登録情報を特定できません。", parent=picker); return
+                if self.delete_fragment(fragment_id):
+                    state["comparisons"] = [item for item in state["comparisons"] if item is not source["item"]]
+                    populate(); populate_sources()
+
+            def apply_replacement():
+                source = selected_source()
+                target_rows = [picker_state["targets"][iid] for iid in target_tree.selection()
+                               if iid in picker_state["targets"]]
+                if not source or not target_rows:
+                    messagebox.showinfo("関数置換", "置換元関数を1つ、反映先関数を1つ以上選択してください。", parent=picker); return
+                function_texts = {row["name"]: source["text"] for row in target_rows}
+                use_everywhere = source["kind"] == "sample" and propagate_var.get()
+                detail = "\nプロジェクト内の同名関数の使用箇所にも反映します。" if use_everywhere else ""
+                if not messagebox.askyesno(
+                        "関数置換",
+                        "置換元: {}\n反映先: {}{}\n\n反映しますか？".format(
+                            source["name"], ", ".join(row["name"] for row in target_rows), detail), parent=picker):
+                    return
+                current_source = self.editor.get("1.0", "end-1c")
+                try:
+                    updated = replace_class_functions(current_source, function_texts)
+                except (SyntaxError, ValueError) as error:
+                    messagebox.showerror("関数置換", str(error), parent=picker); return
+                if updated == current_source:
+                    messagebox.showinfo("関数置換", "反映対象に変更はありません。", parent=picker); return
+                self.set_editor_content(updated, self.current_path)
+                self.editor_dirty = True; self.update_editor_view(); populate_targets(); refresh()
+                if not use_everywhere:
+                    self.status.set("関数を{}件置換しました。現在のソースを保存してください。".format(len(function_texts)))
+                    messagebox.showinfo("関数置換", "現在のソースへ反映しました。\n保存してください。", parent=picker)
+                    return
+                current_path = os.path.abspath(self.current_path) if self.current_path else ""
+                disk_paths = [path for path in self.files if str(path).lower().endswith(".py")
+                              and os.path.abspath(path) != current_path]
+
+                def completed(changed_paths):
+                    self.refresh_index(); refresh()
+                    parent = picker if picker.winfo_exists() else self
+                    messagebox.showinfo("使用箇所へ反映", "{}ファイルへ反映しました。\n現在のソースは保存してください。".format(
+                        len(changed_paths) + 1), parent=parent)
+                self.run_background("picked_sample_usage_replace", "選択サンプルを使用箇所へ反映中",
+                                    lambda: propagate_sample_functions(disk_paths, function_texts), completed)
+
+            browse_button = ttk.Button(source_top, text="選択...", command=choose_source_file)
+            browse_button.pack(side="left", padx=2)
+            reload_button = ttk.Button(source_top, text="再読込", command=lambda: (load_specified(), populate_sources()))
+            reload_button.pack(side="left", padx=2)
+            buttons = ttk.Frame(picker); buttons.pack(fill="x", padx=8, pady=(3, 8))
+            ttk.Button(buttons, text="選択した関数を反映", command=apply_replacement).pack(side="left", padx=3)
+            ttk.Button(buttons, text="置換元を編集", command=edit_source).pack(side="left", padx=3)
+            ttk.Button(buttons, text="置換元を削除", command=delete_source).pack(side="left", padx=3)
+            ttk.Button(buttons, text="閉じる", command=picker.destroy).pack(side="right", padx=3)
+            mode_combo.bind("<<ComboboxSelected>>", update_mode)
+            source_search_var.trace_add("write", lambda *_args: self.debounce("replacement_source_search", 100, populate_sources))
+            target_search_var.trace_add("write", lambda *_args: self.debounce("replacement_target_search", 100, populate_targets))
+            populate_targets(); update_mode()
+
+        def apply_to_all_usages():
+            items = [item for item in selected_items()
+                     if item.get("status") != "duplicate" and len(item.get("fragments", [])) == 1]
+            if not items:
+                messagebox.showinfo("関数置換", "反映するサンプル関数を選択してください。", parent=dialog); return
+            function_texts = {item["name"]: item["fragments"][0]["text"] for item in items}
+            python_paths = [path for path in self.files if str(path).lower().endswith(".py")]
+            current_path = os.path.abspath(self.current_path) if self.current_path else ""
+            disk_paths = [path for path in python_paths if os.path.abspath(path) != current_path]
+            if not messagebox.askyesno(
+                    "使用箇所へ反映",
+                    "選択した{}関数を、プロジェクト内の同名関数を使用している箇所へ反映します。\n"
+                    "検索対象: {}ファイル\n続行しますか？".format(len(function_texts), len(python_paths)),
+                    parent=dialog): return
+            current_source = self.editor.get("1.0", "end-1c")
+
+            def worker():
+                changed_paths = propagate_sample_functions(disk_paths, function_texts)
+                try:
+                    updated_current = replace_class_functions(current_source, function_texts)
+                except (SyntaxError, ValueError):
+                    updated_current = current_source
+                return changed_paths, updated_current
+
+            def completed(result):
+                if not dialog_alive(): return
+                changed_paths, updated_current = result
+                current_changed = updated_current != current_source
+                if current_changed:
+                    self.set_editor_content(updated_current, self.current_path)
+                    self.editor_dirty = True
+                    self.update_editor_view()
+                self.refresh_index(); refresh()
+                messagebox.showinfo(
+                    "使用箇所へ反映",
+                    "{}ファイルへ反映しました。{}".format(
+                        len(changed_paths) + (1 if current_changed else 0),
+                        "現在のソースは保存してください。" if current_changed else ""), parent=dialog)
+            self.run_background("sample_usage_replace", "サンプル関数を使用箇所へ反映中", worker, completed)
+
         ttk.Button(top, text="フォルダー選択", command=choose_folder).pack(side="left", padx=2)
         ttk.Button(top, text="再チェック", command=refresh).pack(side="left", padx=2)
+        search_var.trace_add("write", lambda *args: self.debounce("sample_function_search", 120, populate))
+        selected_actions = ttk.Frame(dialog); selected_actions.pack(fill="x", padx=7, pady=(2, 0))
+        ttk.Button(selected_actions, text="関数を選んで置換...",
+                   command=open_replacement_picker).pack(side="left", padx=3)
+        ttk.Button(selected_actions, text="選択 サンプル関数 → 現在ソース",
+                   command=lambda: library_to_source(True)).pack(side="left", padx=3)
+        ttk.Button(selected_actions, text="選択 現在ソース → サンプル関数",
+                   command=lambda: source_to_library(True)).pack(side="left", padx=3)
+        ttk.Button(selected_actions, text="選択サンプルを使用箇所すべてへ反映",
+                   command=apply_to_all_usages).pack(side="left", padx=3)
+        ttk.Button(selected_actions, text="編集", command=edit_selected).pack(side="right", padx=3)
+        ttk.Button(selected_actions, text="削除", command=delete_selected).pack(side="right", padx=3)
         bottom = ttk.Frame(dialog); bottom.pack(fill="x", padx=7, pady=7)
         ttk.Label(bottom, textvariable=summary_var).pack(side="left")
         ttk.Button(bottom, text="画像検知も ソース → 登録設定", command=lambda: (
@@ -2001,7 +2329,7 @@ class DevStudio(tk.Tk):
         try:
             metadata, _, metadata_path, body_path = load_fragment(self.fragment_root(), fragment_id)
         except (OSError, ValueError, KeyError) as error:
-            messagebox.showerror("Fragment", str(error), parent=self); return
+            messagebox.showerror("Fragment", str(error), parent=self); return False
         data = self._read_sample_lists(); used_by = []
         for list_name, item in data["lists"].items():
             if any(member["type"] == "fragment" and member["id"] == fragment_id for member in item["members"]):
@@ -2012,7 +2340,7 @@ class DevStudio(tk.Tk):
                 self.ui_text("Delete registered sample function", "登録済みサンプル関数の削除"),
                 self.ui_text("Delete '{}'?{}\n\nThis removes its metadata/body files and list references.",
                              "「{}」を削除しますか？{}\n\nメタデータ、関数コード、リストからの参照が削除されます。").format(
-                                 metadata.get("name", fragment_id), detail), parent=self): return
+                                 metadata.get("name", fragment_id), detail), parent=self): return False
         for item in data["lists"].values():
             item["members"] = [member for member in item["members"] if not (member["type"] == "fragment" and member["id"] == fragment_id)]
         self._write_sample_lists(data)
@@ -2024,12 +2352,13 @@ class DevStudio(tk.Tk):
         except OSError as error:
             messagebox.showerror(self.ui_text("Sample function", "サンプル関数"),
                                  self.ui_text("References were removed, but a file could not be deleted: {}",
-                                              "リストからの参照は削除されましたが、ファイルを削除できませんでした: {}").format(error), parent=self); return
+                                              "リストからの参照は削除されましたが、ファイルを削除できませんでした: {}").format(error), parent=self); return False
         self._fragment_catalog_cache = None
         if self.editing_fragment_id == fragment_id: self.cancel_fragment_edit()
         self.refresh_registered_fragment_choices(); self.refresh_sample_lists_tab(select=self.sample_list_name.get().strip())
         self.refresh_catalog_tag_choices(); self.rebuild_catalog_folder_tree()
         self.status.set(self.ui_text("Deleted registered sample function: ", "登録済みサンプル関数を削除しました: ") + metadata.get("name", fragment_id))
+        return True
 
     def choose_fragment_folder(self):
         root = self.fragment_root()
@@ -2636,9 +2965,11 @@ class DevStudio(tk.Tk):
         editor_frame.pack(fill="both", expand=True, padx=10, pady=(4, 10))
         self.sample_program_line_numbers = tk.Text(editor_frame, width=6, padx=4, takefocus=0, state="disabled",
                                                    wrap="none", background="#252526", foreground="#858585",
-                                                   selectbackground="#264f78", cursor="arrow")
+                                                   selectbackground="#264f78", cursor="arrow",
+                                                   font=self.code_font, tabs=self.code_tabs)
         self.sample_program_line_numbers.pack(side="left", fill="y")
-        self.sample_program_editor = tk.Text(editor_frame, undo=True, wrap="none", tabs=("4c",),
+        self.sample_program_editor = tk.Text(editor_frame, undo=True, wrap="none",
+                                             font=self.code_font, tabs=self.code_tabs,
                                              background="#1e1e1e", foreground="#d4d4d4",
                                              insertbackground="white", selectbackground="#264f78")
         self.sample_program_editor.pack(side="left", fill="both", expand=True)

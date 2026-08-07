@@ -5,8 +5,41 @@ The evaluator stores only small scalar snapshots and is intended to run at
 """
 from __future__ import annotations
 
+import ast
 import re
 import time
+
+
+def discover_state_values(source, variable_name):
+    """Extract selectable state-table keys from Python source text."""
+    target = str(variable_name or "").strip().upper()
+    wanted_names = {target}
+    if target in ("STEP", "CURRENT_STEP"):
+        wanted_names.update(("STEP_LABELS", "STEPS"))
+    found = set()
+    tree = ast.parse(str(source))
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)):
+            continue
+        assigned = node.targets if isinstance(node, ast.Assign) else [node.target]
+        names = set()
+        for item in assigned:
+            if isinstance(item, ast.Name):
+                names.add(item.id.upper())
+            elif isinstance(item, ast.Attribute):
+                names.add(item.attr.upper())
+        if names.intersection(wanted_names) and isinstance(node.value, ast.Dict):
+            for key in node.value.keys:
+                if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                    found.add(key.value)
+    if not found:
+        story = re.fullmatch(r"STATE_(\d+)_STORY_FUNCTION", target)
+        prefix = story.group(1) + "_STORY_" if story else ""
+        for match in re.finditer(r"['\"]([A-Z0-9_]{4,})['\"]", str(source)):
+            value = match.group(1)
+            if (not prefix or value.startswith(prefix)) and ("STORY" in value or "STEP" in value):
+                found.add(value)
+    return sorted(found, key=str.casefold)
 
 
 def resolve_command_value(command, requested_name):
