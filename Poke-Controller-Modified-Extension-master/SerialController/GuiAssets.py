@@ -23,6 +23,7 @@ from Commands.Keys import Direction, Stick, Touchscreen, NEUTRAL, KeyPress
 import logging
 from logging import StreamHandler, getLogger, DEBUG, NullHandler
 from Commands.PythonCommandBase import PythonCommand
+from UiResponsiveness import preview_render_interval
 
 try:
     os.makedirs("log")
@@ -105,7 +106,17 @@ class CaptureArea(tk.Canvas):
         self.region_listener = None
         self.frame_listener = None
         self.record_listener = None
+        self.render_priority_provider = None
         self._last_listener_time = 0.0
+        self._last_preview_render_time = 0.0
+        self._requested_fps = 30
+        self._last_lstick_send = 0.0
+        self._last_rstick_send = 0.0
+        self._last_lstick_position = None
+        self._last_rstick_position = None
+        # A default serial packet is roughly 15-20 ms at 9600 bps.  Sending
+        # every mouse-motion event builds a firmware/driver backlog.
+        self._manual_stick_interval = 0.020
 
         self.stick_handler = StreamHandler()
         self.stick_logging_level = DEBUG
@@ -211,8 +222,12 @@ class CaptureArea(tk.Canvas):
         self.frame_listener = listener
 
     def set_record_listener(self, listener):
-        """Set a callback invoked for every displayed capture frame."""
+        """Set a callback for every capture frame, before preview throttling."""
         self.record_listener = listener
+
+    def set_render_priority_provider(self, provider):
+        """Set a callback returning (last-active-PokeCon, allow-full-rate)."""
+        self.render_priority_provider = provider
 
     def StartOutputRegion(self, event):
         self.min_x, self.min_y = event.x, event.y
@@ -395,13 +410,15 @@ class CaptureArea(tk.Canvas):
 
     def setFps(self, fps):
         # self.next_frames = int(16 * (60 / int(fps)))
-        self.next_frames = int(1000 / int(fps))
+        self._requested_fps = max(1, int(fps))
+        self.next_frames = max(1, int(1000 / self._requested_fps))
         self._logger.info(f"FPS set to {fps}")
 
     def setShowsize(self, show_height, show_width):
         self.show_width = int(show_width)
         self.show_height = int(show_height)
         self.show_size = (self.show_width, self.show_height)
+        self._last_preview_render_time = 0.0
         self.config(width=self.show_width, height=self.show_height)
         print("Show size set to {0} x {1}".format(self.show_width, self.show_height))
         self._logger.info("Show size set to {0} x {1}".format(self.show_width, self.show_height))
@@ -437,6 +454,9 @@ class CaptureArea(tk.Canvas):
             self.BindLeftClick()
 
     def mouseLeftPress(self, event, ser):
+        self.ser.begin_manual_override()
+        self._last_lstick_send = 0.0
+        self._last_lstick_position = None
         if self.master.is_use_right_stick_mouse.get():
             self.UnbindRightClick()
         self.config(cursor="dot")
@@ -497,15 +517,16 @@ class CaptureArea(tk.Canvas):
                 self.dq.append([langle, mag, _time - self.calc_time])
                 self.calc_time = _time
         elif not isTakeLog:
-            self.ser.input(
-                Direction(
-                    Stick.LEFT,
-                    (
-                        int(128 + mag * 127.5 * np.cos(np.deg2rad(langle))),
-                        255 - int(128 - mag * 127.5 * np.sin(np.deg2rad(langle))),
-                    ),
-                )
+            position = (
+                int(128 + mag * 127.5 * np.cos(np.deg2rad(langle))),
+                255 - int(128 - mag * 127.5 * np.sin(np.deg2rad(langle))),
             )
+            now = time.perf_counter()
+            if (position != self._last_lstick_position
+                    and now - self._last_lstick_send >= self._manual_stick_interval):
+                self.ser.input(Direction(Stick.LEFT, position))
+                self._last_lstick_position = position
+                self._last_lstick_send = now
 
         if mag >= 1:
             center_x = (self.radius + self.radius // 11) * np.cos(np.deg2rad(langle))
@@ -532,7 +553,11 @@ class CaptureArea(tk.Canvas):
 
     def mouseLeftRelease(self, ser):
         self.config(cursor="tcross")
-        self.ser.input(Direction(Stick.LEFT, NEUTRAL))
+        try:
+            self.ser.input(Direction(Stick.LEFT, NEUTRAL))
+        finally:
+            self.ser.end_manual_override()
+            self._last_lstick_position = None
         self.delete("lcircle")
         self.delete("lcircle2")
         if self.master.is_use_right_stick_mouse.get():
@@ -544,6 +569,9 @@ class CaptureArea(tk.Canvas):
                 self.LSTICK_logger.debug(",".join(list(map(str, _))))
 
     def mouseRightPress(self, event, ser):
+        self.ser.begin_manual_override()
+        self._last_rstick_send = 0.0
+        self._last_rstick_position = None
         if self.master.is_use_left_stick_mouse.get():
             self.UnbindLeftClick()
 
@@ -558,7 +586,13 @@ class CaptureArea(tk.Canvas):
                 height = self.touchscreen_end_y - self.touchscreen_start_y
                 pos_x = int(320.0 * (event.x - self.touchscreen_start_x) / width)
                 pos_y = int(240.0 * (event.y - self.touchscreen_start_y) / height)
-                ser.input(Touchscreen(pos_x, pos_y))
+                position = (pos_x, pos_y)
+                now = time.perf_counter()
+                if (position != self._last_rstick_position
+                        and now - self._last_rstick_send >= self._manual_stick_interval):
+                    ser.input(Touchscreen(pos_x, pos_y))
+                    self._last_rstick_position = position
+                    self._last_rstick_send = now
         else:
             self.config(cursor="dot")
             self.rx_init, self.ry_init = event.x, event.y
@@ -607,7 +641,13 @@ class CaptureArea(tk.Canvas):
                 height = self.touchscreen_end_y - self.touchscreen_start_y
                 pos_x = int(320.0 * (event.x - self.touchscreen_start_x) / width)
                 pos_y = int(240.0 * (event.y - self.touchscreen_start_y) / height)
-                ser.input(Touchscreen(pos_x, pos_y))
+                position = (pos_x, pos_y)
+                now = time.perf_counter()
+                if (position != self._last_rstick_position
+                        and now - self._last_rstick_send >= self._manual_stick_interval):
+                    ser.input(Touchscreen(pos_x, pos_y))
+                    self._last_rstick_position = position
+                    self._last_rstick_send = now
         else:
             rangle = np.rad2deg(np.arctan2(self.ry_init - event.y, event.x - self.rx_init))
             mag = np.sqrt((self.ry_init - event.y) ** 2 + (event.x - self.rx_init) ** 2) / self.radius
@@ -630,15 +670,16 @@ class CaptureArea(tk.Canvas):
                     self.dq.append([rangle, mag, _time - self.calc_time])
                     self.calc_time = _time
             elif not isTakeLog:
-                self.ser.input(
-                    Direction(
-                        Stick.RIGHT,
-                        (
-                            int(128 + mag * 127.5 * np.cos(np.deg2rad(rangle))),
-                            255 - int(128 - mag * 127.5 * np.sin(np.deg2rad(rangle))),
-                        ),
-                    )
+                position = (
+                    int(128 + mag * 127.5 * np.cos(np.deg2rad(rangle))),
+                    255 - int(128 - mag * 127.5 * np.sin(np.deg2rad(rangle))),
                 )
+                now = time.perf_counter()
+                if (position != self._last_rstick_position
+                        and now - self._last_rstick_send >= self._manual_stick_interval):
+                    self.ser.input(Direction(Stick.RIGHT, position))
+                    self._last_rstick_position = position
+                    self._last_rstick_send = now
             if mag >= 1:
                 center_x = (self.radius + self.radius // 11) * np.cos(np.deg2rad(rangle))
                 center_y = (self.radius + self.radius // 11) * np.sin(np.deg2rad(rangle))
@@ -663,11 +704,16 @@ class CaptureArea(tk.Canvas):
             self._rmag = mag
 
     def mouseRightRelease(self, ser):
-        if self.RightMouseMode == "Qingpi":
-            ser.inputEnd(Touchscreen(0, 0))
-        else:
-            self.config(cursor="tcross")
-            self.ser.input(Direction(Stick.RIGHT, NEUTRAL))
+        try:
+            if self.RightMouseMode == "Qingpi":
+                ser.inputEnd(Touchscreen(0, 0))
+            else:
+                self.config(cursor="tcross")
+                self.ser.input(Direction(Stick.RIGHT, NEUTRAL))
+        finally:
+            self.ser.end_manual_override()
+            self._last_rstick_position = None
+        if self.RightMouseMode != "Qingpi":
             self.delete("rcircle")
             self.delete("rcircle2")
             if self.master.is_use_left_stick_mouse.get():
@@ -689,14 +735,40 @@ class CaptureArea(tk.Canvas):
             self.after(self.next_frames, self.capture)
             return
 
+        now = time.monotonic()
         if image_bgr is not None:
             if self.record_listener is not None:
                 self.record_listener(image_bgr)
-            if self.frame_listener is not None and time.monotonic() - self._last_listener_time >= 0.25:
-                self._last_listener_time = time.monotonic()
+            if self.frame_listener is not None and now - self._last_listener_time >= 0.25:
+                self._last_listener_time = now
                 self.frame_listener(image_bgr.copy())
+
+        try:
+            top = self.winfo_toplevel()
+            viewable = bool(top.winfo_viewable()) and top.state() != "iconic"
+            focused = top.focus_displayof() is not None
+        except tk.TclError:
+            viewable, focused = True, True
+        last_active, allow_full_rate = False, False
+        if callable(self.render_priority_provider):
+            try:
+                last_active, allow_full_rate = self.render_priority_provider()
+            except Exception as error:
+                self._logger.warning("Preview priority provider failed: %s", error)
+        prioritized = bool(focused or last_active)
+        render_interval = preview_render_interval(
+            self._requested_fps, focused=prioritized, viewable=viewable,
+            full_rate=bool(allow_full_rate and prioritized))
+        if now - self._last_preview_render_time < render_interval:
+            self.after(self.next_frames, self.capture)
+            return
+        self._last_preview_render_time = now
+
+        if image_bgr is not None:
             image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
-            image_pil = Image.fromarray(image_rgb).resize(self.show_size)
+            image_pil = Image.fromarray(image_rgb)
+            if image_pil.size != self.show_size:
+                image_pil = image_pil.resize(self.show_size)
             image_tk = ImageTk.PhotoImage(image_pil)
 
             self.im = image_tk

@@ -1,3 +1,6 @@
+# Reproducible environments use requirements-py312.lock.txt or
+# requirements-py314.lock.txt. This file remains the direct dependency list.
+
 #
 # from original wiki:
 #
@@ -19,14 +22,16 @@ scipy
 #
 # from README:
 # 
-pygame
+pygame; python_version < "3.14"
+pygame-ce; python_version >= "3.14"
 paho-mqtt
-windows-capture-device-list
+windows-capture-device-list; python_version < "3.12"
 gitpython
 plyer
 pytesseract
 sounddevice
 imageio-ffmpeg
+pywin32; platform_system == "Windows"
 
 #
 # requirements not mentioned in the documents above:

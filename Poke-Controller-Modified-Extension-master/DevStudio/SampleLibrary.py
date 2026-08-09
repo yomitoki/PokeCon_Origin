@@ -11,6 +11,17 @@ import os
 SCHEMA_VERSION = 2
 
 
+def _literal_string(node):
+    """Return a string AST literal across Python 3.7 through 3.14."""
+    constant_type = getattr(ast, "Constant", ())
+    if isinstance(node, constant_type) and isinstance(getattr(node, "value", None), str):
+        return node.value
+    legacy_type = getattr(ast, "Str", ())
+    if isinstance(node, legacy_type) and isinstance(getattr(node, "s", None), str):
+        return node.s
+    return None
+
+
 def empty_library():
     return {"schema_version": SCHEMA_VERSION, "lists": {}}
 
@@ -159,12 +170,8 @@ def image_targets_from_bodies(bodies):
                               (isinstance(function, ast.Name) and function.id == "image_check"))
             if not is_image_check:
                 continue
-            argument = node.args[0]
-            if isinstance(argument, ast.Str):
-                name = argument.s
-            elif isinstance(argument, ast.Constant) and isinstance(argument.value, str):
-                name = argument.value
-            else:
+            name = _literal_string(node.args[0])
+            if name is None:
                 continue
             if name not in targets:
                 targets.append(name)

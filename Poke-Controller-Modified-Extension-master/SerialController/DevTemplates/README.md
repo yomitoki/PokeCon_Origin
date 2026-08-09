@@ -9,9 +9,11 @@ creates exactly one class with `NAME` and `TAGS`, so it appears once in PokeCon'
 **Commands > Python Command** list after **Reload Commands**.
 
 All generator templates include `stop_checkpoint()`. Call it in every loop and
-inside any long chapter/detail step so that the Commands tab's **Force stop**
-button can end the command at the next safe point. `ForceStopSafePattern.py`
-is a copyable reference for adding this pattern to existing commands.
+inside any long chapter/detail step so the normal **Stop** can end at a safe
+point. **Force stop** can now interrupt Python bytecode when normal Stop is
+stuck, but native serial/camera I/O can only finish after that I/O call returns.
+`ForceStopSafePattern.py` remains the preferred safe pattern for existing
+commands.
 
 `ImageDetectionCommand.py` shows `get_detection_targets()`. Add this class
 method to an image-detection command and list its image paths, thresholds and

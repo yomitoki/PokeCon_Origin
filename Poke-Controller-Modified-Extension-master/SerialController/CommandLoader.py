@@ -22,26 +22,34 @@ class CommandLoader:
         self.path = base_path
         self.base_type = base_class
         self.modules = []
+        self.errors = []
 
     def load(self):
         if not self.modules:  # load if empty
-            self.modules = util.importAllModules(self.path)
+            self.errors = []
+            self.modules = util.importAllModules(self.path, errors=self.errors)
 
         # return command class types
         return self.getCommandClasses()
 
     def reload(self):
+        self.errors = []
         loaded_module_dic = {mod.__name__: mod for mod in self.modules}
         cur_module_names = util.getModuleNames(self.path)
 
         # Load only not loaded modules
         not_loaded_module_names = list(set(cur_module_names) - set(loaded_module_dic.keys()))
         if len(not_loaded_module_names) > 0:
-            self.modules.extend(util.importAllModules(self.path, not_loaded_module_names))
+            self.modules.extend(util.importAllModules(
+                self.path, not_loaded_module_names, errors=self.errors))
 
         # Reload commands except deleted ones
         for mod_name in list(set(cur_module_names) & set(loaded_module_dic.keys())):
-            importlib.reload(loaded_module_dic[mod_name])
+            try:
+                importlib.reload(loaded_module_dic[mod_name])
+            except Exception as error:
+                logger.exception("Could not reload command module: %s", mod_name)
+                self.errors.append({"module": str(mod_name), "error": str(error)})
 
         # Unload deleted commands
         for mod_name in list(set(loaded_module_dic.keys()) - set(cur_module_names)):
@@ -116,13 +124,16 @@ class FileCommandLoader(CommandLoader):
                 except Exception:
                     sys.modules.pop(module_name, None)
                     logger.exception("Could not load PythonSampleCommand: %s", path)
+                    self.errors.append({"module": path, "error": "import failed"})
         return modules
 
     def load(self):
+        self.errors = []
         self.modules = self._load_files()
         return self.getCommandClasses()
 
     def reload(self):
+        self.errors = []
         for module in self.modules:
             sys.modules.pop(module.__name__, None)
         self.modules = self._load_files()

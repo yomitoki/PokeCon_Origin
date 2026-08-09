@@ -35,7 +35,15 @@ class PokeConDialogue(object):
 
         self.message_dialogue = parent
         self.message_dialogue.title(title)
-        self.message_dialogue.attributes("-topmost", True)
+        # Keep this as a normal child of the current PokeCon window.  A
+        # system-wide topmost dialog also stays above a second PokeCon
+        # instance and prevents the user from choosing the window order.
+        try:
+            owner = self.message_dialogue.master
+            if owner is not None:
+                self.message_dialogue.transient(owner)
+        except tk.TclError:
+            pass
         self.message_dialogue.protocol("WM_DELETE_WINDOW", self.close_window)
 
         self.main_frame = tk.Frame(self.message_dialogue)

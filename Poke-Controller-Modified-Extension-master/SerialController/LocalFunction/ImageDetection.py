@@ -143,6 +143,7 @@ def detect_image(
         "threshold": float(threshold),
         "position": absolute_location,
         "template_size": (int(template.shape[1]), int(template.shape[0])),
+        "show_value": bool(show_value),
         "timestamp": time.time(),
     }
     event_callback = getattr(command, "image_detection_event", None)

@@ -45,7 +45,11 @@ from ImageDetectionLibrary import (folder_tags as image_folder_tags,
 from ImageDetectionSync import (compare_settings as compare_image_detection_settings,
                                 parse_source_settings as parse_source_image_detection_settings,
                                 update_library_from_source)
+from ImageHealthCheck import audit_image_library, suggested_crop
 from CompletionEngine import CompletionEngine
+from SourceFunctionTools import (build_rename_map, register_source_functions,
+                                 rename_source_functions, source_function_records,
+                                 step_function_names)
 
 
 PYTHON_SUFFIXES = (".py", ".pyfrag")
@@ -63,6 +67,17 @@ TODO_HELP_TEXT = (
     + TODO_PLAIN_FUNCTION_HELP
     + "# ※［＋現在の関数へ紐づけ］を使うと自動で記載されます。\n\n"
 )
+
+
+def _literal_string(node):
+    """Return a string AST literal across Python 3.7 through 3.14."""
+    constant_type = getattr(ast, "Constant", ())
+    if isinstance(node, constant_type) and isinstance(getattr(node, "value", None), str):
+        return node.value
+    legacy_type = getattr(ast, "Str", ())
+    if isinstance(node, legacy_type) and isinstance(getattr(node, "s", None), str):
+        return node.s
+    return None
 
 
 class Fragment(object):
@@ -160,6 +175,7 @@ class DevStudio(tk.Tk):
         self.tag_text = tk.StringVar()
         self.files = []
         self.fragments = []
+        self.index_errors = []
         self._fragment_catalog_cache = None
         self.editing_fragment_id = None
         self.search_hits = []
@@ -539,13 +555,19 @@ class DevStudio(tk.Tk):
         self.right_tabs = ttk.Notebook(right)
         self.right_tabs.pack(fill="both", expand=True)
         image_targets_tab = ttk.Frame(self.right_tabs)
+        image_health_tab = ttk.Frame(self.right_tabs)
         step_hierarchy_tab = ttk.Frame(self.right_tabs)
         completion_tab = ttk.Frame(self.right_tabs)
+        source_functions_tab = ttk.Frame(self.right_tabs)
         self.right_tabs.add(image_targets_tab, text="Image detection")
+        self.right_tabs.add(image_health_tab, text="画像チェック")
         self.right_tabs.add(step_hierarchy_tab, text="Step hierarchy")
         self.right_tabs.add(completion_tab, text="Completion")
+        self.right_tabs.add(source_functions_tab, text="関数登録")
         self.step_hierarchy_tab = step_hierarchy_tab
         self.completion_tab = completion_tab
+        self.source_functions_tab = source_functions_tab
+        self.image_health_tab = image_health_tab
         self.right_tabs.bind("<<NotebookTabChanged>>", self.on_right_tool_tab_changed)
         source_tab_bar = ttk.Frame(center)
         source_tab_bar.pack(fill="x")
@@ -613,8 +635,10 @@ class DevStudio(tk.Tk):
         self.todo_editor.bind("<Double-Button-1>", self.open_todo_source_location)
         self.bind_text_undo_redo(self.todo_editor)
         self._build_image_targets_tab(image_targets_tab)
+        self._build_image_health_tab(image_health_tab)
         self._build_step_hierarchy_tab(step_hierarchy_tab)
         self._build_completion_tab(completion_tab)
+        self._build_source_functions_tab(source_functions_tab)
         self._build_sample_functions_tab(sample_functions_workspace)
         self._build_sample_lists_tab(sample_lists_workspace)
         self._build_sample_program_tab(sample_program_workspace)
@@ -929,11 +953,362 @@ class DevStudio(tk.Tk):
         parent.columnconfigure(0, weight=1)
         parent.rowconfigure(3, weight=1)
 
+    def _build_source_functions_tab(self, parent):
+        self.source_function_search = tk.StringVar()
+        self.source_function_find = tk.StringVar()
+        self.source_function_replace = tk.StringVar()
+        self.source_function_prefix = tk.StringVar()
+        self.source_function_suffix = tk.StringVar()
+        self.source_function_whole_name = tk.BooleanVar(value=True)
+        self.source_function_show_steps = tk.BooleanVar(value=False)
+        self.source_function_folder = tk.StringVar(value="SourceImports")
+        self.source_function_tags = tk.StringVar(value="source")
+        self.source_function_overwrite = tk.BooleanVar(value=False)
+        self.source_function_summary = tk.StringVar(value="現在のソースを解析します。")
+        self.source_function_rows = {}
+        self.source_function_name_overrides = {}
+        self.source_function_last_registered = []
+
+        help_box = ttk.Label(
+            parent,
+            text="①関数を選択 → ②登録名を確認 → ③ソース改名またはサンプル登録\n"
+                 "登録済み行はダブルクリックでサンプル関数の変更画面へ移動",
+            justify="left", foreground="#174a7e")
+        help_box.pack(fill="x", padx=6, pady=(6, 3))
+
+        search_row = ttk.Frame(parent); search_row.pack(fill="x", padx=6, pady=3)
+        ttk.Label(search_row, text="検索:").pack(side="left")
+        ttk.Entry(search_row, textvariable=self.source_function_search).pack(
+            side="left", fill="x", expand=True, padx=3)
+        ttk.Button(search_row, text="再読込", command=self.refresh_source_functions).pack(side="right")
+        ttk.Checkbutton(
+            search_row, text="Step関数も表示", variable=self.source_function_show_steps,
+            command=lambda: self.refresh_source_functions(reload_source=False)).pack(
+                side="right", padx=4)
+
+        tree_frame = ttk.Frame(parent); tree_frame.pack(fill="both", expand=True, padx=6, pady=3)
+        self.source_function_tree = ttk.Treeview(
+            tree_frame, columns=("new_name", "line", "status"),
+            show="tree headings", selectmode="extended", height=12)
+        self.source_function_tree.heading("#0", text="現在の関数名")
+        self.source_function_tree.heading("new_name", text="登録・変更後")
+        self.source_function_tree.heading("line", text="行")
+        self.source_function_tree.heading("status", text="サンプル")
+        self.source_function_tree.column("#0", width=175, stretch=True)
+        self.source_function_tree.column("new_name", width=175, stretch=True)
+        self.source_function_tree.column("line", width=42, stretch=False, anchor="e")
+        self.source_function_tree.column("status", width=70, stretch=False)
+        tree_x_scroll = ttk.Scrollbar(
+            tree_frame, orient="horizontal", command=self.source_function_tree.xview)
+        tree_x_scroll.pack(side="bottom", fill="x")
+        tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.source_function_tree.yview)
+        tree_scroll.pack(side="right", fill="y")
+        self.source_function_tree.pack(side="left", fill="both", expand=True)
+        self.source_function_tree.configure(
+            yscrollcommand=tree_scroll.set, xscrollcommand=tree_x_scroll.set)
+        self.source_function_tree.bind("<Double-1>", self.open_or_name_source_function)
+
+        rename_box = ttk.Labelframe(parent, text="関数名を一括作成")
+        rename_box.pack(fill="x", padx=6, pady=3)
+        ttk.Label(rename_box, text="検索文字").grid(column=0, row=0, padx=3, pady=2, sticky="w")
+        ttk.Entry(rename_box, textvariable=self.source_function_find, width=12).grid(
+            column=1, row=0, padx=3, pady=2, sticky="ew")
+        ttk.Label(rename_box, text="→置換").grid(column=2, row=0, padx=3, pady=2)
+        ttk.Entry(rename_box, textvariable=self.source_function_replace, width=12).grid(
+            column=3, row=0, padx=3, pady=2, sticky="ew")
+        ttk.Label(rename_box, text="先頭追加").grid(column=0, row=1, padx=3, pady=2, sticky="w")
+        ttk.Entry(rename_box, textvariable=self.source_function_prefix, width=12).grid(
+            column=1, row=1, padx=3, pady=2, sticky="ew")
+        ttk.Label(rename_box, text="末尾追加").grid(column=2, row=1, padx=3, pady=2)
+        ttk.Entry(rename_box, textvariable=self.source_function_suffix, width=12).grid(
+            column=3, row=1, padx=3, pady=2, sticky="ew")
+        ttk.Checkbutton(
+            rename_box,
+            text="完全一致（関数名全体が検索文字と同じ場合だけ置換・安全）",
+            variable=self.source_function_whole_name).grid(
+                column=0, columnspan=4, row=2, padx=3, pady=2, sticky="w")
+        rename_buttons = ttk.Frame(rename_box); rename_buttons.grid(
+            column=0, columnspan=4, row=3, padx=3, pady=3, sticky="ew")
+        ttk.Button(rename_buttons, text="変更名をプレビュー",
+                   command=self.preview_source_function_names).pack(side="left")
+        ttk.Button(rename_buttons, text="選択1件の名前を直接指定",
+                   command=self.edit_source_function_target_name).pack(side="left", padx=3)
+        ttk.Button(rename_buttons, text="リセット",
+                   command=self.reset_source_function_names).pack(side="right")
+        rename_box.columnconfigure(1, weight=1); rename_box.columnconfigure(3, weight=1)
+
+        sample_box = ttk.Labelframe(parent, text="サンプル登録先")
+        sample_box.pack(fill="x", padx=6, pady=3)
+        ttk.Label(sample_box, text="フォルダー").grid(column=0, row=0, padx=3, pady=2, sticky="w")
+        ttk.Entry(sample_box, textvariable=self.source_function_folder).grid(
+            column=1, row=0, padx=3, pady=2, sticky="ew")
+        ttk.Label(sample_box, text="タグ（,区切り）").grid(column=0, row=1, padx=3, pady=2, sticky="w")
+        ttk.Entry(sample_box, textvariable=self.source_function_tags).grid(
+            column=1, row=1, padx=3, pady=2, sticky="ew")
+        ttk.Checkbutton(sample_box, text="同名サンプルは内容を更新",
+                        variable=self.source_function_overwrite).grid(
+                            column=0, columnspan=2, row=2, padx=3, pady=2, sticky="w")
+        sample_box.columnconfigure(1, weight=1)
+
+        actions = ttk.Frame(parent); actions.pack(fill="x", padx=6, pady=4)
+        ttk.Button(actions, text="選択名をソースへ一括反映",
+                   command=self.apply_source_function_renames).pack(fill="x", pady=2)
+        ttk.Button(actions, text="選択をサンプルへ登録",
+                   command=self.register_selected_source_functions).pack(fill="x", pady=2)
+        ttk.Button(actions, text="選択サンプルを変更画面で開く",
+                   command=self.open_selected_source_sample).pack(fill="x", pady=2)
+        ttk.Label(parent, textvariable=self.source_function_summary,
+                  wraplength=350, justify="left").pack(fill="x", padx=6, pady=(2, 6))
+        self.source_function_search.trace_add(
+            "write", lambda *_: self.debounce(
+                "source_function_search", 120,
+                lambda: self.refresh_source_functions(reload_source=False)))
+
+    def _source_function_preview_map(self):
+        names = [item["name"] for item in getattr(self, "source_function_records", [])]
+        preview = build_rename_map(
+            names, self.source_function_find.get(), self.source_function_replace.get(),
+            self.source_function_prefix.get(), self.source_function_suffix.get(),
+            whole_name=self.source_function_whole_name.get())
+        preview.update({name: value for name, value in self.source_function_name_overrides.items()
+                        if name in preview})
+        # Validate explicit per-row changes and duplicate results as one set.
+        for value in preview.values():
+            build_rename_map([value])
+        if len(set(preview.values())) != len(preview):
+            raise ValueError("変更後の関数名が重複しています。")
+        return preview
+
+    def refresh_source_functions(self, select_names=None, reload_source=True):
+        if not hasattr(self, "source_function_tree"):
+            return
+        if select_names is None:
+            select_names = {self.source_function_rows[iid]["name"]
+                            for iid in self.source_function_tree.selection()
+                            if iid in self.source_function_rows}
+        else:
+            select_names = set(select_names)
+        try:
+            if reload_source:
+                source = self.editor.get("1.0", "end-1c")
+                self.source_function_records = source_function_records(source)
+                self.source_function_step_names = step_function_names(source)
+            records = getattr(self, "source_function_records", [])
+            step_names = getattr(self, "source_function_step_names", set())
+            preview = self._source_function_preview_map()
+        except (SyntaxError, ValueError, tokenize.TokenError) as error:
+            self.source_function_records = []
+            self.source_function_rows = {}
+            self.source_function_tree.delete(*self.source_function_tree.get_children())
+            self.source_function_summary.set("ソースを解析できません: {}".format(error))
+            return
+        catalog_by_name = {}
+        for item in self.fragment_catalog():
+            catalog_by_name.setdefault(item.get("name", ""), []).append(item)
+        needle = self.source_function_search.get().strip().casefold()
+        self.source_function_rows = {}
+        self.source_function_tree.delete(*self.source_function_tree.get_children())
+        selected_iids = []
+        registered_count = 0
+        hidden_step_count = 0
+        for index, record in enumerate(records):
+            old_name = record["name"]
+            new_name = preview.get(old_name, old_name)
+            if needle and needle not in (old_name + " " + new_name).casefold():
+                continue
+            if not self.source_function_show_steps.get() and old_name in step_names:
+                hidden_step_count += 1
+                continue
+            registered = catalog_by_name.get(new_name, [])
+            if len(registered) == 1:
+                status = "登録済み"; fragment_id = registered[0]["id"]; registered_count += 1
+            elif len(registered) > 1:
+                status = "同名複数"; fragment_id = ""
+            else:
+                status = "未登録"; fragment_id = ""
+            iid = self.source_function_tree.insert(
+                "", "end", text=old_name,
+                values=(new_name, record["line"], status))
+            row = dict(record)
+            row.update({"new_name": new_name, "fragment_id": fragment_id})
+            self.source_function_rows[iid] = row
+            if old_name in select_names:
+                selected_iids.append(iid)
+        if selected_iids:
+            self.source_function_tree.selection_set(selected_iids)
+            self.source_function_tree.see(selected_iids[0])
+        hidden_text = " / Step非表示{}件".format(hidden_step_count) \
+            if hidden_step_count else ""
+        self.source_function_summary.set(
+            "{}関数を検出 / 表示{}件 / 登録済み{}件{}".format(
+                len(records), len(self.source_function_rows), registered_count, hidden_text))
+
+    def _selected_source_functions(self, require=True):
+        rows = [self.source_function_rows[iid] for iid in self.source_function_tree.selection()
+                if iid in self.source_function_rows]
+        if require and not rows:
+            messagebox.showinfo("関数登録", "関数を1つ以上選択してください。", parent=self)
+        return rows
+
+    def _selected_source_function_plan(self):
+        rows = self._selected_source_functions()
+        if not rows:
+            return []
+        try:
+            preview = self._source_function_preview_map()
+        except ValueError as error:
+            messagebox.showwarning("関数名", str(error), parent=self); return []
+        planned = []
+        for row in rows:
+            item = dict(row)
+            item["new_name"] = preview.get(item["name"], item["name"])
+            planned.append(item)
+        return planned
+
+    def preview_source_function_names(self):
+        try:
+            preview = self._source_function_preview_map()
+        except ValueError as error:
+            messagebox.showwarning("関数名", str(error), parent=self); return
+        self.refresh_source_functions(reload_source=False)
+        changed = sum(name != value for name, value in preview.items())
+        self.source_function_summary.set("変更名をプレビューしました: {}件".format(changed))
+
+    def reset_source_function_names(self):
+        self.source_function_find.set(""); self.source_function_replace.set("")
+        self.source_function_prefix.set(""); self.source_function_suffix.set("")
+        self.source_function_name_overrides = {}
+        self.refresh_source_functions(reload_source=False)
+
+    def edit_source_function_target_name(self):
+        rows = self._selected_source_functions()
+        if len(rows) != 1:
+            messagebox.showinfo("関数名", "直接指定する関数を1つだけ選択してください。", parent=self); return
+        row = rows[0]
+        value = simpledialog.askstring(
+            "関数名を指定", "{} の登録・変更後の関数名:".format(row["name"]),
+            initialvalue=row["new_name"], parent=self)
+        if value is None:
+            return
+        try:
+            build_rename_map([value.strip()])
+        except ValueError as error:
+            messagebox.showwarning("関数名", str(error), parent=self); return
+        self.source_function_name_overrides[row["name"]] = value.strip()
+        self.refresh_source_functions(select_names=[row["name"]], reload_source=False)
+
+    def _source_function_mapping_detail(self, rows):
+        lines = ["{} → {}".format(row["name"], row["new_name"]) for row in rows]
+        if len(lines) > 15:
+            lines = lines[:15] + ["ほか{}件".format(len(rows) - 15)]
+        return "\n".join(lines)
+
+    def apply_source_function_renames(self):
+        rows = self._selected_source_function_plan()
+        if not rows:
+            return
+        mapping = {row["name"]: row["new_name"] for row in rows
+                   if row["name"] != row["new_name"]}
+        if not mapping:
+            messagebox.showinfo("関数名一括変更", "選択した関数の変更名が同じです。", parent=self); return
+        if not messagebox.askyesno(
+                "関数名一括変更",
+                "関数定義とソース内の参照を一括変更します。\n\n{}\n\n反映しますか？".format(
+                    self._source_function_mapping_detail(rows)), parent=self):
+            return
+        source = self.editor.get("1.0", "end-1c")
+        try:
+            updated = rename_source_functions(source, mapping)
+        except (SyntaxError, ValueError, tokenize.TokenError) as error:
+            messagebox.showerror("関数名一括変更", str(error), parent=self); return
+        line = int(self.editor.index("insert").split(".")[0])
+        self.set_editor_content(updated, self.current_path, line)
+        self.editor_dirty = True
+        self.update_editor_view()
+        changed_names = list(mapping.values())
+        self.source_function_find.set(""); self.source_function_replace.set("")
+        self.source_function_prefix.set(""); self.source_function_suffix.set("")
+        self.source_function_name_overrides = {}
+        self.refresh_source_functions(select_names=changed_names)
+        self.status.set("{}関数の名前と参照を変更しました。ソースを保存してください。".format(len(mapping)))
+
+    def register_selected_source_functions(self):
+        rows = self._selected_source_function_plan()
+        if not rows:
+            return
+        source = self.editor.get("1.0", "end-1c")
+        names = [row["name"] for row in rows]
+        rename_map = {row["name"]: row["new_name"] for row in rows}
+        tags = [value.strip() for value in self.source_function_tags.get().split(",")
+                if value.strip()]
+        detail = self._source_function_mapping_detail(rows)
+        overwrite = self.source_function_overwrite.get()
+        action = "登録済みサンプルは内容を更新します。" if overwrite else \
+            "登録済みと同名の場合は中断します。"
+        if not messagebox.askyesno(
+                "ソースからサンプル登録",
+                "{}関数をサンプルへ登録します。\n{}\n\n{}\n\n続行しますか？".format(
+                    len(rows), action, detail), parent=self):
+            return
+        root = self.fragment_root()
+        folder = self.source_function_folder.get().strip() or "SourceImports"
+        current_path = self.current_path or ""
+
+        def worker():
+            return register_source_functions(
+                source, names, root, folder=folder, rename_map=rename_map,
+                tags=tags, overwrite=overwrite, source_path=current_path)
+
+        def completed(created):
+            self._fragment_catalog_cache = None
+            self.source_function_last_registered = [item["id"] for item in created]
+            self.refresh_index()
+            self.refresh_registered_fragment_choices()
+            self.refresh_sample_lists_tab(select=self.sample_list_name.get().strip())
+            self.refresh_sample_apply_lists()
+            self.refresh_source_functions(select_names=names, reload_source=False)
+            self.status.set("ソースからサンプル関数を{}件登録しました。".format(len(created)))
+            if len(created) == 1 and messagebox.askyesno(
+                    "サンプル登録完了",
+                    "登録しました: {}\n\nサンプル関数タブで変更しますか？".format(created[0]["name"]),
+                    parent=self):
+                self.load_fragment_for_editing(created[0]["id"])
+            elif len(created) > 1:
+                messagebox.showinfo(
+                    "サンプル登録完了",
+                    "{}件登録しました。\n一覧で1件選択し「選択サンプルを変更画面で開く」を押すと編集できます。".format(
+                        len(created)), parent=self)
+
+        self.run_background(
+            "source_function_register", "ソースからサンプル関数を登録中",
+            worker, completed,
+            lambda error: messagebox.showerror("ソースからサンプル登録", str(error), parent=self))
+
+    def open_selected_source_sample(self):
+        rows = self._selected_source_functions()
+        if len(rows) != 1:
+            messagebox.showinfo("サンプル関数", "開く関数を1つだけ選択してください。", parent=self); return
+        fragment_id = rows[0].get("fragment_id")
+        if not fragment_id:
+            messagebox.showinfo("サンプル関数", "この登録名のサンプル関数はまだ登録されていません。", parent=self); return
+        self.load_fragment_for_editing(fragment_id)
+
+    def open_or_name_source_function(self, event=None):
+        rows = self._selected_source_functions(require=False)
+        if len(rows) == 1 and rows[0].get("fragment_id"):
+            self.load_fragment_for_editing(rows[0]["fragment_id"])
+        elif len(rows) == 1:
+            self.edit_source_function_target_name()
+
     def on_right_tool_tab_changed(self, event=None):
-        if self.right_tabs.select() == str(self.step_hierarchy_tab):
+        if self.right_tabs.select() == str(self.image_health_tab):
+            self.run_image_health_check()
+        elif self.right_tabs.select() == str(self.step_hierarchy_tab):
             self.load_steps_from_editor(silent=True)
         elif self.right_tabs.select() == str(self.completion_tab):
             self.refresh_completion()
+        elif self.right_tabs.select() == str(self.source_functions_tab):
+            self.refresh_source_functions()
 
     def add_step_item(self, parent):
         label = self.step_entry.get().strip()
@@ -1078,10 +1453,11 @@ class DevStudio(tk.Tk):
                 continue
             members = []
             for key, value in zip(node.value.keys, node.value.values):
-                if not isinstance(key, ast.Str):
+                state_name = _literal_string(key)
+                if state_name is None:
                     continue
                 if isinstance(value, ast.Attribute) and isinstance(value.value, ast.Name) and value.value.id == "self":
-                    members.append((key.s, value.attr, methods.get(value.attr, getattr(value, "lineno", 1))))
+                    members.append((state_name, value.attr, methods.get(value.attr, getattr(value, "lineno", 1))))
             if members:
                 dictionaries.append((target_names[0], members))
         if not dictionaries:
@@ -1306,6 +1682,285 @@ class DevStudio(tk.Tk):
         self.update_editor_view()
         self.load_steps_from_editor(silent=True)
         self.status.set("Applied {} state-machine dictionaries".format(len(definitions)))
+
+    def _build_image_health_tab(self, parent):
+        self.image_health_reference = tk.StringVar(value="1280x720")
+        self.image_health_problems_only = tk.BooleanVar(value=True)
+        self.image_health_show_ignored = tk.BooleanVar(value=False)
+        self.image_health_summary = tk.StringVar(value="［一括チェック］を押すと登録画像を検査します。")
+        self.image_health_results = []
+        self.image_health_tree_rows = {}
+
+        ttk.Label(
+            parent,
+            text="登録画像を実行前に検査します。画像ファイルは変更せず、修正可能な検知範囲だけ確認後に更新します。",
+            foreground="#174a7e", justify="left", wraplength=430,
+        ).pack(fill="x", padx=6, pady=(7, 4))
+        controls = ttk.Frame(parent)
+        controls.pack(fill="x", padx=6, pady=3)
+        ttk.Label(controls, text="基準画面:").pack(side="left")
+        ttk.Entry(controls, textvariable=self.image_health_reference, width=11).pack(
+            side="left", padx=(3, 7))
+        ttk.Checkbutton(
+            controls, text="問題のみ", variable=self.image_health_problems_only,
+            command=self.refresh_image_health_results,
+        ).pack(side="left")
+        ttk.Checkbutton(
+            controls, text="除外済みも表示", variable=self.image_health_show_ignored,
+            command=self.refresh_image_health_results,
+        ).pack(side="left", padx=(4, 0))
+        ttk.Button(controls, text="一括チェック", command=self.run_image_health_check).pack(
+            side="right")
+        ttk.Label(parent, textvariable=self.image_health_summary, wraplength=430).pack(
+            fill="x", padx=6, pady=(1, 4))
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill="both", expand=True, padx=6)
+        self.image_health_tree = ttk.Treeview(
+            tree_frame, columns=("status", "name", "size", "crop"),
+            show="headings", height=10, selectmode="browse")
+        for column, label, width in (
+                ("status", "結果", 52), ("name", "検知名", 190),
+                ("size", "画像", 80), ("crop", "検知範囲", 90)):
+            self.image_health_tree.heading(column, text=label)
+            self.image_health_tree.column(column, width=width, stretch=(column == "name"))
+        self.image_health_tree.tag_configure("error", foreground="#b00020")
+        self.image_health_tree.tag_configure("warning", foreground="#9a4e00")
+        self.image_health_tree.tag_configure("ok", foreground="#176b2c")
+        self.image_health_tree.tag_configure("ignored", foreground="#666666")
+        tree_y = ttk.Scrollbar(tree_frame, orient="vertical", command=self.image_health_tree.yview)
+        tree_x = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.image_health_tree.xview)
+        self.image_health_tree.configure(
+            yscrollcommand=tree_y.set, xscrollcommand=tree_x.set)
+        self.image_health_tree.grid(column=0, row=0, sticky="nsew")
+        tree_y.grid(column=1, row=0, sticky="ns")
+        tree_x.grid(column=0, row=1, sticky="ew")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+        self.image_health_tree.bind(
+            "<<TreeviewSelect>>", self.show_selected_image_health_detail)
+
+        detail_box = ttk.Labelframe(parent, text="原因と直し方")
+        detail_box.pack(fill="both", padx=6, pady=5)
+        self.image_health_detail = tk.Text(
+            detail_box, height=9, wrap="word", background="#fafafa")
+        detail_scroll = ttk.Scrollbar(
+            detail_box, orient="vertical", command=self.image_health_detail.yview)
+        self.image_health_detail.configure(yscrollcommand=detail_scroll.set)
+        self.image_health_detail.pack(side="left", fill="both", expand=True)
+        detail_scroll.pack(side="right", fill="y")
+        self.image_health_detail.configure(state="disabled")
+
+        actions = ttk.Frame(parent)
+        actions.pack(fill="x", padx=6, pady=(0, 7))
+        ttk.Button(
+            actions, text="画像検知タブで調整",
+            command=self.open_selected_image_health_editor).pack(side="left")
+        ttk.Button(
+            actions, text="範囲を自動修正",
+            command=self.repair_selected_image_health_crop).pack(side="left", padx=3)
+        ttk.Button(
+            actions, text="警告を除外／解除",
+            command=self.toggle_selected_image_health_warning).pack(side="left", padx=3)
+
+    def _image_health_frame_size(self):
+        value = self.image_health_reference.get().strip()
+        match = re.match(r"^(\d+)\s*[xX,×]\s*(\d+)$", value)
+        if not match or int(match.group(1)) <= 0 or int(match.group(2)) <= 0:
+            raise ValueError("基準画面は 1280x720 の形式で指定してください。")
+        return int(match.group(1)), int(match.group(2))
+
+    def run_image_health_check(self):
+        if not hasattr(self, "image_health_tree"):
+            return
+        try:
+            frame_size = self._image_health_frame_size()
+        except ValueError as error:
+            messagebox.showwarning("画像チェック", str(error), parent=self)
+            return
+        template_root = self.template_root()
+
+        def worker():
+            return audit_image_library(
+                self._read_image_library(), template_root, frame_size)
+
+        def completed(rows):
+            self.image_health_results = rows
+            self.refresh_image_health_results()
+            self.status.set("登録画像のチェックが完了しました: {}件".format(len(rows)))
+
+        self.run_background(
+            "image_health_check", "登録画像をチェック中", worker, completed,
+            lambda error: messagebox.showerror("画像チェック", str(error), parent=self))
+
+    def refresh_image_health_results(self):
+        if not hasattr(self, "image_health_tree"):
+            return
+        self.image_health_tree.delete(*self.image_health_tree.get_children())
+        self.image_health_tree_rows = {}
+        rows = list(getattr(self, "image_health_results", []))
+        displayed = [row for row in rows if (
+            (not self.image_health_problems_only.get()
+             and row.get("status") != "除外")
+            or row.get("status") in ("エラー", "警告")
+            or (self.image_health_show_ignored.get()
+                and row.get("status") == "除外"))]
+        for row_index, row in enumerate(rows):
+            if row not in displayed:
+                continue
+            image_size = row.get("image_size")
+            crop_size = row.get("crop_size")
+            name = row.get("name", "")
+            if isinstance(row.get("index"), int):
+                name += " / パターン{}".format(row["index"] + 1)
+            iid = self.image_health_tree.insert(
+                "", "end", values=(
+                    row.get("status", ""), name,
+                    "{}x{}".format(*image_size) if image_size else "-",
+                    "{}x{}".format(*crop_size) if crop_size else "-"),
+                tags=({"エラー": "error", "警告": "warning", "除外": "ignored"}.get(
+                    row.get("status"), "ok"),))
+            self.image_health_tree_rows[iid] = row_index
+        counts = {name: sum(1 for row in rows if row.get("status") == name)
+                  for name in ("エラー", "警告", "正常", "除外")}
+        self.image_health_summary.set(
+            "エラー {error}件 / 警告 {warning}件 / 除外 {ignored}件 / 正常 {ok}件（表示 {shown}件）".format(
+                error=counts["エラー"], warning=counts["警告"],
+                ignored=counts["除外"], ok=counts["正常"], shown=len(displayed)))
+        self._set_image_health_detail(
+            "問題行を選ぶと、例外の原因と修正方法をここに表示します。")
+
+    def _set_image_health_detail(self, value):
+        self.image_health_detail.configure(state="normal")
+        self.image_health_detail.delete("1.0", "end")
+        self.image_health_detail.insert("1.0", str(value))
+        self.image_health_detail.configure(state="disabled")
+
+    def _selected_image_health_row(self):
+        selected = self.image_health_tree.selection()
+        if not selected:
+            return None
+        index = self.image_health_tree_rows.get(selected[0])
+        if index is None or not 0 <= index < len(self.image_health_results):
+            return None
+        return self.image_health_results[index]
+
+    def show_selected_image_health_detail(self, event=None):
+        row = self._selected_image_health_row()
+        if not row:
+            return
+        lines = ["{}: {}".format(row.get("status", ""), row.get("name", ""))]
+        if isinstance(row.get("index"), int):
+            lines[0] += " / パターン{}".format(row["index"] + 1)
+        if row.get("path"):
+            lines.append("画像: " + row["path"])
+        if row.get("image_size"):
+            lines.append("画像サイズ: {}x{}".format(*row["image_size"]))
+        if row.get("crop_size"):
+            lines.append("検知範囲サイズ: {}x{}".format(*row["crop_size"]))
+        lines.append("\n［検出内容］")
+        lines.extend("・" + value for value in row.get("details", []))
+        if row.get("fixes"):
+            lines.append("\n［直し方］")
+            lines.extend("・" + value for value in row["fixes"])
+        if row.get("repairable"):
+            lines.append("\nこの問題は［範囲を自動修正］で設定だけ修正できます。")
+        if row.get("warning_codes"):
+            lines.append("\n意図的な単色画像なら［警告を除外／解除］でこの画像だけ除外できます。")
+        elif row.get("ignored_warning_codes"):
+            lines.append("\nこの画像では警告を除外中です。同じボタンで解除できます。")
+        self._set_image_health_detail("\n".join(lines))
+
+    def open_selected_image_health_editor(self):
+        row = self._selected_image_health_row()
+        if not row or not isinstance(row.get("index"), int):
+            messagebox.showinfo(
+                "画像チェック", "編集する画像パターンを選択してください。", parent=self)
+            return
+        data = self._read_image_library()
+        name, index = row["name"], row["index"]
+        if name not in data.get("targets", {}) or index >= len(data["targets"][name].get("variants", [])):
+            messagebox.showwarning(
+                "画像チェック", "登録内容が更新されています。再チェックしてください。", parent=self)
+            return
+        self.workspace_tabs.select(self.image_library_workspace)
+        self.refresh_image_library_workspace(select=(name, index))
+        self.load_selected_image_library_variant()
+
+    def repair_selected_image_health_crop(self):
+        row = self._selected_image_health_row()
+        if not row or not isinstance(row.get("index"), int):
+            messagebox.showinfo("画像チェック", "修正する画像パターンを選択してください。", parent=self)
+            return
+        if not row.get("repairable"):
+            messagebox.showinfo(
+                "画像チェック",
+                "この問題は範囲だけでは安全に直せません。［画像検知タブで調整］から直してください。",
+                parent=self)
+            return
+        data = self._read_image_library()
+        name, index = row["name"], row["index"]
+        try:
+            variant = data["targets"][name]["variants"][index]
+            old_crop = list(variant.get("crop", [0, 0, 0, 0]))
+            new_crop = suggested_crop(
+                old_crop, row["image_size"], self._image_health_frame_size())
+        except (KeyError, IndexError, TypeError, ValueError) as error:
+            messagebox.showwarning("画像チェック", str(error), parent=self)
+            return
+        if old_crop == new_crop:
+            messagebox.showinfo("画像チェック", "検知範囲の変更は不要です。", parent=self)
+            return
+        if not messagebox.askyesno(
+                "検知範囲の自動修正",
+                "{} / パターン{}\n\n{} → {}\n\n画像ファイルは変更せず、検知範囲だけ更新しますか？".format(
+                    name, index + 1, ",".join(map(str, old_crop)),
+                    ",".join(map(str, new_crop))), parent=self):
+            return
+        variant["crop"] = new_crop
+        save_image_library(self._image_library_config_path(), data)
+        self.refresh_image_library_workspace(select=(name, index))
+        self.run_image_health_check()
+
+    def toggle_selected_image_health_warning(self):
+        row = self._selected_image_health_row()
+        if not row or not isinstance(row.get("index"), int):
+            messagebox.showinfo("画像チェック", "警告のある画像パターンを選択してください。", parent=self)
+            return
+        active = list(row.get("warning_codes", []))
+        ignored = list(row.get("ignored_warning_codes", []))
+        if not active and not ignored:
+            messagebox.showinfo("画像チェック", "この画像に除外可能な警告はありません。", parent=self)
+            return
+        data = self._read_image_library()
+        name, index = row["name"], row["index"]
+        try:
+            variant = data["targets"][name]["variants"][index]
+        except (KeyError, IndexError, TypeError):
+            messagebox.showwarning("画像チェック", "登録内容が更新されています。再チェックしてください。", parent=self)
+            return
+        configured = {str(value) for value in variant.get("health_ignored_warnings", [])}
+        if active:
+            action = "除外"
+            changed_codes = active
+            configured.update(active)
+            question = (
+                "{} / パターン{}\n\nこの画像だけ警告を除外しますか？\n"
+                "文字画面の色判定など、意図的な単色画像に使用してください。").format(name, index + 1)
+        else:
+            action = "除外解除"
+            changed_codes = ignored
+            configured.difference_update(ignored)
+            question = "{} / パターン{} の警告除外を解除しますか？".format(name, index + 1)
+        if not messagebox.askyesno("画像警告の" + action, question, parent=self):
+            return
+        if configured:
+            variant["health_ignored_warnings"] = sorted(configured)
+        else:
+            variant.pop("health_ignored_warnings", None)
+        save_image_library(self._image_library_config_path(), data)
+        self.status.set("{}: {} / {}".format(action, name, ", ".join(changed_codes)))
+        self.run_image_health_check()
 
     def _build_image_targets_tab(self, parent):
         self.image_detection_targets = []
@@ -3379,6 +4034,11 @@ class DevStudio(tk.Tk):
         old_name, index = selected
         data = self._read_image_library()
         if old_name not in data["targets"] or index >= len(data["targets"][old_name]["variants"]): return
+        ignored_warnings = list(
+            data["targets"][old_name]["variants"][index].get(
+                "health_ignored_warnings", []))
+        if ignored_warnings:
+            variant["health_ignored_warnings"] = ignored_warnings
         if name != old_name:
             del data["targets"][old_name]["variants"][index]
             if not data["targets"][old_name]["variants"]: del data["targets"][old_name]
@@ -3897,6 +4557,9 @@ class DevStudio(tk.Tk):
             self.debounce("editor_find_count", 120, self.refresh_find_count)
         if self.completion_mode.get() == "右タブ":
             self.debounce("editor_completion_tab", 80, self.refresh_completion)
+        if hasattr(self, "source_functions_tab") and \
+                self.right_tabs.select() == str(self.source_functions_tab):
+            self.debounce("source_function_editor_tab", 80, self.refresh_source_functions)
 
     def todo_storage_path(self):
         return os.path.join(os.path.dirname(__file__), "source_todos.json")
@@ -4662,20 +5325,30 @@ class DevStudio(tk.Tk):
             return
         self._fragment_catalog_cache = None
         def worker():
-            files, fragments = [], []
+            files, fragments, errors = [], [], []
             for directory, dirs, filenames in os.walk(root):
-                dirs[:] = [item for item in dirs if item not in ("__pycache__", ".git", ".venv", "venv")]
+                dirs[:] = [
+                    item for item in dirs
+                    if item not in ("__pycache__", ".git", "venv")
+                    and not item.lower().startswith(".venv")
+                ]
                 for filename in sorted(filenames):
                     if filename.lower().endswith(PYTHON_SUFFIXES):
                         path = os.path.join(directory, filename)
-                        files.append(path); fragments.extend(self.extract_fragments(path))
-            return root, files, fragments
+                        files.append(path)
+                        try:
+                            fragments.extend(self.extract_fragments(path))
+                        except Exception as error:
+                            # One damaged/generated source must not prevent all
+                            # other files from appearing in DevStudio.
+                            errors.append((path, str(error)))
+            return root, files, fragments, errors
 
         def completed(result):
-            indexed_root, files, fragments = result
+            indexed_root, files, fragments, errors = result
             if os.path.abspath(indexed_root) != os.path.abspath(self.root_dir.get()):
                 return
-            self.files, self.fragments = files, fragments
+            self.files, self.fragments, self.index_errors = files, fragments, errors
             self.tree.delete(*self.tree.get_children())
             self._populate_index_tree(indexed_root, files, 0, {"": ""})
         self.run_background("refresh_index", "ソース索引を更新中", worker, completed)
@@ -4696,7 +5369,13 @@ class DevStudio(tk.Tk):
             self.status.set("ソース一覧を表示中... {}/{}".format(min(next_offset, len(files)), len(files)))
             self.after(1, self._populate_index_tree, root, files, next_offset, nodes)
         else:
-            self.status.set("{} Python files, {} tagged code fragments indexed".format(len(files), len(self.fragments)))
+            status = "{} Python files, {} tagged code fragments indexed".format(
+                len(files), len(self.fragments))
+            if self.index_errors:
+                first_path, first_error = self.index_errors[0]
+                status += " / 読込除外 {}件: {} ({})".format(
+                    len(self.index_errors), os.path.relpath(first_path, root), first_error)
+            self.status.set(status)
 
     def _read_lines(self, path):
         try:

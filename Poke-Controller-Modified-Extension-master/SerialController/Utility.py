@@ -42,10 +42,16 @@ def getModuleNames(base_path):
     return [name[:-3].replace(os.sep, ".") for name in filenames]
 
 
-def importAllModules(base_path, mod_names=None):
+def importAllModules(base_path, mod_names=None, errors=None):
+    """Import command modules independently so one broken file is isolated."""
     modules = []
     for name in getModuleNames(base_path) if mod_names is None else mod_names:
         logger.debug(f"Import module: {name}")
-        modules.append(importlib.import_module(name))
+        try:
+            modules.append(importlib.import_module(name))
+        except Exception as error:
+            logger.exception("Could not import command module: %s", name)
+            if errors is not None:
+                errors.append({"module": str(name), "error": str(error)})
 
     return modules

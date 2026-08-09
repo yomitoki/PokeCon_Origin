@@ -32,6 +32,16 @@ SPECIAL_NAMES = {
 }
 
 
+def literal_string(node):
+    constant_type = getattr(ast, "Constant", ())
+    if isinstance(node, constant_type) and isinstance(getattr(node, "value", None), str):
+        return node.value
+    legacy_type = getattr(ast, "Str", ())
+    if isinstance(node, legacy_type) and isinstance(getattr(node, "s", None), str):
+        return node.s
+    return None
+
+
 def image_check_node(tree):
     for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "image_check":
@@ -42,7 +52,7 @@ def image_check_node(tree):
 def branch_names(test):
     if isinstance(test, ast.Compare) and len(test.ops) == 1 and isinstance(test.ops[0], ast.Eq):
         values = [test.left] + list(test.comparators)
-        return [value.s for value in values if isinstance(value, ast.Str)]
+        return [text for text in (literal_string(value) for value in values) if text is not None]
     if isinstance(test, ast.BoolOp) and isinstance(test.op, ast.Or):
         output = []
         for value in test.values:

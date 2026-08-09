@@ -24,6 +24,12 @@ class Sender:
         # command packet at the byte-stream level.
         self.write_lock = threading.RLock()
         self.is_show_serial = is_show_serial
+        try:
+            self._show_serial = bool(is_show_serial.get())
+        except Exception:
+            self._show_serial = bool(is_show_serial)
+        self._manual_condition = threading.Condition()
+        self._manual_override = False
 
         self._logger = getLogger(__name__)
         self._logger.addHandler(NullHandler())
@@ -57,6 +63,26 @@ class Sender:
             "Button.CAPTURE",
         ]
         self.Hat = ["TOP", "TOP_RIGHT", "RIGHT", "BTM_RIGHT", "BTM", "BTM_LEFT", "LEFT", "TOP_LEFT", "CENTER"]
+
+    def set_show_serial(self, enabled):
+        """Cache the Tk setting so worker threads never call Tk variables."""
+        self._show_serial = bool(enabled)
+
+    def begin_manual_override(self):
+        with self._manual_condition:
+            self._manual_override = True
+
+    def end_manual_override(self):
+        with self._manual_condition:
+            self._manual_override = False
+            self._manual_condition.notify_all()
+
+    def _wait_for_manual_override(self, priority=False):
+        if priority:
+            return
+        with self._manual_condition:
+            while self._manual_override:
+                self._manual_condition.wait(timeout=0.05)
 
     def openSerial(self, portNum: int, portName: str = "", baudrate: int = 9600):
         try:
@@ -96,19 +122,21 @@ class Sender:
 
     def closeSerial(self):
         self._logger.debug("Closing the serial communication")
+        self.end_manual_override()
         self.ser.close()
 
     def isOpened(self):
         self._logger.debug("Checking if serial communication is open")
         return True if self.ser is not None and self.ser.isOpen() else False
 
-    def writeRow(self, row: str, is_show: bool = False):
+    def writeRow(self, row: str, is_show: bool = False, priority: bool = False):
         try:
             self.time_bef = time.perf_counter()
             if self.before is not None and self.before != "end" and is_show:
                 output = self.before.split(" ")
                 self.show_input(output)
 
+            self._wait_for_manual_override(priority)
             with self.write_lock:
                 self.ser.write((row + "\r\n").encode("utf-8"))
             self.time_aft = time.perf_counter()
@@ -122,16 +150,17 @@ class Sender:
             self._logger.error(e)
         # self._logger.debug(f"{row}")
         # Show sending serial datas
-        if self.is_show_serial.get():
+        if self._show_serial:
             print(row)
 
 
-    def writeList(self, values: list, is_show: bool = False):
+    def writeList(self, values: list, is_show: bool = False, priority: bool = False):
         try:
             self.time_bef = time.perf_counter()
             if self.before is not None and self.before != "end" and is_show:
                 pass
 
+            self._wait_for_manual_override(priority)
             with self.write_lock:
                 self.ser.write(values)
             self.time_aft = time.perf_counter()
@@ -145,11 +174,13 @@ class Sender:
             self._logger.error(e)
         # self._logger.debug(f"{values}")
         # Show sending serial datas
-        if self.is_show_serial.get():
+        if self._show_serial:
             print(values)
 
-    def writeRow_wo_perf_counter(self, row: str, is_show: bool = False):
+    def writeRow_wo_perf_counter(self, row: str, is_show: bool = False,
+                                 priority: bool = False):
         try:
+            self._wait_for_manual_override(priority)
             with self.write_lock:
                 self.ser.write((row + "\r\n").encode("utf-8"))
         except serial.serialutil.SerialException as e:
@@ -162,7 +193,7 @@ class Sender:
             self._logger.error(e)
         # self._logger.debug(f"{row}")
         # Show sending serial datas
-        if self.is_show_serial.get():
+        if self._show_serial:
             print(row)
 
     def show_input(self, output: List[str]):

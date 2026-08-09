@@ -10,6 +10,24 @@ import re
 import time
 
 
+def discover_state_variables(source):
+    """Return dictionary-backed state variables selectable before Commands start."""
+    found = set()
+    tree = ast.parse(str(source))
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Assign, ast.AnnAssign)) or not isinstance(node.value, ast.Dict):
+            continue
+        assigned = node.targets if isinstance(node, ast.Assign) else [node.target]
+        for item in assigned:
+            name = item.id if isinstance(item, ast.Name) else (
+                item.attr if isinstance(item, ast.Attribute) else "")
+            upper = name.upper()
+            if ((upper.startswith("STATE_") and upper.endswith("_FUNCTION"))
+                    or upper in ("STEP_LABELS", "STEPS")):
+                found.add(name)
+    return sorted(found, key=str.casefold)
+
+
 def discover_state_values(source, variable_name):
     """Extract selectable state-table keys from Python source text."""
     target = str(variable_name or "").strip().upper()
@@ -47,7 +65,7 @@ def resolve_command_value(command, requested_name):
     if command is None:
         return False, None, ""
     name = str(requested_name or "").strip()
-    candidates = [name]
+    candidates = []
     upper = name.upper()
     if upper == "STATE_MAIN_FUNCTION":
         candidates.extend(("main_current_state", "za_infi_main_current_state"))
@@ -59,6 +77,10 @@ def resolve_command_value(command, requested_name):
         candidates.append("common_{}_current_state".format(common.group(1).lower()))
     if upper in ("STEP", "CURRENT_STEP"):
         candidates.extend(("current_step", "step", "step_name"))
+    # A STATE_*_FUNCTION attribute is normally the dispatch dictionary, not
+    # its current value. Resolve the known current-state alias first and use
+    # the requested name only as the fallback for ordinary scalar variables.
+    candidates.append(name)
     for candidate in candidates:
         if candidate and hasattr(command, candidate):
             try:

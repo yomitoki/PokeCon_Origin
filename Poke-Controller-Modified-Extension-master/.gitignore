@@ -13,6 +13,7 @@
 !SerialController/Commands/PythonCommands/Samples/vision_rules.json
 *.bat
 !ExecutePokeConModified-Extension.bat
+!SetupPokeConPythonEnvironments.bat
 !UpdatePokeConModified-Extension.bat
 .idea/
 SerialController/Captures/
@@ -123,6 +124,8 @@ celerybeat-schedule
 # Environments
 .env
 .venv
+.venv*/
+.pokecon-python-version
 env/
 venv/
 ENV/

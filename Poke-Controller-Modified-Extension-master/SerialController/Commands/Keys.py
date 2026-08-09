@@ -316,7 +316,9 @@ class SendFormat:
 class Direction:
     def __init__(self, stick, angle, magnification=1.0, isDegree=True, showName=None):
         self._logger = getLogger(__name__)
-        self._logger.addHandler(NullHandler())
+        if not any(isinstance(handler, NullHandler)
+                   for handler in self._logger.handlers):
+            self._logger.addHandler(NullHandler())
         self._logger.setLevel(DEBUG)
         self._logger.propagate = True
 
@@ -335,7 +337,7 @@ class Direction:
             self.x = angle[0]
             self.y = angle[1]
             self.showName = "(" + str(self.x) + ", " + str(self.y) + ")"
-            print("押し込み量", self.showName)
+            self._logger.debug("Stick position: %s", self.showName)
         else:
             angle = math.radians(angle) if isDegree else angle
 
@@ -414,7 +416,9 @@ Direction.R_UP_LEFT = Direction(Stick.RIGHT, 135, showName="UP_LEFT")
 class Touchscreen:
     def __init__(self, x, y):
         self._logger = getLogger(__name__)
-        self._logger.addHandler(NullHandler())
+        if not any(isinstance(handler, NullHandler)
+                   for handler in self._logger.handlers):
+            self._logger.addHandler(NullHandler())
         self._logger.setLevel(DEBUG)
         self._logger.propagate = True
 
@@ -428,7 +432,7 @@ class Touchscreen:
 class KeyPress:
     serial_data_format_name = "Default"
 
-    def __init__(self, ser: Sender):
+    def __init__(self, ser: Sender, priority: bool = False):
         self._logger = getLogger(__name__)
         self._logger.addHandler(NullHandler())
         self._logger.setLevel(DEBUG)
@@ -436,6 +440,7 @@ class KeyPress:
 
         self.q = queue.Queue()
         self.ser = ser
+        self.priority = bool(priority)
         self.format = SendFormat()
         self.holdButton = []
         self.btn_name2 = ["LEFT", "RIGHT", "UP", "DOWN", "UP_LEFT", "UP_RIGHT", "DOWN_LEFT", "DOWN_RIGHT"]
@@ -469,16 +474,16 @@ class KeyPress:
             )
             self.format.setHat([btn for btn in btns if type(btn) is Hat])
             self.format.setAnyDirection([btn for btn in btns if type(btn) is Direction])
-            self.ser.writeList(self.format.convert2list2())
+            self.ser.writeList(self.format.convert2list2(), priority=self.priority)
         else:
             self.format.setButton([btn for btn in btns if type(btn) is Button])
             self.format.setHat([btn for btn in btns if type(btn) is Hat])
             self.format.setAnyDirection([btn for btn in btns if type(btn) is Direction])
             if self.serial_data_format_name == "Qingpi":
                 self.format.setTouchscreen([btn for btn in btns if type(btn) is Touchscreen])
-                self.ser.writeList(self.format.convert2list())
+                self.ser.writeList(self.format.convert2list(), priority=self.priority)
             else:
-                self.ser.writeRow(self.format.convert2str())
+                self.ser.writeRow(self.format.convert2str(), priority=self.priority)
         self.input_time_0 = time.perf_counter()
 
         # self._logger.debug(f": {list(map(str,self.format.format.values()))}")
@@ -507,7 +512,7 @@ class KeyPress:
             if unset_hat:
                 self.format.unsetHat()
             self.format.unsetDirection(tilts)
-            self.ser.writeList(self.format.convert2list2())
+            self.ser.writeList(self.format.convert2list2(), priority=self.priority)
         else:
             self.format.unsetButton([btn for btn in btns if type(btn) is Button])
             if unset_hat:
@@ -516,9 +521,9 @@ class KeyPress:
             if self.serial_data_format_name == "Qingpi":
                 if unset_Touchscreen or (True in [btn for btn in btns if type(btn) is Touchscreen]):
                     self.format.unsetTouchscreen()
-                self.ser.writeList(self.format.convert2list())
+                self.ser.writeList(self.format.convert2list(), priority=self.priority)
             else:
-                self.ser.writeRow(self.format.convert2str())
+                self.ser.writeRow(self.format.convert2str(), priority=self.priority)
 
     def hold(self, btns: Button | Hat | Stick | Direction):
         if not isinstance(btns, list):
@@ -548,7 +553,8 @@ class KeyPress:
         flag_isTouchscreen = False
         for btn in btns:
             if type(btn) is not Touchscreen:
-                self.holdButton.remove(btn)
+                if btn in self.holdButton:
+                    self.holdButton.remove(btn)
             else:
                 flag_isTouchscreen = True
         if flag_isTouchscreen:
@@ -563,13 +569,20 @@ class KeyPress:
         self.holdButton = []
         self.inputEnd(btns, unset_hat=True, unset_Touchscreen=True)
 
+    def begin_manual_override(self):
+        self.ser.begin_manual_override()
+
+    def end_manual_override(self):
+        self.ser.end_manual_override()
+
     def end(self):
         if self.serial_data_format_name in ["Qingpi", "3DS Controller"]:
             pass
         else:
-            self.ser.writeRow("end")
+            self.ser.writeRow("end", priority=self.priority)
 
     def serialcommand_direct_send(self, serialcommands: list, waittime: list):
         for wtime, row in zip(waittime, serialcommands):
             time.sleep(wtime)
-            self.ser.writeRow_wo_perf_counter(row, is_show=False)
+            self.ser.writeRow_wo_perf_counter(
+                row, is_show=False, priority=self.priority)

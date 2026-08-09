@@ -1,0 +1,32 @@
+# Python 3.14.7 free-threaded core environment for readiness checks.
+# OpenCV, pygame and pythonnet are intentionally absent: their current Windows
+# builds are not safe/usable while the GIL is disabled.
+
+certifi==2026.7.22
+cffi==2.1.1
+charset-normalizer==3.4.9
+gitdb==4.0.12
+GitPython==3.1.58
+idna==3.18
+imageio-ffmpeg==0.6.0
+numpy==2.5.1
+packaging==26.3
+paho-mqtt==2.1.0
+pandas==3.0.5
+pillow==12.3.0
+plyer==2.1.0
+pycparser==3.0
+pygubu==0.41.2
+pynput==1.8.2
+pyserial==3.5
+pytesseract==0.3.13
+python-dateutil==2.9.0.post0
+requests==2.34.2
+scipy==1.18.0
+setuptools==84.0.0
+six==1.17.0
+smmap==5.0.3
+sounddevice==0.5.5
+tzdata==2026.3
+urllib3==2.7.0
+wheel==0.47.0

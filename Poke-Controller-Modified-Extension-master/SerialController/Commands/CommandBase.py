@@ -47,6 +47,9 @@ class Command:
     # Assigned by Window at startup.  Python commands can call show_output()
     # without importing or depending on Tkinter widgets.
     output = None
+    # Text output is also dispatched by Window.  Commands run on worker
+    # threads, so touching a Tk Text widget here can stall every GUI action.
+    text_output = None
 
     def __init__(self):
         self.isRunning = False
@@ -86,6 +89,9 @@ class Command:
         """
         try:
             txt = sep.join([str(obj) for obj in objects]) + end
+            if Command.text_output is not None:
+                Command.text_output("Output#1", "a", txt)
+                return
             self.text_area_1.config(state="normal")
             self.text_area_1.insert("end", txt)
             self.text_area_1.config(state="disable")
@@ -99,6 +105,9 @@ class Command:
         """
         try:
             txt = sep.join([str(obj) for obj in objects]) + end
+            if Command.text_output is not None:
+                Command.text_output("Output#2", "a", txt)
+                return
             self.text_area_2.config(state="normal")
             self.text_area_2.insert("end", txt)
             self.text_area_2.config(state="disable")
@@ -131,6 +140,9 @@ class Command:
         """
         try:
             txt = sep.join([str(obj) for obj in objects]) + end
+            if Command.text_output is not None:
+                Command.text_output("Output#1", mode, txt)
+                return
             self.text_area_1.config(state="normal")
             if mode in ["w", "d"]:
                 self.text_area_1.delete("1.0", "end")
@@ -150,6 +162,9 @@ class Command:
         """
         try:
             txt = sep.join([str(obj) for obj in objects]) + end
+            if Command.text_output is not None:
+                Command.text_output("Output#2", mode, txt)
+                return
             self.text_area_2.config(state="normal")
             if mode in ["w", "d"]:
                 self.text_area_2.delete("1.0", "end")

@@ -17,6 +17,16 @@ LIST_PATH = os.path.join(FRAGMENT_ROOT, "sample_lists.json")
 TAG = "Pokemon_ZA"
 
 
+def literal_string(node):
+    constant_type = getattr(ast, "Constant", ())
+    if isinstance(node, constant_type) and isinstance(getattr(node, "value", None), str):
+        return node.value
+    legacy_type = getattr(ast, "Str", ())
+    if isinstance(node, legacy_type) and isinstance(getattr(node, "s", None), str):
+        return node.s
+    return None
+
+
 GROUP_PATTERNS = [
     ("ZA_MovementAndEvent", [
         r"sendCommand", r"etc_sendCommand", r"zone_check", r"MOVE_.*", r"ROTOM_GLIDE", r"ZL_ACTION", r"renda_button",
@@ -60,8 +70,9 @@ def state_initializers(initializer, group_methods, mapping):
             continue
         members = []
         for key, value in zip(node.value.keys, node.value.values):
-            if isinstance(key, ast.Str) and isinstance(value, ast.Attribute) and value.attr in group_methods:
-                members.append((key.s, mapping[value.attr]))
+            state_name = literal_string(key)
+            if state_name is not None and isinstance(value, ast.Attribute) and value.attr in group_methods:
+                members.append((state_name, mapping[value.attr]))
         if not members:
             continue
         dictionary_name = "ZA_" + targets[0]

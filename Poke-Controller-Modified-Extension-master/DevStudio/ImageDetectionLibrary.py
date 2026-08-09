@@ -110,6 +110,7 @@ def generate_image_check(data, name, selection_type="list"):
         "    results = []",
         "    for settings in variants:",
         "        detect_settings = dict(settings)",
+        "        detect_settings.pop('health_ignored_warnings', None)",
         "        output_panel = getattr(self, 'IMAGE_DETECTION_OUTPUT_PANEL', None)",
         "        show_value = bool(detect_settings.get('show_value', False) or getattr(self, 'show_value_bool', False))",
         "        if output_panel and show_value:",

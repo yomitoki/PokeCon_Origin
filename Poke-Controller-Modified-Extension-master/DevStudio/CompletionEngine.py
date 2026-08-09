@@ -18,9 +18,10 @@ import re
 _IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
 _TOKEN_AT_END_RE = re.compile(r"[A-Za-z_]\w*$")
 _SOURCE_NAMES_RE = re.compile(
-    r"(?m)^\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)|"
-    r"(?m)^\s*([A-Za-z_]\w*)\s*(?::[^=\n]+)?=|"
-    r"\bself\.([A-Za-z_]\w*)"
+    r"^\s*(?:async\s+)?(?:def|class)\s+([A-Za-z_]\w*)|"
+    r"^\s*([A-Za-z_]\w*)\s*(?::[^=\n]+)?=|"
+    r"\bself\.([A-Za-z_]\w*)",
+    re.MULTILINE,
 )
 _METHOD_START_RE = re.compile(r"^ {4}def\s+([A-Za-z_]\w*)\s*(.*)$")
 

@@ -8,8 +8,54 @@ import tkinter.ttk as ttk
 import tkinter.messagebox as tkmsg
 import tkinter.scrolledtext as st
 import platform
+import os
+import re
 import Constant
-import pkg_resources
+
+try:
+    from importlib import metadata as package_metadata
+except ImportError:  # Python 3.7
+    try:
+        import importlib_metadata as package_metadata
+    except ImportError:
+        package_metadata = None
+
+legacy_package_resources = None
+if package_metadata is None:
+    try:
+        import pkg_resources as legacy_package_resources
+    except ImportError:
+        pass
+
+
+def requirement_distribution_name(requirement):
+    """Extract a distribution name without evaluating a requirements marker."""
+    text = str(requirement or "").strip()
+    if not text or text.startswith(("#", "-")):
+        return ""
+    text = text.split(";", 1)[0].strip()
+    match = re.match(r"^([A-Za-z0-9][A-Za-z0-9._-]*)", text)
+    return match.group(1) if match else ""
+
+
+def installed_distribution_version(requirement):
+    """Return an installed version on Python 3.7-3.14 without requiring setuptools."""
+    name = requirement_distribution_name(requirement)
+    if not name:
+        return None
+    if package_metadata is not None:
+        try:
+            return package_metadata.version(name)
+        except package_metadata.PackageNotFoundError:
+            return None
+        except Exception:
+            pass
+    if legacy_package_resources is not None:
+        try:
+            return legacy_package_resources.get_distribution(name).version
+        except Exception:
+            pass
+    return None
 
 # ソースコードの見た目がよくないので、こっちで定義する。
 QUESTION_TITLE = """--------------------------質問をする際の注意事項--------------------------
@@ -45,7 +91,10 @@ class PokeConQuestionDialogue(object):
             developer_name = ""
         self.message_dialogue = parent
         self.message_dialogue.title("Poke-Controller Modified Question Template Maker")
-        self.message_dialogue.attributes("-topmost", True)
+        try:
+            self.message_dialogue.transient(self.message_dialogue.master)
+        except tk.TclError:
+            pass
         self.message_dialogue.protocol("WM_DELETE_WINDOW", self.close_window)
 
         self.main_frame = tk.Frame(self.message_dialogue)
@@ -165,19 +214,23 @@ class PokeConVersionCheck(object):
             txt += f"■OS\n{platform.platform()}\n\n"
         txt += f"■Python version\n{sys.version.split(' ')[0]}\n\n"
         txt += "■Libraries version\n"
-        with open("../requirements.txt", "r") as file:
+        requirements_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "requirements.txt")
+        with open(requirements_path, "r", encoding="utf-8") as file:
             for line in file:
                 library_name = line.strip()
-                try:
-                    version = pkg_resources.get_distribution(library_name).version
-                    txt += f"{library_name}: {version}\n"
-                except pkg_resources.DistributionNotFound:
-                    txt += f"{library_name}: Not installed\n"
-                except Exception:
-                    pass
+                distribution_name = requirement_distribution_name(library_name)
+                if not distribution_name:
+                    continue
+                version = installed_distribution_version(library_name)
+                txt += f"{library_name}: {version or 'Not installed'}\n"
         self.window = parent
         self.window.title("Version確認")
-        self.window.attributes("-topmost", True)
+        try:
+            self.window.transient(self.window.master)
+        except tk.TclError:
+            pass
         self.window.protocol("WM_DELETE_WINDOW", self.close_window)
 
         self.main_frame = tk.Frame(self.window)
@@ -210,7 +263,10 @@ class PokeConChangeLog(object):
 
         self.window = parent
         self.window.title("更新履歴")
-        self.window.attributes("-topmost", True)
+        try:
+            self.window.transient(self.window.master)
+        except tk.TclError:
+            pass
         self.window.protocol("WM_DELETE_WINDOW", self.close_window)
 
         self.main_frame = tk.Frame(self.window)
@@ -255,7 +311,10 @@ class PokeConCopyright(object):
 
         self.window = parent
         self.window.title("LICENSE")
-        self.window.attributes("-topmost", True)
+        try:
+            self.window.transient(self.window.master)
+        except tk.TclError:
+            pass
         self.window.protocol("WM_DELETE_WINDOW", self.close_window)
 
         self.main_frame = tk.Frame(self.window)

@@ -51,7 +51,9 @@ class CaptureRecorder:
     def start(self, frame, fps, audio_device="", audio_gain_percent=100, cleanup_rules=None, minimum_duration=0):
         if self.active or frame is None:
             return
-        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        # Sub-second suffix prevents a rotating Commands monitor from reusing
+        # the previous chunk folder when capture is restarted within a second.
+        stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         # Keep all artefacts belonging to one recording together.  A new
         # template-triggered segment gets its own timestamped folder too.
         self.session_dir = os.path.join(self.output_dir, stamp)
@@ -205,9 +207,12 @@ class CaptureRecorder:
         with self.lock:
             self._finalizing_count += 1
         process_audio_gain = self.process_audio_gain
+        cleanup_rules = list(self.cleanup_rules)
+        minimum_duration = float(self.minimum_duration)
         threading.Thread(target=self._finalize_worker,
                          args=(video_path, wav_path, mp4_path, actual_fps, elapsed,
-                               process_audio_gain, bool(discard)), daemon=True).start()
+                               process_audio_gain, bool(discard), cleanup_rules,
+                               minimum_duration), daemon=True).start()
         print("[RECORDING] Finalizing MP4 in background ({:.2f} captured FPS): {}".format(actual_fps, mp4_path))
         return mp4_path
 
@@ -217,22 +222,26 @@ class CaptureRecorder:
             return self._finalizing_count > 0
 
     def _finalize_worker(self, video_path, wav_path, mp4_path, actual_fps, elapsed,
-                         process_audio_gain=1.0, discard=False):
+                         process_audio_gain=1.0, discard=False,
+                         cleanup_rules=None, minimum_duration=0.0):
         try:
             self._finalize(video_path, wav_path, mp4_path, actual_fps, elapsed,
-                           process_audio_gain, discard)
+                           process_audio_gain, discard, cleanup_rules,
+                           minimum_duration)
         finally:
             with self.lock:
                 self._finalizing_count = max(0, self._finalizing_count - 1)
 
     def _finalize(self, video_path, wav_path, mp4_path, actual_fps, elapsed,
-                  process_audio_gain=1.0, discard=False):
+                  process_audio_gain=1.0, discard=False,
+                  cleanup_rules=None, minimum_duration=0.0):
         if discard:
             session_dir = os.path.dirname(video_path)
             print("[RECORDING] Discarded recording by command-variable rule.")
             shutil.rmtree(session_dir, ignore_errors=True)
             return None
-        reason = self._discard_reason(video_path, elapsed)
+        reason = self._discard_reason(
+            video_path, elapsed, cleanup_rules, minimum_duration)
         if reason:
             session_dir = os.path.dirname(video_path)
             print("[RECORDING] Discarded recording: " + reason)
@@ -242,15 +251,18 @@ class CaptureRecorder:
         return self._mux(video_path, wav_path, mp4_path, actual_fps,
                          process_audio_gain)
 
-    def _discard_reason(self, video_path, elapsed):
-        if self.minimum_duration and elapsed < self.minimum_duration:
-            return "duration {:.2f}s is below {:.2f}s".format(elapsed, self.minimum_duration)
-        if not self.cleanup_rules:
+    def _discard_reason(self, video_path, elapsed, cleanup_rules=None,
+                        minimum_duration=None):
+        cleanup_rules = self.cleanup_rules if cleanup_rules is None else cleanup_rules
+        minimum_duration = self.minimum_duration if minimum_duration is None else minimum_duration
+        if minimum_duration and elapsed < minimum_duration:
+            return "duration {:.2f}s is below {:.2f}s".format(elapsed, minimum_duration)
+        if not cleanup_rules:
             return None
         capture = cv2.VideoCapture(video_path)
         total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
         step = max(1, total // 120)  # analyse at most about 120 frames per clip
-        matches = [0] * len(self.cleanup_rules)
+        matches = [0] * len(cleanup_rules)
         sampled = 0
         index = 0
         while True:
@@ -259,7 +271,7 @@ class CaptureRecorder:
                 break
             if index % step == 0:
                 sampled += 1
-                for pos, rule in enumerate(self.cleanup_rules):
+                for pos, rule in enumerate(cleanup_rules):
                     image = rule.get("image")
                     if image is None or frame.shape[0] < image.shape[0] or frame.shape[1] < image.shape[1]:
                         continue
@@ -270,7 +282,7 @@ class CaptureRecorder:
         capture.release()
         if not sampled:
             return None
-        for pos, rule in enumerate(self.cleanup_rules):
+        for pos, rule in enumerate(cleanup_rules):
             percent = 100.0 * matches[pos] / sampled
             if percent >= float(rule.get("minimum_percent", 100.0)):
                 return "discard image {} detected in {:.1f}% of sampled frames".format(pos + 1, percent)

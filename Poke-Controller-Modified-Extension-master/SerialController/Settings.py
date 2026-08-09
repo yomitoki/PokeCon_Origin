@@ -30,6 +30,8 @@ class GuiSettings:
         # default
         self.camera_id = tk.IntVar(value=self.setting["General Setting"].getint("camera_id"))
         self.video_source = self.setting.get("General Setting", "video_source", fallback="Capture device")
+        self.window_capture_mode = self.setting.get(
+            "General Setting", "window_capture_mode", fallback="client")
         self.window_title = self.setting.get("General Setting", "window_title", fallback="")
         self.window_process = self.setting.get("General Setting", "window_process", fallback="")
         self.com_port = tk.IntVar(value=self.setting["General Setting"].getint("com_port"))
@@ -37,6 +39,8 @@ class GuiSettings:
         self.baud_rate = tk.IntVar(value=self.setting["General Setting"].getint("baud_rate"))
         self.fps = tk.StringVar(value=self.setting["General Setting"]["fps"])
         self.show_size = tk.StringVar(value=self.setting["General Setting"].get("show_size"))
+        self.last_active_preview_full_fps = self.setting.getboolean(
+            "General Setting", "last_active_preview_full_fps", fallback=False)
         self.is_show_realtime = tk.BooleanVar(value=self.setting["General Setting"].getboolean("is_show_realtime"))
         self.is_show_value = tk.BooleanVar(value=self.setting["General Setting"].getboolean("is_show_value"))
         self.is_show_guide = tk.BooleanVar(value=self.setting["General Setting"].getboolean("is_show_guide"))
@@ -143,14 +147,6 @@ class GuiSettings:
         self.right_panel_count = self.setting["Output"].get("right_panel_count", "2")
         self.side_width_balance = self.setting["Output"].get("side_width_balance", "50")
         self.show_software_controller = self.setting["Output"].getboolean("show_software_controller", True)
-        self.quick_actions_left_position = self.setting["Output"].get(
-            "quick_actions_left_position", "上")
-        self.quick_actions_right_position = self.setting["Output"].get(
-            "quick_actions_right_position", "上")
-        self.quick_actions_left_items = self.setting["Output"].get(
-            "quick_actions_left_items", "[]")
-        self.quick_actions_right_items = self.setting["Output"].get(
-            "quick_actions_right_items", "[]")
         self.audio_input = self.setting.get("Audio", "input_device", fallback="")
         self.audio_gain = self.setting.get("Audio", "gain", fallback="100")
         self.audio_filter_camera = self.setting.getboolean("Audio", "filter_camera", fallback=False)
@@ -223,6 +219,7 @@ class GuiSettings:
         self.setting["General Setting"] = {
             "camera_id": 0,
             "video_source": "Capture device",
+            "window_capture_mode": "client",
             "window_title": "",
             "window_process": "",
             "com_port": 0,
@@ -230,6 +227,7 @@ class GuiSettings:
             "baud_rate": 9600,
             "fps": 45,
             "show_size": "640x360",
+            "last_active_preview_full_fps": False,
             "is_show_realtime": True,
             "is_show_value": False,
             "is_show_guide": False,
@@ -332,10 +330,6 @@ class GuiSettings:
             "right_panel_count": "2",
             "side_width_balance": "50",
             "show_software_controller": True,
-            "quick_actions_left_position": "上",
-            "quick_actions_right_position": "上",
-            "quick_actions_left_items": "[]",
-            "quick_actions_right_items": "[]",
         }
         self.setting["Audio"] = {"input_device": "", "gain": "100", "filter_camera": False, "auto_start": False}
         self.setting["Analysis"] = {
@@ -377,6 +371,7 @@ class GuiSettings:
         self.setting["General Setting"] = {
             "camera_id": self.camera_id.get(),
             "video_source": self.video_source,
+            "window_capture_mode": self.window_capture_mode,
             "window_title": self.window_title,
             "window_process": self.window_process,
             "com_port": self.com_port.get(),
@@ -384,6 +379,7 @@ class GuiSettings:
             "baud_rate": self.baud_rate.get(),
             "fps": self.fps.get(),
             "show_size": self.show_size.get(),
+            "last_active_preview_full_fps": self.last_active_preview_full_fps,
             "is_show_realtime": self.is_show_realtime.get(),
             "is_show_value": self.is_show_value.get(),
             "is_show_guide": self.is_show_guide.get(),
@@ -452,10 +448,6 @@ class GuiSettings:
             "right_panel_count": self.right_panel_count,
             "side_width_balance": self.side_width_balance,
             "show_software_controller": self.show_software_controller,
-            "quick_actions_left_position": self.quick_actions_left_position,
-            "quick_actions_right_position": self.quick_actions_right_position,
-            "quick_actions_left_items": self.quick_actions_left_items,
-            "quick_actions_right_items": self.quick_actions_right_items,
         }
         self.setting["Audio"] = {
             "input_device": self.audio_input,

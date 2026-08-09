@@ -29,6 +29,7 @@ from LineNotify import Line_Notify
 from DiscordNotify import Discord_Notify
 from Commands import CommandBase
 from Commands.Keys import KeyPress
+from ThreadCancellation import raise_in_thread, request_stop_flags
 
 if TYPE_CHECKING:
     from Window import PokeControllerApp
@@ -63,6 +64,7 @@ class PythonCommand(CommandBase.Command):
         # A Step-debug worker may use the initialized command while its main
         # thread is intentionally paused at the state-function boundary.
         self._pause_bypass_threads = set()
+        self._cleanup_started = False
         self.postProcess = None
         self.Line = Line_Notify()
         self.Discord = Discord_Notify()
@@ -74,8 +76,13 @@ class PythonCommand(CommandBase.Command):
         """
 
         def inner(self, *args, **kwargs):
-            func(self, *args, **kwargs)
+            # Check before the next controller operation as well as after it.
+            # Manual control can therefore take ownership without waiting for
+            # another complete press/wait cycle.
             self.checkIfAlive()
+            result = func(self, *args, **kwargs)
+            self.checkIfAlive()
+            return result
 
         return inner
 
@@ -184,8 +191,23 @@ class PythonCommand(CommandBase.Command):
             if sys.__stderr__ is not None and sys.stderr is not sys.__stderr__:
                 print("Interrupt: コマンド実行中に例外が発生しました。", file=sys.__stderr__)
                 traceback.print_exc(file=sys.__stderr__)
-            self.keys.end()
             self.alive = False
+        finally:
+            self._cleanup_started = True
+            self.alive = False
+            self.pause_requested = False
+            try:
+                if self.keys is not None:
+                    self.keys.end()
+            except Exception as error:
+                self._logger.warning("Command key release failed: %s", error)
+            self.keys = None
+            if self.thread is threading.current_thread():
+                self.thread = None
+            post_process = self.postProcess
+            self.postProcess = None
+            if post_process is not None:
+                post_process()
 
     def start(self, ser: Sender, postProcess: PokeControllerApp.stopPlayPost):
         """
@@ -193,6 +215,7 @@ class PythonCommand(CommandBase.Command):
         """
         self.alive = True
         self.pause_requested = False
+        self._cleanup_started = False
         self.socket0.alive = True
         self.mqtt0.alive = True
         self.postProcess = postProcess
@@ -207,12 +230,20 @@ class PythonCommand(CommandBase.Command):
         self.sendStopRequest()
 
     def sendStopRequest(self):
-        if self.checkIfAlive():  # try if we can stop now
-            self.alive = False
-            print("-- sent a stop request. --")
-            self._logger.info("Sending stop request")
-        if self.socket0.flag_socket:
-            self.socket_disconnect()
+        # This method can be called from Tk's GUI thread.  It must only set
+        # cancellation flags and must never enter checkIfAlive(), which may be
+        # waiting on a CommandsAssist/Step-debug pause owned by another thread.
+        request_stop_flags(self)
+        print("-- sent a stop request. --")
+        self._logger.info("Sending stop request")
+
+    def force_stop(self):
+        """Request stop and interrupt a Python-bytecode worker immediately."""
+        self.sendStopRequest()
+        worker = self.thread
+        interrupted = False if self._cleanup_started else raise_in_thread(worker, StopThread)
+        self._logger.warning("Force stop async interruption: %s", interrupted)
+        return interrupted
 
     # NOTE: Use this function if you want to get out from a command loop by yourself
     def finish(self):
@@ -294,6 +325,9 @@ class PythonCommand(CommandBase.Command):
         """Yield the GIL while retaining prompt pause/stop checkpoints."""
         deadline = time.perf_counter() + max(0.0, float(seconds))
         while self.alive:
+            if (self.pause_requested or self.isPause) and \
+                    threading.get_ident() not in self._pause_bypass_threads:
+                self.checkIfAlive()
             remaining = deadline - time.perf_counter()
             if remaining <= 0:
                 return
@@ -326,6 +360,7 @@ class PythonCommand(CommandBase.Command):
             # threads responsive; no interpreter/GIL spin is required.
             sleep(0.02)
         if not self.alive:
+            self._cleanup_started = True
             self.keys.end()
             self.keys = None
             self.thread = None
