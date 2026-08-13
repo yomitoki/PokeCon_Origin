@@ -30,6 +30,7 @@ class Sender:
             self._show_serial = bool(is_show_serial)
         self._manual_condition = threading.Condition()
         self._manual_override = False
+        self._activity_callback = None
 
         self._logger = getLogger(__name__)
         self._logger.addHandler(NullHandler())
@@ -67,6 +68,19 @@ class Sender:
     def set_show_serial(self, enabled):
         """Cache the Tk setting so worker threads never call Tk variables."""
         self._show_serial = bool(enabled)
+
+    def set_activity_callback(self, callback):
+        """Register a non-blocking observer for successfully sent packets."""
+        self._activity_callback = callback
+
+    def _notify_activity(self, payload, priority):
+        callback = self._activity_callback
+        if callback is None:
+            return
+        try:
+            callback(payload, bool(priority))
+        except Exception as error:
+            self._logger.warning("Serial activity callback failed: %s", error)
 
     def begin_manual_override(self):
         with self._manual_condition:
@@ -139,6 +153,7 @@ class Sender:
             self._wait_for_manual_override(priority)
             with self.write_lock:
                 self.ser.write((row + "\r\n").encode("utf-8"))
+            self._notify_activity(row, priority)
             self.time_aft = time.perf_counter()
             self.before = row
         except serial.serialutil.SerialException as e:
@@ -163,6 +178,7 @@ class Sender:
             self._wait_for_manual_override(priority)
             with self.write_lock:
                 self.ser.write(values)
+            self._notify_activity(values, priority)
             self.time_aft = time.perf_counter()
             self.before = values
         except serial.serialutil.SerialException as e:
@@ -183,6 +199,7 @@ class Sender:
             self._wait_for_manual_override(priority)
             with self.write_lock:
                 self.ser.write((row + "\r\n").encode("utf-8"))
+            self._notify_activity(row, priority)
         except serial.serialutil.SerialException as e:
             # エラーはあえてprintでも出す。
             print(e)

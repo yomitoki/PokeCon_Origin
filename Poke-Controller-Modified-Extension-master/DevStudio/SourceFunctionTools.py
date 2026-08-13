@@ -12,6 +12,8 @@ import re
 import textwrap
 import tokenize
 
+from PythonSourceSafety import normalize_python_indentation
+
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_]\w*$")
 
@@ -22,9 +24,22 @@ def _node_end_line(node, lines):
         return end
     for index in range(node.lineno, len(lines)):
         value = lines[index]
-        if value.strip() and len(value) - len(value.lstrip(" \t")) <= node.col_offset:
+        stripped = value.strip()
+        if stripped and not stripped.startswith("#") and \
+                len(value) - len(value.lstrip(" \t")) <= node.col_offset:
             return index
     return len(lines)
+
+
+def _dedent_node_text(raw, node, source_lines):
+    """Remove only the function's structural indent, ignoring comments."""
+    definition_line = source_lines[node.lineno - 1]
+    prefix = definition_line[:node.col_offset]
+    if not prefix:
+        return raw
+    return "".join(
+        line[len(prefix):] if line.startswith(prefix) else line
+        for line in raw.splitlines(True))
 
 
 def source_function_records(source):
@@ -42,12 +57,13 @@ def source_function_records(source):
         decorator_lines = [item.lineno for item in node.decorator_list]
         start = min(decorator_lines + [node.lineno]) - 1
         end = _node_end_line(node, lines)
+        raw = "".join(lines[start:end])
         records.append({
             "name": node.name,
             "line": node.lineno,
             "start": start,
             "end": end,
-            "text": textwrap.dedent("".join(lines[start:end])),
+            "text": _dedent_node_text(raw, node, lines),
             "async": isinstance(node, ast.AsyncFunctionDef),
         })
     return records
@@ -270,7 +286,7 @@ def register_source_functions(source, names, fragment_root, folder="SourceImport
     saved_tags = list(dict.fromkeys(str(tag).strip() for tag in (tags or []) if str(tag).strip()))
     created = []
     for old_name, final_name, sample_dir, metadata_path, body_path, existing_metadata in planned:
-        body = records[old_name]["text"]
+        body = normalize_python_indentation(records[old_name]["text"])
         # The extracted block has no competing functions, so this safely also
         # updates recursive self.old_name() references inside the sample.
         if any(old != new for old, new in final_names.items()):

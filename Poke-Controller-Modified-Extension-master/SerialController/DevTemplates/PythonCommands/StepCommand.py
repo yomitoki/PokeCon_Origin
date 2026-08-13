@@ -5,7 +5,12 @@ from Commands.PythonCommandBase import PythonCommand
 class StepCommandTemplate(PythonCommand):
     NAME = "Example step command"
     TAGS = ["Example"]
+    COMMAND_RUN_SETTINGS = True
     STEP_LABELS = ["Chapter 1: preparation", "Chapter 2: detailed task"]
+    STEP_DESCRIPTIONS = {
+        "Chapter 1: preparation": "Initial preparation before the detailed task / 詳細処理前の準備",
+        "Chapter 2: detailed task": "Main detailed operation / メインの詳細処理",
+    }
 
     @classmethod
     def get_detection_targets(cls):

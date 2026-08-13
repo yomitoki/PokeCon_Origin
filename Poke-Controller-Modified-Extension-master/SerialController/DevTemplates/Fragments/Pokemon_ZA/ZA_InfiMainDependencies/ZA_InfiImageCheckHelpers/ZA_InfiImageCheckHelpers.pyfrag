@@ -1,0 +1,54 @@
+def _image_check_target(self, targetimage):
+    variants = self.IMAGE_DETECTION_TARGETS.get(str(targetimage), [])
+    if not hasattr(self, '_image_similarity_history'):
+        self._image_similarity_history = SimilarityHistory()
+    for settings in variants:
+        result = detect_image(self, name=targetimage, history=self._image_similarity_history, **settings)
+        self.last_image_detection = result
+        if result['matched']:
+            return True
+    return False
+
+
+def _image_check_set(self, set_name):
+    settings = self.IMAGE_DETECTION_SETS[str(set_name)]
+    results = []
+    for member in settings.get('members', []):
+        if member.get('type') == 'list':
+            results.append(self._image_check_set(member['id']))
+        else:
+            results.append(self._image_check_target(member['id']))
+    if not results:
+        return False
+    return all(results) if settings.get('operator', 'OR') == 'AND' else any(results)
+
+
+def image_check(self, targetimage, nocheckflag=1):
+    # nocheckflag=0 is the test-output skip used by existing commands.
+    if nocheckflag == 0:
+        return False
+    if str(targetimage) in self.IMAGE_DETECTION_SETS:
+        return bool(self._image_check_set(str(targetimage)))
+    if str(targetimage) in self.IMAGE_DETECTION_TARGETS:
+        return bool(self._image_check_target(str(targetimage)))
+    return bool(self.image_check_exception(targetimage))
+
+
+def image_check_exception(self, targetimage):
+    """Handle Pokemon ZA checks that do not use a template image."""
+    if targetimage in ("POKEMON_ZA_TRUE_RETURN", "TRUE_RETURN", "RETURN_TRUE", "RETURN TRUE"):
+        return True
+    if targetimage in ("POKEMON_ZA_FALSE_RETURN", "FALSE_RETURN", "RETURN_FALSE", "RETURN FALSE"):
+        return False
+    if targetimage == "POKEMON_ZA_FILED_HARD_CHECK_0":
+        return bool(self.ZA_story_Template_Field_HardGaurd())
+    if targetimage == "POKEMON_ZA_FILED_HARD_CHECK_1":
+        return bool(self.ZA_story_Template_Field_HardGaurd(mode=1))
+    if targetimage == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK":
+        return bool(self.ZA_no_battle_filed_check_HardGaurd())
+    if targetimage == "POKEMON_ZA_ZONE12":
+        return True
+    # POKECON_IMAGE_CHECK_EXCEPTION_USER_BEGIN
+    # Add command-specific non-image checks here.
+    # POKECON_IMAGE_CHECK_EXCEPTION_USER_END
+    return False

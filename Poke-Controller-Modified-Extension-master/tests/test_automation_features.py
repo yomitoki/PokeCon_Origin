@@ -1,4 +1,5 @@
 import datetime
+import ast
 import inspect
 import os
 import sys
@@ -22,10 +23,30 @@ if DEV_STUDIO not in sys.path:
 from AutomationTriggers import (StableRuleEvaluator, discover_state_values,
                                 discover_state_variables, resolve_command_value)
 from CommandStartOverride import apply_command_start_override
+from CommandRunOptions import (apply_command_run_options,
+                               apply_profile_to_dialogue_result,
+                               discover_command_run_options,
+                               preserve_location_selection,
+                               perform_failure_save_recovery)
 from ControllerInputLog import (python_replacement_body, replay_recording,
                                 rotate_log_range, rotate_serial_message)
 from DiskSpaceGuard import disk_space_violations
-from SampleFunctionSync import replace_class_functions
+from SampleFunctionSync import (compare_folder as compare_sample_function_folder,
+                                comparison_source_text,
+                                create_sample_sync_backup,
+                                function_records as sample_sync_function_records,
+                                latest_sample_sync_backup,
+                                merge_sample_names_with_source_bodies,
+                                reflect_fragment_function_text,
+                                fragment_function_stats,
+                                remove_fragment_function_text,
+                                replace_fragment_function_text,
+                                replace_class_functions,
+                                restore_sample_sync_backup,
+                                side_by_side_diff_rows,
+                                source_paths_for_folder,
+                                update_fragments as update_sample_fragments,
+                                update_source as update_source_from_samples)
 from StepDebugAssist import (DELETE_OPERATION_CODE, derive_follow_step_rule,
                              extract_step_method, execute_operation,
                              recommended_next_state, replacement_is_enabled)
@@ -37,33 +58,106 @@ from ThreadCancellation import raise_in_thread, request_stop_flags
 from SourceFunctionTools import (build_rename_map, register_source_functions,
                                  rename_source_functions, source_function_records,
                                  step_function_names)
+from SourceDependencyTools import (analyze_source_dependencies,
+                                   analyze_state_dictionary_dependencies,
+                                   compare_preview_functions,
+                                   compare_preview_support,
+                                   generate_state_machine_main,
+                                   merge_preview_functions_safely,
+                                   merge_preview_support_safely,
+                                   register_dependency_group,
+                                   state_dictionary_current_state,
+                                   state_dictionary_handlers,
+                                   state_dictionary_names,
+                                   suggest_state_dictionary)
+from SampleLibrary import compose_preview, save_library
+from SampleOriginSync import (apply_sample_list_to_origins,
+                              compare_sample_list_origins,
+                              restore_origin_sync_backup)
 from SharedDebugLibrary import (SharedDebugConflictError, read_shared_debug,
                                 write_shared_debug)
 from QuickActions import ACTION_BY_ID, normalize_action_ids, normalize_position
 from InputSetData import (INPUT_SET_VARIABLES, SCHEMA_VERSION,
                           has_complete_snapshot, legacy_combined_snapshot,
                           input_set_commands_enabled, strip_commands_from_snapshot,
+                          snapshot_values_with_defaults,
                           sync_command_start_overrides, sync_commands_assist_rules,
+                          sync_output_layout,
                           sync_quick_actions,
                           sync_step_debug_rules)
+from SoftwareControllerState import SoftwareControllerState
 from InputSetRuntimeRegistry import (ActiveInputSetRegistry,
+                                     canonical_device_key,
                                      default_window_activity_registry_path,
+                                     device_usage_conflicts,
+                                     main_resource_conflicts,
                                      process_identity, read_active_input_sets)
-from ImageDetectionMonitor import filter_target_names, load_detection_library
+from ResourceControl import (clamp_cpu_target, resource_throttle_level,
+                             throttle_multiplier)
+from ImageDetectionMonitor import (filter_target_names, format_show_value_entries,
+                                   load_detection_library,
+                                   padded_search_crop,
+                                   prune_show_value_entries,
+                                   update_show_value_entries)
 from ImageHealthCheck import audit_image_library, suggested_crop
+from ImageCheckReferenceAudit import (audit_image_check_references,
+                                      merge_library_targets_into_source,
+                                      preserve_library_import_block)
 from ImageDetectionLibrary import generate_image_check
 from CompletionEngine import CompletionEngine
 from PokeConShowInfo import (installed_distribution_version,
                              requirement_distribution_name)
-from UiResponsiveness import preview_render_interval
-from CommandMonitorRecording import (CommandStateTimeline,
+from UiResponsiveness import preview_capture_interval, preview_render_interval
+from CommandMonitorRecording import (CommandInputActivityTracker,
+                                     CommandStateTimeline, DarkStillFrameDetector,
+                                     command_source_descriptor,
+                                     failure_evidence_end,
+                                     runtime_execution_location,
                                      historical_retention_ids,
                                      relevant_state_path,
                                      runtime_state_snapshot,
                                      temporary_chunk_ids_for_session)
 from CommandRecordingMerge import merge_command_recording_chunks
+from OperationCaptureSession import (OperationCaptureSession,
+                                     decode_serial_message,
+                                     find_paused_session, load_manifest,
+                                     operation_input_source_is_recordable,
+                                     paused_session_names,
+                                     remove_session_directory)
+from PythonSourceSafety import (normalize_and_compile_python,
+                                normalize_python_indentation)
+from OperationGamepadMap import (OperationGamepadMapDialog,
+                                 OperationGamepadProfileStore,
+                                 controls_for_token,
+                                 gamepad_axis_token,
+                                 normalize_gamepad_mapping,
+                                 opposite_axis_tokens)
+from OperationSessionModel import (GENERATION_TARGET_PORTABLE,
+                                   STICK_MODE_EIGHT_WAY, STICK_MODE_EXACT,
+                                   compact_line_ranges, generate_intermediate, pending_lines,
+                                   input_row_is_commands_recordable,
+                                   operation_video_sources,
+                                   quantize_serial_stick_message,
+                                   replace_generated_region, save_mappings,
+                                   semantic_controls, source_class_names)
+from OperationVisionSample import (generate_vision_sample,
+                                   vision_output_paths)
+from OperationDebugCommand import (create_debug_command_package,
+                                   build_debug_draft_mappings,
+                                   debug_output_paths, deploy_debug_command,
+                                   intermediate_revisions,
+                                   save_intermediate_revision)
+from CommandRecordingModel import (filtered_timeline, load_command_timeline,
+                                   source_function_block, timeline_page)
 from Commands.CommandBase import Command
-from Commands.Keys import Button, Direction, KeyPress, Stick
+from Commands.Keys import Button, Direction, Hat, KeyPress, Stick
+try:
+    from Commands.ProController import ProController
+except ModuleNotFoundError as error:
+    if error.name != "pygame":
+        raise
+    with mock.patch.dict(sys.modules, {"pygame": mock.MagicMock()}):
+        from Commands.ProController import ProController
 import Utility as command_utility
 
 
@@ -153,6 +247,176 @@ class CommandStartOverrideTests(unittest.TestCase):
             [("_1_story_current_state_init", "1_STORY_B"),
              ("main_current_state_init", "MAIN_1_Z_LANK")],
         )
+
+
+class CommandRunOptionsTests(unittest.TestCase):
+    def test_filtering_end_chapter_does_not_reset_selected_start(self):
+        selected_start = "2_STORY_TOWER_79"
+        visible_end_candidates = ["7_STORY_START_CHECK", "7_STORY_END"]
+        self.assertEqual(
+            preserve_location_selection(
+                selected_start, visible_end_candidates),
+            selected_start)
+        self.assertEqual(
+            preserve_location_selection("", visible_end_candidates),
+            "7_STORY_START_CHECK")
+        self.assertEqual(
+            preserve_location_selection(
+                "（終了場所を指定しない）", visible_end_candidates,
+                "（終了場所を指定しない）"),
+            "（終了場所を指定しない）")
+
+    def test_za_tower_step_is_exposed_for_both_run_location_pickers(self):
+        path = os.path.abspath(os.path.join(
+            os.path.dirname(__file__), "..", "SerialController", "Commands",
+            "PythonCommands", "ZA", "ZA_story", "ZA_story.py"))
+        with open(path, "r", encoding="utf-8-sig") as stream:
+            result = discover_command_run_options(
+                stream.read(), class_name="ZA_story")
+        item = next(row for row in result["locations"]
+                    if row.get("value") == "2_STORY_TOWER_79")
+        self.assertTrue(result["enabled"])
+        self.assertEqual(item["label"], "2_STORY_TOWER_79")
+        self.assertEqual(item["variable"], "STATE_2_STORY_FUNCTION")
+
+    def test_discovers_numbered_routes_and_debug_like_frlg(self):
+        source = '''
+class Story:
+    def do(self):
+        self.cb_restart_flag = [
+            " 0: 最初～町", " 1: 町～ジム", " 2: 終了"]
+        self.DEBUG = False
+'''
+        result = discover_command_run_options(source)
+        self.assertEqual(
+            [(row["value"], row["description"])
+             for row in result["locations"]],
+            [(0, "最初～町"), (1, "町～ジム"), (2, "終了")])
+        self.assertEqual(result["locations"][0]["end_variable"], "stop_flag")
+        self.assertEqual(
+            [row["attribute"] for row in result["debug_options"]], ["DEBUG"])
+
+    def test_discovers_step_labels_and_state_docstrings(self):
+        step = discover_command_run_options('''
+class StepDemo:
+    STEP_LABELS = ["準備", "実行"]
+    STEP_KEYS = ["READY", "RUN"]
+''')
+        self.assertEqual(
+            [row["value"] for row in step["locations"]], [0, 1])
+        state = discover_command_run_options('''
+class StateDemo:
+    def __init__(self):
+        self.STATE_MAIN_FUNCTION = {"START": self.start}
+    def start(self):
+        """開始画面から町まで進める"""
+        return "START"
+''')
+        self.assertEqual(state["locations"][0]["description"],
+                         "開始画面から町まで進める")
+
+    def test_commands_owned_popup_flag_and_inherited_states_are_discovered(self):
+        result = discover_command_run_options('''
+class StoryBase:
+    COMMAND_RUN_SETTINGS = True
+    COMMAND_STEP_DESCRIPTIONS = {"START": "最初の町から開始"}
+    def __init__(self):
+        self.STATE_MAIN_FUNCTION = {"START": self.start, "END": self.end}
+        self.DEBUG = False
+    def start(self): return "END"
+    def end(self): return "END"
+class Story(StoryBase):
+    NAME = "Story"
+''', class_name="Story")
+        self.assertTrue(result["enabled"])
+        self.assertEqual([item["value"] for item in result["locations"]],
+                         ["START", "END"])
+        self.assertEqual(result["locations"][0]["description"],
+                         "最初の町から開始")
+        self.assertEqual(result["debug_options"][0]["attribute"], "DEBUG")
+
+    def test_applies_step_debug_user_and_legacy_dialogue_values(self):
+        class Demo:
+            step = 0
+        command = Demo()
+        route = {
+            "mode": "attribute", "variable": "restart_flag",
+            "end_variable": "stop_flag", "value": 3,
+            "dialog_value": " 3: 町～森", "dialog_start_index": 0,
+            "dialog_end_index": 1, "label": "3: 町～森"}
+        config = {
+            "start": route, "end": dict(route), "debug": {"DEBUG": True},
+            "save_delete_user_number": 7, "retry_on_failure": False}
+        apply_command_run_options(command, config)
+        self.assertEqual(command.restart_flag, 3)
+        self.assertEqual(command.stop_flag, 3)
+        self.assertTrue(command.DEBUG)
+        self.assertEqual(command.save_delete_user_number, 7)
+        result = apply_profile_to_dialogue_result(
+            command,
+            [["Combo", "スタート番号"], ["Combo", "ストップ番号"],
+             ["Check", "DEBUG"]],
+            ["old-start", "old-end", False])
+        self.assertEqual(result, [" 3: 町～森", " 3: 町～森", True])
+
+    def test_state_and_step_end_hooks_stop_after_successful_handler(self):
+        class StateCommand:
+            def __init__(self):
+                self.events = []
+                self.STATE_MAIN_FUNCTION = {
+                    "START": self.start, "END": self.end}
+
+            def start(self):
+                self.events.append("start")
+                return "END"
+
+            def end(self):
+                self.events.append("end")
+                return "DONE"
+
+            def sendStopRequest(self):
+                self.events.append("stop")
+
+        state_command = StateCommand()
+        apply_command_run_options(state_command, {"end": {
+            "kind": "state", "mode": "state",
+            "variable": "STATE_MAIN_FUNCTION", "value": "END"}})
+        self.assertEqual(state_command.STATE_MAIN_FUNCTION["END"](), "DONE")
+        self.assertEqual(state_command.events, ["end", "stop"])
+
+        class StepCommand:
+            def __init__(self):
+                self.events = []
+
+            def _step_1(self):
+                self.events.append("step")
+                return 2
+
+            def sendStopRequest(self):
+                self.events.append("stop")
+
+        step_command = StepCommand()
+        apply_command_run_options(step_command, {"end": {
+            "kind": "step", "mode": "attribute",
+            "variable": "step", "value": 1}})
+        self.assertEqual(step_command._step_1(), 2)
+        self.assertEqual(step_command.events, ["step", "stop"])
+
+    def test_failure_recovery_requires_hook_and_obeys_retry_limit(self):
+        class Recoverable:
+            def __init__(self):
+                self.calls = []
+                self._command_run_profile = {
+                    "retry_on_failure": True, "max_retries": 1,
+                    "recovery_method": "delete_save_for_user",
+                    "save_delete_user_number": 4}
+                self._command_failure_recovery_attempts = 0
+            def delete_save_for_user(self, user_number):
+                self.calls.append(user_number)
+        command = Recoverable()
+        self.assertTrue(perform_failure_save_recovery(command, RuntimeError()))
+        self.assertEqual(command.calls, [4])
+        self.assertFalse(perform_failure_save_recovery(command, RuntimeError()))
 
 
 class ForceStopTests(unittest.TestCase):
@@ -481,6 +745,57 @@ class InputSetRuntimeRegistryTests(unittest.TestCase):
         self.assertEqual(os.path.basename(path), "active_windows.json")
         self.assertIn("PokeConModifiedExtension", path)
 
+    def test_device_usage_is_shared_and_current_instance_is_excluded(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = os.path.join(temporary, "active_windows.json")
+            provider = lambda pid: "{}:start".format(pid)
+            first = ActiveInputSetRegistry(
+                path, profile="one", identity_provider=provider,
+                token="first", pid=601)
+            second = ActiveInputSetRegistry(
+                path, profile="two", identity_provider=provider,
+                token="second", pid=602)
+            camera_key = canonical_device_key("camera", "USB Capture A")
+            first.mark_focused(marker=100)
+            first.set_device("camera", camera_key, "USB Capture A")
+            second.mark_focused(marker=200)
+            conflicts = device_usage_conflicts(
+                second.entries(include_self=False), "camera", camera_key)
+            self.assertEqual([item["pid"] for item in conflicts], [601])
+            self.assertEqual(conflicts[0]["devices"]["camera"]["label"],
+                             "USB Capture A")
+            self.assertTrue(second.is_last_focused())
+            first.set_active("Profile B", "Combined B")
+            conflicts = device_usage_conflicts(
+                second.entries(include_self=False), "camera", camera_key)
+            self.assertEqual([item["pid"] for item in conflicts], [601])
+            self.assertEqual(conflicts[0]["input_set"], "Profile B")
+            self.assertEqual(conflicts[0]["devices"]["camera"]["label"],
+                             "USB Capture A")
+            first.set_active("")
+            conflicts = device_usage_conflicts(
+                second.entries(include_self=False), "camera", camera_key)
+            self.assertEqual([item["pid"] for item in conflicts], [601])
+            self.assertEqual(conflicts[0]["input_set"], "")
+            first.set_device("camera", "", "")
+            self.assertEqual(device_usage_conflicts(
+                second.entries(include_self=False), "camera", camera_key), [])
+
+    def test_main_resource_role_is_unique_across_processes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = os.path.join(temporary, "active_windows.json")
+            provider = lambda pid: "{}:start".format(pid)
+            first = ActiveInputSetRegistry(
+                path, identity_provider=provider, token="first", pid=701)
+            second = ActiveInputSetRegistry(
+                path, identity_provider=provider, token="second", pid=702)
+            self.assertTrue(first.set_resource_state(main_requested=True))
+            self.assertFalse(second.set_resource_state(main_requested=True))
+            conflicts = main_resource_conflicts(second.entries(include_self=False))
+            self.assertEqual([item["pid"] for item in conflicts], [701])
+            first.close()
+            self.assertTrue(second.set_resource_state(main_requested=True))
+
 
 class InputSetDataTests(unittest.TestCase):
     def test_commands_disabled_input_set_rejects_debug_auto_sync(self):
@@ -510,11 +825,13 @@ class InputSetDataTests(unittest.TestCase):
     def test_commands_disabled_snapshot_drops_command_owned_settings(self):
         source = {
             "values": {"fps": "60", "command_watch_enabled": True,
-                       "step_debug_skip_confirm": True},
+                       "step_debug_skip_confirm": True,
+                       "operation_capture_last_session": "D:/operation"},
             "command_selection": {"python": "ZA_story"},
             "shortcuts": {"1": {"class": "Python", "name": "ZA_story"}},
             "commands_assist": {"step_debug_rules": [{"state": "STEP_A"}]},
             "controller_recordings": {"move": {}},
+            "operation_capture": {"output_dir": "D:/recordings"},
             "quick_actions": {
                 "left": {"position": "上", "items": [
                     "commands.start_stop", "camera.capture", "watch.enabled"]},
@@ -525,7 +842,7 @@ class InputSetDataTests(unittest.TestCase):
         self.assertFalse(saved["commands_enabled"])
         self.assertEqual(saved["values"], {"fps": "60"})
         for key in ("command_selection", "shortcuts", "commands_assist",
-                    "controller_recordings"):
+                    "controller_recordings", "operation_capture"):
             self.assertNotIn(key, saved)
         self.assertEqual(saved["quick_actions"]["left"]["items"],
                          ["camera.capture"])
@@ -557,12 +874,65 @@ class InputSetDataTests(unittest.TestCase):
     def test_command_start_overrides_are_mirrored_to_input_set(self):
         data = {"input_sets": {"Switch": {"all_tabs": {}}}}
         overrides = {"ZA_story": {
-            "variable": "STATE_1_STORY_FUNCTION", "state": "1_STORY_STEP_B"}}
+            "variable": "STATE_1_STORY_FUNCTION", "state": "1_STORY_STEP_B",
+            "start": {
+                "id": "state:STATE_1_STORY_FUNCTION:1_STORY_STEP_B",
+                "mode": "state", "variable": "STATE_1_STORY_FUNCTION",
+                "value": "1_STORY_STEP_B", "label": "ホテルを出る"},
+            "end": {
+                "id": "state:STATE_1_STORY_FUNCTION:1_STORY_STEP_D",
+                "mode": "state", "variable": "STATE_1_STORY_FUNCTION",
+                "value": "1_STORY_STEP_D", "label": "広場へ移動"},
+            "debug": {"fastread": True, "TESTADDCODE": False},
+            "save_delete_user_number": 2,
+            "retry_on_failure": True,
+            "recovery_method": "delete_save_for_user",
+            "max_retries": 2,
+        }}
         self.assertTrue(sync_command_start_overrides(data, "Switch", overrides))
         item = data["input_sets"]["Switch"]
         self.assertEqual(item["commands_assist"]["start_overrides"], overrides)
         self.assertEqual(
             item["all_tabs"]["commands_assist"]["start_overrides"], overrides)
+
+    def test_command_run_favorites_are_mirrored_to_input_set(self):
+        data = {"input_sets": {"Switch": {
+            "commands": {"enabled": True}, "all_tabs": {}}}}
+        overrides = {"ZA_story": {"start": {"id": "step-a"}}}
+        favorites = {"ZA_story": [
+            {"name": "ホテルから", "config": {
+                "start": {"id": "step-a"}, "end": {"id": "step-c"}}},
+            {"name": "バトル確認", "config": {
+                "start": {"id": "step-b"}, "debug": {"fastread": True}}},
+        ]}
+        self.assertTrue(sync_command_start_overrides(
+            data, "Switch", overrides, favorites=favorites))
+        item = data["input_sets"]["Switch"]
+        self.assertEqual(item["commands_assist"]["run_favorites"], favorites)
+        self.assertEqual(
+            item["all_tabs"]["commands_assist"]["run_favorites"], favorites)
+        favorites["ZA_story"][0]["name"] = "changed"
+        self.assertEqual(
+            item["commands_assist"]["run_favorites"]["ZA_story"][0]["name"],
+            "ホテルから")
+
+    def test_manual_control_choices_belong_to_input_set(self):
+        for name in (
+                "is_use_keyboard", "is_use_left_stick_mouse",
+                "is_use_right_stick_mouse", "pc_gamepad",
+                "is_record_Pro_Controller", "is_use_Pro_Controller",
+                "pc_gamepad_input_enabled"):
+            self.assertIn(name, INPUT_SET_VARIABLES)
+        snapshot = {
+            "commands_enabled": False,
+            "manual_control": {
+                "hardware_enabled": True, "input_permission": True,
+                "gamepad": "0: Controller"},
+            "commands_assist": {"start_overrides": {"Story": {}}},
+        }
+        stripped = strip_commands_from_snapshot(snapshot)
+        self.assertNotIn("commands_assist", stripped)
+        self.assertEqual(stripped["manual_control"], snapshot["manual_control"])
 
     def test_quick_actions_are_mirrored_to_schema3_input_set(self):
         data = {"input_sets": {"Switch": {"all_tabs": {}}}}
@@ -583,6 +953,27 @@ class InputSetDataTests(unittest.TestCase):
         self.assertTrue(sync_quick_actions(data, "Legacy", quick))
         self.assertNotIn("all_tabs", data["input_sets"]["Legacy"])
         self.assertEqual(data["input_sets"]["Legacy"]["quick_actions"], quick)
+
+    def test_log_boundary_sliders_are_mirrored_to_loaded_input_set(self):
+        data = {"input_sets": {"Switch": {"all_tabs": {
+            "values": {"fps": "60", "panel_ratio": 50},
+        }}}}
+        sliders = {
+            "side_width_balance": 63,
+            "panel_ratio": 42,
+            "right_panel_ratio": 71,
+        }
+        self.assertTrue(sync_output_layout(data, "Switch", sliders))
+        values = data["input_sets"]["Switch"]["all_tabs"]["values"]
+        self.assertEqual(values["fps"], "60")
+        self.assertEqual(
+            {name: values[name] for name in sliders}, sliders)
+
+    def test_log_boundary_sync_does_not_convert_legacy_input_set(self):
+        data = {"input_sets": {"Legacy": {"camera": {}}}}
+        self.assertFalse(sync_output_layout(
+            data, "Legacy", {"side_width_balance": 60}))
+        self.assertNotIn("all_tabs", data["input_sets"]["Legacy"])
 
     def test_step_debug_replacements_are_continuously_mirrored(self):
         data = {"input_sets": {"Switch": {"all_tabs": {}}}}
@@ -613,12 +1004,19 @@ class InputSetDataTests(unittest.TestCase):
         }}}
         self.assertGreaterEqual(SCHEMA_VERSION, 3)
         self.assertTrue(has_complete_snapshot(item))
-        for required in ("panel_ratio", "show_python_samples", "is_win_notification_start",
+        for required in ("side_width_balance", "panel_ratio", "right_panel_ratio",
+                         "show_python_samples", "is_win_notification_start",
                          "object_detection_threshold", "step_debug_skip_confirm",
                          "window_capture_mode", "record_monitor_chunk_seconds",
                          "record_monitor_keep_steps", "record_monitor_loop_cycles",
-                         "record_monitor_long_seconds", "record_monitor_auto_arm",
-                         "record_monitor_confirm_delete_on_stop"):
+                          "record_monitor_long_seconds",
+                          "record_monitor_failure_tail_seconds",
+                          "record_monitor_auto_arm",
+                          "record_monitor_confirm_delete_on_stop",
+                          "operation_capture_output_dir",
+                          "operation_capture_include_audio",
+                          "operation_capture_auto_controller",
+                          "operation_capture_last_session"):
             self.assertIn(required, INPUT_SET_VARIABLES)
 
     def test_complete_input_set_is_not_overridden_by_old_combination(self):
@@ -645,6 +1043,91 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as stream:
                 stream.write("[]")
             self.assertEqual(load_detection_library(path)["targets"], {})
+
+    def test_area_capture_registration_adds_arrow_move_margin(self):
+        self.assertEqual(
+            padded_search_crop((421, 184, 455, 54), 5, (720, 1280, 3)),
+            [416, 179, 881, 243])
+
+    def test_area_capture_registration_margin_is_clamped_to_frame(self):
+        self.assertEqual(
+            padded_search_crop((2, 3, 1277, 716), 5, (720, 1280, 3)),
+            [0, 0, 1280, 720])
+
+    def test_show_values_are_kept_separately_and_stale_names_disappear(self):
+        entries = {}
+        update_show_value_entries(entries, {
+            "name": "FIELD", "score": 0.7, "threshold": 0.8,
+            "matched": False, "position": (10, 20), "source": "Commands",
+        }, now=10.0)
+        update_show_value_entries(entries, {
+            "name": "MENU", "variant": "2", "score": 0.9,
+            "threshold": 0.85, "matched": True, "position": (30, 40),
+            "source": "Commands",
+        }, now=12.0)
+        text = format_show_value_entries(entries, "ShowValue")
+        self.assertIn("[ShowValue] FIELD", text)
+        self.assertIn("[ShowValue] MENU / パターン2", text)
+        self.assertIn("\n\n[ShowValue] MENU", text)
+
+        removed = prune_show_value_entries(entries, 5.0, now=16.0)
+        self.assertEqual(removed, [("FIELD", "")])
+        self.assertNotIn("FIELD", format_show_value_entries(entries))
+        self.assertIn("MENU", format_show_value_entries(entries))
+        self.assertEqual(prune_show_value_entries(entries, 5.0, now=18.0), [
+            ("MENU", "2")])
+        self.assertEqual(format_show_value_entries(entries), "")
+
+    def test_repeated_show_value_updates_replace_only_the_same_image(self):
+        entries = {}
+        update_show_value_entries(entries, {
+            "name": "FIELD", "score": 0.1, "threshold": 0.8,
+        }, now=1.0)
+        update_show_value_entries(entries, {
+            "name": "MENU", "score": 0.2, "threshold": 0.8,
+        }, now=2.0)
+        update_show_value_entries(entries, {
+            "name": "FIELD", "score": 0.95, "threshold": 0.8,
+            "matched": True,
+        }, now=3.0)
+        self.assertEqual(list(entries), [("MENU", ""), ("FIELD", "")])
+        text = format_show_value_entries(entries)
+        self.assertNotIn("0.100000", text)
+        self.assertIn("0.950000", text)
+
+    def test_za_kohuki_get5_uses_the_fifth_slot_as_a_separate_target(self):
+        profile_path = os.path.join(
+            SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
+        with open(profile_path, "r", encoding="utf-8") as stream:
+            library = json.load(stream)
+
+        targets = library["targets"]
+        get4 = targets["POKEMON_ZA_KOHUKI_ICON_GET4"]["variants"][0]
+        get5 = targets["POKEMON_ZA_KOHUKI_ICON_GET5"]["variants"][0]
+        fifth_slot_reference = targets["POKEMON_ZA_MERIP_ICON_GET5"]["variants"][0]
+        self.assertEqual(get5["crop"], fifth_slot_reference["crop"])
+        self.assertNotEqual(get5["crop"], get4["crop"])
+        self.assertEqual(get5["template_path"], get4["template_path"])
+
+        folder_members = library["lists"]["POKEMON_ZA_FOLDER_1_Z_LANK"]["members"]
+        member_ids = {member["id"] for member in folder_members
+                      if member.get("type") == "target"}
+        self.assertIn("POKEMON_ZA_KOHUKI_ICON_GET5", member_ids)
+
+        generated = generate_image_check(library, "POKEMON_ZA_ALL", "list")
+        self.assertIn("POKEMON_ZA_KOHUKI_ICON_GET5", generated)
+
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+        self.assertIn(
+            'IMAGE_DETECTION_TARGETS["POKEMON_ZA_KOHUKI_ICON_GET5"]', source)
+        self.assertRegex(
+            source,
+            r'image_check\("POKEMON_ZA_KOHUKI_ICON_GET4"\)\s*'
+            r'and self\.image_check\("POKEMON_ZA_KOHUKI_ICON_GET5"\)')
 
 
 class ImageHealthCheckTests(unittest.TestCase):
@@ -738,6 +1221,131 @@ class ImageHealthCheckTests(unittest.TestCase):
         self.assertIn("detect_settings.pop('health_ignored_warnings', None)", source)
 
 
+class ImageCheckReferenceAuditTests(unittest.TestCase):
+    def test_missing_literal_is_compared_with_all_runtime_registration_forms(self):
+        source = '''
+class Command:
+    IMAGE_DETECTION_TARGETS = {"READY": [{}]}
+    IMAGE_DETECTION_TARGETS["EXTRA"] = [{}]
+    IMAGE_DETECTION_TARGETS.update({"UPDATED": [{}]})
+    IMAGE_DETECTION_SETS = {"ANY_READY": {"members": []}}
+
+    def image_check_exception(self, targetimage):
+        if targetimage in ("TRUE_RETURN", "FALSE_RETURN"):
+            return targetimage == "TRUE_RETURN"
+        return False
+
+    def run(self, selected):
+        self.image_check("READY")
+        self.image_check("EXTRA")
+        self.image_check("UPDATED")
+        self.image_check("ANY_READY")
+        self.image_check("TRUE_RETURN")
+        self.image_check("MISSING")
+        self.image_check(selected)
+'''
+        result = audit_image_check_references(source)
+        self.assertEqual([row["name"] for row in result["missing"]], ["MISSING"])
+        self.assertEqual(result["dynamic"][0]["expression"], "selected")
+        resolved = {row["name"]: row["resolved_by"] for row in result["references"]}
+        self.assertEqual(resolved["READY"], "画像検知")
+        self.assertEqual(resolved["ANY_READY"], "検知セット")
+        self.assertEqual(resolved["TRUE_RETURN"], "例外判定")
+
+    def test_duplicate_references_keep_all_source_lines(self):
+        source = '''
+IMAGE_DETECTION_TARGETS = {}
+image_check("LOST")
+self.image_check("LOST")
+'''
+        result = audit_image_check_references(source)
+        self.assertEqual(len(result["missing"]), 1)
+        self.assertEqual(result["missing"][0]["lines"], [3, 4])
+        self.assertEqual(result["missing"][0]["count"], 2)
+
+    def test_invalid_python_is_reported_as_syntax_error(self):
+        with self.assertRaises(SyntaxError):
+            audit_image_check_references('self.image_check("BROKEN"')
+
+    def test_registered_library_target_can_be_merged_without_replacing_existing_targets(self):
+        source = '''
+class Command:
+    IMAGE_DETECTION_TARGETS = {"READY": [{"template_path": "ready.png"}]}
+    IMAGE_DETECTION_OPERATORS = {"READY": "OR"}
+    IMAGE_DETECTION_DESCRIPTIONS = {"targets": {"READY": "ready"}}
+
+    def _image_check_target(self, targetimage):
+        return targetimage in self.IMAGE_DETECTION_TARGETS
+
+    def run(self):
+        return self.image_check("MISSING")
+'''
+        library = {"targets": {"MISSING": {
+            "operator": "AND", "description": "added from DevStudio",
+            "variants": [{"template_path": "missing.png", "threshold": 0.8,
+                          "health_ignored_warnings": ["low_contrast"]}],
+        }}}
+        updated, added = merge_library_targets_into_source(source, library, ["MISSING"])
+        self.assertEqual(added, ["MISSING"])
+        self.assertIn('IMAGE_DETECTION_TARGETS = {"READY"', updated)
+        self.assertIn("POKECON_IMAGE_CHECK_LIBRARY_IMPORTS_BEGIN", updated)
+        self.assertNotIn("health_ignored_warnings", updated)
+        result = audit_image_check_references(updated)
+        self.assertEqual(result["missing"], [])
+        self.assertIn("MISSING", result["target_names"])
+
+    def test_multiple_merges_accumulate_and_generated_code_preserves_managed_block(self):
+        source = '''
+class Command:
+    IMAGE_DETECTION_TARGETS = {}
+    IMAGE_DETECTION_OPERATORS = {}
+    IMAGE_DETECTION_DESCRIPTIONS = {"targets": {}}
+    def _image_check_target(self, targetimage):
+        return False
+'''
+        library = {"targets": {
+            "ONE": {"operator": "OR", "description": "one",
+                    "variants": [{"template_path": "one.png"}]},
+            "TWO": {"operator": "OR", "description": "two",
+                    "variants": [{"template_path": "two.png"}]},
+        }}
+        first, _ = merge_library_targets_into_source(source, library, ["ONE"])
+        second, _ = merge_library_targets_into_source(first, library, ["TWO"])
+        self.assertIn("'ONE'", second)
+        self.assertIn("'TWO'", second)
+        generated = '''
+IMAGE_DETECTION_TARGETS = {"BASE": []}
+IMAGE_DETECTION_OPERATORS = {"BASE": "OR"}
+IMAGE_DETECTION_DESCRIPTIONS = {"targets": {}}
+def _image_check_target(self, targetimage):
+    return False
+'''
+        preserved = preserve_library_import_block(generated, second)
+        self.assertIn("POKECON_IMAGE_CHECK_LIBRARY_IMPORTS_BEGIN", preserved)
+        self.assertIn("'ONE'", preserved)
+        self.assertIn("'TWO'", preserved)
+
+    def test_merge_supports_older_generated_source_without_operator_dictionary(self):
+        source = '''
+class Command:
+    IMAGE_DETECTION_TARGETS = {}
+    IMAGE_DETECTION_DESCRIPTIONS = {"targets": {}}
+    def _image_check_target(self, targetimage):
+        return False
+'''
+        library = {"targets": {"MARKER": {
+            "operator": "OR", "description": "marker",
+            "variants": [{"template_path": "marker.png"}],
+        }}}
+        updated, _ = merge_library_targets_into_source(source, library, ["MARKER"])
+        namespace = {}
+        exec(compile(updated, "<old-generated-source>", "exec"), namespace)
+        command = namespace["Command"]
+        self.assertIn("MARKER", command.IMAGE_DETECTION_TARGETS)
+        self.assertEqual(
+            command.IMAGE_DETECTION_DESCRIPTIONS["targets"]["MARKER"], "marker")
+
+
 class ManualControllerResponsivenessTests(unittest.TestCase):
     class _ShowSerial:
         def __init__(self):
@@ -764,6 +1372,9 @@ class ManualControllerResponsivenessTests(unittest.TestCase):
             from Commands.Sender import Sender as TestSender
         sender = TestSender(show_serial)
         sender.ser = self._Serial()
+        activities = []
+        sender.set_activity_callback(
+            lambda payload, priority: activities.append((payload, priority)))
         sender.begin_manual_override()
         completed = threading.Event()
 
@@ -780,6 +1391,7 @@ class ManualControllerResponsivenessTests(unittest.TestCase):
         self.assertTrue(completed.wait(0.3))
         worker.join(timeout=0.3)
         self.assertEqual(sender.ser.rows, [b"manual\r\n", b"command\r\n"])
+        self.assertEqual(activities, [("manual", True), ("command", False)])
         self.assertEqual(show_serial.calls, 1)
 
     def test_priority_keypress_marks_serial_packet_as_manual(self):
@@ -794,6 +1406,42 @@ class ManualControllerResponsivenessTests(unittest.TestCase):
         KeyPress(sender, priority=True).input(Button.A)
         self.assertTrue(sender.priority)
 
+    def test_latest_software_controller_state_supersedes_delayed_press(self):
+        state = SoftwareControllerState()
+        press_version = state.update("hold", Button.A)
+        release_version = state.update("holdEnd", Button.A)
+        self.assertIsNone(state.snapshot_if_current(press_version))
+        self.assertEqual(state.snapshot_if_current(release_version), ())
+
+    def test_button_and_hat_with_same_integer_value_remain_distinct(self):
+        class CaptureSender:
+            def __init__(self):
+                self.rows = []
+
+            def writeRow(self, row, is_show=False, priority=False):
+                self.rows.append(row)
+
+        # Button.B and Hat.RIGHT are both int-backed value 2.  They must still
+        # survive as two separate controls during a simultaneous GUI press.
+        state = SoftwareControllerState()
+        state.update("hold", Button.B)
+        version = state.update("hold", Hat.RIGHT)
+        controls = state.snapshot_if_current(version)
+        self.assertEqual(len(controls), 2)
+
+        sender = CaptureSender()
+        keys = KeyPress(sender, priority=True)
+        keys.replace_hold(controls)
+        self.assertEqual(len(keys.holdButton), 2)
+        packet = sender.rows[-1].split()
+        self.assertEqual(int(packet[0], 16) >> 2, int(Button.B))
+        self.assertEqual(packet[1], str(int(Hat.RIGHT)))
+
+        keys.replace_hold([])
+        neutral = sender.rows[-1].split()
+        self.assertEqual(int(neutral[0], 16) >> 2, 0)
+        self.assertEqual(neutral[1], str(int(Hat.CENTER)))
+
     def test_tuple_stick_position_does_not_flood_standard_output(self):
         logger = Direction(Stick.LEFT, (128, 127))._logger
         before = len(logger.handlers)
@@ -805,6 +1453,64 @@ class ManualControllerResponsivenessTests(unittest.TestCase):
 
 
 class CommandMonitorRecordingTests(unittest.TestCase):
+    class _SolidFrame:
+        shape = (40, 60, 3)
+
+        def __init__(self, value):
+            self.value = int(value)
+
+        def __getitem__(self, _position):
+            return (self.value, self.value, self.value)
+
+    def test_ten_thousand_source_links_are_paged_without_truncation(self):
+        events = [{
+            "index": index, "video_time": index / 10.0,
+            "event": "execution", "step_text": "STEP_{}".format(index % 5),
+            "location": {"function": "move", "line": index},
+        } for index in range(1, 10001)]
+        filtered = filtered_timeline(events, "step_3")
+        self.assertEqual(len(filtered), 2000)
+        visible, page, page_count = timeline_page(events, page=19, page_size=500)
+        self.assertEqual((page, page_count, len(visible)), (19, 20, 500))
+        self.assertEqual(visible[-1]["index"], 10000)
+
+    def test_recorded_function_block_works_on_python_37_ast_positions(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "story.py")
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write(
+                    "class Story(object):\n"
+                    "    def move_to_hotel(self):\n"
+                    "        value = 1\n"
+                    "        return value\n")
+            block = source_function_block(path, "move_to_hotel", 3)
+            self.assertEqual((block["start_line"], block["end_line"]), (2, 4))
+            self.assertIn("return value", block["text"])
+
+    def test_running_command_location_links_to_user_function_without_source_edit(self):
+        ready = threading.Event()
+        release = threading.Event()
+
+        def recorded_story_function():
+            ready.set()
+            release.wait(2.0)
+
+        command = type("RecordedCommand", (), {"NAME": "Recorded"})()
+        worker = threading.Thread(target=recorded_story_function)
+        command.thread = worker
+        worker.start()
+        try:
+            self.assertTrue(ready.wait(1.0))
+            location = runtime_execution_location(
+                command, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+            self.assertEqual(location["function"], "recorded_story_function")
+            self.assertTrue(location["file"].endswith("test_automation_features.py"))
+            descriptor = command_source_descriptor(command)
+            self.assertEqual(descriptor["class"], "RecordedCommand")
+        finally:
+            release.set()
+            worker.join(2.0)
+
     def test_kept_command_chunks_are_merged_with_step_and_output_logs(self):
         with tempfile.TemporaryDirectory() as root:
             chunks = []
@@ -815,9 +1521,22 @@ class CommandMonitorRecordingTests(unittest.TestCase):
                     stream.write(b"avi" + bytes([index]))
                 with open(os.path.join(session_dir, "recording.wav"), "wb") as stream:
                     stream.write(b"wav" + bytes([index]))
+                snapshot_relative = os.path.join(
+                    "source_snapshots", "story{}.py".format(index))
+                os.makedirs(os.path.join(session_dir, "source_snapshots"))
+                with open(os.path.join(session_dir, snapshot_relative),
+                          "w", encoding="utf-8") as stream:
+                    stream.write("def step_{}(self):\n    pass\n".format(index))
                 with open(os.path.join(session_dir, "steps.jsonl"),
                           "w", encoding="utf-8") as stream:
-                    stream.write('{"state":"' + state + '"}\n')
+                    stream.write(json.dumps({
+                        "event": "execution", "step_path": state,
+                        "chunk_time": 1.25,
+                        "location": {
+                            "file": "story.py", "function": "step_{}".format(index),
+                            "line": 1, "snapshot": snapshot_relative,
+                        },
+                    }) + "\n")
                 with open(os.path.join(session_dir, "commands.log"),
                           "w", encoding="utf-8") as stream:
                     stream.write("log {}\n".format(index))
@@ -830,6 +1549,10 @@ class CommandMonitorRecordingTests(unittest.TestCase):
                     "states": [state],
                     "command": "ZA_story",
                     "command_session_id": "run-1",
+                    "source": {
+                        "file": "story.py", "function": "step_{}".format(index),
+                        "line": 1, "snapshot": snapshot_relative,
+                    },
                 })
             chunks[0]["pinned"] = True
 
@@ -861,6 +1584,12 @@ class CommandMonitorRecordingTests(unittest.TestCase):
                       "r", encoding="utf-8") as stream:
                 metadata = json.load(stream)
             self.assertEqual(metadata["source_chunk_ids"], ["chunk1", "chunk2"])
+            timeline = load_command_timeline(merged["session_dir"])
+            self.assertEqual(len(timeline), 2)
+            self.assertEqual(timeline[0]["video_time"], 1.25)
+            self.assertEqual(timeline[1]["video_time"], 4.25)
+            self.assertTrue(os.path.isfile(os.path.join(
+                merged["session_dir"], timeline[0]["location"]["snapshot"])))
             # Source deletion is deliberately a later GUI step, only after a
             # fully written merged folder is returned.
             self.assertTrue(os.path.isdir(chunks[0]["session_dir"]))
@@ -893,6 +1622,86 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         self.assertEqual(timeline.recent_unique_cutoff(5), 0.0)
         self.assertEqual(timeline.recent_loop_cutoff(3), 0.0)
 
+    def test_unescaped_loop_keeps_five_preceding_steps_and_only_three_cycles(self):
+        timeline = CommandStateTimeline(loop_cycles=3)
+        values = ("P1", "P2", "P3", "P4", "P5",
+                  "A", "B", "A", "B", "A", "B", "A", "B")
+        for now, value in enumerate(values):
+            timeline.add({"STATE": value}, now)
+        retention = timeline.retention(
+            120, keep_unique_steps=5, long_step_seconds=180, loop_cycles=3)
+        self.assertEqual(retention["mode"], "loop")
+        self.assertEqual(retention["keep_after"], 0.0)
+        self.assertEqual(retention["keep_before"], 10.0)
+        self.assertEqual(timeline.active_loop["period"], 2)
+
+    def test_dark_still_failure_keeps_only_the_last_five_steps_to_detection(self):
+        timeline = CommandStateTimeline(loop_cycles=3)
+        for now, value in enumerate(("A", "B", "C", "D", "E", "F")):
+            timeline.add({"STATE": value}, now)
+        retention = timeline.retention(
+            60, keep_unique_steps=5, long_step_seconds=180,
+            loop_cycles=3, terminal_time=5.0)
+        self.assertEqual(retention["mode"], "dark_still")
+        self.assertEqual(retention["keep_after"], 1.0)
+        self.assertEqual(retention["keep_before"], 5.0)
+
+    def test_key_inactivity_waits_sixty_seconds_and_clears_on_recovery(self):
+        tracker = CommandInputActivityTracker(timeout_seconds=60.0)
+        tracker.reset(0.0)
+        self.assertFalse(tracker.check(59.9)["stall_started"])
+        stalled = tracker.check(60.0)
+        self.assertTrue(stalled["stall_started"])
+        self.assertEqual(stalled["active"]["started_at"], 0.0)
+        tracker.mark_activity(61.0)
+        recovered = tracker.check(61.0)
+        self.assertTrue(recovered["recovered"])
+        self.assertIsNone(recovered["active"])
+
+    def test_key_inactivity_retention_ends_at_last_key_activity(self):
+        timeline = CommandStateTimeline(loop_cycles=3)
+        for now, value in enumerate(("A", "B", "C", "D", "E", "F")):
+            timeline.add({"STATE": value}, now * 10.0)
+        retention = timeline.retention(
+            120, keep_unique_steps=5, long_step_seconds=180,
+            terminal_time=50.0, terminal_mode="key_inactivity")
+        self.assertEqual(retention["mode"], "key_inactivity")
+        self.assertEqual(retention["keep_after"], 10.0)
+        self.assertEqual(retention["keep_before"], 50.0)
+
+    def test_failure_evidence_keeps_sixty_seconds_of_stalled_screen(self):
+        self.assertEqual(failure_evidence_end(100.0, 125.0, 60.0), 125.0)
+        self.assertEqual(failure_evidence_end(100.0, 200.0, 60.0), 160.0)
+        timeline = CommandStateTimeline(loop_cycles=3)
+        for now, value in enumerate(("A", "B", "C", "D", "E", "STUCK")):
+            timeline.add({"STATE": value}, now * 20.0)
+        cutoff = failure_evidence_end(100.0, 200.0, 60.0)
+        retention = timeline.retention(
+            200.0, keep_unique_steps=5, long_step_seconds=180,
+            terminal_time=cutoff, terminal_mode="key_inactivity")
+        self.assertEqual(retention["keep_before"], 160.0)
+        self.assertEqual(retention["mode"], "key_inactivity")
+
+    def test_dark_still_detector_ignores_bright_static_screen(self):
+        detector = DarkStillFrameDetector(hold_seconds=2.0, sample_interval=0.5)
+        bright = self._SolidFrame(180)
+        results = [detector.add(bright, index * 0.5) for index in range(8)]
+        self.assertFalse(any(result.get("stall_started") for result in results))
+        self.assertIsNone(detector.active)
+
+    def test_dark_still_detector_marks_failure_then_recovers_on_change(self):
+        detector = DarkStillFrameDetector(hold_seconds=2.0, sample_interval=0.5)
+        dark = self._SolidFrame(0)
+        results = []
+        for index in range(7):
+            results.append(detector.add(dark, index * 0.5))
+        self.assertTrue(any(result.get("stall_started") for result in results))
+        self.assertIsNotNone(detector.active)
+        changed = self._SolidFrame(160)
+        recovered = detector.add(changed, 3.5)
+        self.assertTrue(recovered["recovered"])
+        self.assertIsNone(detector.active)
+
     def test_loop_anchor_is_released_after_different_step(self):
         timeline = CommandStateTimeline(loop_cycles=3)
         for now, value in enumerate(("A", "B", "A", "B", "A", "B")):
@@ -900,6 +1709,10 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         result = timeline.add({"STATE": "C"}, 6)
         self.assertTrue(result["loop_ended"])
         self.assertIsNone(timeline.active_loop)
+        retention = timeline.retention(
+            10, keep_unique_steps=5, long_step_seconds=180, loop_cycles=3)
+        self.assertEqual(retention["mode"], "normal")
+        self.assertIsNone(retention["keep_before"])
 
     def test_long_same_step_keeps_time_window_even_without_transitions(self):
         timeline = CommandStateTimeline(loop_cycles=3)
@@ -938,6 +1751,8 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             {"id": "previous", "command_session_id": "run-1", "pinned": False},
             {"id": "loaded", "command_session_id": "run-2", "pinned": False,
              "historical": True},
+            {"id": "trimmed", "command_session_id": "run-2", "pinned": False,
+             "delete_pending": True},
             {"id": "legacy", "pinned": False},
         ]
         self.assertEqual(
@@ -961,16 +1776,73 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
     def test_full_rate_choice_belongs_to_each_input_set(self):
         self.assertIn("last_active_preview_full_fps", INPUT_SET_VARIABLES)
 
-    def test_preview_rendering_is_throttled_without_reducing_capture_callbacks(self):
+    def test_resource_choices_belong_to_each_input_set(self):
+        self.assertTrue({"resource_control_enabled", "resource_cpu_target",
+                         "resource_main_tool"}.issubset(INPUT_SET_VARIABLES))
+
+    def test_old_input_set_does_not_inherit_previous_main_resource_role(self):
+        old_snapshot = {"values": {"fps": "30"}}
+        restored = snapshot_values_with_defaults(old_snapshot)
+        self.assertFalse(restored["resource_main_tool"])
+        self.assertTrue(restored["resource_control_enabled"])
+        self.assertEqual(restored["resource_cpu_target"], 90)
+
+        saved_snapshot = {"values": {
+            "resource_control_enabled": True,
+            "resource_cpu_target": 80,
+            "resource_main_tool": True,
+        }}
+        restored = snapshot_values_with_defaults(saved_snapshot)
+        self.assertTrue(restored["resource_main_tool"])
+        self.assertEqual(restored["resource_cpu_target"], 80)
+
+        normal_snapshot = {"values": {
+            "resource_control_enabled": True,
+            "resource_cpu_target": 80,
+            "resource_main_tool": False,
+        }}
+        restored = snapshot_values_with_defaults(normal_snapshot)
+        self.assertFalse(restored["resource_main_tool"])
+
+    def test_cpu_target_throttles_only_unprotected_non_main_work(self):
+        self.assertEqual(clamp_cpu_target(120), 95)
+        self.assertEqual(clamp_cpu_target(10), 50)
+        self.assertEqual(
+            resource_throttle_level(True, 91, 90, foreground=False), "strong")
+        self.assertEqual(
+            resource_throttle_level(True, 91, 90, foreground=True), "strong")
+        self.assertEqual(
+            resource_throttle_level(True, 87, 90, foreground=True), "light")
+        self.assertEqual(
+            resource_throttle_level(True, 99, 90, main_tool=True), "normal")
+        self.assertEqual(
+            resource_throttle_level(True, 99, 90, protected=True), "normal")
+        self.assertEqual(throttle_multiplier("strong"), 8.0)
+
+    def test_resource_multiplier_extends_background_preview_interval(self):
+        self.assertEqual(
+            preview_render_interval(
+                60, False, True, resource_multiplier=4), 0.8)
+
+    def test_preview_rendering_is_throttled_for_non_active_instances(self):
         self.assertAlmostEqual(preview_render_interval(60, True, True), 1.0 / 30)
         self.assertAlmostEqual(
             preview_render_interval(60, True, True, full_rate=True), 1.0 / 60)
         self.assertEqual(preview_render_interval(60, False, True), 0.2)
         # Minimized windows stay inexpensive even when full-rate display was
-        # requested; recording runs on the separate listener path.
+        # requested; recording explicitly restores the capture cadence.
         self.assertEqual(
             preview_render_interval(60, True, False, full_rate=True), 0.5)
         self.assertEqual(preview_render_interval(60, False, False), 0.5)
+
+    def test_inactive_frame_consumption_is_throttled_unless_recording(self):
+        self.assertEqual(
+            preview_capture_interval(60, False, True, background_work=False), 0.2)
+        self.assertEqual(
+            preview_capture_interval(60, False, False, background_work=False), 0.5)
+        self.assertAlmostEqual(
+            preview_capture_interval(60, False, False, background_work=True),
+            1.0 / 60.0)
 
 
 class SharedDebugLibraryTests(unittest.TestCase):
@@ -1053,6 +1925,673 @@ def sample_function(self):
         self.assertNotIn("def sample_function(self):", updated)
 
 
+class PythonSourceSafetyTests(unittest.TestCase):
+    def test_mixed_leading_tabs_are_normalized_without_changing_string_data(self):
+        source = ("def sample():\n"
+                  "\tif True:\n"
+                  "\t\tvalue = 1\n"
+                  "    text = \"\"\"line one\n"
+                  "\tkeep this tab in the string\n"
+                  "\"\"\"\n"
+                  "    return value, text\n")
+        normalized = normalize_and_compile_python(source, "mixed.py")
+        self.assertNotIn("\tif True", normalized)
+        self.assertNotIn("\t\tvalue", normalized)
+        self.assertIn("\tkeep this tab in the string", normalized)
+
+    def test_fragment_replacement_removes_pasted_indentation_tabs(self):
+        fragment = "def sample(self):\n    return 1\n"
+        replacement = (
+            "def sample(self):\n"
+            "\tif True:\n"
+            "\t\treturn 2\n")
+        updated = replace_fragment_function_text(
+            fragment, "sample", replacement)
+        self.assertEqual(normalize_python_indentation(updated), updated)
+        compile(updated, "sample.pyfrag", "exec")
+
+
+class SampleFunctionSyncTests(unittest.TestCase):
+    def test_fragment_stats_count_functions_and_references(self):
+        fragment = (
+            "def first(self):\n"
+            "    return self.second()\n\n"
+            "def second(self):\n"
+            "    return self.second\n")
+        self.assertEqual(
+            fragment_function_stats(fragment, "second"),
+            {"function_count": 2, "reference_count": 2})
+
+    def test_sample_to_sample_reflection_replaces_function_and_keeps_name(self):
+        source_function = (
+            "def ZA_sample(self):\n"
+            "    return self.ZA_sample()\n")
+        target_fragment = (
+            "def sample(self):\n"
+            "    return False\n\n"
+            "def untouched(self):\n"
+            "    return True\n")
+        updated = reflect_fragment_function_text(
+            source_function, "ZA_sample", target_fragment, "sample")
+        self.assertIn("def sample(self):", updated)
+        self.assertIn("self.sample()", updated)
+        self.assertIn("def untouched(self):", updated)
+        self.assertNotIn("ZA_sample", updated)
+        compile(updated, "sample.pyfrag", "exec")
+
+    def test_manual_fragment_edit_replaces_only_selected_function(self):
+        fragment = (
+            "def first(self):\n    return 1\n\n"
+            "def second(self):\n    return 2\n")
+        updated = replace_fragment_function_text(
+            fragment, "first", "def first(self):\n    return 3\n")
+        self.assertIn("return 3", updated)
+        self.assertIn("def second(self):\n    return 2", updated)
+        compile(updated, "sample.pyfrag", "exec")
+
+    def test_discard_duplicate_removes_only_selected_function(self):
+        fragment = (
+            "def first(self):\n    return 1\n\n"
+            "def second(self):\n    return 2\n")
+        updated = remove_fragment_function_text(fragment, "first")
+        self.assertNotIn("def first", updated)
+        self.assertIn("def second(self):\n    return 2", updated)
+        compile(updated, "sample.pyfrag", "exec")
+
+    def test_manual_fragment_edit_rejects_function_rename(self):
+        with self.assertRaises(ValueError):
+            replace_fragment_function_text(
+                "def first(self):\n    return 1\n", "first",
+                "def renamed(self):\n    return 1\n")
+
+    def test_duplicate_samples_report_same_or_different_content(self):
+        source = '''
+class Demo:
+    def sample(self):
+        return True
+'''
+        with tempfile.TemporaryDirectory() as root:
+            for folder_name in ("one", "two"):
+                folder = os.path.join(root, folder_name)
+                os.makedirs(folder)
+                with open(os.path.join(folder, "sample.pyfrag"), "w",
+                          encoding="utf-8") as stream:
+                    stream.write("def sample(self):\n    return True\n")
+            comparisons = compare_sample_function_folder(source, root, root)
+            self.assertEqual(comparisons[0]["status"], "duplicate")
+            self.assertEqual(comparisons[0]["duplicate_kind"], "same")
+            with open(os.path.join(root, "two", "sample.pyfrag"), "w",
+                      encoding="utf-8") as stream:
+                stream.write("def sample(self):\n    return False\n")
+            comparisons = compare_sample_function_folder(source, root, root)
+            self.assertEqual(comparisons[0]["duplicate_kind"], "different")
+
+    def test_lowercase_semantic_prefix_is_not_treated_as_function_rename(self):
+        source = '''
+class Demo:
+    def image_check(self, name):
+        return bool(name)
+'''
+        with tempfile.TemporaryDirectory() as root:
+            folder = os.path.join(root, "game_input_router")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "router.pyfrag"), "w",
+                      encoding="utf-8") as stream:
+                stream.write(
+                    "def game_image_check(self, logical_name):\n"
+                    "    return self.image_check(logical_name)\n")
+            comparisons = compare_sample_function_folder(source, root, root)
+            self.assertEqual(len(comparisons), 1)
+            self.assertEqual(comparisons[0]["name"], "game_image_check")
+            self.assertEqual(comparisons[0]["status"], "missing_source")
+
+    def test_uppercase_namespace_prefix_remains_a_rename_candidate(self):
+        source = '''
+class Demo:
+    def move(self):
+        return True
+'''
+        with tempfile.TemporaryDirectory() as root:
+            folder = os.path.join(root, "Pokemon")
+            os.makedirs(folder)
+            with open(os.path.join(folder, "move.pyfrag"), "w",
+                      encoding="utf-8") as stream:
+                stream.write("def ZA_move(self):\n    return True\n")
+            comparisons = compare_sample_function_folder(source, root, root)
+            self.assertEqual(comparisons[0]["name"], "move")
+            self.assertEqual(comparisons[0]["sample_name"], "ZA_move")
+            self.assertEqual(comparisons[0]["status"], "name_different")
+
+    def test_clean_editor_recheck_reads_externally_updated_source(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "Demo.py")
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write("class Demo:\n    pass\n")
+            source, mode = comparison_source_text(
+                path, path, "class Old:\n    pass\n", editor_dirty=False)
+            self.assertEqual(mode, "disk")
+            self.assertIn("class Demo", source)
+
+    def test_dirty_editor_recheck_keeps_unsaved_reflection(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "Demo.py")
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write("class Disk:\n    pass\n")
+            editor_source = "class Edited:\n    pass\n"
+            source, mode = comparison_source_text(
+                path, path, editor_source, editor_dirty=True)
+            self.assertEqual((source, mode), (editor_source, "editor"))
+
+    def test_class_method_extraction_ignores_shallow_comment_indent(self):
+        source = '''
+class Demo:
+    def first(self):
+        return True
+
+  # comment saved with shallower indentation by an older source
+    def second(self):
+        return False
+'''
+        records = sample_sync_function_records(source, class_only=True)
+        self.assertTrue(records["second"]["text"].startswith("def second"))
+        compile(records["second"]["text"], "second.pyfrag", "exec")
+
+    def test_python37_fallback_keeps_unindented_comment_with_function_body(self):
+        source = '''
+def sample(self):
+# explanatory comment saved by an older sample
+    return True
+
+def next_sample(self):
+    return False
+'''
+        records = sample_sync_function_records(source)
+        self.assertIn("return True", records["sample"]["text"])
+        compile(records["sample"]["text"], "sample.pyfrag", "exec")
+
+    def test_side_by_side_diff_highlights_only_changed_characters(self):
+        rows = side_by_side_diff_rows(
+            "def old_name(self):\n    return 1\n",
+            "def new_name(self):\n    return 1\n")
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["kind"], "replace")
+        self.assertEqual(rows[0]["left_spans"], [(4, 7)])
+        self.assertEqual(rows[0]["right_spans"], [(4, 7)])
+        self.assertEqual(rows[1]["kind"], "equal")
+        self.assertEqual(rows[1]["left_spans"], [])
+        self.assertEqual(rows[1]["right_spans"], [])
+
+    def test_side_by_side_diff_aligns_added_lines_with_a_blank_side(self):
+        rows = side_by_side_diff_rows(
+            "def sample(self):\n    return True\n",
+            "# comment\ndef sample(self):\n    return True\n")
+        self.assertIsNone(rows[0]["left_line"])
+        self.assertEqual(rows[0]["right_line"], 1)
+        self.assertEqual(rows[0]["kind"], "insert")
+        self.assertEqual(rows[1]["left"], "def sample(self):")
+        self.assertEqual(rows[1]["right"], "def sample(self):")
+        self.assertEqual(rows[1]["kind"], "equal")
+
+    def test_renamed_sample_compares_and_syncs_with_its_recorded_origin(self):
+        original_source = '''
+class Demo:
+    def original(self):
+        self.original()
+        return 1
+'''
+        changed_source = '''
+class Demo:
+    def original(self):
+        self.original()
+        return 3
+'''
+        with tempfile.TemporaryDirectory() as root:
+            source_path = os.path.join(root, "Demo.py")
+            sample_dir = os.path.join(root, "Imported", "ZA_original")
+            os.makedirs(sample_dir)
+            with open(source_path, "w", encoding="utf-8") as stream:
+                stream.write(original_source)
+            metadata_path = os.path.join(sample_dir, "ZA_original.pokesample.json")
+            body_path = os.path.join(sample_dir, "ZA_original.pyfrag")
+            with open(metadata_path, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "name": "ZA_original",
+                    "fragment": "ZA_original.pyfrag",
+                    "source": {"path": source_path, "function": "original"},
+                }, stream)
+            with open(body_path, "w", encoding="utf-8") as stream:
+                stream.write(
+                    "def ZA_original(self):\n"
+                    "    self.ZA_original()\n"
+                    "    return 2\n")
+
+            comparisons = compare_sample_function_folder(
+                original_source, root, os.path.join(root, "Imported"))
+            self.assertEqual(len(comparisons), 1)
+            self.assertEqual(comparisons[0]["sample_name"], "ZA_original")
+            self.assertEqual(comparisons[0]["name"], "original")
+            self.assertEqual(comparisons[0]["status"], "different")
+            self.assertEqual(
+                source_paths_for_folder(root, os.path.join(root, "Imported")),
+                [os.path.abspath(source_path)])
+
+            updated = update_source_from_samples(
+                original_source, comparisons, ["original"])
+            self.assertIn("def original(self):", updated)
+            self.assertIn("self.original()", updated)
+            self.assertIn("return 2", updated)
+            self.assertNotIn("ZA_original", updated)
+
+            update_sample_fragments(
+                changed_source, comparisons, ["original"])
+            with open(body_path, "r", encoding="utf-8") as stream:
+                updated_sample = stream.read()
+            self.assertIn("def ZA_original(self):", updated_sample)
+            self.assertIn("self.ZA_original()", updated_sample)
+            self.assertIn("return 3", updated_sample)
+            self.assertNotIn("def original(self):", updated_sample)
+
+    def test_merge_keeps_sample_name_and_source_processing(self):
+        source = '''
+class Demo:
+    def original(self):
+        self.original()
+        return "source-correct"
+'''
+        with tempfile.TemporaryDirectory() as root:
+            source_path = os.path.join(root, "Demo.py")
+            sample_dir = os.path.join(root, "Imported", "ZA_original")
+            os.makedirs(sample_dir)
+            with open(source_path, "w", encoding="utf-8") as stream:
+                stream.write(source)
+            metadata_path = os.path.join(sample_dir, "ZA_original.pokesample.json")
+            body_path = os.path.join(sample_dir, "ZA_original.pyfrag")
+            with open(metadata_path, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "name": "ZA_original",
+                    "fragment": "ZA_original.pyfrag",
+                    "source": {"path": source_path, "function": "original"},
+                }, stream)
+            with open(body_path, "w", encoding="utf-8") as stream:
+                stream.write(
+                    "def ZA_original(self):\n"
+                    "    self.ZA_original()\n"
+                    "    return \"sample-old\"\n")
+            comparisons = compare_sample_function_folder(
+                source, root, os.path.join(root, "Imported"), source_path)
+            updated, changed, mapping = merge_sample_names_with_source_bodies(
+                source, comparisons, ["original"])
+            self.assertEqual(mapping, {"original": "ZA_original"})
+            self.assertEqual(changed, [body_path])
+            self.assertIn("def ZA_original(self):", updated)
+            self.assertIn("self.ZA_original()", updated)
+            self.assertIn('return "source-correct"', updated)
+            self.assertNotIn("def original(self):", updated)
+            with open(body_path, "r", encoding="utf-8") as stream:
+                sample = stream.read()
+            self.assertIn("def ZA_original(self):", sample)
+            self.assertIn('return "source-correct"', sample)
+            self.assertNotIn("sample-old", sample)
+            with open(metadata_path, "r", encoding="utf-8") as stream:
+                metadata = json.load(stream)
+            self.assertEqual(metadata["source"]["function"], "ZA_original")
+
+    def test_batch_merge_updates_same_name_sample_from_source(self):
+        source = '''
+class Demo:
+    def same_name(self):
+        return "source-correct"
+'''
+        with tempfile.TemporaryDirectory() as root:
+            sample_dir = os.path.join(root, "Imported", "same_name")
+            os.makedirs(sample_dir)
+            metadata_path = os.path.join(sample_dir, "same_name.pokesample.json")
+            body_path = os.path.join(sample_dir, "same_name.pyfrag")
+            with open(metadata_path, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "name": "same_name", "fragment": "same_name.pyfrag",
+                    "source": {"path": "Demo.py", "function": "same_name"},
+                }, stream)
+            with open(body_path, "w", encoding="utf-8") as stream:
+                stream.write(
+                    "def same_name(self):\n    return \"sample-old\"\n")
+            comparisons = compare_sample_function_folder(
+                source, root, os.path.join(root, "Imported"))
+            updated, changed, mapping = merge_sample_names_with_source_bodies(
+                source, comparisons, ["same_name"])
+            self.assertEqual(updated, source)
+            self.assertEqual(mapping, {})
+            self.assertEqual(changed, [body_path])
+            with open(body_path, "r", encoding="utf-8") as stream:
+                self.assertIn('return "source-correct"', stream.read())
+
+    def test_batch_backup_can_restore_samples_and_source_snapshot(self):
+        with tempfile.TemporaryDirectory() as root:
+            source_path = os.path.join(root, "Demo.py")
+            sample_dir = os.path.join(root, "Imported", "sample")
+            backup_root = os.path.join(root, "Backups")
+            os.makedirs(sample_dir)
+            body_path = os.path.join(sample_dir, "sample.pyfrag")
+            metadata_path = os.path.join(sample_dir, "sample.pokesample.json")
+            source_before = "class Demo:\n    pass\n"
+            with open(source_path, "w", encoding="utf-8") as stream:
+                stream.write(source_before)
+            with open(body_path, "w", encoding="utf-8") as stream:
+                stream.write("def sample(self):\n    return 1\n")
+            with open(metadata_path, "w", encoding="utf-8") as stream:
+                json.dump({"name": "sample", "fragment": "sample.pyfrag"}, stream)
+            comparisons = [{
+                "name": "sample",
+                "fragments": [{"path": body_path}],
+            }]
+            backup = create_sample_sync_backup(
+                source_path, source_before, comparisons, ["sample"], backup_root)
+            self.assertEqual(
+                latest_sample_sync_backup(backup_root), backup["manifest_path"])
+            with open(body_path, "w", encoding="utf-8") as stream:
+                stream.write("changed")
+            with open(metadata_path, "w", encoding="utf-8") as stream:
+                stream.write("{}")
+            restored_source, restored_path, manifest = restore_sample_sync_backup(
+                backup["manifest_path"])
+            self.assertEqual(restored_source, source_before)
+            self.assertEqual(restored_path, os.path.abspath(source_path))
+            self.assertEqual(manifest["created"], backup["created"])
+            with open(body_path, "r", encoding="utf-8") as stream:
+                self.assertIn("return 1", stream.read())
+            with open(metadata_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["name"], "sample")
+
+    def test_batch_backup_restores_deleted_sample_and_extra_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            sample_dir = os.path.join(root, "Imported", "sample")
+            os.makedirs(sample_dir)
+            body_path = os.path.join(sample_dir, "sample.pyfrag")
+            extra_path = os.path.join(root, "sample_lists.json")
+            with open(body_path, "w", encoding="utf-8") as stream:
+                stream.write("def sample(self):\n    return 1\n")
+            with open(extra_path, "w", encoding="utf-8") as stream:
+                stream.write('{"before": true}')
+            comparisons = [{
+                "name": "sample", "fragments": [{"path": body_path}]}]
+            backup = create_sample_sync_backup(
+                "", "", comparisons, ["sample"],
+                os.path.join(root, "Backups"), extra_paths=[extra_path])
+            os.remove(body_path)
+            with open(extra_path, "w", encoding="utf-8") as stream:
+                stream.write('{"after": true}')
+            restore_sample_sync_backup(backup["manifest_path"])
+            with open(body_path, "r", encoding="utf-8") as stream:
+                self.assertIn("return 1", stream.read())
+            with open(extra_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream), {"before": True})
+
+
+class SourceDependencyToolsTests(unittest.TestCase):
+    SOURCE = '''
+import time
+
+class Demo:
+    CLASS_LIMIT = 3
+
+    def __init__(self):
+        self.STATE_FLOW_FUNCTION = {
+            "START": self.flow_start,
+            "END": self.flow_end,
+        }
+        self.flow_state = "START"
+        self.delay = 0.2
+
+    def flow_main(self):
+        while True:
+            self.flow_state = self.STATE_FLOW_FUNCTION[self.flow_state]()
+            self.wait(self.delay)
+
+    def flow_start(self):
+        self.helper()
+        return "END"
+
+    def flow_end(self):
+        return "END"
+
+    def helper(self):
+        return self.CLASS_LIMIT
+
+    def unrelated(self):
+        return False
+'''
+
+    def test_state_dictionary_drives_dependency_group(self):
+        analysis = analyze_source_dependencies(self.SOURCE, ["flow_main"])
+        self.assertEqual(
+            analysis["methods"],
+            ["flow_main", "flow_start", "flow_end", "helper"])
+        self.assertEqual(
+            analysis["state_dictionaries"]["STATE_FLOW_FUNCTION"],
+            [{"state": "START", "handler": "flow_start"},
+             {"state": "END", "handler": "flow_end"}])
+        self.assertIn("self.STATE_FLOW_FUNCTION", analysis["initializer"])
+        self.assertIn("CLASS_LIMIT = 3", analysis["class_variables"])
+        self.assertEqual(
+            state_dictionary_handlers(self.SOURCE, "STATE_FLOW_FUNCTION"),
+            [("START", "flow_start"), ("END", "flow_end")])
+
+    def test_state_machine_main_can_be_generated_from_dictionary_names(self):
+        generated = generate_state_machine_main(
+            "flow_main", "STATE_FLOW_FUNCTION", "flow_state", "self.delay")
+        self.assertIn(
+            "self.flow_state = self.STATE_FLOW_FUNCTION[self.flow_state]()",
+            generated)
+        compile(generated, "generated.py", "exec")
+
+    def test_state_dictionary_can_be_the_authoritative_group_root(self):
+        analysis = analyze_state_dictionary_dependencies(
+            self.SOURCE, "STATE_FLOW_FUNCTION")
+        self.assertEqual(
+            analysis["methods"], ["flow_start", "flow_end", "helper"])
+        self.assertEqual(analysis["root_state_dictionary"],
+                         "STATE_FLOW_FUNCTION")
+        self.assertEqual(analysis["current_state_attribute"], "flow_state")
+        self.assertEqual(
+            state_dictionary_current_state(self.SOURCE, "STATE_FLOW_FUNCTION"),
+            "flow_state")
+        self.assertEqual(
+            state_dictionary_names(self.SOURCE), ["STATE_FLOW_FUNCTION"])
+        ordinary = analyze_source_dependencies(self.SOURCE, ["flow_main"])
+        self.assertEqual(
+            suggest_state_dictionary(ordinary, "flow_main"),
+            "STATE_FLOW_FUNCTION")
+
+    def test_managed_image_dictionaries_are_external_requirements(self):
+        source = '''
+class Demo:
+    IMAGE_DETECTION_TARGETS = {"A": [{"threshold": 0.8}]}
+
+    def __init__(self):
+        self.state = "START"
+
+    def check(self):
+        return self.IMAGE_DETECTION_TARGETS.get("A")
+'''
+        analysis = analyze_source_dependencies(source, ["check"])
+        self.assertEqual(analysis["class_variables"], [])
+        self.assertEqual(
+            analysis["external_class_variables"],
+            ["IMAGE_DETECTION_TARGETS"])
+        self.assertNotIn("IMAGE_DETECTION_TARGETS",
+                         analysis["unresolved_attributes"])
+
+    def test_function_scoped_sample_member_extracts_only_requested_method(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = os.path.join(root, "group")
+            os.makedirs(folder)
+            metadata_path = os.path.join(folder, "group.pokesample.json")
+            body_path = os.path.join(folder, "group.pyfrag")
+            with open(metadata_path, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "name": "group", "fragment": "group.pyfrag",
+                    "imports": [], "class_variables": [],
+                }, stream)
+            with open(body_path, "w", encoding="utf-8") as stream:
+                stream.write(
+                    "def wanted(self):\n    return 1\n\n"
+                    "def unwanted(self):\n    return 2\n")
+            library_path = os.path.join(root, "sample_lists.json")
+            save_library(library_path, {
+                "schema_version": 2,
+                "lists": {"OnlyWanted": {"tags": [], "members": [{
+                    "type": "fragment", "id": "group/group.pokesample.json",
+                    "function": "wanted"}]}}})
+            with open(library_path, "r", encoding="utf-8") as stream:
+                data = json.load(stream)
+            preview = compose_preview(root, data, "OnlyWanted")
+            self.assertEqual(preview["included"], ["wanted"])
+            self.assertIn("def wanted", preview["bodies"][0])
+            self.assertNotIn("def unwanted", preview["bodies"][0])
+
+    def test_safe_apply_reuses_matches_adds_missing_and_blocks_differences(self):
+        source = '''
+class Demo:
+    def __init__(self):
+        pass
+
+    def same(self):
+        return 1
+'''
+        preview = {
+            "imports": ["import time"],
+            "class_variables": ["LIMIT = 3"],
+            "initializers": ["self.state = 'START'"],
+            "bodies": [
+                "def same(self):\n    return 1",
+                "def added(self):\n    return self.LIMIT"],
+        }
+        self.assertEqual(
+            [row["status"] for row in compare_preview_functions(source, preview)],
+            ["match", "missing"])
+        self.assertTrue(all(
+            row["status"] == "missing"
+            for row in compare_preview_support(source, preview)))
+        updated, _ = merge_preview_support_safely(source, preview)
+        updated, _ = merge_preview_functions_safely(updated, preview, "DemoGroup")
+        compile(updated, "merged.py", "exec")
+        self.assertIn("import time", updated)
+        self.assertIn("LIMIT = 3", updated)
+        self.assertIn("self.state = 'START'", updated)
+        self.assertIn("def added", updated)
+        different = dict(preview)
+        different["bodies"] = ["def same(self):\n    return 9"]
+        with self.assertRaises(ValueError):
+            merge_preview_functions_safely(source, different, "DemoGroup")
+
+    def test_register_dependency_group_creates_function_scoped_members(self):
+        with tempfile.TemporaryDirectory() as root:
+            with mock.patch(
+                    "SourceDependencyTools.catalog_function_candidates",
+                    wraps=sys.modules[
+                        "SourceDependencyTools"].catalog_function_candidates) as scan:
+                plan, members = register_dependency_group(
+                    self.SOURCE, ["flow_main"], root,
+                    "Imported/DemoFlow", "DemoFlow", source_path="Demo.py")
+            # Missing functions are completed from the just-created file list;
+            # the entire sample library must not be parsed for a second pass.
+            self.assertEqual(scan.call_count, 1)
+            self.assertEqual(len(plan["methods"]), 4)
+            self.assertTrue(all(
+                row["status"] == "created" for row in plan["registration"]))
+            functions = [member.get("function") for member in members
+                         if member.get("function")]
+            self.assertEqual(
+                functions, ["flow_main", "flow_start", "flow_end", "helper"])
+            scoped = [member for member in members if member.get("function")]
+            self.assertTrue(all(
+                member.get("origin_path") == "Demo.py" and
+                member.get("origin_function") == member.get("function")
+                for member in scoped))
+            self.assertTrue(members[0]["id"].endswith(
+                "DemoFlow__support/DemoFlow__support.pokesample.json"))
+
+
+class SampleOriginSyncTests(unittest.TestCase):
+    SOURCE = '''
+class Demo:
+    def reusable(self):
+        return 1
+
+    def untouched(self):
+        return 5
+'''
+
+    def _create_library(self, root, origin_paths):
+        folder = os.path.join(root, "shared")
+        os.makedirs(folder)
+        body_path = os.path.join(folder, "shared.pyfrag")
+        metadata_path = os.path.join(folder, "shared.pokesample.json")
+        with open(body_path, "w", encoding="utf-8") as stream:
+            stream.write("def reusable(self):\n    return 9\n")
+        with open(metadata_path, "w", encoding="utf-8") as stream:
+            json.dump({
+                "name": "shared", "fragment": "shared.pyfrag",
+                "imports": [], "class_variables": [], "initializer": "",
+                "source": {"path": origin_paths[0],
+                           "function": "reusable"},
+            }, stream)
+        members = []
+        for path in origin_paths:
+            members.append({
+                "type": "fragment", "id": "shared/shared.pokesample.json",
+                "function": "reusable", "origin_path": path,
+                "origin_function": "reusable"})
+        data = {"schema_version": 2, "lists": {
+            "SharedCommands": {"tags": [], "members": members}}}
+        save_library(os.path.join(root, "sample_lists.json"), data)
+        with open(os.path.join(root, "sample_lists.json"),
+                  "r", encoding="utf-8") as stream:
+            return json.load(stream)
+
+    def test_sample_list_can_update_selected_origin_commands_and_restore(self):
+        with tempfile.TemporaryDirectory() as root:
+            command1 = os.path.join(root, "Command1.py")
+            command2 = os.path.join(root, "Command2.py")
+            for path in (command1, command2):
+                with open(path, "w", encoding="utf-8") as stream:
+                    stream.write(self.SOURCE)
+            data = self._create_library(root, [command1, command2])
+            rows = compare_sample_list_origins(
+                root, data, "SharedCommands")
+            self.assertEqual(len(rows), 2)
+            self.assertTrue(all(row["status"] == "different" for row in rows))
+            result = apply_sample_list_to_origins(
+                rows, [rows[0]["key"]], os.path.join(root, "Backups"),
+                "SharedCommands")
+            self.assertEqual(result["functions"], 1)
+            with open(command1, "r", encoding="utf-8-sig") as stream:
+                self.assertIn("return 9", stream.read())
+            with open(command2, "r", encoding="utf-8-sig") as stream:
+                self.assertIn("return 1", stream.read())
+            restore_origin_sync_backup(result["backup"]["manifest_path"])
+            with open(command1, "r", encoding="utf-8-sig") as stream:
+                restored = stream.read()
+            self.assertIn("return 1", restored)
+            self.assertIn("return 5", restored)
+
+    def test_missing_origin_function_is_added(self):
+        with tempfile.TemporaryDirectory() as root:
+            command = os.path.join(root, "Command.py")
+            with open(command, "w", encoding="utf-8") as stream:
+                stream.write("class Demo:\n    pass\n")
+            data = self._create_library(root, [command])
+            rows = compare_sample_list_origins(root, data, "SharedCommands")
+            self.assertEqual(rows[0]["status"], "missing_source")
+            apply_sample_list_to_origins(
+                rows, [rows[0]["key"]], os.path.join(root, "Backups"),
+                "SharedCommands")
+            with open(command, "r", encoding="utf-8-sig") as stream:
+                updated = stream.read()
+            compile(updated, command, "exec")
+            self.assertIn("def reusable", updated)
+
+
 class SourceFunctionToolsTests(unittest.TestCase):
     SOURCE = '''
 import time
@@ -1076,6 +2615,20 @@ class Demo:
             build_rename_map(["move_old"], "_old", "", prefix="ZA_"),
             {"move_old": "ZA_move"},
         )
+
+    def test_source_record_ignores_shallow_comment_indent(self):
+        source = '''
+class Demo:
+    def first(self):
+        return True
+
+  # shallower comment must not affect the following method extraction
+    def second(self):
+        return False
+'''
+        records = {item["name"]: item for item in source_function_records(source)}
+        self.assertTrue(records["second"]["text"].startswith("def second"))
+        compile(records["second"]["text"], "second.pyfrag", "exec")
 
     def test_whole_name_replace_does_not_touch_similar_function_names(self):
         self.assertEqual(
@@ -1236,6 +2789,762 @@ class RecordingDiskGuardTests(unittest.TestCase):
             disk_space_violations((("output", SERIAL_CONTROLLER),), 5, 95, healthy),
             [],
         )
+
+
+class OperationCaptureSessionTests(unittest.TestCase):
+    def test_keyboard_input_is_rejected_from_operation_recording(self):
+        self.assertFalse(operation_input_source_is_recordable("keyboard"))
+        self.assertTrue(operation_input_source_is_recordable("pc_gamepad"))
+        self.assertTrue(operation_input_source_is_recordable("software_controller"))
+        with tempfile.TemporaryDirectory() as folder:
+            session = OperationCaptureSession(folder, input_set="Switch", name="keyboard")
+            segment = os.path.join(session.session_dir, "segments", "first")
+            os.makedirs(segment)
+            session.begin_segment(segment, started=10.0)
+            item = session.record_input(
+                "0x0004 8", occurred=10.5, source="keyboard")
+            self.assertIsNone(item)
+            self.assertEqual(session.manifest["input_count"], 0)
+            session.pause(stopped=11.0)
+            session.close()
+
+    def test_serial_packet_is_decoded_for_video_and_devstudio(self):
+        decoded = decode_serial_message("0x0012 8 ff 80")
+        self.assertIn("A", decoded["buttons"])
+        self.assertAlmostEqual(decoded["left_stick"]["angle"], 0.0)
+        self.assertIn("L@0deg", decoded["summary"])
+
+    def test_pause_gap_is_not_added_to_the_authoring_timeline(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = OperationCaptureSession(folder, input_set="Switch", name="story")
+            first = os.path.join(session.session_dir, "segments", "first")
+            second = os.path.join(session.session_dir, "segments", "second")
+            os.makedirs(first)
+            os.makedirs(second)
+            session.begin_segment(first, started=100.0)
+            session.record_input("0x0010 8", occurred=101.0)
+            session.record_input("0x0000 8", occurred=102.0)
+            session.pause(stopped=103.0)
+            session.begin_segment(second, started=200.0)
+            item = session.record_input("0x0008 8", occurred=201.0)
+            session.pause(stopped=202.0)
+            self.assertEqual(item["time"], 4.0)
+            self.assertEqual(session.manifest["active_duration"], 5.0)
+            session.complete()
+            saved = load_manifest(session.session_dir)
+            self.assertEqual(saved["status"], "finalizing")
+            self.assertEqual(saved["input_count"], 3)
+            self.assertEqual(len(saved["segments"]), 2)
+
+    def test_interrupted_operation_merge_can_be_prepared_for_retry(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = OperationCaptureSession(folder, name="retry")
+            segment = os.path.join(session.session_dir, "segments", "first")
+            os.makedirs(segment)
+            session.begin_segment(segment, started=10.0)
+            session.pause(stopped=11.0)
+            session.complete()
+
+            reopened = OperationCaptureSession(
+                folder, session_dir=session.session_dir)
+            self.assertEqual(reopened.prepare_finalize_retry(), 1)
+            reopened.close()
+            saved = load_manifest(session.session_dir)
+            self.assertEqual(saved["status"], "finalizing")
+            self.assertEqual(saved["finalize_retry_count"], 1)
+            self.assertIn("finalize_retried_at", saved)
+
+    def test_paused_operation_merge_cannot_be_retried(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = OperationCaptureSession(folder, name="paused")
+            segment = os.path.join(session.session_dir, "segments", "first")
+            os.makedirs(segment)
+            session.begin_segment(segment, started=10.0)
+            session.pause(stopped=11.0)
+            with self.assertRaises(RuntimeError):
+                session.prepare_finalize_retry()
+            session.close()
+
+    def test_selected_gamepad_profile_and_full_mapping_are_saved(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = OperationCaptureSession(folder, input_set="Switch", name="keys")
+            mapping = normalize_gamepad_mapping({"A": "button:1", "B": "button:0"})
+            session.set_input_configuration(
+                gamepad="0: Controller", gamepad_profile="Story pad",
+                gamepad_mapping=mapping)
+            saved = load_manifest(session.session_dir)["input_configuration"]
+            self.assertEqual(saved["gamepad_profile"], "Story pad")
+            self.assertEqual(saved["gamepad_mapping"]["A"], "button:1")
+            self.assertEqual(saved["gamepad_mapping"]["B"], "button:0")
+            self.assertEqual(saved["gamepad"], "0: Controller")
+            session.close()
+
+    def test_software_controller_home_is_identified_in_operation_recording(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = OperationCaptureSession(folder, input_set="Switch", name="home")
+            segment = os.path.join(session.session_dir, "segments", "first")
+            os.makedirs(segment)
+            session.begin_segment(segment, started=10.0)
+            item = session.record_input(
+                "0x4003 8 80 80 80 80", occurred=10.5,
+                source="software_controller")
+            self.assertEqual(item["source"], "software_controller")
+            self.assertIn("HOME", item["buttons"])
+            session.pause(stopped=11.0)
+            session.close()
+
+    def test_paused_operation_session_can_be_discarded_before_deletion(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = OperationCaptureSession(folder, input_set="Switch", name="mistake")
+            segment = os.path.join(session.session_dir, "segments", "first")
+            os.makedirs(segment)
+            session.begin_segment(segment, started=10.0)
+            session.record_input("0x0010 8", occurred=10.2)
+            session.pause(stopped=10.5)
+            session_dir = session.discard()
+            saved = load_manifest(session_dir)
+            self.assertEqual(saved["status"], "discarded")
+            self.assertIn("discarded_at", saved)
+            self.assertEqual(find_paused_session(folder, "mistake"), "")
+            self.assertNotIn("mistake", paused_session_names(folder))
+
+    def test_paused_session_names_are_available_for_editable_dropdown(self):
+        with tempfile.TemporaryDirectory() as folder:
+            sessions = []
+            for index, name in enumerate(("Route B", "Route A", "Route A"), 1):
+                session = OperationCaptureSession(folder, name=name)
+                segment = os.path.join(session.session_dir, "segments", str(index))
+                os.makedirs(segment)
+                session.begin_segment(segment, started=float(index))
+                session.pause(stopped=float(index) + 0.5)
+                session.close()
+                sessions.append(session.session_dir)
+            self.assertEqual(paused_session_names(folder), ["Route A", "Route B"])
+
+    def test_discarded_session_directory_retries_transient_windows_lock(self):
+        with mock.patch("OperationCaptureSession.shutil.rmtree",
+                        side_effect=(PermissionError("locked"), None)) as remove:
+            with mock.patch("OperationCaptureSession.time.sleep") as sleep:
+                self.assertEqual(
+                    remove_session_directory("discarded", attempts=3, delay=0.01), "")
+        self.assertEqual(remove.call_count, 2)
+        sleep.assert_called_once_with(0.01)
+
+    def test_devstudio_edits_survive_resume_from_pause(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = OperationCaptureSession(folder, input_set="Switch", name="resume")
+            first = os.path.join(session.session_dir, "segments", "first")
+            second = os.path.join(session.session_dir, "segments", "second")
+            os.makedirs(first)
+            os.makedirs(second)
+            session.begin_segment(first, started=10.0)
+            session.pause(stopped=11.0)
+            path = os.path.join(session.session_dir, "session.json")
+            with open(path, "r", encoding="utf-8") as stream:
+                external = json.load(stream)
+            external["generation"] = {
+                "input_target": "switch_steam_ps4",
+                "vision_sample": {"candidate_count": 2},
+            }
+            external["video_sync_offset"] = 0.125
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump(external, stream)
+            session.begin_segment(second, started=20.0)
+            saved = load_manifest(session.session_dir)
+            self.assertEqual(saved["generation"]["input_target"], "switch_steam_ps4")
+            self.assertEqual(saved["generation"]["vision_sample"]["candidate_count"], 2)
+            self.assertEqual(saved["video_sync_offset"], 0.125)
+            session.pause(stopped=21.0)
+            session.close()
+
+    def test_newest_paused_session_can_be_found_again_by_recording_name(self):
+        with tempfile.TemporaryDirectory() as folder:
+            older = OperationCaptureSession(folder, name="story")
+            older_segment = os.path.join(
+                older.session_dir, "segments", "first")
+            os.makedirs(older_segment)
+            older.begin_segment(older_segment, started=10.0)
+            older.pause(stopped=11.0)
+            older.close()
+
+            newer = OperationCaptureSession(folder, name="story")
+            newer_segment = os.path.join(
+                newer.session_dir, "segments", "first")
+            os.makedirs(newer_segment)
+            newer.begin_segment(newer_segment, started=20.0)
+            newer.pause(stopped=21.0)
+            newer.close()
+
+            completed = OperationCaptureSession(folder, name="story")
+            completed_segment = os.path.join(
+                completed.session_dir, "segments", "first")
+            os.makedirs(completed_segment)
+            completed.begin_segment(completed_segment, started=30.0)
+            completed.pause(stopped=31.0)
+            completed.complete()
+
+            self.assertEqual(
+                find_paused_session(folder, "story"), newer.session_dir)
+            self.assertEqual(find_paused_session(folder, "unknown"), "")
+
+
+class OperationGamepadMapTests(unittest.TestCase):
+    class _Joystick:
+        def __init__(self, axes, buttons=None, hats=None):
+            self.axes = list(axes)
+            self.buttons = list(buttons or [])
+            self.hats = list(hats or [])
+
+        def get_numaxes(self):
+            return len(self.axes)
+
+        def get_axis(self, index):
+            return self.axes[index]
+
+        def get_numbuttons(self):
+            return len(self.buttons)
+
+        def get_button(self, index):
+            return self.buttons[index]
+
+        def get_numhats(self):
+            return len(self.hats)
+
+        def get_hat(self, index):
+            return self.hats[index]
+
+    @staticmethod
+    def _dialog_logic(mapping):
+        dialog = OperationGamepadMapDialog.__new__(OperationGamepadMapDialog)
+        dialog.mapping = normalize_gamepad_mapping(mapping)
+        dialog.active_control = None
+        dialog.capture_armed = False
+        dialog.last_detected_token = ""
+        dialog.pressed_controls = set()
+        dialog.status = mock.Mock()
+        dialog.assign_detected_text = mock.Mock()
+        dialog.assign_detected_button = mock.Mock()
+        dialog._update_tree_values = mock.Mock()
+        dialog._paint_controls = mock.Mock()
+        return dialog
+
+    def test_profiles_preserve_selected_name_and_complete_mapping(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store = OperationGamepadProfileStore(os.path.join(folder, "operation_gamepads.json"))
+            data = store.load()
+            data["profiles"]["Second"] = {"mapping": normalize_gamepad_mapping({
+                "A": "button:1", "B": "button:0"})}
+            data["selected"] = "Second"
+            saved = store.save(data)
+            loaded = store.load()
+            self.assertEqual(saved["selected"], "Second")
+            self.assertEqual(loaded["selected"], "Second")
+            self.assertEqual(loaded["profiles"]["Second"]["mapping"]["A"], "button:1")
+            self.assertIn("ZR", loaded["profiles"]["Second"]["mapping"])
+
+    def test_dpad_alias_accepts_button_and_hat_devices(self):
+        mapping = normalize_gamepad_mapping({"DPAD_UP": "dpad:up"})
+        self.assertEqual(controls_for_token(mapping, "button:11"), {"DPAD_UP"})
+        self.assertEqual(controls_for_token(mapping, "hat:up"), {"DPAD_UP"})
+
+    def test_trigger_teaching_accepts_any_axis_and_both_directions(self):
+        self.assertEqual(gamepad_axis_token(2, 1.0, 0.0), "axis:2+")
+        self.assertEqual(gamepad_axis_token(2, -1.0, 0.0), "axis:2-")
+        self.assertEqual(gamepad_axis_token(5, 0.1, 0.0), "")
+        plus = ProController(control_mapping={"ZL": "axis:2+"})
+        plus._apply_physical("axis:2+", True)
+        self.assertEqual(plus.bits_16, 1 << 8)
+        minus = ProController(control_mapping={"ZL": "axis:2-"})
+        minus._apply_physical("axis:2-", True)
+        self.assertEqual(minus.bits_16, 1 << 8)
+
+    def test_direct_opposite_after_trigger_release_is_suppressed(self):
+        self.assertTrue(opposite_axis_tokens("axis:4+", "axis:4-"))
+        active = {4: "axis:4+"}
+        suppressed = {}
+        events = []
+        callback = lambda token, pressed: events.append((token, pressed))
+        ProController._axis_transition(
+            4, "axis:4-", active, suppressed, callback)
+        self.assertEqual(events, [("axis:4+", False)])
+        self.assertEqual(active, {})
+        self.assertEqual(suppressed, {4: "axis:4-"})
+        ProController._axis_transition(
+            4, "axis:4-", active, suppressed, callback)
+        self.assertEqual(events, [("axis:4+", False)])
+        ProController._axis_transition(
+            4, "axis:4+", active, suppressed, callback)
+        self.assertEqual(events[-1], ("axis:4+", True))
+        self.assertEqual(active, {4: "axis:4+"})
+
+    def test_explicitly_mapped_negative_axis_remains_available(self):
+        controller = ProController(control_mapping={"ZR": "axis:5-"})
+        active = {5: "axis:5+"}
+        suppressed = {}
+        events = []
+        controller._axis_transition(
+            5, "axis:5-", active, suppressed,
+            lambda token, pressed: events.append((token, pressed)),
+            allow_opposite=controller.physical_token_is_mapped)
+        self.assertEqual(events, [("axis:5+", False), ("axis:5-", True)])
+        self.assertEqual(active, {5: "axis:5-"})
+        self.assertEqual(suppressed, {})
+
+    def test_taught_trigger_axis_does_not_also_move_a_stick(self):
+        controller = ProController(control_mapping={"ZL": "axis:2+"})
+        controller.axis_baseline = {index: 0.0 for index in range(6)}
+        controller.joystick_move_detection(self._Joystick([0, 0, 1, 0, 0, 0]))
+        self.assertEqual(controller.stick_status_new, [128, 128, 128, 128])
+
+    def test_mapped_trigger_axis_never_blocks_neutral_gate(self):
+        controller = ProController(control_mapping={"ZL": "axis:4+"})
+        controller.axis_baseline = {index: 0.0 for index in range(6)}
+        joystick = self._Joystick([0, 0, 0, 0, -1, -1])
+        self.assertEqual(controller.joystick_neutral_blocker(joystick), "")
+        controller.stabilize_mapped_axis_baselines(joystick)
+        self.assertEqual(controller.joystick_neutral_blocker(joystick), "")
+        self.assertTrue(controller.joystick_is_neutral(joystick))
+
+    def test_startup_held_button_does_not_block_entire_controller(self):
+        controller = ProController(control_mapping={"A": "button:2"})
+        controller.axis_baseline = {0: 0.0, 1: 0.0}
+        joystick = self._Joystick([0, 0], buttons=[0, 0, 1])
+        self.assertEqual(controller.joystick_neutral_blocker(joystick), "")
+        self.assertTrue(controller.joystick_is_neutral(joystick))
+
+    def test_polled_buttons_and_hat_reach_mapping_preview_and_switch(self):
+        physical = []
+        controller = ProController(
+            control_mapping={"A": "button:1", "DPAD_UP": "hat:up"},
+            physical_input_callback=lambda token, pressed: physical.append((token, pressed)))
+        joystick = self._Joystick([0, 0], buttons=[0, 0], hats=[(0, 0)])
+        controller.poll_digital_states(joystick, forward=True, report=True)
+        joystick.buttons[1] = 1
+        controller.poll_digital_states(joystick, forward=True, report=True)
+        self.assertEqual(controller.bits_16, 1 << 4)
+        self.assertEqual(physical[-1], ("button:1", True))
+        joystick.hats[0] = (0, 1)
+        controller.poll_digital_states(joystick, forward=True, report=True)
+        self.assertEqual(controller.hat_status, 1)
+        self.assertEqual(physical[-1], ("hat:up", True))
+        joystick.buttons[1] = 0
+        joystick.hats[0] = (0, 0)
+        controller.poll_digital_states(joystick, forward=True, report=True)
+        self.assertEqual(controller.bits_16, 0)
+        self.assertEqual(controller.hat_status, 0)
+
+    def test_unarmed_press_only_highlights_current_mapping(self):
+        dialog = self._dialog_logic({"A": "button:0", "B": "button:1"})
+        dialog.active_control = "A"
+        original = dict(dialog.mapping)
+        dialog.handle_physical_input("button:1", True)
+        self.assertEqual(dialog.mapping, original)
+        self.assertEqual(dialog.pressed_controls, {"B"})
+
+    def test_explicit_change_button_arms_selected_target(self):
+        dialog = self._dialog_logic({"A": "button:0"})
+        dialog.active_control = "A"
+        dialog._arm_selected()
+        self.assertTrue(dialog.capture_armed)
+        dialog._paint_controls.assert_called_once()
+
+    def test_preview_detection_can_be_explicitly_registered_to_zl(self):
+        dialog = self._dialog_logic({"ZL": ""})
+        dialog.handle_physical_input("axis:4+", True)
+        self.assertEqual(dialog.mapping["ZL"], "")
+        self.assertEqual(dialog.last_detected_token, "axis:4+")
+        dialog.active_control = "ZL"
+        dialog._assign_last_detected()
+        self.assertEqual(dialog.mapping["ZL"], "axis:4+")
+
+    def test_selected_target_teaches_once_then_returns_to_preview(self):
+        dialog = self._dialog_logic({"A": "button:0", "B": "button:1"})
+        dialog.active_control = "A"
+        dialog.capture_armed = True
+        dialog.handle_physical_input("button:1", True)
+        self.assertEqual(dialog.mapping["A"], "button:1")
+        self.assertEqual(dialog.mapping["B"], "")
+        self.assertFalse(dialog.capture_armed)
+        dialog.handle_physical_input("button:2", True)
+        self.assertEqual(dialog.mapping["A"], "button:1")
+
+    def test_ab_swap_long_hold_and_release_only_one(self):
+        physical = []
+        controller = ProController(control_mapping={
+            "A": "button:1", "B": "button:0", "HOME": "button:5"},
+            physical_input_callback=lambda token, pressed: physical.append((token, pressed)))
+        controller._apply_physical("button:0", True)
+        self.assertEqual(controller.bits_16, 1 << 3)
+        controller._apply_physical("button:1", True)
+        self.assertEqual(controller.bits_16, (1 << 3) | (1 << 4))
+        controller._apply_physical("button:0", False)
+        self.assertEqual(controller.bits_16, 1 << 4)
+        self.assertEqual(physical[-1], ("button:0", False))
+
+    def test_home_is_mapped_when_driver_delivers_guide_button(self):
+        controller = ProController(control_mapping={"HOME": "button:5"})
+        controller._apply_physical("button:5", True)
+        self.assertEqual(controller.bits_16, 1 << 14)
+
+    def test_two_dpad_inputs_become_diagonal_and_release_independently(self):
+        controller = ProController(control_mapping={
+            "DPAD_UP": "button:11", "DPAD_RIGHT": "button:14"})
+        controller._apply_physical("button:11", True)
+        controller._apply_physical("button:14", True)
+        self.assertEqual(controller.hat_status, 3)
+        self.assertEqual(controller.hat_dict[controller.hat_status], 1)
+        controller._apply_physical("button:11", False)
+        self.assertEqual(controller.hat_status, 2)
+
+
+class OperationSessionModelTests(unittest.TestCase):
+    @staticmethod
+    def _inputs():
+        return [
+            {"kind": "input", "line": line, "time": float(line),
+             "message": "message-{}".format(line), "summary": "input {}".format(line)}
+            for line in range(1, 7)
+        ]
+
+    def test_paused_session_exposes_every_closed_segment_to_devstudio(self):
+        with tempfile.TemporaryDirectory() as folder:
+            segments = []
+            for number, start in ((1, 0.0), (2, 12.5)):
+                segment_dir = os.path.join(folder, "segment-{}".format(number))
+                os.makedirs(segment_dir)
+                with open(os.path.join(segment_dir, "recording.avi"), "wb") as stream:
+                    stream.write(b"RIFF-test")
+                segments.append({
+                    "number": number, "recorder_dir": segment_dir,
+                    "timeline_start": start, "duration": 2.0,
+                })
+            sources = operation_video_sources({
+                "status": "paused", "segments": segments, "outputs": {},
+            })
+            self.assertEqual(len(sources), 2)
+            self.assertEqual(sources[1]["timeline_start"], 12.5)
+            self.assertIn("2", sources[1]["label"])
+
+    def test_large_pending_input_list_is_compacted_to_ranges(self):
+        self.assertEqual(
+            compact_line_ranges(list(range(1, 27591)) + [30000, 30002, 30003]),
+            "#0001-#27590, #30000, #30002-#30003")
+
+    def test_paused_session_can_generate_intermediate_code(self):
+        inputs = [{
+            "kind": "input", "line": 1, "time": 0.2,
+            "message": "0x4003 8 80 80 80 80", "summary": "HOME",
+        }]
+        mappings = [{
+            "start_line": 1, "end_line": 1, "kind": "step",
+            "step_name": "OPEN_HOME", "next_step": "NEXT",
+        }]
+        generated = generate_intermediate(
+            {"status": "paused", "session_id": "paused-home"},
+            inputs, mappings)
+        self.assertIn("def OPEN_HOME", generated)
+        self.assertIn("0x4003", generated)
+
+    def test_legacy_keyboard_rows_are_excluded_from_commands_generation(self):
+        inputs = [
+            {"kind": "input", "line": 1, "time": 0.1,
+             "message": "keyboard-message", "source": "pc_keyboard"},
+            {"kind": "input", "line": 2, "time": 0.2,
+             "message": "gamepad-message", "source": "pc_gamepad"},
+        ]
+        mappings = [{"start_line": 1, "end_line": 2, "kind": "raw"}]
+        generated = generate_intermediate(
+            {"session_id": "without-keyboard"}, inputs, mappings)
+        self.assertFalse(input_row_is_commands_recordable(inputs[0]))
+        self.assertTrue(input_row_is_commands_recordable(inputs[1]))
+        self.assertNotIn("keyboard-message", generated)
+        self.assertIn("gamepad-message", generated)
+
+    def test_function_range_is_called_in_order_inside_step_without_duplication(self):
+        session = {"session_id": "session-a"}
+        mappings = [
+            {"start_line": 1, "end_line": 6, "kind": "step",
+             "step_name": "STEP_A", "next_step": "STEP_B"},
+            {"start_line": 2, "end_line": 3, "kind": "function",
+             "function_name": "turn_corner", "call_from_step": "STEP_A"},
+            {"start_line": 4, "end_line": 5, "kind": "ignore",
+             "notes": "mistake during manual play"},
+        ]
+        generated = generate_intermediate(session, self._inputs(), mappings)
+        self.assertIn("def STEP_A(self):", generated)
+        self.assertIn("self.turn_corner()", generated)
+        self.assertIn("def turn_corner(self):", generated)
+        self.assertIn("return 'STEP_B'", generated)
+        for line in (1, 2, 3, 6):
+            self.assertEqual(generated.count("message-{}".format(line)), 1)
+        for line in (4, 5):
+            self.assertNotIn("message-{}".format(line), generated)
+        self.assertEqual(pending_lines(self._inputs(), mappings), [])
+
+    def test_generated_region_is_inserted_in_selected_class_and_updated_in_place(self):
+        source = "class Story(object):\n    def existing(self):\n        pass\n"
+        generated = ("# POKECON_OPERATION_SESSION:s1:BEGIN\n"
+                     "def STEP_A(self):\n"
+                     "    pass\n"
+                     "# POKECON_OPERATION_SESSION:s1:END\n")
+        updated = replace_generated_region(source, generated, "s1", class_name="Story")
+        self.assertEqual(source_class_names(updated), ["Story"])
+        self.assertIn("    def STEP_A(self):", updated)
+        ast.parse(updated)
+        changed = generated.replace("pass", "return 'NEXT'")
+        replaced = replace_generated_region(updated, changed, "s1", class_name="Story")
+        self.assertEqual(replaced.count("POKECON_OPERATION_SESSION:s1:BEGIN"), 1)
+        self.assertIn("return 'NEXT'", replaced)
+        ast.parse(replaced)
+
+    def test_existing_method_is_replaced_instead_of_duplicated(self):
+        source = ("class Story(object):\n"
+                  "    def STEP_A(self):\n"
+                  "        return 'OLD'\n")
+        generated = ("# POKECON_OPERATION_SESSION:s2:BEGIN\n"
+                     "def STEP_A(self):\n"
+                     "    return 'NEW'\n"
+                     "# POKECON_OPERATION_SESSION:s2:END\n")
+        updated = replace_generated_region(source, generated, "s2", class_name="Story")
+        self.assertEqual(updated.count("def STEP_A"), 1)
+        self.assertNotIn("return 'OLD'", updated)
+        self.assertIn("return 'NEW'", updated)
+        ast.parse(updated)
+
+    def test_mapping_draft_is_persistent_and_searchable_after_reload(self):
+        from OperationSessionModel import load_mappings
+        with tempfile.TemporaryDirectory() as folder:
+            saved = save_mappings(folder, [{
+                "start_line": 7, "end_line": 9, "kind": "function",
+                "function_name": "move_to_door", "notes": "hotel",
+            }])
+            loaded = load_mappings(folder)
+            self.assertEqual(loaded, saved)
+            self.assertEqual(loaded[0]["function_name"], "move_to_door")
+
+    def test_portable_generation_uses_editable_semantic_game_inputs(self):
+        inputs = [
+            {"kind": "input", "line": 1, "time": 1.0,
+             "message": "switch-press", "buttons": ["A"], "hat": "RIGHT",
+             "left_stick": {"angle": 90.0, "magnitude": 1.0},
+             "right_stick": None},
+            {"kind": "input", "line": 2, "time": 1.5,
+             "message": "switch-neutral", "buttons": [], "hat": "CENTER",
+             "left_stick": None, "right_stick": None},
+        ]
+        mappings = [{"start_line": 1, "end_line": 2, "kind": "step",
+                     "step_name": "PORTABLE_STEP", "next_step": ""}]
+        generated = generate_intermediate(
+            {"session_id": "portable"}, inputs, mappings,
+            generation_target=GENERATION_TARGET_PORTABLE)
+        self.assertIn("Steam_Switch_Game_Input", generated)
+        self.assertIn("self.game_input_state(", generated)
+        self.assertIn("['A', 'Lbutton_right', 'Lstick@90.00/1.0000']", generated)
+        self.assertIn("duration=0.5", generated)
+        self.assertNotIn("self.direct_serial(", generated)
+        self.assertIn("game_image_profiles", generated)
+        ast.parse(generated)
+
+        eight_way = generate_intermediate(
+            {"session_id": "portable"}, inputs, mappings,
+            generation_target=GENERATION_TARGET_PORTABLE,
+            stick_mode=STICK_MODE_EIGHT_WAY)
+        self.assertIn("['A', 'Lbutton_right', 'Lstick_up']", eight_way)
+        self.assertNotIn("Lstick@", eight_way)
+
+    def test_switch_stick_generation_defaults_to_exact_and_can_use_eight_way(self):
+        row = {
+            "kind": "input", "line": 1, "time": 1.0,
+            "message": "0x0002 8 b5 6a", "buttons": [], "hat": "CENTER",
+            "left_stick": {"angle": 20.0, "magnitude": 0.5},
+            "right_stick": None,
+        }
+        mappings = [{"start_line": 1, "end_line": 1, "kind": "raw"}]
+        exact = generate_intermediate(
+            {"session_id": "exact"}, [row], mappings)
+        self.assertIn("0x0002 8 b5 6a", exact)
+
+        quantized_message = quantize_serial_stick_message(row)
+        self.assertEqual(quantized_message, "0x0002 8 c0 80")
+        eight_way = generate_intermediate(
+            {"session_id": "eight"}, [row], mappings,
+            stick_mode=STICK_MODE_EIGHT_WAY)
+        self.assertIn("0x0002 8 c0 80", eight_way)
+        self.assertNotIn("0x0002 8 b5 6a", eight_way)
+
+    def test_semantic_stick_names_are_quantized_to_eight_directions(self):
+        row = {"buttons": ["ZR"], "hat": "UP_LEFT",
+               "left_stick": {"angle": 315.0, "magnitude": 0.8},
+               "right_stick": {"angle": 180.0, "magnitude": 0.7}}
+        self.assertEqual(semantic_controls(row), [
+            "ZR", "Lbutton_up_left", "Lstick_down_right", "Rstick_left"])
+
+    def test_game_input_sample_has_late_key_and_image_overrides(self):
+        root = os.path.abspath(os.path.join(
+            os.path.dirname(__file__), "..", "SerialController", "DevTemplates",
+            "Fragments", "game_input_router"))
+        with open(os.path.join(root, "game_input_router.pyfrag"),
+                  "r", encoding="utf-8") as stream:
+            fragment = stream.read()
+        ast.parse(fragment)
+        self.assertIn("def game_input_state", fragment)
+        self.assertIn("def set_game_input_mapping", fragment)
+        self.assertIn("def set_game_image_mapping", fragment)
+        self.assertIn("def game_image_check", fragment)
+        with open(os.path.join(root, "game_input_router.pokesample.json"),
+                  "r", encoding="utf-8") as stream:
+            sample = json.load(stream)
+        self.assertIn("Direction", sample["imports"][0])
+        self.assertIn("Stick", sample["imports"][0])
+
+        namespace = {}
+        exec(compile(fragment, "game_input_router.pyfrag", "exec"), namespace)
+        methods = {name: value for name, value in namespace.items()
+                   if inspect.isfunction(value)}
+        PortableCommand = type("PortableCommand", (), methods)
+        command = PortableCommand()
+        command.game_input_target = "steam"
+        command.game_input_profiles = [{"A": ["enter"]}]
+        keyboard_calls = []
+        command.steam_keyboard_press = lambda *keys, **options: keyboard_calls.append(
+            (keys, options))
+        command.select_game_input_profile(0)
+        command.game_input_state(["A", "Lstick_up"], duration=0.4, wait=0.0)
+        self.assertEqual(keyboard_calls[-1][0][:2], ("enter", "w"))
+        command.game_input_state(["Lstick@136.25/0.8000"], wait=0.0)
+        self.assertEqual(keyboard_calls[-1][0][:2], ("w", "a"))
+        command.set_game_input_mapping("A", "space")
+        command.game_input("A", duration=0.2, wait=0.0)
+        self.assertEqual(keyboard_calls[-1][0][0], "space")
+
+        switch_calls = []
+        command.game_input_target = "switch"
+        command.press = lambda controls, **options: switch_calls.append(
+            (controls, options))
+        command.game_input_state(["A", "Lstick_up"], duration=0.3, wait=0.0)
+        self.assertEqual(len(switch_calls[-1][0]), 2)
+        self.assertEqual(switch_calls[-1][1]["duration"], 0.3)
+        command.game_input_state(["Lstick@136.25/0.8000"], wait=0.0)
+        exact_stick = switch_calls[-1][0][0]
+        self.assertAlmostEqual(exact_stick.angle_for_show, 136.25)
+        self.assertAlmostEqual(exact_stick.mag, 0.8)
+
+        command.image_check = lambda name, flag=1: (name, flag)
+        command.game_input_target = "steam"
+        self.assertEqual(command.game_image_check("READY"), ("READY", 1))
+        command.set_game_image_mapping("steam", "READY", "READY_STEAM")
+        self.assertEqual(command.game_image_check("READY"), ("READY_STEAM", 1))
+
+    def test_video_vision_sample_is_separate_parseable_and_logs_support(self):
+        with tempfile.TemporaryDirectory() as folder:
+            paths = vision_output_paths(folder)
+            image_path = os.path.join(paths["image_dir"], "step_a.png")
+            metadata = {"candidates": [{
+                "step_name": "STEP_A", "next_step": "STEP_B",
+                "logical_name": "AUTO_STEP_A_COMPLETE",
+                "video_time": 12.4, "confidence": 0.78,
+                "template_path": image_path, "roi": [100, 80, 400, 220],
+                "threshold": 0.82,
+            }]}
+            source = generate_vision_sample(
+                folder, {"session_id": "vision-test"}, metadata,
+                support_timeout=1.0)
+            ast.parse(source)
+            self.assertIn("POKECON_OPERATION_VISION_SAMPLE", source)
+            self.assertNotIn("POKECON_OPERATION_SESSION:vision-test:BEGIN", source)
+            self.assertIn("def VISION_SAMPLE_STEP_A", source)
+            self.assertIn("support_requested", source)
+            self.assertIn("support_completed", source)
+
+            namespace = {}
+            exec(compile(source, "vision_sample.py", "exec"), namespace)
+            methods = {name: value for name, value in namespace.items()
+                       if inspect.isfunction(value)}
+            SampleCommand = type("SampleCommand", (), methods)
+            command = SampleCommand()
+            results = iter((False, False, True))
+            recorded = []
+            command.STEP_A = lambda: recorded.append("STEP_A")
+            command._operation_sample_detect = lambda *_args, **_options: next(results)
+            command.wait = lambda _seconds: None
+            self.assertEqual(command.VISION_SAMPLE_STEP_A(), "STEP_B")
+            self.assertEqual(recorded, ["STEP_A"])
+            with open(paths["support_log"], "r", encoding="utf-8") as stream:
+                events = [json.loads(line)["event"] for line in stream if line.strip()]
+            self.assertEqual(events, ["support_requested", "support_completed"])
+
+    def test_debug_command_package_is_runnable_versioned_and_final_is_untouched(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = {"session_id": "debug-session", "name": "Route debug"}
+            intermediate = (
+                "# POKECON_OPERATION_SESSION:debug-session:BEGIN\n"
+                "def STEP_A(self):\n"
+                "    self.wait(0.1)\n"
+                "# POKECON_OPERATION_SESSION:debug-session:END\n")
+            paths = vision_output_paths(folder)
+            template = os.path.join(paths["image_dir"], "step_a.png")
+            metadata = {"candidates": [{
+                "step_name": "STEP_A", "next_step": "STEP_B",
+                "logical_name": "AUTO_STEP_A_COMPLETE", "video_time": 1.0,
+                "confidence": 0.8, "template_path": template,
+                "roi": [10, 20, 110, 70], "frame_size": [1280, 720],
+                "threshold": 0.82,
+            }]}
+            vision = generate_vision_sample(folder, session, metadata, support_timeout=1.0)
+            revision = save_intermediate_revision(folder, intermediate, "switch")
+            final_path = os.path.join(folder, "final_command.py")
+            with open(final_path, "w", encoding="utf-8") as stream:
+                stream.write("FINAL_SOURCE = True\n")
+            package = create_debug_command_package(
+                folder, session, intermediate, vision, metadata,
+                [{"kind": "step", "step_name": "STEP_A"}],
+                intermediate_revision=revision)
+            with open(package["working"], "r", encoding="utf-8") as stream:
+                debug_source = stream.read()
+            ast.parse(debug_source)
+            self.assertIn("class Route_debug_DebugCommand", debug_source)
+            self.assertIn("NAME = '[DEBUG] Route debug'", debug_source)
+            self.assertIn("self.VISION_SAMPLE_STEP_A()", debug_source)
+            self.assertTrue(os.path.abspath(template).startswith(
+                debug_output_paths(folder)["templates"]))
+            with open(final_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(stream.read(), "FINAL_SOURCE = True\n")
+
+            with open(package["working"], "a", encoding="utf-8") as stream:
+                stream.write("# manual debug adjustment\n")
+            regenerated = create_debug_command_package(
+                folder, session, intermediate, vision, metadata,
+                [{"kind": "step", "step_name": "STEP_A"}],
+                intermediate_revision=revision)
+            self.assertTrue(os.path.isfile(regenerated["working_backup"]))
+            with open(regenerated["working_backup"], "r", encoding="utf-8") as stream:
+                self.assertIn("manual debug adjustment", stream.read())
+
+            second = save_intermediate_revision(
+                folder, intermediate.replace("0.1", "0.2"), "switch")
+            self.assertEqual(intermediate_revisions(folder), [revision, second])
+            deployed = deploy_debug_command(
+                package["working"], folder, "debug-session")
+            self.assertTrue(deployed.endswith(os.path.join(
+                "GeneratedDebug", "debug_session_debug.py")))
+            with open(deployed, "r", encoding="utf-8") as stream:
+                ast.parse(stream.read())
+
+    def test_unassigned_long_recording_gets_bounded_debug_only_draft_steps(self):
+        inputs = [
+            {"kind": "input", "line": index + 1, "time": index * 0.25,
+             "message": "message-{}".format(index + 1)}
+            for index in range(2000)
+        ]
+        mappings = build_debug_draft_mappings(
+            inputs, center_time=200.0, window_seconds=60.0,
+            step_seconds=12.0, max_steps=5)
+        self.assertEqual(len(mappings), 5)
+        self.assertTrue(all(item["kind"] == "step" for item in mappings))
+        self.assertTrue(all(item["step_name"].startswith("DEBUG_AUTO_STEP_")
+                            for item in mappings))
+        self.assertGreaterEqual(mappings[0]["start_line"], 780)
+        self.assertIn("最終版へ反映しない", mappings[0]["notes"])
 
 
 if __name__ == "__main__":

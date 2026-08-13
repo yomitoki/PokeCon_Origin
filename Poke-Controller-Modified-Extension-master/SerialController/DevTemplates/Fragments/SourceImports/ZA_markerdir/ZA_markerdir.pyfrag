@@ -16,7 +16,7 @@ def ZA_markerdir(self,type,nofiled=False):
         right = "POKEMON_ZA_SIDE_MARKER_RIGHT_WIDE"
     else:
         return False
-
+    
     if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W") or nofiled:
         if self.image_check(center):
             return True

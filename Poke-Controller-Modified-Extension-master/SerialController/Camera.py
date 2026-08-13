@@ -209,6 +209,8 @@ class Camera:
         self._window_capture_error = ""
         self._window_reader_stop = None
         self._window_reader_thread = None
+        self._camera_reader_stop = None
+        self._camera_reader_thread = None
         self._window_raw_bgr = None
         self.window_capture_mode = "client"
         self.image_bgr = None
@@ -517,6 +519,34 @@ class Camera:
         self._logger.debug(f"Camera ID {cameraId} opened successfully.")
         self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.capture_size[0])
         self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.capture_size[1])
+        self._start_camera_reader()
+
+    def _start_camera_reader(self):
+        """Drain a capture device outside Tk and retain only its latest frame."""
+        capture = self.camera
+        if capture is None:
+            return
+        stop_event = threading.Event()
+        self._camera_reader_stop = stop_event
+
+        def read_latest_frames():
+            while not stop_event.is_set() and self.camera is capture:
+                try:
+                    ok, frame = capture.read()
+                except Exception as error:
+                    self._logger.warning("Camera reader failed: %s", error)
+                    break
+                if ok and frame is not None:
+                    # A complete ndarray assignment is atomic under CPython.
+                    # Consumers may safely retain this immutable-by-convention
+                    # snapshot while the reader publishes the next ndarray.
+                    self.image_bgr = frame
+                else:
+                    stop_event.wait(0.02)
+
+        self._camera_reader_thread = threading.Thread(
+            target=read_latest_frames, daemon=True, name="CameraCaptureReader")
+        self._camera_reader_thread.start()
 
     def isOpened(self):
         self._logger.debug("Camera is opened")
@@ -528,14 +558,9 @@ class Camera:
         return self.camera is not None and self.camera.isOpened()
 
     def readFrame(self):
-        if self.window_hwnd is not None:
-            # Windows Graphics Capture runs in the helper and the frame-reader
-            # thread. Keep the Tk capture callback non-blocking.
-            return self.image_bgr
-        if self.camera is not None:
-            _, self.image_bgr = self.camera.read()
-            return self.image_bgr
-        return None
+        # Both physical capture and Windows Graphics Capture are drained by a
+        # reader thread.  Never wait for a driver from Tk/Commands callers.
+        return self.image_bgr
 
     def saveCapture(self, filename: str = None, crop: int = None, crop_ax: List[int] = None, img: numpy.ndarray = None):
         if crop_ax is None:
@@ -573,6 +598,22 @@ class Camera:
             self._logger.error(f"Capture Failed :{e}")
 
     def destroy(self):
+        if self._camera_reader_stop is not None:
+            self._camera_reader_stop.set()
+        capture, self.camera = self.camera, None
+        if capture is not None:
+            try:
+                if capture.isOpened():
+                    # Release first: some DirectShow drivers otherwise leave
+                    # read() blocked and delay input-source switching.
+                    capture.release()
+            except Exception:
+                pass
+        if self._camera_reader_thread is not None and \
+                self._camera_reader_thread is not threading.current_thread():
+            self._camera_reader_thread.join(timeout=0.5)
+        self._camera_reader_stop = None
+        self._camera_reader_thread = None
         if self._window_reader_stop is not None:
             self._window_reader_stop.set()
         if self._window_reader_thread is not None and \
@@ -580,10 +621,6 @@ class Camera:
             self._window_reader_thread.join(timeout=0.5)
         self._window_reader_stop = None
         self._window_reader_thread = None
-        if self.camera is not None:
-            if self.camera.isOpened():
-                self.camera.release()
-            self.camera = None
         if self._window_capture_process is not None:
             try:
                 if self._window_capture_process.poll() is None:

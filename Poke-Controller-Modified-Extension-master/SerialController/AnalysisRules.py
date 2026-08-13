@@ -55,10 +55,27 @@ class AnalysisRuleEngine:
         with self.lock:
             self.last_runs.clear()
             self.previous_regions.clear()
+            self.template_cache.clear()
 
     def submit(self, frame, rules, context=None, force=False):
         if frame is None or self.busy:
             return False
+        rules = list(rules or ())
+        active_ids = {
+            str(rule.get("id", "")) for rule in rules
+            if rule.get("enabled", True)
+        }
+        # Rule IDs may be regenerated repeatedly while editing/InputSet
+        # switching.  Discard state for rules that no longer exist so their
+        # thumbnails and timer entries do not accumulate for the process life.
+        self.last_runs = {
+            key: value for key, value in self.last_runs.items()
+            if key in active_ids
+        }
+        self.previous_regions = {
+            key: value for key, value in self.previous_regions.items()
+            if key in active_ids
+        }
         now = time.monotonic()
         due = []
         for rule in rules:
@@ -115,6 +132,8 @@ class AnalysisRuleEngine:
             self.template_cache = {key: value for key, value in self.template_cache.items()
                                    if key[0] != path}
             self.template_cache[state] = image
+            while len(self.template_cache) > 64:
+                self.template_cache.pop(next(iter(self.template_cache)))
         return image
 
     def _condition(self, frame, rule, context):

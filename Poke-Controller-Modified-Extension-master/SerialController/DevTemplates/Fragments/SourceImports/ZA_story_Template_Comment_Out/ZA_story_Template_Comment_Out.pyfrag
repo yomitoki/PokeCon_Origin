@@ -1,0 +1,150 @@
+def ZA_story_Template_Comment_Out(self,substitute=0,green_check=1,black_check=1,endpicture7="RETURN_FALSE",sub9_button="A",sub9_picture="RETURN_FALSE",selected_pic="RETURN FALSE",selected_target=0,mode=0,sleeptime=0.5):
+    selected_out_check=0
+
+    if mode == 0:
+        endpicture4="POKEMON_ZA_FILED_HARD_CHECK_0"
+    else:
+        endpicture4="POKEMON_ZA_FILED_HARD_CHECK_1"
+    nofiled_check=0
+    #コメントチェックができるまでループ
+    for i in range(30):
+        if (not (self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0"))):
+            nofiled_check=1
+        if self.image_check("POKEMON_ZA_EYE_CHECK_HIGH_POKE"):
+            return True#ポケモンに見つかった場合は即座にTrue扱いで抜ける
+        elif self.image_check("POKEMON_ZA_MISSION_COMPLETE"):
+            break
+        elif (self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT") or self.image_check("POKEMON_ZA_COMMENT_MARKER") or ((green_check==1) and (self.image_check("POKEMON_ZA_TEXT_GREEN_COMMENT"))) or ((black_check==1) and (self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT")))):
+            break
+        elif self.image_check("POKEMON_ZA_COIN_ICON"):
+            break
+        elif self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") or self.image_check("POKEMON_ZA_ESCAPE"):
+            return True
+        elif self.image_check(selected_pic):
+            break                
+        elif (nofiled_check==1 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")):
+            return True
+        elif (nofiled_check==1 and self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0")):
+            if (nofiled_check==1 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")):
+                return True
+            break
+        elif (nofiled_check==0 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")):
+            return False 
+        #elif (nofiled_check==1 and((not (self.image_check("BATTLE_BALL_CHECK") or self.image_check("ESCAPE")))and (self.image_check("Filed_Hard_Check_0")))):
+        #    if filed_check_count > 5:
+        #        break
+        #    filed_check_count+=1
+        #elif i == 9:
+        #    return False
+        self.wait(0.5)
+
+    #コメントチェック待ちをおこなっても検知ができなかった場合は、False判定とする。
+    #if (not (self.image_check("COIN_ICON") or self.image_check("TEXT_WHITE_COMMENT") or ((green_check==1) and (self.image_check("TEXT_GREEN_COMMENT"))) or ((black_check==1) and (self.image_check("TEXT_BLACK_COMMENT"))))):
+    #    return False
+
+    while True:
+        self.checkIfAlive()
+        selected_out_check=0
+        if self.ZA_renda_button(rendabutton="B",
+                             endpicture="POKEMON_ZA_BATTLE_BALL_CHECK",
+                             endpicture2="POKEMON_ZA_ESCAPE",
+                             endpicture3=selected_pic,
+                             endpicture4=endpicture4,
+                             endpicture5="POKEMON_ZA_EYE_CHECK_HIGH_POKE",
+                             endpicture7=endpicture7,
+                             not_endpicture="POKEMON_ZA_ZA_ROYALE",
+                             sub_button="A",sub_picture="POKEMON_ZA_TEXT_BLACK_COMMENT",
+                             sub2_button="A",sub2_picture="POKEMON_ZA_1_SELECT",
+                             sub3_button="A",sub3_picture="POKEMON_ZA_2_SELECT",
+                             sub4_button="A",sub4_picture="POKEMON_ZA_3_SELECT",
+                             sub5_button="A",sub5_picture="POKEMON_ZA_4_SELECT",
+                             sub6_button="A",sub6_picture="POKEMON_ZA_HELP_MARKER",
+                             sub7_button="A",sub7_picture="POKEMON_ZA_MORNING",
+                             sub8_button="A",sub8_picture="POKEMON_ZA_NIGHT",
+                             sub9_button=sub9_button,sub9_picture=sub9_picture,
+                             sleeptime=sleeptime):
+            print(f"5rt2{nofiled_check}")
+            selected_out_check=0
+            filed_check_count=0
+            for i in range(30):
+                self.wait(0.5)
+                if self.image_check(selected_pic):
+                    selected_out_check=1
+                    self.wait(1.0)
+                    for i in range(selected_target):
+                        self.etc_sendCommand("Lbutton_down")
+                        self.wait(0.5)
+                    self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                    break
+                elif self.image_check(endpicture7):
+                    break
+                elif self.image_check("POKEMON_ZA_MISSION_COMPLETE"):
+                    break
+                elif ((self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT") or self.image_check("POKEMON_ZA_COMMENT_MARKER") or ((green_check==1) and (self.image_check("POKEMON_ZA_TEXT_GREEN_COMMENT"))) or ((black_check==1) and (self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT")))) ):
+                    self.wait(0.5)
+                    #選択肢チェックのタイミングがずれたようにフォローする
+                    if self.image_check(selected_pic):
+                        selected_out_check=1
+                        self.wait(1.0)
+                        for i in range(selected_target):
+                            self.etc_sendCommand("Lbutton_down")
+                            self.wait(0.5)
+                        self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                        break
+                    else:
+                        self.pressRep(Button.B, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+
+                elif self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") or self.image_check("POKEMON_ZA_ESCAPE"):
+                    if ((self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT") or self.image_check("POKEMON_ZA_COMMENT_MARKER") or ((green_check==1) and (self.image_check("POKEMON_ZA_TEXT_GREEN_COMMENT"))) or ((black_check==1) and (self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT")))) ):
+                        self.wait(0.5)
+                        #選択肢チェックのタイミングがずれたようにフォローする
+                        if self.image_check(selected_pic):
+                            selected_out_check=1
+                            self.wait(1.0)
+                            for i in range(selected_target):
+                                self.etc_sendCommand("Lbutton_down")
+                                self.wait(0.5)
+                            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                            break
+                        else:
+                            self.pressRep(Button.B, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                    else:
+                        break
+                elif (not (self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0"))):
+                    nofiled_check=1
+                elif (nofiled_check==1 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")):
+                    break
+                elif (nofiled_check==1 and self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0")):
+                    break
+
+                    #if filed_check_count > 5:
+                    #    break
+                    #filed_check_count+=1
+
+        #選択肢処理を行っている場合は再度ボタン連打を再開する。
+        if selected_out_check==1:
+            selected_out_check=0
+            continue
+        self.wait(0.5)
+        if self.image_check(endpicture7):
+            break
+        elif self.image_check("POKEMON_ZA_MISSION_COMPLETE"):
+            break   
+        elif (self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT") or self.image_check("POKEMON_ZA_COMMENT_MARKER") or ((green_check==1) and (self.image_check("POKEMON_ZA_TEXT_GREEN_COMMENT"))) or ((black_check==1) and (self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT")))):
+            # 下記処理は戦闘不能となっている場合に実施すると抜けられなくなるため、回復などが前提にある場合でなければ使用しないこと
+            if substitute==1:
+                endpicture4="POKEMON_ZA_WANINOKO_ICON"
+                endpicture5="POKEMON_ZA_ODAIRU_ICON"
+                endpicture6="POKEMON_ZA_ABSOL_ICON"
+        elif self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") or self.image_check("POKEMON_ZA_ESCAPE"):
+            break
+        elif self.image_check("POKEMON_ZA_ZA_ROYALE"):
+            self.pressRep(Button.B, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+        elif (nofiled_check==1 and self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0")):
+            if (nofiled_check==1 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")):
+                break  
+        elif (nofiled_check==1 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")):
+            break
+        elif (nofiled_check==0 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")):
+            return False 
+    return True

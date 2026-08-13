@@ -165,9 +165,9 @@ def replace_image_check(source, library):
     generated = generate_image_check(library, "POKEMON_ZA_ALL", "list")
     exception = '''def image_check_exception(self, targetimage):
     """Handle Pokemon ZA checks that do not use a template image."""
-    if targetimage == "POKEMON_ZA_TRUE_RETURN":
+    if targetimage in ("POKEMON_ZA_TRUE_RETURN", "TRUE_RETURN", "RETURN_TRUE", "RETURN TRUE"):
         return True
-    if targetimage == "POKEMON_ZA_FALSE_RETURN":
+    if targetimage in ("POKEMON_ZA_FALSE_RETURN", "FALSE_RETURN", "RETURN_FALSE", "RETURN FALSE"):
         return False
     if targetimage == "POKEMON_ZA_FILED_HARD_CHECK_0":
         return bool(self.story_Template_Field_HardGaurd())

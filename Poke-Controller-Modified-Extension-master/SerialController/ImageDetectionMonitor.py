@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import time
 
 
 def empty_library():
@@ -46,9 +47,92 @@ def filter_target_names(library, query=""):
     return sorted(results, key=str.casefold)
 
 
+def show_value_entry_key(detail):
+    """Keep different detection names/patterns as independent output rows."""
+    return (str(detail.get("name", "image detection")), str(detail.get("variant") or ""))
+
+
+def update_show_value_entries(entries, detail, now=None, limit=24):
+    """Insert the newest detection result while keeping the cache bounded."""
+    current = time.time() if now is None else float(now)
+    value = dict(detail)
+    value["display_timestamp"] = current
+    key = show_value_entry_key(value)
+    # Reinsert updated items at the end, so the displayed order follows the
+    # latest actual output rather than alphabetical order.
+    entries.pop(key, None)
+    entries[key] = value
+    while len(entries) > max(1, int(limit)):
+        del entries[next(iter(entries))]
+    return key
+
+
+def prune_show_value_entries(entries, timeout_seconds, now=None):
+    """Remove names which have not produced another result within the timeout."""
+    current = time.time() if now is None else float(now)
+    cutoff = current - max(0.1, float(timeout_seconds))
+    stale = [key for key, value in entries.items()
+             if float(value.get("display_timestamp", 0.0)) < cutoff]
+    for key in stale:
+        del entries[key]
+    return stale
+
+
+def format_show_value_entries(entries, tag="ShowValue"):
+    """Render each currently active image detection as a separate block."""
+    blocks = []
+    for detail in entries.values():
+        try:
+            score = float(detail.get("score"))
+            threshold = float(detail.get("threshold", 0.0))
+        except (TypeError, ValueError):
+            continue
+        position = detail.get("position") or ("-", "-")
+        variant = detail.get("variant")
+        variant_text = " / パターン{}".format(variant) if variant else ""
+        blocks.append(("[{}] {}{}\n"
+                       "一致度: {:.6f} / 閾値: {:.6f} / {}\n"
+                       "検出位置: {},{} / 取得元: {}").format(
+                           str(tag or "ShowValue"),
+                           detail.get("name", "image detection"), variant_text,
+                           score, threshold,
+                           "一致" if detail.get("matched") else "不一致",
+                           position[0], position[1],
+                           detail.get("source", "Commands")))
+    return "\n\n".join(blocks)
+
+
 def resolve_template_path(serial_root, template_path):
     path = str(template_path or "").replace("/", os.sep)
     return path if os.path.isabs(path) else os.path.join(serial_root, path)
+
+
+def padded_search_crop(roi, margin, frame_shape):
+    """Convert x,y,w,h into a clamped [x1,y1,x2,y2] search crop.
+
+    Area Capture stores the selected template as x,y,w,h, while registered
+    image detections use x1,y1,x2,y2.  The configured Arrow move amount is a
+    tolerance around the exact template position in every direction.
+    """
+    if not isinstance(roi, (list, tuple)) or len(roi) != 4:
+        raise ValueError("ROI must be x,y,width,height")
+    if not isinstance(frame_shape, (list, tuple)) or len(frame_shape) < 2:
+        raise ValueError("Frame shape must contain height and width")
+    try:
+        x, y, width, height = [int(value) for value in roi]
+        padding = max(0, int(margin))
+        frame_height, frame_width = int(frame_shape[0]), int(frame_shape[1])
+    except (TypeError, ValueError):
+        raise ValueError("ROI, margin, and frame shape must be integers")
+    if width <= 0 or height <= 0 or frame_width <= 0 or frame_height <= 0:
+        raise ValueError("ROI and frame dimensions must be positive")
+    x1 = max(0, x - padding)
+    y1 = max(0, y - padding)
+    x2 = min(frame_width, x + width + padding)
+    y2 = min(frame_height, y + height + padding)
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError("ROI is outside the camera image")
+    return [x1, y1, x2, y2]
 
 
 def crop_search_region(frame, crop):

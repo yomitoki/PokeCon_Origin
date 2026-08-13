@@ -23,7 +23,7 @@ from Commands.Keys import Direction, Stick, Touchscreen, NEUTRAL, KeyPress
 import logging
 from logging import StreamHandler, getLogger, DEBUG, NullHandler
 from Commands.PythonCommandBase import PythonCommand
-from UiResponsiveness import preview_render_interval
+from UiResponsiveness import preview_capture_interval, preview_render_interval
 
 try:
     os.makedirs("log")
@@ -105,8 +105,11 @@ class CaptureArea(tk.Canvas):
         # the preview makes the feature available to every Python command too.
         self.region_listener = None
         self.frame_listener = None
+        self.frame_work_provider = None
         self.record_listener = None
         self.render_priority_provider = None
+        self.capture_work_provider = None
+        self.resource_multiplier_provider = None
         self._last_listener_time = 0.0
         self._last_preview_render_time = 0.0
         self._requested_fps = 30
@@ -221,6 +224,10 @@ class CaptureArea(tk.Canvas):
         """Set a low-rate callback for live BGR frames (max. 4 calls/sec)."""
         self.frame_listener = listener
 
+    def set_frame_work_provider(self, provider):
+        """Set a callback indicating whether low-rate analysis needs frames."""
+        self.frame_work_provider = provider
+
     def set_record_listener(self, listener):
         """Set a callback for every capture frame, before preview throttling."""
         self.record_listener = listener
@@ -228,6 +235,14 @@ class CaptureArea(tk.Canvas):
     def set_render_priority_provider(self, provider):
         """Set a callback returning (last-active-PokeCon, allow-full-rate)."""
         self.render_priority_provider = provider
+
+    def set_capture_work_provider(self, provider):
+        """Set a callback which is true while recording needs every frame."""
+        self.capture_work_provider = provider
+
+    def set_resource_multiplier_provider(self, provider):
+        """Provide a cooperative background-preview interval multiplier."""
+        self.resource_multiplier_provider = provider
 
     def StartOutputRegion(self, event):
         self.min_x, self.min_y = event.x, event.y
@@ -729,20 +744,6 @@ class CaptureArea(tk.Canvas):
         self.capture()
 
     def capture(self):
-        if self.is_show_var.get():
-            image_bgr = self.camera.readFrame()
-        else:
-            self.after(self.next_frames, self.capture)
-            return
-
-        now = time.monotonic()
-        if image_bgr is not None:
-            if self.record_listener is not None:
-                self.record_listener(image_bgr)
-            if self.frame_listener is not None and now - self._last_listener_time >= 0.25:
-                self._last_listener_time = now
-                self.frame_listener(image_bgr.copy())
-
         try:
             top = self.winfo_toplevel()
             viewable = bool(top.winfo_viewable()) and top.state() != "iconic"
@@ -756,11 +757,57 @@ class CaptureArea(tk.Canvas):
             except Exception as error:
                 self._logger.warning("Preview priority provider failed: %s", error)
         prioritized = bool(focused or last_active)
+        background_work = False
+        if callable(self.capture_work_provider):
+            try:
+                background_work = bool(self.capture_work_provider())
+            except Exception as error:
+                self._logger.warning("Capture work provider failed: %s", error)
+        frame_work = self.frame_listener is not None
+        if callable(self.frame_work_provider):
+            try:
+                frame_work = bool(self.frame_work_provider())
+            except Exception as error:
+                self._logger.warning("Frame work provider failed: %s", error)
+        resource_multiplier = 1.0
+        if callable(self.resource_multiplier_provider):
+            try:
+                resource_multiplier = max(
+                    1.0, float(self.resource_multiplier_provider()))
+            except Exception as error:
+                self._logger.warning("Resource multiplier provider failed: %s", error)
+        capture_interval = preview_capture_interval(
+            self._requested_fps, focused=prioritized, viewable=viewable,
+            full_rate=bool(allow_full_rate and prioritized),
+            background_work=background_work,
+            resource_multiplier=resource_multiplier)
+        if frame_work:
+            # Analysis rules are specified as a 0.25-second periodic check.
+            capture_interval = min(capture_interval, 0.25)
+            capture_interval *= resource_multiplier
+        next_delay = max(1, int(round(capture_interval * 1000.0)))
+        if not self.is_show_var.get():
+            self.after(next_delay, self.capture)
+            return
+
+        # readFrame() is a non-blocking latest-frame lookup.  Physical camera
+        # drivers and WGC are drained on their own reader threads.
+        image_bgr = self.camera.readFrame()
+        now = time.monotonic()
+        if image_bgr is not None:
+            if self.record_listener is not None:
+                self.record_listener(image_bgr)
+            if frame_work and self.frame_listener is not None \
+                    and now - self._last_listener_time >= 0.25:
+                self._last_listener_time = now
+                self.frame_listener(image_bgr.copy())
+
         render_interval = preview_render_interval(
             self._requested_fps, focused=prioritized, viewable=viewable,
-            full_rate=bool(allow_full_rate and prioritized))
+            full_rate=bool(allow_full_rate and prioritized),
+            resource_multiplier=resource_multiplier)
         if now - self._last_preview_render_time < render_interval:
-            self.after(self.next_frames, self.capture)
+            self.after(next_delay, self.capture)
             return
         self._last_preview_render_time = now
 
@@ -779,7 +826,7 @@ class CaptureArea(tk.Canvas):
             # self.configure(image=self.disabled_tk)
             self.itemconfig(self.im_, image=self.disabled_tk)
 
-        self.after(self.next_frames, self.capture)
+        self.after(next_delay, self.capture)
 
     def saveCapture(self):
         self.camera.saveCapture()

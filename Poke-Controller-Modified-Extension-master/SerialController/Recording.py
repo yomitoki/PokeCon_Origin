@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime
 import os
+import queue
 import shutil
 import subprocess
 import threading
@@ -47,6 +48,15 @@ class CaptureRecorder:
         # count so the window can avoid being destroyed while ffmpeg still has
         # the recording files open.
         self._finalizing_count = 0
+        # Commands monitoring rotates short clips.  Starting one ffmpeg thread
+        # per clip lets encoders pile up when conversion is slower than
+        # capture, eventually taking CPU away from Commands and controller
+        # input.  Keep the jobs durable on disk and encode them one at a time.
+        self._finalize_queue = queue.Queue()
+        self._finalize_thread = threading.Thread(
+            target=self._finalize_worker, daemon=True,
+            name="CaptureRecordingFinalizer")
+        self._finalize_thread.start()
 
     def start(self, frame, fps, audio_device="", audio_gain_percent=100, cleanup_rules=None, minimum_duration=0):
         if self.active or frame is None:
@@ -114,7 +124,10 @@ class CaptureRecorder:
                 creation_flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
                 self.process_audio = subprocess.Popen(
                     [helper, str(process_id), "includetree", os.path.abspath(self.wav_path)],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    # The helper's output was never consumed.  A PIPE can fill
+                    # during a long recording and stall its audio process.
+                    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                     text=True, creationflags=creation_flags)
                 return
             except Exception as error:
@@ -209,10 +222,10 @@ class CaptureRecorder:
         process_audio_gain = self.process_audio_gain
         cleanup_rules = list(self.cleanup_rules)
         minimum_duration = float(self.minimum_duration)
-        threading.Thread(target=self._finalize_worker,
-                         args=(video_path, wav_path, mp4_path, actual_fps, elapsed,
-                               process_audio_gain, bool(discard), cleanup_rules,
-                               minimum_duration), daemon=True).start()
+        self._finalize_queue.put((
+            video_path, wav_path, mp4_path, actual_fps, elapsed,
+            process_audio_gain, bool(discard), cleanup_rules,
+            minimum_duration))
         print("[RECORDING] Finalizing MP4 in background ({:.2f} captured FPS): {}".format(actual_fps, mp4_path))
         return mp4_path
 
@@ -221,16 +234,21 @@ class CaptureRecorder:
         with self.lock:
             return self._finalizing_count > 0
 
-    def _finalize_worker(self, video_path, wav_path, mp4_path, actual_fps, elapsed,
-                         process_audio_gain=1.0, discard=False,
-                         cleanup_rules=None, minimum_duration=0.0):
-        try:
-            self._finalize(video_path, wav_path, mp4_path, actual_fps, elapsed,
-                           process_audio_gain, discard, cleanup_rules,
-                           minimum_duration)
-        finally:
-            with self.lock:
-                self._finalizing_count = max(0, self._finalizing_count - 1)
+    def _finalize_worker(self):
+        """Serialize CPU-heavy mux/cleanup jobs without blocking capture."""
+        while True:
+            job = self._finalize_queue.get()
+            try:
+                self._finalize(*job)
+            except Exception as error:
+                # A failed encoder must not terminate the sole worker and
+                # leave every later recording permanently queued.
+                print("[RECORDING] Finalizing failed: {}".format(error))
+            finally:
+                with self.lock:
+                    self._finalizing_count = max(
+                        0, self._finalizing_count - 1)
+                self._finalize_queue.task_done()
 
     def _finalize(self, video_path, wav_path, mp4_path, actual_fps, elapsed,
                   process_audio_gain=1.0, discard=False,

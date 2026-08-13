@@ -466,7 +466,7 @@ class KeyPress:
             btns = [btns]
 
         for btn in self.holdButton:
-            if btn not in btns:
+            if not any(type(active) is type(btn) and active == btn for active in btns):
                 btns.append(btn)
         if self.serial_data_format_name == "3DS Controller":
             self.format.setButton(
@@ -538,9 +538,10 @@ class KeyPress:
                 if type(btn) is Touchscreen:
                     self.holdButton.remove(btn)
         for btn in btns:
-            if btn in self.holdButton:
-                print("Warning: " + btn.name + " is already in holding state")
-                self._logger.warning(f"Warning: {btn.name} is already in holding state")
+            if any(type(held) is type(btn) and held == btn for held in self.holdButton):
+                name = getattr(btn, "name", repr(btn))
+                print("Warning: " + name + " is already in holding state")
+                self._logger.warning(f"Warning: {name} is already in holding state")
                 return
 
             self.holdButton.append(btn)
@@ -553,8 +554,10 @@ class KeyPress:
         flag_isTouchscreen = False
         for btn in btns:
             if type(btn) is not Touchscreen:
-                if btn in self.holdButton:
-                    self.holdButton.remove(btn)
+                self.holdButton = [
+                    held for held in self.holdButton
+                    if not (type(held) is type(btn) and held == btn)
+                ]
             else:
                 flag_isTouchscreen = True
         if flag_isTouchscreen:
@@ -563,6 +566,21 @@ class KeyPress:
                     self.holdButton.remove(btn)
 
         self.inputEnd(btns)
+
+    def replace_hold(self, btns):
+        """Send one packet representing the complete current manual state."""
+        if btns is None:
+            btns = []
+        elif not isinstance(btns, (list, tuple)):
+            btns = [btns]
+        unique = []
+        for btn in btns:
+            if not any(type(held) is type(btn) and held == btn for held in unique):
+                unique.append(btn)
+        self.holdButton = unique
+        self.format.resetAllButtons()
+        self.format.unsetHat()
+        self.input([])
 
     def neutral(self):
         btns = self.holdButton

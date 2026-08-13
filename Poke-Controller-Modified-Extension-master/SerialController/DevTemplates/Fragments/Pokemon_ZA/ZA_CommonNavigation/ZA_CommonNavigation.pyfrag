@@ -1,11 +1,10 @@
 def ZA_Common_start(self):
     #dummy
     return "COMMON_MAP_OPEN"
-
 def ZA_Common_map_open(self,check_pic1="POKEMON_ZA_FALSE_RETURN",check_pic2="POKEMON_ZA_FALSE_RETURN",othermap="POKEMON_ZA_FALSE_RETURN"):
-    self.ZA_map_cursor_reset=0
+    self.map_cursor_reset=0
     self.ZA_ZL_ACTION("END")
-    self.wait(0.1)#self.wait(self.ZA_SLEEPLIST[8][2])
+    self.wait(0.1)#self.wait(self.SLEEPLIST[8][2])
     # 想定外の話しかけ用
     if self.image_check("POKEMON_ZA_TEXT_BOX"):
         self.pressRep(Button.B, repeat=5, duration=0.15, wait=0.01, interval=0.1)
@@ -28,7 +27,6 @@ def ZA_Common_map_open(self,check_pic1="POKEMON_ZA_FALSE_RETURN",check_pic2="POK
     #    return "CHECK_TIME"
 
     return "COMMON_MAP_OPEN"
-
 def ZA_Common_goto_select1(self,position,othermap="POKEMON_ZA_FALSE_RETURN"):
     # position:0 すべて
     # position:1 施設
@@ -36,15 +34,15 @@ def ZA_Common_goto_select1(self,position,othermap="POKEMON_ZA_FALSE_RETURN"):
     # position:3 カフェ
     # position:4 ゾーン
     # position:5 やめる
-    self.wait(0.1)#self.wait(self.ZA_SLEEPLIST[7][2])
+    self.wait(0.1)#self.wait(self.SLEEPLIST[7][2])
     if self.image_check("POKEMON_ZA_MAP2") or self.image_check(othermap):      
         self.wait(0.1)
         if self.image_check("POKEMON_ZA_MOVESPOT_TAB"):
-            if self.ZA_map_cursor_reset==0:
+            if self.map_cursor_reset==0:
                 if self.image_check("POKEMON_ZA_SIDE_SELECT_TOP_MAP"):
-                    self.ZA_map_cursor_reset=1
+                    self.map_cursor_reset=1
                 else:
-                    self.ZA_etc_sendCommand("Lbutton_left")
+                    self.etc_sendCommand("Lbutton_left")
                 self.wait(0.5)
                 return "COMMON_GOTO_SELECT1"
             else:
@@ -54,7 +52,7 @@ def ZA_Common_goto_select1(self,position,othermap="POKEMON_ZA_FALSE_RETURN"):
                 elif self.image_check("POKEMON_ZA_SELECT_ALL"):
                     # SELECT
                     for i in range(position):
-                        self.ZA_etc_sendCommand("Lbutton_down")
+                        self.etc_sendCommand("Lbutton_down")
                         #self.wait(0.1)#回数が多い場合に移動が足りない場合は必要
                         
                     self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.01, interval=0.1)
@@ -86,23 +84,22 @@ def ZA_Common_goto_select1(self,position,othermap="POKEMON_ZA_FALSE_RETURN"):
         self.wait(0.1)
         return "COMMON_GOTO_SELECT1"
     return "COMMON_GOTO_SELECT1"
-
 def ZA_Common_goto_select2(self,positionright,positiondown,movepoint_check,othermap="POKEMON_ZA_FALSE_RETURN"):
-    self.wait(0.1)#self.wait(self.ZA_SLEEPLIST[7][2])
+    self.wait(0.1)#self.wait(self.SLEEPLIST[7][2])
     if self.image_check("POKEMON_ZA_MAP2") or self.image_check(othermap):        
         if self.image_check("POKEMON_ZA_MOVESPOT_TAB"):         
             if self.image_check("POKEMON_ZA_TAB_FILTER"):
                 # FILTER
                 for i in range(positionright):
-                    self.ZA_etc_sendCommand("Lbutton_right")
+                    self.etc_sendCommand("Lbutton_right")
                     self.wait(0.1)#回数が多い場合に移動が足りない場合は必要
                 if positiondown > -1:
                     for i in range(positiondown):
-                        self.ZA_etc_sendCommand("Lbutton_down")
+                        self.etc_sendCommand("Lbutton_down")
                         self.wait(0.1)#回数が多い場合に移動が足りない場合は必要
                 else:
                     for i in range(positiondown*-1):
-                        self.ZA_etc_sendCommand("Lbutton_up")
+                        self.etc_sendCommand("Lbutton_up")
                         self.wait(0.1)#回数が多い場合に移動が足りない場合は必要
                 if movepoint_check == 0:
                     ret = self.ZA_Common_goto_jump()#移動
@@ -111,45 +108,43 @@ def ZA_Common_goto_select2(self,positionright,positiondown,movepoint_check,other
                     return "COMMON_GOTO_JUMP"
                     
     return "COMMON_GOTO_SELECT2"
-
 def ZA_Common_goto_jump(self):
-    self.wait(0.1)#self.wait(self.ZA_SLEEPLIST[7][2])
+    self.wait(0.1)#self.wait(self.SLEEPLIST[7][2])
  
     self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.1, interval=0.1)
     for i in range(1,10):
-        self.wait(0.1)#self.wait(self.ZA_SLEEPLIST[10][2])
+        self.wait(0.1)#self.wait(self.SLEEPLIST[10][2])
         if self.image_check("POKEMON_ZA_MOVE_COMMENT"): 
             self.pressRep(Button.A, repeat=15, duration=0.15, wait=0.1, interval=0.1)
-            self.ZA_sleepcount=0
+            self.sleepcount=0
             return "COMMON_CHANGE_TIME"
         
         elif self.image_check("POKEMON_ZA_MOVE_COMMENT_BATTLE"):
-            self.ZA_inactioncount+=1
+            self.inactioncount+=1
             self.pressRep(Button.B, repeat=10, duration=0.15, wait=0.1, interval=0.1)
-            self.ZA_battle_step_return=1
+            self.battle_step_return=1
             return "COMMON_BATTLE_RETURN"
         
         elif i == 1:
             if self.image_check("POKEMON_ZA_MOVE_COMMENT"): 
                 self.pressRep(Button.A, repeat=15, duration=0.15, wait=0.1, interval=0.1)
-                self.ZA_sleepcount=0
+                self.sleepcount=0
                 return "COMMON_CHANGE_TIME"
             self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.2, interval=0.1)
     print("MOVE_COM_ELSE")
-    if self.ZA_battlecheck == 1:
-        self.ZA_inactioncount+=1
+    if self.battlecheck == 1:
+        self.inactioncount+=1
         self.pressRep(Button.B, repeat=20, duration=0.15, wait=0.1, interval=0.1)
-        self.ZA_battle_step_return=1
+        self.battle_step_return=1
         return "COMMON_BATTLE_RETURN"
-    self.ZA_sleepcount=0
+    self.sleepcount=0
     self.pressRep(Button.A, repeat=5, duration=0.15, wait=0.1, interval=0.1)
     return "COMMON_CHANGE_TIME"
-
 def ZA_Common_change_time(self):
     
     #マップコメントの捕捉失敗用
     #if self.image_check("ESCAPE"):
-    #    self.ZA_battlecheck=1
+    #    self.battlecheck=1
     #    return "GOTO_SELECT1"
            
     #ポケモンセンター用
@@ -157,8 +152,8 @@ def ZA_Common_change_time(self):
     #    self.press(Direction(Stick.LEFT, 90), duration=2.0, wait=0.1)
     #    self.pressRep(Button.A, repeat=10, duration=0.15, wait=0.2, interval=0.1)
     #    self.pressRep(Button.B, repeat=50, duration=0.15, wait=0.2, interval=0.1)
-    #    if self.ZA_chicketmaxflag == 1:
-    #        self.ZA_chicketmaxflag = 2
+    #    if self.chicketmaxflag == 1:
+    #        self.chicketmaxflag = 2
     #        return "QUASAR_MAP_OPEN"
     #    else:
     #        return "BENCH_MAP_OPEN"
@@ -168,70 +163,67 @@ def ZA_Common_change_time(self):
         return "COMMON_CHECK_TIME"
 
     else:
-        self.ZA_etc_sendCommand("Lbutton_left")
-        self.wait(0.1)#self.wait(self.ZA_SLEEPLIST[0][2])
+        self.etc_sendCommand("Lbutton_left")
+        self.wait(0.1)#self.wait(self.SLEEPLIST[0][2])
     return "COMMON_CHANGE_TIME"
-
 def ZA_Common_check_time(self,check_timing):
 
     # (時間切り替わりの補足ができない？その場合は朝扱いで一度抜ける(夜だった場合再度、朝・夜の切り替えを行う))
     #必ずMORNING、NIGHT判定できる時間以上のカウント数にしてください。
       
-    if self.image_check("POKEMON_ZA_MORNING") or (check_timing != "POKEMON_ZA_MORNING" and self.ZA_timecount > 200):
+    if self.image_check("POKEMON_ZA_MORNING") or (check_timing != "POKEMON_ZA_MORNING" and self.timecount > 200):
         print("朝")
-        self.ZA_timecount=0
+        self.timecount=0
         while True:
             #ジャスティス会への話しかけが発生する可能性があるので、ループしてしまう場合はBボタンが必要になる場合がある                
             self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
             if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W") or self.image_check("POKEMON_ZA_DEAD"):
-                self.ZA_timecount=0
-                self.ZA_changetimecount+=1
+                self.timecount=0
+                self.changetimecount+=1
                 if check_timing != "POKEMON_ZA_MORNING":
-                    self.ZA_sleepcount=1
+                    self.sleepcount=1
                     return "COMMON_CHANGE_TIME"
                 else:
                     return "COMMON_START"
 
-    elif self.image_check("POKEMON_ZA_NIGHT") or (check_timing != "POKEMON_ZA_NIGHT" and self.ZA_timecount > 200):
+    elif self.image_check("POKEMON_ZA_NIGHT") or (check_timing != "POKEMON_ZA_NIGHT" and self.timecount > 200):
         #1ループの戦闘中移動失敗カウンタの初期化
-        self.ZA_inactioncount=0
+        self.inactioncount=0
         print("夜")
         while True:
             #ジャスティス会への話しかけが発生する可能性があるので、ループしてしまう場合はBボタンが必要になる場合がある       
             self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
             if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W") or self.image_check("POKEMON_ZA_DEAD"):
-                self.ZA_timecount=0
-                self.ZA_changetimecount+=1
+                self.timecount=0
+                self.changetimecount+=1
                 if check_timing != "POKEMON_ZA_NIGHT":
-                    self.ZA_sleepcount=1
+                    self.sleepcount=1
                     return "COMMON_CHANGE_TIME"
                 else:
                     return "COMMON_START"
 
-    self.wait(0.1)#self.wait(self.ZA_SLEEPLIST[6][2])
+    self.wait(0.1)#self.wait(self.SLEEPLIST[6][2])
     #抜けミス用カウント
-    self.ZA_timecount+=1
+    self.timecount+=1
     return "COMMON_CHECK_TIME"
-
 def ZA_Common_change_time_set(self,check_timing,check_pic1="POKEMON_ZA_FALSE_RETURN",check_pic2="POKEMON_ZA_FALSE_RETURN"):
     #type=0:ポケセンブルーにて実施(バトルゾーンに影響あり)
-    if self.ZA_Common_current_state == "COMMON_CHECK_TIME":  
-        self.ZA_Common_current_state = self.ZA_Common_check_time(check_timing)
-    elif self.ZA_Common_current_state == "COMMON_CHANGE_TIME":  
-        self.ZA_Common_current_state = self.ZA_Common_change_time()
+    if self.Common_current_state == "COMMON_CHECK_TIME":  
+        self.Common_current_state = self.ZA_Common_check_time(check_timing)
+    elif self.Common_current_state == "COMMON_CHANGE_TIME":  
+        self.Common_current_state = self.ZA_Common_change_time()
     else:
         ret = self.ZA_Common_goto(2,0,1,check_pic1=check_pic1,check_pic2=check_pic2)
         
         if ret == "START":
-            self.ZA_Common_current_state = "COMMON_CHANGE_TIME"
+            self.Common_current_state = "COMMON_CHANGE_TIME"
             
-    if self.ZA_Common_current_state == "COMMON_START":
+    if self.Common_current_state == "COMMON_START":
         return "START"
     else:
         return "EXEC"
-
 def ZA_Common_event_marker_check(self,othermap="POKEMON_ZA_FALSE_RETURN",markertype=0):
-    self.wait(1.0)#self.wait(self.ZA_SLEEPLIST[7][2])
+    self.wait(1.0)#self.wait(self.SLEEPLIST[7][2])
     if self.image_check("POKEMON_ZA_MAP2") or self.image_check(othermap):      
         self.wait(1.0)
         for i in range(5):
@@ -245,30 +237,27 @@ def ZA_Common_event_marker_check(self,othermap="POKEMON_ZA_FALSE_RETURN",markert
         
     self.ZA_renda_button(rendabutton="B",endpicture="POKEMON_ZA_FIELD_W",endpicture2="POKEMON_ZA_FIELD_BACK_W")
     return "COMMON_FALSE_RETURN"
-
 def ZA_Common_false_return(self,othermap="POKEMON_ZA_FALSE_RETURN"):#dummy
     return "COMMON_FALSE_RETURN"
-
 def ZA_Common_goto(self,position1,position2left,position2down,movepoint_check=0,check_pic1="POKEMON_ZA_FALSE_RETURN",check_pic2="POKEMON_ZA_FALSE_RETURN",othermap="POKEMON_ZA_FALSE_RETURN"):
     #type=0:ポケセンブルーにて実施(バトルゾーンに影響あり)
-    if self.ZA_Common_current_state == "COMMON_MAP_OPEN":
-        self.ZA_Common_current_state = self.ZA_Common_map_open(check_pic1=check_pic1,check_pic2=check_pic2,othermap=othermap)
-    elif self.ZA_Common_current_state == "COMMON_GOTO_SELECT1":
-        self.ZA_Common_current_state = self.ZA_Common_goto_select1(position1,othermap=othermap)
-    elif self.ZA_Common_current_state == "COMMON_GOTO_SELECT2":
-        self.ZA_Common_current_state = self.ZA_Common_goto_select2(position2left,position2down,movepoint_check,othermap=othermap)
+    if self.Common_current_state == "COMMON_MAP_OPEN":
+        self.Common_current_state = self.ZA_Common_map_open(check_pic1=check_pic1,check_pic2=check_pic2,othermap=othermap)
+    elif self.Common_current_state == "COMMON_GOTO_SELECT1":
+        self.Common_current_state = self.ZA_Common_goto_select1(position1,othermap=othermap)
+    elif self.Common_current_state == "COMMON_GOTO_SELECT2":
+        self.Common_current_state = self.ZA_Common_goto_select2(position2left,position2down,movepoint_check,othermap=othermap)
     else:
-        self.ZA_Common_current_state = self.ZA_STATE_COMMON_FUNCTION[self.ZA_Common_current_state]()
+        self.Common_current_state = self.STATE_COMMON_FUNCTION[self.Common_current_state]()
         
-    if movepoint_check==1 and self.ZA_Common_current_state == "COMMON_GOTO_JUMP":#移動先画像チェック用
-        self.ZA_Common_current_state = "COMMON_START"#画像位置で停止するが、移動するかは確定出ないためstartに戻す。(移動の際は移動関数を直接叩く)
+    if movepoint_check==1 and self.Common_current_state == "COMMON_GOTO_JUMP":#移動先画像チェック用
+        self.Common_current_state = "COMMON_START"#画像位置で停止するが、移動するかは確定出ないためstartに戻す。(移動の際は移動関数を直接叩く)
         return "MOVEPOINT_PIC"
-    elif ((self.ZA_Common_current_state == "COMMON_CHANGE_TIME") or (self.ZA_Common_current_state == "COMMON_CHECK_TIME")):
-        self.ZA_Common_current_state = "COMMON_START"
+    elif ((self.Common_current_state == "COMMON_CHANGE_TIME") or (self.Common_current_state == "COMMON_CHECK_TIME")):
+        self.Common_current_state = "COMMON_START"
         return "START"
     else:
         return "EXEC"
-
 def ZA_Common_pokemon_recovery(self):  
     if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W"):
         self.press(Direction(Stick.LEFT, 90), duration=2.0, wait=0.1)
@@ -277,29 +266,35 @@ def ZA_Common_pokemon_recovery(self):
             return True
     else:
         return False
-
 def ZA_Common_mappic_check(self,pic1="NULL",pic2="NULL"):
     for i in range(1,10):
         if ((pic1=="NULL" or self.image_check(pic1)) and (pic2=="NULL" or self.image_check(pic2))):
             return True
         self.wait(0.1)
     return False
-
 def ZA_Common_Event_check(self,othermap="POKEMON_ZA_FALSE_RETURN",markertype=0):
-    if self.ZA_Common_current_state == "COMMON_EVENT_MARKER_CHECK":
-        self.ZA_Common_current_state = self.ZA_Common_event_marker_check(othermap=othermap,markertype=markertype)
-    elif self.ZA_Common_current_state == "COMMON_START":   
-        self.ZA_Common_current_state = self.ZA_STATE_COMMON_FUNCTION[self.ZA_Common_current_state]()
+    if self.Common_current_state == "COMMON_EVENT_MARKER_CHECK":
+        self.Common_current_state = self.ZA_Common_event_marker_check(othermap=othermap,markertype=markertype)
+    elif self.Common_current_state == "COMMON_START":   
+        self.Common_current_state = self.STATE_COMMON_FUNCTION[self.Common_current_state]()
     else:
-        self.ZA_Common_current_state = self.ZA_STATE_COMMON_FUNCTION[self.ZA_Common_current_state](othermap=othermap)
+        self.Common_current_state = self.STATE_COMMON_FUNCTION[self.Common_current_state](othermap=othermap)
 
-    if self.ZA_Common_current_state == "COMMON_GOTO_SELECT1":
-        self.ZA_Common_current_state = "COMMON_EVENT_MARKER_CHECK"
+    if self.Common_current_state == "COMMON_GOTO_SELECT1":
+        self.Common_current_state = "COMMON_EVENT_MARKER_CHECK"
     
-    if self.ZA_Common_current_state == "COMMON_START":
+    if self.Common_current_state == "COMMON_START":
         return "START"
-    elif self.ZA_Common_current_state == "COMMON_FALSE_RETURN":
-        self.ZA_Common_current_state = "COMMON_START"
+    elif self.Common_current_state == "COMMON_FALSE_RETURN":
+        self.Common_current_state = "COMMON_START"
         return "FALSE"
     else:
         return "EXEC"
+
+
+######################################################
+# ZA_battle_infi_Base
+######################################################
+######################################################
+# BENCH FUNCTION
+######################################################

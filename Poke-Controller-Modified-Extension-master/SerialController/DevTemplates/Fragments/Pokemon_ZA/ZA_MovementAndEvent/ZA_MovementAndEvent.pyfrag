@@ -1,57 +1,16 @@
-def ZA_sendCommand(self, row: str, wait: float = 0.04):
+def sendCommand(self, row: str, wait: float = 0.04):
     self.keys.ser.ser.write((row + '\r\n').encode('utf-8'))
     self.wait(wait)
     self.checkIfAlive()
 
-def ZA_etc_sendCommand(self,str, wait: float = 0.04):
-    Lbutton_down1  = "0x0000 4"
-    Lbutton_down2  = "0x0000 8"
-    Bbutton1  = "0x0008 8"
-    Bbutton2  = "0x0000 8"
-    Lbutton_up1  = "0x0000 0"
-    Lbutton_up2  = "0x0000 8"
-    Lbutton_left1  = "0x0000 6"
-    Lbutton_left2  = "0x0000 8"
-    Lbutton_right1  = "0x0000 2"
-    Lbutton_right2  = "0x0000 8"
-    plusbutton1  = "0x0800 8"
-    plusbutton2  = "0x0000 8"
-    Lbutton_rab1  = "0x0018 6"
-    Lbutton_rb1  = "0x0008 6"
-
-    if str == "Lbutton_down":
-        self.ZA_sendCommand(Lbutton_down1,wait)
-        self.ZA_sendCommand(Lbutton_down2,wait)
-    elif str == "Lbutton_up":
-        self.ZA_sendCommand(Lbutton_up1,wait)
-        self.ZA_sendCommand(Lbutton_up2,wait)
-    elif str == "Lbutton_up_push":
-        self.ZA_sendCommand(Lbutton_up1,wait)
-    elif str == "Lbutton_up_pull":
-        self.ZA_sendCommand(Lbutton_up2,wait)
-        
-    elif str == "Lbutton_left":
-        self.ZA_sendCommand(Lbutton_left1,wait)
-        self.ZA_sendCommand(Lbutton_left2,wait)              
-    elif str == "Lbutton_right":
-        self.ZA_sendCommand(Lbutton_right1,wait)
-        self.ZA_sendCommand(Lbutton_right2,wait)
-    elif str == "plusbutton":
-        self.ZA_sendCommand(plusbutton1,wait)
-        self.ZA_sendCommand(plusbutton2,wait)
-    elif str == "plusbutton_push":
-        self.ZA_sendCommand(plusbutton1,wait)
-    elif str == "plusbutton_release":
-        self.ZA_sendCommand(plusbutton2,wait)
-
+# ウインドウ取得関数 (win32gui仕様)
 def ZA_zone_check(self):
-    self.wait(self.ZA_SLEEPLIST[3][2])
+    self.wait(self.SLEEPLIST[3][2])
     for i in range(1,13):
-        if self.image_check(self.ZA_ZONELIST[i][0],1):
-            self.ZA_zonecount[i-1] += 1
+        if self.image_check(self.ZONELIST[i][0],1):
+            self.zonecount[i-1] += 1
             return i
     return 12
-
 def ZA_MOVE_ACTION(self,movestep,lockonflg=1):
     start = time.perf_counter()  # 計測開始
     count= 0
@@ -59,204 +18,204 @@ def ZA_MOVE_ACTION(self,movestep,lockonflg=1):
     waitstart = time.perf_counter() 
     if self.image_check("POKEMON_ZA_EYE_CHECK_HIGH"):
         return movestep
-    elif self.ZA_ZONELIST[self.ZA_targetzone][5 + movestep][3] and self.image_check("POKEMON_ZA_EYE_CHECK"):
+    elif self.ZONELIST[self.targetzone][5 + movestep][3] and self.image_check("POKEMON_ZA_EYE_CHECK"):
         return movestep
-    if self.ZA_ZONELIST[self.ZA_targetzone][5 + movestep][0]:
+    if self.ZONELIST[self.targetzone][5 + movestep][0]:
         
-        self.hold(Direction(Stick.LEFT, self.ZA_ZONELIST[self.ZA_targetzone][5 + movestep][1]))
-        self.wait(self.ZA_SLEEPLIST[5][2])
+        self.hold(Direction(Stick.LEFT, self.ZONELIST[self.targetzone][5 + movestep][1]))
+        self.wait(self.SLEEPLIST[5][2])
         self.press(Button.B, wait=0.0)
         while True:
 
             if count % 30 == 0:
                 self.ZA_ZL_ACTION(lockonflg=lockonflg)
-            if self.ZA_ZL_state == 1:
+            if self.ZL_state == 1:
                 self.press(Button.A, wait=0.0)
-                if (self.ZA_no_Cplus==0 and self.image_check("POKEMON_ZA_C+")):
-                    self.holdEnd(Direction(Stick.LEFT, self.ZA_ZONELIST[self.ZA_targetzone][5 + movestep][1]))
+                if (self.no_Cplus==0 and self.image_check("POKEMON_ZA_C+")):
+                    self.holdEnd(Direction(Stick.LEFT, self.ZONELIST[self.targetzone][5 + movestep][1]))
                     return movestep
             
             if self.image_check("POKEMON_ZA_ESCAPE"):
-                self.holdEnd(Direction(Stick.LEFT, self.ZA_ZONELIST[self.ZA_targetzone][5 + movestep][1]))
+                self.holdEnd(Direction(Stick.LEFT, self.ZONELIST[self.targetzone][5 + movestep][1]))
                 return movestep
 
             end = time.perf_counter()
             elapsed = end - start
             waitelapsed = end - waitstart
-            if waitflg == 1 and waitelapsed > self.ZA_ZONELIST[self.ZA_targetzone][5 + movestep][4] :
-                self.holdEnd(Direction(Stick.LEFT, self.ZA_ZONELIST[self.ZA_targetzone][5 + movestep][1]))
+            if waitflg == 1 and waitelapsed > self.ZONELIST[self.targetzone][5 + movestep][4] :
+                self.holdEnd(Direction(Stick.LEFT, self.ZONELIST[self.targetzone][5 + movestep][1]))
                 
-                if (movestep + 1 ) < self.ZA_ZONELIST[self.ZA_targetzone][3]:
+                if (movestep + 1 ) < self.ZONELIST[self.targetzone][3]:
                     return (movestep + 1)
                 else:
                     return movestep
-            elif elapsed > self.ZA_ZONELIST[self.ZA_targetzone][5 + movestep][2]\
-                or (self.image_check("POKEMON_ZA_ESCAPE") and self.ZA_battle_current_state == "BATTLE_MOVE"): 
-                self.holdEnd(Direction(Stick.LEFT, self.ZA_ZONELIST[self.ZA_targetzone][5 + movestep][1]))
+            elif elapsed > self.ZONELIST[self.targetzone][5 + movestep][2]\
+                or (self.image_check("POKEMON_ZA_ESCAPE") and self.battle_current_state == "BATTLE_MOVE"): 
+                self.holdEnd(Direction(Stick.LEFT, self.ZONELIST[self.targetzone][5 + movestep][1]))
                 
-                if (movestep + 1 ) < self.ZA_ZONELIST[self.ZA_targetzone][3]:
+                if (movestep + 1 ) < self.ZONELIST[self.targetzone][3]:
                     return (movestep + 1)
                 else:
                     return movestep
             elif self.image_check("POKEMON_ZA_EYE_CHECK_HIGH"):
-                self.holdEnd(Direction(Stick.LEFT, self.ZA_ZONELIST[self.ZA_targetzone][5 + movestep][1]))
+                self.holdEnd(Direction(Stick.LEFT, self.ZONELIST[self.targetzone][5 + movestep][1]))
                 
-                if (movestep + 1 ) < self.ZA_ZONELIST[self.ZA_targetzone][3]:
+                if (movestep + 1 ) < self.ZONELIST[self.targetzone][3]:
                     return (movestep + 1)
                 else:
                     return movestep
-            elif self.ZA_ZONELIST[self.ZA_targetzone][5 + movestep][3] and self.image_check("POKEMON_ZA_EYE_CHECK"):
+            elif self.ZONELIST[self.targetzone][5 + movestep][3] and self.image_check("POKEMON_ZA_EYE_CHECK"):
                 #ぎりぎりで止まると戦闘開始に行かないため遅延
                 waitstart = time.perf_counter() 
-                self.wait(self.ZA_ZONELIST[self.ZA_targetzone][5 + movestep][4])
+                self.wait(self.ZONELIST[self.targetzone][5 + movestep][4])
                 waitflg=1
-                self.holdEnd(Direction(Stick.LEFT, self.ZA_ZONELIST[self.ZA_targetzone][5 + movestep][1]))
+                self.holdEnd(Direction(Stick.LEFT, self.ZONELIST[self.targetzone][5 + movestep][1]))
                 
-                if (movestep + 1 ) < self.ZA_ZONELIST[self.ZA_targetzone][3]:
+                if (movestep + 1 ) < self.ZONELIST[self.targetzone][3]:
                     return (movestep + 1)
                 else:
                     return movestep
             count +=1
-    self.holdEnd(Direction(Stick.LEFT, self.ZA_ZONELIST[self.ZA_targetzone][5 + movestep][1]))          
+    self.holdEnd(Direction(Stick.LEFT, self.ZONELIST[self.targetzone][5 + movestep][1]))          
     return movestep
-
 def ZA_MOVE_SEE2(self,action1 = "RELOAD",action2 = "RELOAD",in_see_r1=0.0,in_see_r2=0.0,dirnum=1,action = "RELOAD"):
     if action != "END":
-        if self.ZA_Rstick_state == 0:
+        if self.Rstick_state == 0:
             self.hold(Direction(Stick.RIGHT, 180,local_see_r))
-            self.ZA_Rstick_state = 1
+            self.Rstick_state = 1
         else:
             self.holdEnd(Direction(Stick.RIGHT, 180))
-            self.wait(0.1)#self.wait(self.ZA_SLEEPLIST[4][2])
+            self.wait(0.1)#self.wait(self.SLEEPLIST[4][2])
             self.hold(Direction(Stick.RIGHT, 180,local_see_r))
-            self.ZA_Rstick_state = 1
-    elif action == "END" and self.ZA_Rstick_state == 1:
+            self.Rstick_state = 1
+    elif action == "END" and self.Rstick_state == 1:
         self.holdEnd(Direction(Stick.RIGHT, 180))
-        self.ZA_Rstick_state = 0
-
+        self.Rstick_state = 0
 def ZA_MOVE_SEE(self,action = "RELOAD",in_see_r=0.0):
     if in_see_r==0.0:
         local_see_r = self.see_r
     else:
         local_see_r = in_see_r
         
-    if (self.ZA_no_Cplus==1 and (not self.image_check("POKEMON_ZA_ESCAPE"))):#一旦視点移動はC+がない時のみ
-        self.ZA_notargetcount=0
-        if self.ZA_Rstick_state == 1:
+    if (self.no_Cplus==1 and (not self.image_check("POKEMON_ZA_ESCAPE"))):#一旦視点移動はC+がない時のみ
+        self.notargetcount=0
+        if self.Rstick_state == 1:
             self.holdEnd(Direction(Stick.RIGHT, 180))
-            self.ZA_Rstick_state = 0
+            self.Rstick_state = 0
         return
-    if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.ZA_quasar_battle_lockon==0:
+    if self.quasar_current_state=="QUASAR_BATTLE_LOOP" and self.quasar_battle_lockon==0:
         return
-    if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP":
+    if self.quasar_current_state=="QUASAR_BATTLE_LOOP":
         self.wait(0.1)
-    if self.ZA_quasar_current_state=="QUASAR_BATTLE_LOOP" and self.ZA_no_Cplus==0 and self.image_check("POKEMON_ZA_C+"):
-        self.ZA_notargetcount=0
+    if self.quasar_current_state=="QUASAR_BATTLE_LOOP" and self.no_Cplus==0 and self.image_check("POKEMON_ZA_C+"):
+        self.notargetcount=0
         return
     if action != "END":
-        if self.ZA_Rstick_state == 0:
+        if self.Rstick_state == 0:
             self.hold(Direction(Stick.RIGHT, 180,local_see_r))
-            self.ZA_Rstick_state = 1
+            self.Rstick_state = 1
         else:
             self.holdEnd(Direction(Stick.RIGHT, 180))
-            self.wait(0.1)#self.wait(self.ZA_SLEEPLIST[4][2])
+            self.wait(0.1)#self.wait(self.SLEEPLIST[4][2])
             self.hold(Direction(Stick.RIGHT, 180,local_see_r))
-            self.ZA_Rstick_state = 1
-    elif action == "END" and self.ZA_Rstick_state == 1:
+            self.Rstick_state = 1
+    elif action == "END" and self.Rstick_state == 1:
         self.holdEnd(Direction(Stick.RIGHT, 180))
-        self.ZA_Rstick_state = 0
-
+        self.Rstick_state = 0
+    #else:
+    #    print(f"MOVE_SEE_CHECK:{action}:{self.Rstick_state}:")
 def ZA_MOVE_LStick(self,dir1,dir2,dir3,dir4,dirnum=1,action = "RELOAD"):
         
     if action != "END":
-        if self.ZA_Lstick_state == 0 and self.ZA_Lstick_state2 == 0 and self.ZA_Lstick_state3 == 0 and self.ZA_Lstick_state4 == 0 and self.ZA_Lstick_state_m1 == 0 and self.ZA_Lstick_state_m2 == 0:
+        if self.Lstick_state == 0 and self.Lstick_state2 == 0 and self.Lstick_state3 == 0 and self.Lstick_state4 == 0 and self.Lstick_state_m1 == 0 and self.Lstick_state_m2 == 0:
             if dirnum==1: 
                 self.hold(Direction(Stick.LEFT, dir1,1.0))
-                self.ZA_Lstick_state = 1
+                self.Lstick_state = 1
             elif dirnum==2: 
                 self.hold(Direction(Stick.LEFT, dir2,1.0))
-                self.ZA_Lstick_state2 = 1
+                self.Lstick_state2 = 1
             elif dirnum==3: 
                 self.hold(Direction(Stick.LEFT, dir3,1.0))
-                self.ZA_Lstick_state3 = 1
+                self.Lstick_state3 = 1
             elif dirnum==4: 
                 self.hold(Direction(Stick.LEFT, dir4,1.0))
-                self.ZA_Lstick_state4 = 1  
+                self.Lstick_state4 = 1  
             #ロックオンマーカー時の視点変換用
             elif dirnum==-1: 
                 self.hold(Direction(Stick.LEFT, 50,0.1))
-                self.ZA_Lstick_state_m1 = 1
+                self.Lstick_state_m1 = 1
             elif dirnum==-2: 
                 self.hold(Direction(Stick.LEFT, 140,0.1))
-                self.ZA_Lstick_state_m2 = 1  
+                self.Lstick_state_m2 = 1  
         else:
-            if self.ZA_Lstick_state == 1:
+            if self.Lstick_state == 1:
                 self.holdEnd(Direction(Stick.LEFT, dir1))
-                self.ZA_Lstick_state = 0
-            if self.ZA_Lstick_state2 == 1:
+                self.Lstick_state = 0
+            if self.Lstick_state2 == 1:
                 self.holdEnd(Direction(Stick.LEFT, dir2))
-                self.ZA_Lstick_state2 = 0
-            if self.ZA_Lstick_state3 == 1:
+                self.Lstick_state2 = 0
+            if self.Lstick_state3 == 1:
                 self.holdEnd(Direction(Stick.LEFT, dir3))
-                self.ZA_Lstick_state3 = 0
-            if self.ZA_Lstick_state4 == 1:
+                self.Lstick_state3 = 0
+            if self.Lstick_state4 == 1:
                 self.holdEnd(Direction(Stick.LEFT, dir4))
-                self.ZA_Lstick_state4 = 0
+                self.Lstick_state4 = 0
             #ロックオンマーカー時の視点変換用
-            if self.ZA_Lstick_state_m1 == 1: 
+            if self.Lstick_state_m1 == 1: 
                 self.holdEnd(Direction(Stick.LEFT, 50))
-                self.ZA_Lstick_state_m1 = 0
-            if self.ZA_Lstick_state_m2 == 1: 
+                self.Lstick_state_m1 = 0
+            if self.Lstick_state_m2 == 1: 
                 self.holdEnd(Direction(Stick.LEFT, 140))
-                self.ZA_Lstick_state_m2 = 0  
+                self.Lstick_state_m2 = 0  
                 
-            self.wait(0.1)#self.wait(self.ZA_SLEEPLIST[4][2])
+            self.wait(0.1)#self.wait(self.SLEEPLIST[4][2])
             
             if dirnum==1: 
                 self.hold(Direction(Stick.LEFT, dir1,1.0))
-                self.ZA_Lstick_state = 1
+                self.Lstick_state = 1
             elif dirnum==2: 
                 self.hold(Direction(Stick.LEFT, dir2,1.0))
-                self.ZA_Lstick_state2 = 1
+                self.Lstick_state2 = 1
             elif dirnum==3: 
                 self.hold(Direction(Stick.LEFT, dir3,1.0))
-                self.ZA_Lstick_state3 = 1    
+                self.Lstick_state3 = 1    
             elif dirnum==4: 
                 self.hold(Direction(Stick.LEFT, dir4,1.0))
-                self.ZA_Lstick_state4 = 1   
+                self.Lstick_state4 = 1   
             #ロックオンマーカー時の視点変換用
             elif dirnum==-1: 
                 self.hold(Direction(Stick.LEFT, 50,0.1))
-                self.ZA_Lstick_state_m1 = 1 
+                self.Lstick_state_m1 = 1 
             elif dirnum==-2: 
                 self.hold(Direction(Stick.LEFT, 140,0.1))
-                self.ZA_Lstick_state_m2 = 1 
+                self.Lstick_state_m2 = 1 
     elif action == "END":
-        if self.ZA_Lstick_state == 1:
+        if self.Lstick_state == 1:
             self.holdEnd(Direction(Stick.LEFT, dir1))
-            self.ZA_Lstick_state = 0
-        if self.ZA_Lstick_state2 == 1:
+            self.Lstick_state = 0
+        if self.Lstick_state2 == 1:
             self.holdEnd(Direction(Stick.LEFT, dir2))
-            self.ZA_Lstick_state2 = 0
-        if self.ZA_Lstick_state3 == 1:
+            self.Lstick_state2 = 0
+        if self.Lstick_state3 == 1:
             self.holdEnd(Direction(Stick.LEFT, dir3))
-            self.ZA_Lstick_state3 = 0
-        if self.ZA_Lstick_state4 == 1:
+            self.Lstick_state3 = 0
+        if self.Lstick_state4 == 1:
             self.holdEnd(Direction(Stick.LEFT, dir4))
-            self.ZA_Lstick_state4 = 0
+            self.Lstick_state4 = 0
         #ロックオンマーカー時の視点変換用
-        if self.ZA_Lstick_state_m1 == 1:
+        if self.Lstick_state_m1 == 1:
             self.holdEnd(Direction(Stick.LEFT, 50))
-            self.ZA_Lstick_state_m1 = 0
-        if self.ZA_Lstick_state_m2 == 1:
+            self.Lstick_state_m1 = 0
+        if self.Lstick_state_m2 == 1:
             self.holdEnd(Direction(Stick.LEFT, 140))
-            self.ZA_Lstick_state_m2 = 0
-
+            self.Lstick_state_m2 = 0
 def ZA_ROTOM_GLIDE(self,dir,a_count,a_duration=0.15,a_wait=0.5,a_interval=0.1,move_r=1.0):
     self.hold(Direction(Stick.LEFT, dir,move_r))
     self.pressRep(Button.A, repeat=a_count, duration=a_duration, wait=a_wait, interval=a_interval)
     self.holdEnd(Direction(Stick.LEFT, dir))
-
+######################################################
+# ZA_battle_infi_Base_End
+######################################################
 def ZA_renda_button(self,rendabutton="B",endpicture="",endpicture2="",endpicture3="",endpicture4="",endpicture5="",endpicture6="",endpicture7="",not_endpicture="POKEMON_ZA_FALSE_RETURN",sub_button="NULL",sub_picture="",sub2_button="NULL",sub2_picture="",sub3_button="NULL",sub3_picture="",sub4_button="NULL",sub4_picture="",sub5_button="NULL",sub5_picture="",sub6_button="NULL",sub6_picture="",sub7_button="NULL",sub7_picture="",sub8_button="NULL",sub8_picture="",sub9_button="NULL",sub9_picture="",event_picture="",sleeptime=0.5):
     while True:
         self.checkIfAlive()
@@ -324,7 +283,6 @@ def ZA_renda_button(self,rendabutton="B",endpicture="",endpicture2="",endpicture
                     if ((tmp == endpicture) or (tmp == endpicture2) or (tmp == endpicture3) or (tmp == endpicture4) or (tmp == endpicture5) or (tmp == endpicture6) or (tmp == endpicture7)):
                         return True
                 if self.image_check(sub4_picture):
-                    print("4")
                     if sub4_button == "A":
                         self.pressRep(Button.A, repeat=1, duration=0.04, wait=0.0, interval=0.1)
                         checkerflg=1
@@ -394,10 +352,9 @@ def ZA_renda_button(self,rendabutton="B",endpicture="",endpicture2="",endpicture
             self.pressRep(Button.B, repeat=1, duration=0.04, wait=0.0, interval=0.1)
         self.wait(sleeptime)
     return False
-
 def ZA_mega_evolution_battle_mode_select(self,mode=0,usenum=1,Xaction=1,Aaction=1,Yaction=1,Baction=0):
     #アブソル Bはまもるのため選ばない。
-    #if mode == 0 and self.ZA_mega_evolution_battle(Xaction=1,Aaction=1,Yaction=1,Baction=0,mode=0,dir1=320,dir2=20,see_r=0.20, endpicture="TEXT_WHITE_COMMENT"):
+    #if mode == 0 and self.mega_evolution_battle(Xaction=1,Aaction=1,Yaction=1,Baction=0,mode=0,dir1=320,dir2=20,see_r=0.20, endpicture="TEXT_WHITE_COMMENT"):
     if mode == 0 and self.ZA_mega_evolution_battle(usenum=usenum,Xaction=1,Aaction=1,Yaction=1,Baction=0,mode=0,dir1=20,dir2=340,dir3=40,dir4=300,see_r=0.24, escape_flag=1,target_count_threshold_arg=6,no_target_count_threshold_arg=6, endpicture="POKEMON_ZA_TEXT_WHITE_COMMENT"):
 
 
@@ -406,10 +363,9 @@ def ZA_mega_evolution_battle_mode_select(self,mode=0,usenum=1,Xaction=1,Aaction=
         return True
     elif mode == 2 and self.ZA_mega_evolution_battle(usenum=usenum,Xaction=1,Aaction=1,Yaction=1,Baction=0,mode=0,dir1=20,dir2=340,dir3=40,dir4=300,see_r=0.24, escape_flag=3, endpicture="POKEMON_ZA_TEXT_WHITE_COMMENT"):
         return True
-
 def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction=0,mode=0,dir1=0,dir2=0,dir3=0,dir4=0,see_r=0, escape_flag=0,target_count_threshold_arg=15,no_target_count_threshold_arg=15,endpicture="",end2picture=""):
     count=0
-    self.ZA_no_Cplus=0
+    self.no_Cplus=0
     no_target_count=0
     no_target_count_threshold=no_target_count_threshold_arg
     target_count=0
@@ -455,17 +411,17 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                 or (usenum==6 and (self.image_check("POKEMON_ZA_FIELD6") or self.image_check("POKEMON_ZA_FIELD_BACK6")))
             ):
                 self.wait(0.5)
-                self.ZA_etc_sendCommand("Lbutton_up")
+                self.etc_sendCommand("Lbutton_up")
                 self.ZA_MOVE_LStick(dir1,dir2,dir3,dir4,4,"RELOAD")
                 nofiled=0
             else:
-                self.ZA_etc_sendCommand("Lbutton_left")
+                self.etc_sendCommand("Lbutton_left")
                 self.wait(0.5)
                 continue
       
         for i in range(5): 
             if count==0 and Cp_mode==1:
-                self.ZA_etc_sendCommand("plusbutton")
+                self.etc_sendCommand("plusbutton")
             if self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT"): 
                 break
             if count==0 and Aaction==1 and self.image_check("POKEMON_ZA_C+"):
@@ -735,7 +691,7 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                         self.ZA_MOVE_LStick(dir1,dir2,dir3,dir4,2,"RELOAD")
                     else:
                         self.ZA_MOVE_LStick(dir1,dir2,dir3,dir4,1,"RELOAD")  
-            #self.ZA_MOVE_SEE(action = "END",in_see_r=see_r)
+            #self.MOVE_SEE(action = "END",in_see_r=see_r)
             self.wait(0.1)
 
         elif self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT"):
@@ -744,7 +700,7 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
             self.ZA_MOVE_LStick(dir1,dir2,dir3,dir4,1,"END")
                 
         if self.image_check("POKEMON_ZA_FIELD_W"):
-            self.ZA_etc_sendCommand("Lbutton_up")
+            self.etc_sendCommand("Lbutton_up")
 
         if self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT") and (not (self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W"))):
             if nofiled==0:
@@ -762,7 +718,7 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                     self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1) 
                 else:
                     if not (self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W")):
-                        self.ZA_etc_sendCommand("Lbutton_down")
+                        self.etc_sendCommand("Lbutton_down")
                         self.wait(1.0)
                     self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)  
             elif self.image_check("POKEMON_ZA_3_SELECT"):
@@ -771,7 +727,7 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                     self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
                 else:
                     if not (self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W")):
-                        self.ZA_etc_sendCommand("Lbutton_down")
+                        self.etc_sendCommand("Lbutton_down")
                         self.wait(1.0)
                     self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
             else:
@@ -787,7 +743,7 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                 self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1) 
             else:
                 if not (self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W")):
-                    self.ZA_etc_sendCommand("Lbutton_down")
+                    self.etc_sendCommand("Lbutton_down")
                     self.wait(1.0)
                 self.wait(1.0)
                 self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)  
@@ -798,39 +754,36 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                 self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
             else:
                 if not (self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W")):
-                    self.ZA_etc_sendCommand("Lbutton_down")
+                    self.etc_sendCommand("Lbutton_down")
                     self.wait(1.0)
                 self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
 
         self.wait(0.5)
-
 def ZA_ZL_ACTION(self,action = "RELOAD",lockonflg=1):
     if action != "END":
         if lockonflg == 0:
-            if self.ZA_ZL_state == 1:
+            if self.ZL_state == 1:
                 self.keys.inputEnd(Button.ZL)
-                self.ZA_ZL_state = 0
+                self.ZL_state = 0
             return
-        if self.ZA_ZL_state == 0:
+        if self.ZL_state == 0:
             self.keys.input(Button.ZL)
-            self.ZA_ZL_state = 1
+            self.ZL_state = 1
         else:
             self.keys.inputEnd(Button.ZL)
             #間隔をあけないとロックオンがオンにならない？
-            self.wait(0.1)#self.wait(self.ZA_SLEEPLIST[2][2])
+            self.wait(0.1)#self.wait(self.SLEEPLIST[2][2])
             self.keys.input(Button.ZL)
-            self.ZA_ZL_state = 1
-    elif action == "END" and self.ZA_ZL_state == 1:
+            self.ZL_state = 1
+    elif action == "END" and self.ZL_state == 1:
         self.keys.inputEnd(Button.ZL)
-        self.ZA_ZL_state = 0
-
+        self.ZL_state = 0
 def ZA_story_Template_battle_before(self,noprg_ret,prg_ret,green_check=0,no_filed=0,sleeptime=0.5):
     if self.ZA_story_Template_Comment_Out():
         return prg_ret
     else:
         return noprg_ret
-
-def ZA_story_Template_battle_function(self,bkprg_ret,prg_ret,noprg_ret,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endskip=0,get_chanceicon4=0,noCp=0,markertype=0,battle_mode=0,move=0,sleeptime=0.5):
+def ZA_story_Template_battle_function(self,bkprg_ret,prg_ret,noprg_ret,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endskip=0,get_chanceicon4=0,noCp=0,markertype=0,battle_mode=0,move=0,sleeptime=0.5,rebattle_move_fast=0.1):
     if self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") or self.image_check("POKEMON_ZA_ESCAPE"):
         if noCp==0:
             if move==0:
@@ -871,6 +824,21 @@ def ZA_story_Template_battle_function(self,bkprg_ret,prg_ret,noprg_ret,Xaction=0
         return noprg_ret
     
     if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"):
+    
+        #TODO　処理の更新
+        #for i in range(30):
+        #    if i == 0:
+        #        self.press(Direction(Stick.LEFT,90), duration=rebattle_move_fast, wait=0.5)
+        #    else:
+        #        self.press(Direction(Stick.LEFT,90), duration=0.1, wait=0.5)
+        #        
+        #    if self.image_check("POKEMON_ZA_CHAT_MARKER"):
+        #        self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+        #    elif self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT"):
+        #        return prg_ret
+        #return noprg_ret
+        #TODO　以下をいったん破棄
+        
         if markertype==0:
             if self.ZA_markerdir("EVENT"):
                 
@@ -928,8 +896,7 @@ def ZA_story_Template_battle_function(self,bkprg_ret,prg_ret,noprg_ret,Xaction=0
     #    return bkprg_ret
 
     return noprg_ret
-
-def ZA_story_Template_battle_after(self,bkprg_ret,prg_ret,selected_pic="RETURN FALSE",selected_target=0,mode=0,sleeptime=0.5):
+def ZA_story_Template_battle_after(self,bkprg_ret,prg_ret,selected_pic="POKEMON_ZA_FALSE_RETURN",selected_target=0,mode=0,sleeptime=0.5):
     filed_check_count=0
     if self.ZA_story_Template_Comment_Out(selected_pic=selected_pic,selected_target=selected_target,mode=mode,sleeptime=sleeptime):
         for i in range(30):
@@ -961,159 +928,12 @@ def ZA_story_Template_battle_after(self,bkprg_ret,prg_ret,selected_pic="RETURN F
     else:
         print("after4_")
         return prg_ret
-
-def ZA_story_Template_Comment_Out(self,substitute=0,green_check=1,black_check=1,endpicture7="RETURN_FALSE",sub9_button="A",sub9_picture="RETURN_FALSE",selected_pic="RETURN FALSE",selected_target=0,mode=0,sleeptime=0.5):
-    selected_out_check=0
-
-    if mode == 0:
-        endpicture4="POKEMON_ZA_FILED_HARD_CHECK_0"
-    else:
-        endpicture4="POKEMON_ZA_FILED_HARD_CHECK_1"
-    nofiled_check=0
-    #コメントチェックができるまでループ
-    for i in range(30):
-        if (not (self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0"))):
-            nofiled_check=1
-        if self.image_check("POKEMON_ZA_EYE_CHECK_HIGH_POKE"):
-            return True#ポケモンに見つかった場合は即座にTrue扱いで抜ける
-        elif (self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT") or ((green_check==1) and (self.image_check("POKEMON_ZA_TEXT_GREEN_COMMENT"))) or ((black_check==1) and (self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT")))):
-            break
-        elif self.image_check("POKEMON_ZA_COIN_ICON"):
-            break
-        elif self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") or self.image_check("POKEMON_ZA_ESCAPE"):
-            return True
-        elif self.image_check(selected_pic):
-            break                
-        elif (nofiled_check==1 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")):
-            return True
-        elif (nofiled_check==1 and self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0")):
-            if (nofiled_check==1 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")):
-                return True
-            break
-        elif (nofiled_check==0 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")):
-            return False 
-        #elif (nofiled_check==1 and((not (self.image_check("BATTLE_BALL_CHECK") or self.image_check("ESCAPE")))and (self.image_check("Filed_Hard_Check_0")))):
-        #    if filed_check_count > 5:
-        #        break
-        #    filed_check_count+=1
-        #elif i == 9:
-        #    return False
-        self.wait(0.5)
-        
-    #コメントチェック待ちをおこなっても検知ができなかった場合は、False判定とする。
-    #if (not (self.image_check("COIN_ICON") or self.image_check("TEXT_WHITE_COMMENT") or ((green_check==1) and (self.image_check("TEXT_GREEN_COMMENT"))) or ((black_check==1) and (self.image_check("TEXT_BLACK_COMMENT"))))):
-    #    return False
-        
-    while True:
-        self.checkIfAlive()
-        selected_out_check=0
-        if self.ZA_renda_button(rendabutton="B",
-                             endpicture="POKEMON_ZA_BATTLE_BALL_CHECK",
-                             endpicture2="POKEMON_ZA_ESCAPE",
-                             endpicture3=selected_pic,
-                             endpicture4=endpicture4,
-                             endpicture5="POKEMON_ZA_EYE_CHECK_HIGH_POKE",
-                             endpicture7=endpicture7,
-                             not_endpicture="POKEMON_ZA_ZA_ROYALE",
-                             sub_button="A",sub_picture="POKEMON_ZA_TEXT_BLACK_COMMENT",
-                             sub2_button="A",sub2_picture="POKEMON_ZA_1_SELECT",
-                             sub3_button="A",sub3_picture="POKEMON_ZA_2_SELECT",
-                             sub4_button="A",sub4_picture="POKEMON_ZA_3_SELECT",
-                             sub5_button="A",sub5_picture="POKEMON_ZA_4_SELECT",
-                             sub6_button="A",sub6_picture="POKEMON_ZA_HELP_MARKER",
-                             sub7_button="A",sub7_picture="POKEMON_ZA_MORNING",
-                             sub8_button="A",sub8_picture="POKEMON_ZA_NIGHT",
-                             sub9_button=sub9_button,sub9_picture=sub9_picture,
-                             sleeptime=sleeptime):
-            print(f"5rt2{nofiled_check}")
-            selected_out_check=0
-            filed_check_count=0
-            for i in range(30):
-                self.wait(0.5)
-                if self.image_check(selected_pic):
-                    selected_out_check=1
-                    self.wait(1.0)
-                    for i in range(selected_target):
-                        self.ZA_etc_sendCommand("Lbutton_down")
-                        self.wait(0.5)
-                    self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-                    break
-                elif self.image_check(endpicture7):
-                    break
-                elif ((self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT") or ((green_check==1) and (self.image_check("POKEMON_ZA_TEXT_GREEN_COMMENT"))) or ((black_check==1) and (self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT")))) ):
-                    self.wait(0.5)
-                    #選択肢チェックのタイミングがずれたようにフォローする
-                    if self.image_check(selected_pic):
-                        selected_out_check=1
-                        self.wait(1.0)
-                        for i in range(selected_target):
-                            self.ZA_etc_sendCommand("Lbutton_down")
-                            self.wait(0.5)
-                        self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-                        break
-                    else:
-                        self.pressRep(Button.B, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-                        
-                elif self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") or self.image_check("POKEMON_ZA_ESCAPE"):
-                    if ((self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT") or ((green_check==1) and (self.image_check("POKEMON_ZA_TEXT_GREEN_COMMENT"))) or ((black_check==1) and (self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT")))) ):
-                        self.wait(0.5)
-                        #選択肢チェックのタイミングがずれたようにフォローする
-                        if self.image_check(selected_pic):
-                            selected_out_check=1
-                            self.wait(1.0)
-                            for i in range(selected_target):
-                                self.ZA_etc_sendCommand("Lbutton_down")
-                                self.wait(0.5)
-                            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-                            break
-                        else:
-                            self.pressRep(Button.B, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-                    else:
-                        break
-                elif (not (self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0"))):
-                    nofiled_check=1
-                elif (nofiled_check==1 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")):
-                    break
-                elif (nofiled_check==1 and self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0")):
-                    break
-                
-                    #if filed_check_count > 5:
-                    #    break
-                    #filed_check_count+=1
-                        
-        #選択肢処理を行っている場合は再度ボタン連打を再開する。
-        if selected_out_check==1:
-            selected_out_check=0
-            continue
-        self.wait(0.5)
-        if self.image_check(endpicture7):
-            break    
-        elif (self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT") or ((green_check==1) and (self.image_check("POKEMON_ZA_TEXT_GREEN_COMMENT"))) or ((black_check==1) and (self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT")))):
-            # 下記処理は戦闘不能となっている場合に実施すると抜けられなくなるため、回復などが前提にある場合でなければ使用しないこと
-            if substitute==1:
-                endpicture4="POKEMON_ZA_WANINOKO_ICON"
-                endpicture5="POKEMON_ZA_ODAIRU_ICON"
-                endpicture6="POKEMON_ZA_ABSOL_ICON"
-        elif self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") or self.image_check("POKEMON_ZA_ESCAPE"):
-            break
-        elif self.image_check("POKEMON_ZA_ZA_ROYALE"):
-            self.pressRep(Button.B, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-        elif (nofiled_check==1 and self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0")):
-            if (nofiled_check==1 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")):
-                break  
-        elif (nofiled_check==1 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")):
-            break
-        elif (nofiled_check==0 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")):
-            return False 
-    return True
-
 def ZA_story_Template_Field_HardGaurd(self,mode=0):
     if ( ((mode==0 and (self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W"))) or mode==1)
         and (self.image_check("POKEMON_ZA_WANINOKO_ICON") or self.image_check("POKEMON_ZA_ODAIRU_ICON") or self.image_check("POKEMON_ZA_ABSOL_ICON") or self.image_check("POKEMON_ZA_DEAD"))):
         return True
     else:
         return False
-
 def ZA_no_battle_filed_check_HardGaurd(self):
 #チェックタイミングによってバトル中が非バトル中扱いとなる可能性があるため、sleeptimeなしで連続でチェックを行ってから判断させる。
 
@@ -1132,6 +952,9 @@ def ZA_no_battle_filed_check_HardGaurd(self):
             return False #バトル中扱いとする
     return False #フィールドチェックできない
 
+######################################################
+# story_Template
+######################################################
 def ZA_get_pokemon(self):
     self.ZA_ZL_ACTION("")
     self.wait(0.1)
@@ -1140,7 +963,6 @@ def ZA_get_pokemon(self):
     self.keys.inputEnd(Button.ZR)
     self.wait(0.1)
     self.ZA_ZL_ACTION("END")
-
 def ZA_ball_change(self,type=0):
 
     for i in range(20):
@@ -1158,7 +980,7 @@ def ZA_ball_change(self,type=0):
             return True
         else:
             self.wait(1.0)
-            self.ZA_etc_sendCommand("Lbutton_left")
+            self.etc_sendCommand("Lbutton_left")
             self.wait(1.0)
         self.pressRep(Button.B, repeat=1, duration=0.15, wait=0.5, interval=0.1)
         self.wait(1.0)
@@ -1167,48 +989,10 @@ def ZA_ball_change(self,type=0):
 
 
     return False
-
 def ZA_EventSkip_plus(self):
     for i in range(3):
-        self.ZA_etc_sendCommand("plusbutton")
+        self.etc_sendCommand("plusbutton")
         self.wait(0.1)
-        self.ZA_etc_sendCommand("plusbutton_push")
+        self.etc_sendCommand("plusbutton_push")
         self.wait(3.0)
-        self.ZA_etc_sendCommand("plusbutton_release")
-
-def ZA_markerdir(self,type,nofiled=False):
-    if type == "EVENT":
-        center = "POKEMON_ZA_EVENT_MARKER_CENTER"
-        center_wide = "POKEMON_ZA_EVENT_MARKER_CENTER_WIDE"
-        left = "POKEMON_ZA_EVENT_MARKER_LEFT_WIDE"
-        right = "POKEMON_ZA_EVENT_MARKER_RIGHT_WIDE"
-    elif type == "PIN":
-        center = "POKEMON_ZA_PIN_MARKER_CENTER"
-        center_wide = "POKEMON_ZA_PIN_MARKER_CENTER_WIDE"
-        left = "POKEMON_ZA_PIN_MARKER_LEFT_WIDE"
-        right = "POKEMON_ZA_PIN_MARKER_RIGHT_WIDE"
-    elif type == "SIDE_MARKER":
-        center = "POKEMON_ZA_SIDE_MARKER_CENTER"
-        center_wide = "POKEMON_ZA_SIDE_MARKER_CENTER_WIDE"
-        left = "POKEMON_ZA_SIDE_MARKER_LEFT_WIDE"
-        right = "POKEMON_ZA_SIDE_MARKER_RIGHT_WIDE"
-    else:
-        return False
-    
-    if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W") or nofiled:
-        if self.image_check(center):
-            return True
-        elif self.image_check(left):
-            if self.image_check(center_wide):
-                self.press(Direction(Stick.RIGHT,180,0.3), duration=0.01, wait=0.0)
-            else:
-                self.press(Direction(Stick.RIGHT,180), duration=0.01, wait=0.0)
-        elif self.image_check(right):
-            if self.image_check(center_wide):
-                self.press(Direction(Stick.RIGHT,0,0.3), duration=0.01, wait=0.0)
-            else:
-                self.press(Direction(Stick.RIGHT,0), duration=0.01, wait=0.0)
-        else:
-            self.press(Direction(Stick.RIGHT,180), duration=0.3, wait=0.0)
-        self.wait(0.1)
-    return False
+        self.etc_sendCommand("plusbutton_release")

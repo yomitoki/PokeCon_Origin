@@ -37,6 +37,15 @@ SerialController/Commands/PythonCommands/ImageProcessingOnly/*
 SerialController/Recordings/
 SerialController/Recordings/*
 SerialController/Recordings/**
+SerialController/OperationSessions/
+SerialController/OperationSessions/**
+SerialController/CommandsRecording/
+SerialController/CommandsRecording/**
+SerialController/Captures_Area/
+SerialController/Captures_Area/**
+
+# Editor/runtime backup files are local recovery artifacts.
+*.bak
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -144,3 +153,7 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# Locally archived legacy/GAS files kept out of the active Python tree.
+bk/
+DevStudio/Backups/

@@ -238,6 +238,17 @@ class Command:
         ).ret_value(need)
         self.message_dialogue = None
 
+        # The common Commands start/end settings can override matching legacy
+        # widgets (for example FRLG's numbered start/stop selectors) without
+        # requiring each old command to duplicate the PokeCon settings UI.
+        if ret and need is list:
+            try:
+                from CommandRunOptions import apply_profile_to_dialogue_result
+                ret = apply_profile_to_dialogue_result(
+                    self, dialogue_list, ret)
+            except (ImportError, TypeError, ValueError):
+                pass
+
         if not ret:
             self.finish()
         else:

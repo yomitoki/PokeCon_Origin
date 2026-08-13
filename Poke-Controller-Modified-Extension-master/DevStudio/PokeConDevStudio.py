@@ -30,6 +30,9 @@ from tkinter import filedialog, messagebox, simpledialog, ttk
 from CommandBuilder import command_path, folder_segment, python_identifier, template_source
 from SampleLibrary import (catalog, compose_preview, detect_conflicts, load_fragment,
                            load_library, merge_preview, resolve_members, save_library)
+from SampleOriginSync import (apply_sample_list_to_origins,
+                              compare_sample_list_origins,
+                              restore_origin_sync_backup)
 from SampleProgramLoader import inspect_sample_program
 from SampleFunctionSync import compare_folder as compare_sample_function_folder
 from SampleFunctionSync import update_fragments as update_sample_function_fragments
@@ -37,6 +40,17 @@ from SampleFunctionSync import update_source as update_source_sample_functions
 from SampleFunctionSync import propagate_functions as propagate_sample_functions
 from SampleFunctionSync import replace_class_functions
 from SampleFunctionSync import function_records as sample_sync_function_records
+from SampleFunctionSync import source_paths_for_folder as sample_sync_source_paths
+from SampleFunctionSync import comparison_source_text
+from SampleFunctionSync import merge_sample_names_with_source_bodies
+from SampleFunctionSync import side_by_side_diff_rows
+from SampleFunctionSync import replace_fragment_function_text
+from SampleFunctionSync import reflect_fragment_function_text
+from SampleFunctionSync import remove_fragment_function_text
+from SampleFunctionSync import fragment_function_stats
+from SampleFunctionSync import (create_sample_sync_backup,
+                                latest_sample_sync_backup,
+                                restore_sample_sync_backup)
 from ImageDetectionLibrary import (folder_tags as image_folder_tags,
                                    generate_image_check,
                                    load_library as load_image_library,
@@ -46,10 +60,28 @@ from ImageDetectionSync import (compare_settings as compare_image_detection_sett
                                 parse_source_settings as parse_source_image_detection_settings,
                                 update_library_from_source)
 from ImageHealthCheck import audit_image_library, suggested_crop
+from ImageCheckReferenceAudit import (audit_image_check_references,
+                                      merge_library_targets_into_source,
+                                      preserve_library_import_block)
 from CompletionEngine import CompletionEngine
 from SourceFunctionTools import (build_rename_map, register_source_functions,
                                  rename_source_functions, source_function_records,
                                  step_function_names)
+from SourceDependencyTools import (analyze_source_dependencies,
+                                   analyze_state_dictionary_dependencies,
+                                   compare_preview_functions,
+                                   compare_preview_support,
+                                   generate_state_machine_main,
+                                   merge_preview_functions_safely,
+                                   merge_preview_support_safely,
+                                   register_dependency_group,
+                                   state_dictionary_current_state,
+                                   state_dictionary_names,
+                                   suggest_state_dictionary)
+from OperationSessionStudio import OperationSessionWorkspace
+from CommandRecordingStudio import CommandRecordingWorkspace
+from PythonSourceSafety import (normalize_and_compile_python,
+                                normalize_python_indentation)
 
 
 PYTHON_SUFFIXES = (".py", ".pyfrag")
@@ -93,7 +125,8 @@ class Fragment(object):
 
 class TagPicker(ttk.Frame):
     """Searchable tag picker that also accepts a new tag from the search box."""
-    def __init__(self, parent, choices_provider, initial=None):
+    def __init__(self, parent, choices_provider, initial=None,
+                 defer_choices=False):
         ttk.Frame.__init__(self, parent)
         self.choices_provider = choices_provider
         self.search = tk.StringVar()
@@ -114,7 +147,7 @@ class TagPicker(ttk.Frame):
         self.listbox.configure(yscrollcommand=scrollbar.set)
         self.columnconfigure(1, weight=1); self.columnconfigure(2, weight=1)
         self.rowconfigure(1, weight=1)
-        self.set_tags(initial or [])
+        self.set_tags(initial or [], refresh_choices=not defer_choices)
 
     def _available_tags(self):
         return sorted(set(str(value).strip() for value in self.choices_provider() if str(value).strip()), key=str.lower)
@@ -153,17 +186,18 @@ class TagPicker(ttk.Frame):
     def get_tags(self):
         return list(self.listbox.get(0, "end"))
 
-    def set_tags(self, tags):
+    def set_tags(self, tags, refresh_choices=True):
         self.listbox.delete(0, "end")
         for tag in tags:
             value = str(tag).strip()
             if value and value not in self.get_tags():
                 self.listbox.insert("end", value)
-        self.refresh_choices()
+        if refresh_choices:
+            self.refresh_choices()
 
 
 class DevStudio(tk.Tk):
-    def __init__(self, initial_root):
+    def __init__(self, initial_root, operation_session="", command_recording=""):
         tk.Tk.__init__(self)
         self.code_font = tkfont.Font(self, family="Consolas", size=10)
         self.code_tabs = (self.code_font.measure("    "),)
@@ -178,6 +212,7 @@ class DevStudio(tk.Tk):
         self.index_errors = []
         self._fragment_catalog_cache = None
         self.editing_fragment_id = None
+        self._fragment_loaded_body = ""
         self.search_hits = []
         self.current_path = None
         self.editor_dirty = False
@@ -195,10 +230,18 @@ class DevStudio(tk.Tk):
         self.completion_popup_list = None
         self.background_queue = queue.Queue()
         self.background_tasks = set()
+        self.background_cursor_tasks = set()
         self.find_text = tk.StringVar()
         self.find_result_text = tk.StringVar(value="0 / 0")
+        self.find_target_text = tk.StringVar(value="対象: ソース編集")
+        self._find_editors = {}
+        self._find_target_editor = None
         self.replace_text = tk.StringVar()
         self.ui_language = tk.StringVar(value="日本語")
+        self.initial_operation_session = os.path.abspath(operation_session) \
+            if operation_session else ""
+        self.initial_command_recording = os.path.abspath(command_recording) \
+            if command_recording else ""
         self._build()
         self._build_menu()
         self.apply_language()
@@ -208,18 +251,30 @@ class DevStudio(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.close_dev_studio)
         self.refresh_index()
         self.refresh_local_explorer()
-        self.refresh_sample_apply_lists()
-        self.refresh_sample_lists_tab()
-        self.refresh_registered_fragment_choices()
+        self.refresh_sample_apply_lists(include_images=False)
+        # Populate the controls at startup, but do not compose a potentially
+        # very large sample program until its workspace is opened.
+        self.refresh_sample_lists_tab(
+            render_preview=False, refresh_catalog=False)
+        # Fill the registered-sample pull-down after Tk has painted the first
+        # frame.  Always schedule this even when the sample workspace is not
+        # selected yet, otherwise its combo can remain blank indefinitely.
+        self.registered_fragment_choice.set("（サンプル関数を読み込み中…）")
+        self.registered_fragment_combo.configure(
+            values=("（サンプル関数を読み込み中…）",))
+        self.after(200, self.refresh_fragment_catalog_background)
 
-    def run_background(self, key, label, worker, on_success, on_error=None):
+    def run_background(self, key, label, worker, on_success, on_error=None,
+                       busy_cursor=True):
         """Run non-Tk work without blocking the UI and marshal completion safely."""
         if key in self.background_tasks:
             self.status.set(label + "（処理中です）")
             return False
         self.background_tasks.add(key)
         self.status.set(label + "...")
-        self.configure(cursor="watch")
+        if busy_cursor:
+            self.background_cursor_tasks.add(key)
+            self.configure(cursor="watch")
 
         def run():
             try:
@@ -234,7 +289,8 @@ class DevStudio(tk.Tk):
             while True:
                 key, label, succeeded, value, on_success, on_error = self.background_queue.get_nowait()
                 self.background_tasks.discard(key)
-                if not self.background_tasks:
+                self.background_cursor_tasks.discard(key)
+                if not self.background_cursor_tasks:
                     self.configure(cursor="")
                 try:
                     if succeeded:
@@ -312,8 +368,23 @@ class DevStudio(tk.Tk):
                 translate(child)
         translate(self)
         if hasattr(self, "workspace_tabs"):
-            titles = ("🟦 ソース編集", "🟩 サンプル関数", "🟨 サンプルリスト") if self.ui_language.get() == "日本語" else ("🟦 Source edit", "🟩 Sample functions", "🟨 Sample lists")
-            for tab, title in zip(self.workspace_tabs.tabs(), titles):
+            if self.ui_language.get() == "日本語":
+                titles = ((self.source_workspace, "🟦 ソース編集"),
+                          (self.operation_workspace, "🟥 操作記録→Commands"),
+                          (self.command_recording_workspace, "🟪 動画・ソース比較"),
+                          (self.sample_functions_workspace, "🟩 サンプル関数"),
+                          (self.sample_lists_workspace, "🟨 サンプルリスト"),
+                          (self.sample_program_workspace, "🟦 サンプルプログラム"),
+                          (self.image_library_workspace, "画像検知"))
+            else:
+                titles = ((self.source_workspace, "🟦 Source edit"),
+                          (self.operation_workspace, "🟥 Operation → Commands"),
+                          (self.command_recording_workspace, "🟪 Video / source compare"),
+                          (self.sample_functions_workspace, "🟩 Sample functions"),
+                          (self.sample_lists_workspace, "🟨 Sample lists"),
+                          (self.sample_program_workspace, "🟦 Sample program"),
+                          (self.image_library_workspace, "Image detection"))
+            for tab, title in titles:
                 self.workspace_tabs.tab(tab, text=title)
         if hasattr(self, "sample_lists_tree"):
             self.refresh_sample_lists_tab(select=self.sample_list_name.get().strip())
@@ -417,14 +488,17 @@ class DevStudio(tk.Tk):
         ttk.Button(edit_tools, text="Go to line", command=self.go_to_line).pack(side="left", padx=(8, 3))
         ttk.Button(edit_tools, text="構文チェック  F5", command=self.check_syntax).pack(side="left")
         ttk.Label(edit_tools, text="   Find:").pack(side="left")
-        find_entry = ttk.Entry(edit_tools, textvariable=self.find_text, width=16)
-        find_entry.pack(side="left", padx=2)
-        find_entry.bind("<Return>", lambda event: self.find_next())
+        self.find_entry = ttk.Entry(
+            edit_tools, textvariable=self.find_text, width=16)
+        self.find_entry.pack(side="left", padx=2)
+        self.find_entry.bind("<Return>", lambda event: self.find_next())
         self.find_text.trace_add("write", lambda *args: self.debounce(
             "editor_find_count", 120, self.refresh_find_count))
         ttk.Button(edit_tools, text="前へ", command=self.find_previous).pack(side="left")
         ttk.Button(edit_tools, text="次へ", command=self.find_next).pack(side="left", padx=(2, 0))
         ttk.Label(edit_tools, textvariable=self.find_result_text, width=9, anchor="center").pack(side="left", padx=(3, 0))
+        ttk.Label(edit_tools, textvariable=self.find_target_text,
+                  width=22, anchor="w").pack(side="left", padx=(3, 0))
         ttk.Entry(edit_tools, textvariable=self.replace_text, width=16).pack(side="left", padx=(7, 2))
         ttk.Button(edit_tools, text="Replace", command=self.replace_one).pack(side="left")
         ttk.Button(edit_tools, text="All", command=self.replace_all).pack(side="left", padx=2)
@@ -442,16 +516,28 @@ class DevStudio(tk.Tk):
         # height and pushed these controls below the visible window.
         self.workspace_tabs.pack(fill="both", expand=True, padx=7, pady=(0, 7))
         source_workspace = ttk.Frame(self.workspace_tabs)
+        operation_workspace = ttk.Frame(self.workspace_tabs)
+        command_recording_workspace = ttk.Frame(self.workspace_tabs)
         sample_functions_workspace = ttk.Frame(self.workspace_tabs)
         sample_lists_workspace = ttk.Frame(self.workspace_tabs)
         sample_program_workspace = ttk.Frame(self.workspace_tabs)
         image_library_workspace = ttk.Frame(self.workspace_tabs)
+        self.source_workspace = source_workspace
+        self.operation_workspace = operation_workspace
+        self.command_recording_workspace = command_recording_workspace
+        self.sample_functions_workspace = sample_functions_workspace
+        self.sample_lists_workspace = sample_lists_workspace
+        self.sample_program_workspace = sample_program_workspace
         self.image_library_workspace = image_library_workspace
         self.workspace_tabs.add(source_workspace, text="🟦 ソース編集")
+        self.workspace_tabs.add(operation_workspace, text="🟥 操作記録→Commands")
+        self.workspace_tabs.add(command_recording_workspace, text="🟪 動画・ソース比較")
         self.workspace_tabs.add(sample_functions_workspace, text="🟩 サンプル関数")
         self.workspace_tabs.add(sample_lists_workspace, text="🟨 サンプルリスト")
         self.workspace_tabs.add(sample_program_workspace, text="🟦 サンプルプログラム")
         self.workspace_tabs.tab(source_workspace, padding=(10, 4))
+        self.workspace_tabs.tab(operation_workspace, padding=(10, 4))
+        self.workspace_tabs.tab(command_recording_workspace, padding=(10, 4))
         self.workspace_tabs.tab(sample_functions_workspace, padding=(10, 4))
         self.workspace_tabs.tab(sample_lists_workspace, padding=(10, 4))
         self.workspace_tabs.tab(sample_program_workspace, padding=(10, 4))
@@ -491,6 +577,11 @@ class DevStudio(tk.Tk):
         self.left_tabs.add(local_explorer_tab, text="LocalExplorer")
         self.left_tabs.add(sample_apply_tab, text="Apply sample list")
         self.left_tabs.add(search_tab, text="Search / Tags")
+        self.sample_apply_tab = sample_apply_tab
+        self._sample_apply_images_loaded = False
+        self.left_tabs.bind(
+            "<<NotebookTabChanged>>", self._left_workspace_tab_changed,
+            add="+")
         self.search_tab = search_tab
 
         ttk.Label(explorer_tab, text="Python files").pack(anchor="w")
@@ -556,6 +647,7 @@ class DevStudio(tk.Tk):
         self.right_tabs.pack(fill="both", expand=True)
         image_targets_tab = ttk.Frame(self.right_tabs)
         image_health_tab = ttk.Frame(self.right_tabs)
+        image_reference_tab = ttk.Frame(self.right_tabs)
         step_hierarchy_tab = ttk.Frame(self.right_tabs)
         completion_tab = ttk.Frame(self.right_tabs)
         source_functions_tab = ttk.Frame(self.right_tabs)
@@ -564,10 +656,14 @@ class DevStudio(tk.Tk):
         self.right_tabs.add(step_hierarchy_tab, text="Step hierarchy")
         self.right_tabs.add(completion_tab, text="Completion")
         self.right_tabs.add(source_functions_tab, text="関数登録")
+        # Append new tools so saved numeric tab selections from older versions
+        # keep pointing at the same existing tool.
+        self.right_tabs.add(image_reference_tab, text="検知名チェック")
         self.step_hierarchy_tab = step_hierarchy_tab
         self.completion_tab = completion_tab
         self.source_functions_tab = source_functions_tab
         self.image_health_tab = image_health_tab
+        self.image_reference_tab = image_reference_tab
         self.right_tabs.bind("<<NotebookTabChanged>>", self.on_right_tool_tab_changed)
         source_tab_bar = ttk.Frame(center)
         source_tab_bar.pack(fill="x")
@@ -595,7 +691,8 @@ class DevStudio(tk.Tk):
         self.editor.bind("<<Modified>>", self.editor_modified)
         self.editor.bind("<KeyRelease>", self.on_editor_key_release)
         self.editor.bind("<ButtonRelease-1>", lambda event: self.debounce(
-            "editor_completion_click", 80, self.refresh_completion))
+            "editor_completion_click", 80,
+            self.refresh_completion_if_visible))
         self.editor.bind("<Control-s>", lambda event: (self.save_current(), "break"))
         self.bind_text_undo_redo(self.editor)
         self.editor.bind("<F5>", lambda event: (self.check_syntax(), "break"))
@@ -619,6 +716,7 @@ class DevStudio(tk.Tk):
         self.editor.bind("<Up>", self.completion_up)
         self.editor.bind("<Return>", self.completion_accept_key)
         self.editor.bind("<Tab>", self.completion_accept_key)
+        self._register_find_editor(self.editor, "ソース編集")
         todo_frame = ttk.Labelframe(center, text="TODO / 改修予定（ソースファイル別）")
         todo_frame.pack(fill="x", pady=(5, 0))
         todo_top = ttk.Frame(todo_frame); todo_top.pack(fill="x", padx=3, pady=(3, 0))
@@ -633,9 +731,11 @@ class DevStudio(tk.Tk):
         self.todo_editor.bind("<<Modified>>", self.todo_modified)
         self.todo_editor.bind("<FocusOut>", lambda event: self.save_current_todo(silent=True))
         self.todo_editor.bind("<Double-Button-1>", self.open_todo_source_location)
+        self._register_find_editor(self.todo_editor, "ソースTODO")
         self.bind_text_undo_redo(self.todo_editor)
         self._build_image_targets_tab(image_targets_tab)
         self._build_image_health_tab(image_health_tab)
+        self._build_image_reference_tab(image_reference_tab)
         self._build_step_hierarchy_tab(step_hierarchy_tab)
         self._build_completion_tab(completion_tab)
         self._build_source_functions_tab(source_functions_tab)
@@ -643,10 +743,106 @@ class DevStudio(tk.Tk):
         self._build_sample_lists_tab(sample_lists_workspace)
         self._build_sample_program_tab(sample_program_workspace)
         self._build_image_library_workspace(image_library_workspace)
+        self.operation_session_workspace = OperationSessionWorkspace(
+            operation_workspace, initial_session=self.initial_operation_session,
+            code_root_provider=lambda: self.root_dir.get(),
+            open_image_callback=self.open_operation_image_in_library,
+            open_source_callback=self.show_file)
+        self.operation_session_workspace.pack(fill="both", expand=True)
+        self.command_recording_studio = CommandRecordingWorkspace(
+            command_recording_workspace,
+            initial_recording=self.initial_command_recording,
+            open_image_callback=self.open_operation_image_in_library,
+            open_source_callback=self.show_file)
+        self.command_recording_studio.pack(fill="both", expand=True)
+        for widget, label, replace in (
+                (self.operation_session_workspace.intermediate_text,
+                 "操作記録: 中間ファイル", True),
+                (self.operation_session_workspace.final_text,
+                 "操作記録: 反映後プレビュー", False),
+                (self.operation_session_workspace.diff_text,
+                 "操作記録: 差分", False),
+                (self.operation_session_workspace.vision_sample_text,
+                 "操作記録: 画像判断サンプル", True),
+                (self.operation_session_workspace.intermediate_history_diff_text,
+                 "操作記録: 中間コード差分", False),
+                (self.command_recording_studio.source_text,
+                 "動画・ソース比較: ソース", False)):
+            self._register_find_editor(widget, label, replace=replace)
+        self.operation_session_workspace.code_tabs.bind(
+            "<<NotebookTabChanged>>",
+            lambda _event: (
+                self._active_find_editor(),
+                self.refresh_find_count() if self.find_text.get() else None),
+            add="+")
+        self.workspace_tabs.bind(
+            "<<NotebookTabChanged>>", self._workspace_tab_changed, add="+")
+        self.bind("<Control-f>", self.focus_current_tab_find, add="+")
+        if self.initial_command_recording:
+            self.workspace_tabs.select(command_recording_workspace)
+        elif self.initial_operation_session:
+            self.workspace_tabs.select(operation_workspace)
         self.add_editor_document("", None)
 
         self.status = tk.StringVar(value="Ready")
         ttk.Label(source_workspace, textvariable=self.status, anchor="w").pack(fill="x", pady=(0, 5))
+
+    def open_operation_image_in_library(self, path, crop, name):
+        """Hand an exact 1280x720 capture to the existing image-detection editor."""
+        self.image_library_path.set(os.path.abspath(path))
+        self.image_library_name.set(str(name or "OPERATION_CAPTURE").upper())
+        self.image_library_description.set("操作記録の映像フレームから作成")
+        self.image_library_crop.set(",".join(str(int(value)) for value in crop))
+        self.image_library_threshold.set(0.80)
+        self.image_library_gray.set(True)
+        self.workspace_tabs.select(self.image_library_workspace)
+        self.status.set("操作記録の画像と1280x720検知範囲を引き渡しました。設定確認後に保存してください。")
+
+    def _workspace_tab_changed(self, _event=None):
+        """Do not decode operation video while another DevStudio tab is used."""
+        if (hasattr(self, "operation_session_workspace")
+                and self.workspace_tabs.select() != str(self.operation_workspace)):
+            self.operation_session_workspace.stop_video()
+        if (hasattr(self, "command_recording_studio")
+                and self.workspace_tabs.select() != str(self.command_recording_workspace)):
+            self.command_recording_studio.stop_video()
+        if (hasattr(self, "image_library_workspace") and
+                self.workspace_tabs.select() == str(self.image_library_workspace) and
+                not getattr(self, "_image_library_workspace_loaded", False)):
+            self._image_library_workspace_loaded = True
+            self.after_idle(self.refresh_image_library_workspace)
+        # Building a large sample-list preview reads and composes every member.
+        # Registration may finish while this workspace is hidden, so defer
+        # that visual-only work until the user actually opens the tab.
+        if (hasattr(self, "sample_lists_workspace")
+                and self.workspace_tabs.select() == str(self.sample_lists_workspace)):
+            pending = getattr(self, "_sample_lists_refresh_deferred", "")
+            if pending:
+                self._sample_lists_refresh_deferred = ""
+                self.refresh_sample_lists_tab(
+                    select=pending,
+                    refresh_catalog=self._fragment_catalog_cache is not None)
+        sample_workspaces = {
+            str(getattr(self, "sample_functions_workspace", "")),
+            str(getattr(self, "sample_lists_workspace", "")),
+        }
+        if (hasattr(self, "_fragment_catalog_cache") and
+                self._fragment_catalog_cache is None and
+                self.workspace_tabs.select() in sample_workspaces):
+            self.refresh_fragment_catalog_background()
+        if hasattr(self, "find_target_text"):
+            self._active_find_editor()
+            if self.find_text.get():
+                self.debounce(
+                    "editor_find_count", 50, self.refresh_find_count)
+
+    def _left_workspace_tab_changed(self, _event=None):
+        if (hasattr(self, "sample_apply_tab") and
+                self.left_tabs.select() == str(self.sample_apply_tab) and
+                not getattr(self, "_sample_apply_images_loaded", False)):
+            self._sample_apply_images_loaded = True
+            # Let the selected tab paint before inserting the image tree.
+            self.after_idle(self.refresh_sample_apply_image_tree)
 
     def toggle_left_panel(self):
         if self.left_panel_visible:
@@ -726,7 +922,10 @@ class DevStudio(tk.Tk):
                 "Up", "Down", "Return", "Tab", "Escape", "Shift_L", "Shift_R",
                 "Control_L", "Control_R", "Alt_L", "Alt_R"):
             return
-        if self.completion_mode.get() != "無効":
+        if (self.completion_mode.get() == "エディタ内" or
+                (self.completion_mode.get() == "右タブ" and
+                 hasattr(self, "completion_tab") and
+                 self.right_tabs.select() == str(self.completion_tab))):
             self.debounce("editor_completion", 140, self.refresh_completion)
 
     def show_completion_now(self, event=None):
@@ -734,6 +933,13 @@ class DevStudio(tk.Tk):
             return "break"
         self.refresh_completion(explicit=True)
         return "break"
+
+    def refresh_completion_if_visible(self):
+        mode = self.completion_mode.get()
+        if (mode == "エディタ内" or
+                (mode == "右タブ" and
+                 self.right_tabs.select() == str(self.completion_tab))):
+            self.refresh_completion()
 
     def refresh_completion(self, explicit=False):
         if not hasattr(self, "completion_tree") or self.completion_mode.get() == "無効":
@@ -880,6 +1086,11 @@ class DevStudio(tk.Tk):
 
     def completion_accept_key(self, event=None):
         if not self.completion_popup_visible():
+            # Tk.Text inserts a literal tab by default. All other DevStudio
+            # Python editors use four spaces, so keep the main source editor
+            # consistent when completion is closed.
+            if event is not None and getattr(event, "keysym", "") == "Tab":
+                return self._python_editor_tab(self.editor)
             return None
         selection = self.completion_popup_list.curselection()
         index = selection[0] if selection else 0
@@ -964,14 +1175,17 @@ class DevStudio(tk.Tk):
         self.source_function_folder = tk.StringVar(value="SourceImports")
         self.source_function_tags = tk.StringVar(value="source")
         self.source_function_overwrite = tk.BooleanVar(value=False)
+        self.source_function_rename_source_on_register = tk.BooleanVar(value=True)
         self.source_function_summary = tk.StringVar(value="現在のソースを解析します。")
         self.source_function_rows = {}
         self.source_function_name_overrides = {}
         self.source_function_last_registered = []
+        self.source_dependency_list_name = tk.StringVar(value="")
 
         help_box = ttk.Label(
             parent,
-            text="①関数を選択 → ②登録名を確認 → ③ソース改名またはサンプル登録\n"
+            text="①関数を選択 → ②登録名を確認 → ③サンプル登録\n"
+                 "変更名は既定でソースの関数定義・呼び出しにも同時反映\n"
                  "登録済み行はダブルクリックでサンプル関数の変更画面へ移動",
             justify="left", foreground="#174a7e")
         help_box.pack(fill="x", padx=6, pady=(6, 3))
@@ -1048,7 +1262,44 @@ class DevStudio(tk.Tk):
         ttk.Checkbutton(sample_box, text="同名サンプルは内容を更新",
                         variable=self.source_function_overwrite).grid(
                             column=0, columnspan=2, row=2, padx=3, pady=2, sticky="w")
+        ttk.Checkbutton(
+            sample_box,
+            text="登録時、変更名をソースの関数定義・全参照にも反映",
+            variable=self.source_function_rename_source_on_register).grid(
+                column=0, columnspan=2, row=3, padx=3, pady=2, sticky="w")
         sample_box.columnconfigure(1, weight=1)
+
+        dependency_box = ttk.Labelframe(
+            parent, text="main・状態辞書配下をまとめて登録")
+        dependency_box.pack(fill="x", padx=6, pady=3)
+        ttk.Label(
+            dependency_box,
+            text=("選択関数を入口にself関数とSTATE_*_FUNCTIONの全処理を追跡し、\n"
+                  "各関数をサンプルとして再利用/登録してサンプルリストへまとめます。"),
+            foreground="#174a7e", justify="left").grid(
+                column=0, columnspan=2, row=0, padx=3, pady=2, sticky="w")
+        ttk.Label(dependency_box, text="リスト名（空欄は入口名）").grid(
+            column=0, row=1, padx=3, pady=2, sticky="w")
+        ttk.Entry(
+            dependency_box, textvariable=self.source_dependency_list_name).grid(
+                column=1, row=1, padx=3, pady=2, sticky="ew")
+        ttk.Button(
+            dependency_box, text="選択を起点に依存処理を確認",
+            command=self.preview_source_dependency_group).grid(
+                column=0, row=2, padx=3, pady=3, sticky="ew")
+        ttk.Button(
+            dependency_box, text="依存処理をサンプル関数＋リストへ登録",
+            command=self.register_source_dependency_group).grid(
+                column=1, row=2, padx=3, pady=3, sticky="ew")
+        ttk.Button(
+            dependency_box, text="状態辞書からmainひな形を追加",
+            command=self.create_state_dictionary_main_template).grid(
+                column=0, columnspan=2, row=3, padx=3, pady=3, sticky="ew")
+        ttk.Button(
+            dependency_box, text="別の作成済みCommandsを開いて登録",
+            command=self.open_commands_source_for_samples).grid(
+                column=0, columnspan=2, row=4, padx=3, pady=3, sticky="ew")
+        dependency_box.columnconfigure(1, weight=1)
 
         actions = ttk.Frame(parent); actions.pack(fill="x", padx=6, pady=4)
         ttk.Button(actions, text="選択名をソースへ一括反映",
@@ -1239,12 +1490,18 @@ class DevStudio(tk.Tk):
         source = self.editor.get("1.0", "end-1c")
         names = [row["name"] for row in rows]
         rename_map = {row["name"]: row["new_name"] for row in rows}
+        changed_mapping = {
+            old: new for old, new in rename_map.items() if old != new}
+        rename_source = bool(
+            changed_mapping and self.source_function_rename_source_on_register.get())
         tags = [value.strip() for value in self.source_function_tags.get().split(",")
                 if value.strip()]
         detail = self._source_function_mapping_detail(rows)
         overwrite = self.source_function_overwrite.get()
         action = "登録済みサンプルは内容を更新します。" if overwrite else \
             "登録済みと同名の場合は中断します。"
+        if rename_source:
+            action += "\n変更名をソースの関数定義と全呼び出しにも反映します。"
         if not messagebox.askyesno(
                 "ソースからサンプル登録",
                 "{}関数をサンプルへ登録します。\n{}\n\n{}\n\n続行しますか？".format(
@@ -1255,19 +1512,43 @@ class DevStudio(tk.Tk):
         current_path = self.current_path or ""
 
         def worker():
-            return register_source_functions(
+            if rename_source:
+                updated_source = rename_source_functions(source, changed_mapping)
+                registered_names = [rename_map[name] for name in names]
+                created = register_source_functions(
+                    updated_source, registered_names, root, folder=folder,
+                    tags=tags, overwrite=overwrite, source_path=current_path)
+                return created, updated_source, registered_names
+            created = register_source_functions(
                 source, names, root, folder=folder, rename_map=rename_map,
                 tags=tags, overwrite=overwrite, source_path=current_path)
+            return created, source, names
 
-        def completed(created):
+        def completed(result):
+            created, updated_source, selected_names = result
+            if updated_source != source:
+                line = int(self.editor.index("insert").split(".")[0])
+                self.set_editor_content(updated_source, current_path, line)
+                self.editor_dirty = True
+                self.update_editor_view()
+                self.source_function_find.set("")
+                self.source_function_replace.set("")
+                self.source_function_prefix.set("")
+                self.source_function_suffix.set("")
+                self.source_function_name_overrides = {}
             self._fragment_catalog_cache = None
             self.source_function_last_registered = [item["id"] for item in created]
             self.refresh_index()
             self.refresh_registered_fragment_choices()
             self.refresh_sample_lists_tab(select=self.sample_list_name.get().strip())
             self.refresh_sample_apply_lists()
-            self.refresh_source_functions(select_names=names, reload_source=False)
-            self.status.set("ソースからサンプル関数を{}件登録しました。".format(len(created)))
+            self.refresh_source_functions(
+                select_names=selected_names, reload_source=False)
+            self.status.set(
+                "ソースからサンプル関数を{}件登録しました。{}".format(
+                    len(created),
+                    " 関数名と参照も変更したため、ソースを保存してください。"
+                    if updated_source != source else ""))
             if len(created) == 1 and messagebox.askyesno(
                     "サンプル登録完了",
                     "登録しました: {}\n\nサンプル関数タブで変更しますか？".format(created[0]["name"]),
@@ -1293,6 +1574,248 @@ class DevStudio(tk.Tk):
             messagebox.showinfo("サンプル関数", "この登録名のサンプル関数はまだ登録されていません。", parent=self); return
         self.load_fragment_for_editing(fragment_id)
 
+    def _source_dependency_selection(self):
+        rows = self._selected_source_functions()
+        if not rows:
+            return None
+        roots = [row["name"] for row in rows]
+        list_name = self.source_dependency_list_name.get().strip() or (
+            roots[0] if len(roots) == 1 else roots[0] + "_group")
+        return roots, list_name
+
+    def open_commands_source_for_samples(self):
+        root = os.path.abspath(self.root_dir.get() or os.getcwd())
+        candidates = [
+            os.path.join(root, "SerialController", "Commands", "PythonCommands"),
+            os.path.join(root, "Commands", "PythonCommands"), root]
+        initial = next((path for path in candidates if os.path.isdir(path)), root)
+        path = filedialog.askopenfilename(
+            parent=self, title="サンプル登録する作成済みCommandsを選択",
+            initialdir=initial,
+            filetypes=[("Python Commands", "*.py"), ("All files", "*.*")])
+        if not path:
+            return
+        self.show_file(path)
+        self.after_idle(lambda: self.right_tabs.select(self.source_functions_tab))
+
+    def _analyze_source_dependency_selection(self, source, roots):
+        """Prefer a state dictionary as the root when a selected main uses one."""
+        analysis = analyze_source_dependencies(source, roots)
+        dictionary = suggest_state_dictionary(
+            analysis, roots[0] if len(roots) == 1 else "")
+        if dictionary:
+            analysis = analyze_state_dictionary_dependencies(
+                source, dictionary,
+                main_function_name=roots[0] if len(roots) == 1 else "")
+        return analysis
+
+    def create_state_dictionary_main_template(self):
+        """Add a main loop generated from a selected STATE_*_FUNCTION map."""
+        source = self.editor.get("1.0", "end-1c")
+        try:
+            dictionaries = state_dictionary_names(source)
+        except SyntaxError as error:
+            messagebox.showwarning("状態辞書からmainを作成", str(error), parent=self)
+            return
+        if not dictionaries:
+            messagebox.showinfo(
+                "状態辞書からmainを作成",
+                "__init__ に STATE_*_FUNCTION 辞書がありません。", parent=self)
+            return
+        selected = self._source_dependency_selection()
+        selected_name = selected[0][0] if selected and len(selected[0]) == 1 else ""
+        suggested = ""
+        if selected:
+            try:
+                ordinary = analyze_source_dependencies(source, selected[0])
+                suggested = suggest_state_dictionary(ordinary, selected_name)
+            except (SyntaxError, ValueError):
+                pass
+        dictionary = simpledialog.askstring(
+            "状態辞書からmainを作成",
+            "正本にする状態辞書名:\n候補: {}".format(", ".join(dictionaries)),
+            initialvalue=suggested or dictionaries[0], parent=self)
+        if not dictionary:
+            return
+        dictionary = dictionary.strip()
+        if dictionary not in dictionaries:
+            messagebox.showwarning(
+                "状態辞書からmainを作成",
+                "指定した状態辞書がありません: " + dictionary, parent=self)
+            return
+        function_name = simpledialog.askstring(
+            "状態辞書からmainを作成", "作成するmain関数名:",
+            initialvalue=selected_name or dictionary[6:-9].lower() + "_main",
+            parent=self)
+        if not function_name:
+            return
+        current_state = state_dictionary_current_state(source, dictionary)
+        current_state = simpledialog.askstring(
+            "状態辞書からmainを作成", "現在状態を保持するself属性名:",
+            initialvalue=current_state, parent=self)
+        if not current_state:
+            return
+        try:
+            generated = generate_state_machine_main(
+                function_name.strip(), dictionary, current_state.strip())
+            preview = {
+                "imports": [], "class_variables": [], "initializers": [],
+                "bodies": [generated], "included": [function_name.strip()]}
+            comparison = compare_preview_functions(source, preview)[0]
+            if comparison["status"] == "match":
+                messagebox.showinfo(
+                    "状態辞書からmainを作成",
+                    "同じmain関数が既にあります。変更はありません。", parent=self)
+                return
+            if comparison["status"] != "missing":
+                messagebox.showwarning(
+                    "状態辞書からmainを作成",
+                    "同名mainの処理が異なるため上書きしません。\n"
+                    "サンプル関数チェックで差分を確認してください。", parent=self)
+                return
+            merged, _rows = merge_preview_functions_safely(
+                source, preview, function_name.strip())
+        except (SyntaxError, ValueError) as error:
+            messagebox.showwarning("状態辞書からmainを作成", str(error), parent=self)
+            return
+        self.editor.delete("1.0", "end")
+        self.editor.insert("1.0", merged)
+        self.editor.edit_modified(True)
+        self.refresh_source_functions(
+            select_names=[function_name.strip()], reload_source=False)
+        self.status.set("状態辞書 {} からmain {} を追加しました。".format(
+            dictionary, function_name.strip()))
+
+    def preview_source_dependency_group(self):
+        selected = self._source_dependency_selection()
+        if not selected:
+            return
+        roots, list_name = selected
+        source = self.editor.get("1.0", "end-1c")
+        try:
+            analysis = self._analyze_source_dependency_selection(source, roots)
+        except (SyntaxError, ValueError) as error:
+            messagebox.showwarning("依存処理の解析", str(error), parent=self)
+            return
+        states = []
+        for dictionary, entries in analysis.get("state_dictionaries", {}).items():
+            states.append("{}: {}状態".format(dictionary, len(entries)))
+        root_dictionary = analysis.get("root_state_dictionary", "")
+        details = (
+            "リスト名: {}\n入口: {}\n依存サンプル関数: {}件\n"
+            "初期化ブロック: {}文字\nクラス変数ブロック: {}件\n状態辞書: {}\n"
+            "正本の状態辞書: {}\n画像検知側の外部設定: {}\n\n{}"
+        ).format(
+            list_name, ", ".join(roots), len(analysis["methods"]),
+            len(analysis["initializer"]), len(analysis["class_variables"]),
+            ", ".join(states) if states else "なし",
+            root_dictionary or "なし",
+            ", ".join(analysis.get("external_class_variables", [])) or "なし",
+            "\n".join(analysis["methods"]))
+        viewer = tk.Toplevel(self)
+        viewer.title("依存処理の確認 - " + list_name)
+        viewer.geometry("760x720")
+        viewer.transient(self)
+        text = tk.Text(viewer, wrap="none", font=self.code_font)
+        yscroll = ttk.Scrollbar(viewer, orient="vertical", command=text.yview)
+        xscroll = ttk.Scrollbar(viewer, orient="horizontal", command=text.xview)
+        text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+        text.grid(column=0, row=0, sticky="nsew")
+        yscroll.grid(column=1, row=0, sticky="ns")
+        xscroll.grid(column=0, row=1, sticky="ew")
+        text.insert("1.0", details)
+        text.configure(state="disabled")
+        viewer.columnconfigure(0, weight=1)
+        viewer.rowconfigure(0, weight=1)
+        ttk.Button(viewer, text="閉じる", command=viewer.destroy).grid(
+            column=0, row=2, pady=6)
+
+    def register_source_dependency_group(self):
+        selected = self._source_dependency_selection()
+        if not selected:
+            return
+        roots, list_name = selected
+        source = self.editor.get("1.0", "end-1c")
+        root = self.fragment_root()
+        base_folder = self.source_function_folder.get().strip() or "SourceImports"
+        folder = base_folder.rstrip("/\\") + "/" + python_identifier(list_name)
+        source_path = self.current_path or ""
+
+        def failed(error):
+            if messagebox.askyesno(
+                    "依存処理の登録を中断",
+                    "{}\n\nサンプル関数チェックを開きますか？".format(error),
+                    parent=self):
+                self.open_sample_function_check_mode()
+
+        def analysis_completed(analysis):
+            states = ", ".join(
+                "{}（{}状態）".format(name, len(entries))
+                for name, entries in analysis.get("state_dictionaries", {}).items())
+            summary = (
+                "{}を入口として{}関数を登録・再利用します。\n"
+                "状態辞書: {}\n保存リスト: {}\n\n"
+                "登録済み関数はソースと完全一致する場合だけ再利用します。\n"
+                "差分がある関数は上書きせず、サンプル関数チェックを要求します。\n\n"
+                "続行しますか？"
+            ).format(
+                ", ".join(roots), len(analysis["methods"]), states or "なし",
+                list_name)
+            if not messagebox.askyesno(
+                    "依存処理をまとめて登録", summary, parent=self):
+                self.status.set("依存処理の登録をキャンセルしました。")
+                return
+
+            def worker():
+                plan, members = register_dependency_group(
+                    source, roots, root, folder, list_name,
+                    source_path=source_path,
+                    state_dictionary=analysis.get("root_state_dictionary", ""),
+                    analysis=analysis)
+                data = self._read_sample_lists()
+                data["lists"][list_name] = {
+                    "tags": ["source", "dependency-group"],
+                    "members": members,
+                    "origin_path": str(source_path),
+                }
+                self._write_sample_lists(data)
+                # Populate the UI cache off the Tk thread as well.  The
+                # catalog only contains plain dictionaries and is safe to
+                # transfer through the background result queue.
+                return plan, catalog(root)
+
+            def completed(result):
+                plan, catalog_items = result
+                reused = sum(
+                    row["status"] == "reuse" for row in plan["registration"])
+                self._fragment_catalog_cache = list(catalog_items)
+                self.refresh_index()
+                entry_id = next((
+                    row.get("selected", {}).get("id")
+                    for row in plan["registration"]
+                    if row.get("name") in roots and row.get("selected")), None)
+                self.refresh_registered_fragment_choices(select=entry_id)
+                if (hasattr(self, "sample_lists_workspace") and
+                        self.workspace_tabs.select() == str(self.sample_lists_workspace)):
+                    self.refresh_sample_lists_tab(select=list_name)
+                else:
+                    self._sample_lists_refresh_deferred = list_name
+                self.refresh_sample_apply_lists()
+                self.refresh_source_functions(
+                    select_names=roots, reload_source=False)
+                self.status.set(
+                    "依存処理リスト「{}」を登録しました: {}関数（既存再利用{}件）".format(
+                        list_name, len(plan["methods"]), reused))
+
+            self.run_background(
+                "source_dependency_group", "依存サンプルを比較・登録中",
+                worker, completed, failed)
+
+        self.run_background(
+            "source_dependency_group", "依存関数を解析中",
+            lambda: self._analyze_source_dependency_selection(source, roots),
+            analysis_completed, failed)
+
     def open_or_name_source_function(self, event=None):
         rows = self._selected_source_functions(require=False)
         if len(rows) == 1 and rows[0].get("fragment_id"):
@@ -1303,6 +1826,8 @@ class DevStudio(tk.Tk):
     def on_right_tool_tab_changed(self, event=None):
         if self.right_tabs.select() == str(self.image_health_tab):
             self.run_image_health_check()
+        elif self.right_tabs.select() == str(self.image_reference_tab):
+            self.run_image_reference_check()
         elif self.right_tabs.select() == str(self.step_hierarchy_tab):
             self.load_steps_from_editor(silent=True)
         elif self.right_tabs.select() == str(self.completion_tab):
@@ -1682,6 +2207,289 @@ class DevStudio(tk.Tk):
         self.update_editor_view()
         self.load_steps_from_editor(silent=True)
         self.status.set("Applied {} state-machine dictionaries".format(len(definitions)))
+
+    def _build_image_reference_tab(self, parent):
+        self.image_reference_problems_only = tk.BooleanVar(value=True)
+        self.image_reference_show_dynamic = tk.BooleanVar(value=True)
+        self.image_reference_summary = tk.StringVar(
+            value="開いている.pyの image_check 指定名を確認します。")
+        self.image_reference_result = None
+        self.image_reference_rows = {}
+        self._image_reference_request = 0
+
+        ttk.Label(
+            parent,
+            text=("開いているソース内の image_check(\"検知名\") と、同じソースに登録された"
+                  " IMAGE_DETECTION_TARGETS を照合します。ソースは実行しません。"),
+            foreground="#174a7e", justify="left", wraplength=430,
+        ).pack(fill="x", padx=6, pady=(7, 4))
+        controls = ttk.Frame(parent)
+        controls.pack(fill="x", padx=6, pady=3)
+        ttk.Checkbutton(
+            controls, text="未登録のみ", variable=self.image_reference_problems_only,
+            command=self.refresh_image_reference_results,
+        ).pack(side="left")
+        ttk.Checkbutton(
+            controls, text="動的指定も表示", variable=self.image_reference_show_dynamic,
+            command=self.refresh_image_reference_results,
+        ).pack(side="left", padx=(4, 0))
+        ttk.Button(
+            controls, text="再チェック", command=self.run_image_reference_check,
+        ).pack(side="right")
+        self.image_reference_summary_label = ttk.Label(
+            parent, textvariable=self.image_reference_summary, wraplength=430)
+        self.image_reference_summary_label.pack(fill="x", padx=6, pady=(1, 4))
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill="both", expand=True, padx=6)
+        self.image_reference_tree = ttk.Treeview(
+            tree_frame, columns=("status", "name", "line", "count"),
+            show="headings", height=12, selectmode="extended")
+        for column, label, width in (
+                ("status", "状態", 85), ("name", "検知名／式", 210),
+                ("line", "行", 55), ("count", "回数", 48)):
+            self.image_reference_tree.heading(column, text=label)
+            self.image_reference_tree.column(
+                column, width=width, stretch=(column == "name"), anchor="w")
+        self.image_reference_tree.tag_configure("missing", foreground="#b00020")
+        self.image_reference_tree.tag_configure("available", foreground="#174a7e")
+        self.image_reference_tree.tag_configure("dynamic", foreground="#9a4e00")
+        self.image_reference_tree.tag_configure("ok", foreground="#176b2c")
+        tree_y = ttk.Scrollbar(
+            tree_frame, orient="vertical", command=self.image_reference_tree.yview)
+        tree_x = ttk.Scrollbar(
+            tree_frame, orient="horizontal", command=self.image_reference_tree.xview)
+        self.image_reference_tree.configure(
+            yscrollcommand=tree_y.set, xscrollcommand=tree_x.set)
+        self.image_reference_tree.grid(column=0, row=0, sticky="nsew")
+        tree_y.grid(column=1, row=0, sticky="ns")
+        tree_x.grid(column=0, row=1, sticky="ew")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+        self.image_reference_tree.bind(
+            "<<TreeviewSelect>>", self.show_selected_image_reference_detail)
+        self.image_reference_tree.bind(
+            "<Double-Button-1>", self.go_to_selected_image_reference)
+
+        detail_box = ttk.Labelframe(parent, text="判定内容")
+        detail_box.pack(fill="both", padx=6, pady=5)
+        self.image_reference_detail = tk.Text(
+            detail_box, height=7, wrap="word", background="#fafafa")
+        detail_scroll = ttk.Scrollbar(
+            detail_box, orient="vertical", command=self.image_reference_detail.yview)
+        self.image_reference_detail.configure(yscrollcommand=detail_scroll.set)
+        self.image_reference_detail.pack(side="left", fill="both", expand=True)
+        detail_scroll.pack(side="right", fill="y")
+        self.image_reference_detail.configure(state="disabled")
+        actions = ttk.Frame(parent)
+        actions.pack(fill="x", padx=6, pady=(0, 7))
+        ttk.Button(
+            actions, text="使用行へ移動",
+            command=self.go_to_selected_image_reference).pack(side="left")
+        ttk.Button(
+            actions, text="選択を登録",
+            command=lambda: self.apply_missing_image_references(False)).pack(
+                side="left", padx=(4, 0))
+        ttk.Button(
+            actions, text="登録可能をすべて登録",
+            command=lambda: self.apply_missing_image_references(True)).pack(
+                side="right")
+
+    def run_image_reference_check(self, silent=False):
+        if not hasattr(self, "image_reference_tree"):
+            return
+        source = self.editor.get("1.0", "end-1c")
+        tab_id = self.active_editor_tab
+        self._image_reference_request += 1
+        request = self._image_reference_request
+
+        def worker():
+            result = audit_image_check_references(source)
+            library = self._read_image_library()
+            result["library_available_names"] = sorted(
+                name for name, item in library.get("targets", {}).items()
+                if isinstance(item, dict) and item.get("variants"))
+            return result
+
+        def completed(result):
+            if request != self._image_reference_request or tab_id != self.active_editor_tab:
+                return
+            self.image_reference_result = result
+            self.refresh_image_reference_results()
+            missing_count = len(result.get("missing", []))
+            if not silent:
+                if missing_count:
+                    self.status.set("画像検知名チェック: 未登録{}件".format(missing_count))
+                else:
+                    self.status.set("画像検知名チェック: 未登録はありません")
+
+        def failed(error):
+            if request != self._image_reference_request or tab_id != self.active_editor_tab:
+                return
+            self.image_reference_result = None
+            self.image_reference_summary.set(
+                "構文エラーのため検知名を確認できません: {}".format(error))
+            self.image_reference_summary_label.configure(foreground="#b00020")
+            self.right_tabs.tab(self.image_reference_tab, text="検知名チェック (?)")
+            self.image_reference_tree.delete(*self.image_reference_tree.get_children())
+            self._set_image_reference_detail(str(error))
+
+        self.run_background(
+            "image_reference_check_{}".format(request), "画像検知名を確認中",
+            worker, completed, failed, busy_cursor=not silent)
+
+    def refresh_image_reference_results(self):
+        if not hasattr(self, "image_reference_tree"):
+            return
+        self.image_reference_tree.delete(*self.image_reference_tree.get_children())
+        self.image_reference_rows = {}
+        result = self.image_reference_result
+        if result is None:
+            return
+        references = result.get("references", [])
+        displayed = references
+        if self.image_reference_problems_only.get():
+            displayed = [row for row in references if row.get("status") == "missing"]
+        available_names = set(result.get("library_available_names", []))
+        for row in displayed:
+            can_register = row.get("status") == "missing" and row.get("name") in available_names
+            if can_register:
+                status = "登録可能"
+            else:
+                status = "未登録" if row.get("status") == "missing" else row.get("resolved_by", "登録済み")
+            iid = self.image_reference_tree.insert(
+                "", "end", values=(status, row.get("name", ""), row.get("line", ""),
+                                     row.get("count", 1)),
+                tags=("available" if can_register else
+                      ("missing" if row.get("status") == "missing" else "ok"),))
+            self.image_reference_rows[iid] = dict(
+                row, row_type="literal", library_available=can_register)
+        if self.image_reference_show_dynamic.get():
+            for row in result.get("dynamic", []):
+                iid = self.image_reference_tree.insert(
+                    "", "end", values=("確認不可", row.get("expression", "<動的指定>"),
+                                         row.get("line", ""), 1), tags=("dynamic",))
+                self.image_reference_rows[iid] = dict(row, row_type="dynamic")
+
+        missing_count = len(result.get("missing", []))
+        available_count = sum(
+            1 for row in result.get("missing", []) if row.get("name") in available_names)
+        dynamic_count = len(result.get("dynamic", []))
+        reference_count = len(references)
+        registered_count = len(result.get("target_names", []))
+        set_count = len(result.get("set_names", []))
+        exception_count = len(result.get("exception_names", []))
+        if missing_count:
+            self.image_reference_summary.set(
+                "⚠ 未登録 {missing}件（DevStudioから登録可能 {available}件） / 参照名 {refs}件 / 動的指定 {dynamic}件\n"
+                "登録: 画像検知 {targets}件・セット {sets}件・例外判定 {exceptions}件".format(
+                    missing=missing_count, available=available_count,
+                    refs=reference_count, dynamic=dynamic_count,
+                    targets=registered_count, sets=set_count, exceptions=exception_count))
+            self.image_reference_summary_label.configure(foreground="#b00020")
+            self.right_tabs.tab(
+                self.image_reference_tab,
+                text="⚠ 検知名チェック ({})".format(missing_count))
+        else:
+            self.image_reference_summary.set(
+                "未登録なし / 参照名 {refs}件 / 動的指定 {dynamic}件\n"
+                "登録: 画像検知 {targets}件・セット {sets}件・例外判定 {exceptions}件".format(
+                    refs=reference_count, dynamic=dynamic_count, targets=registered_count,
+                    sets=set_count, exceptions=exception_count))
+            self.image_reference_summary_label.configure(foreground="#176b2c")
+            self.right_tabs.tab(self.image_reference_tab, text="検知名チェック")
+        self._set_image_reference_detail(
+            "未登録の検知名を選ぶと使用行を確認できます。動的指定は実行時に値が決まるため、静的には登録確認できません。")
+
+    def _set_image_reference_detail(self, value):
+        self.image_reference_detail.configure(state="normal")
+        self.image_reference_detail.delete("1.0", "end")
+        self.image_reference_detail.insert("1.0", str(value))
+        self.image_reference_detail.configure(state="disabled")
+
+    def _selected_image_reference_row(self):
+        selected = self.image_reference_tree.selection()
+        return self.image_reference_rows.get(selected[0]) if selected else None
+
+    def show_selected_image_reference_detail(self, event=None):
+        row = self._selected_image_reference_row()
+        if not row:
+            return
+        if row.get("row_type") == "dynamic":
+            text = ("行 {line}: image_check({expression})\n\n"
+                    "変数・式による動的指定のため、実行せずに登録名との一致を確定できません。".format(
+                        line=row.get("line", "?"), expression=row.get("expression", "")))
+        elif row.get("status") == "missing":
+            availability = ("DevStudioの画像検知設定から登録できます。"
+                            if row.get("library_available") else
+                            "DevStudioの画像検知設定にも同名登録がありません。")
+            text = ("未登録: {name}\n使用行: {lines}\n\n{availability}\n\n"
+                    "この名前は IMAGE_DETECTION_TARGETS / IMAGE_DETECTION_SETS / "
+                    "image_check_exception のいずれにも登録されていません。".format(
+                        name=row.get("name", ""),
+                        lines=", ".join(str(line) for line in row.get("lines", [])),
+                        availability=availability))
+        else:
+            text = ("登録済み: {name}\n判定元: {resolved}\n使用行: {lines}".format(
+                name=row.get("name", ""), resolved=row.get("resolved_by", ""),
+                lines=", ".join(str(line) for line in row.get("lines", []))))
+        self._set_image_reference_detail(text)
+
+    def go_to_selected_image_reference(self, event=None):
+        row = self._selected_image_reference_row()
+        if not row:
+            return
+        line = int(row.get("line", 1))
+        self.editor.mark_set("insert", "{}.0".format(line))
+        self.editor.see("{}.0".format(line))
+        self.editor.focus_set()
+        self.status.set("画像検知の使用行へ移動しました: {}行".format(line))
+
+    def apply_missing_image_references(self, apply_all=False):
+        result = self.image_reference_result or {}
+        available = set(result.get("library_available_names", []))
+        if apply_all:
+            names = [row.get("name") for row in result.get("missing", [])
+                     if row.get("name") in available]
+        else:
+            names = []
+            for iid in self.image_reference_tree.selection():
+                row = self.image_reference_rows.get(iid, {})
+                if row.get("row_type") == "literal" and row.get("status") == "missing" \
+                        and row.get("library_available"):
+                    names.append(row.get("name"))
+        names = list(dict.fromkeys(name for name in names if name))
+        if not names:
+            messagebox.showinfo(
+                "画像検知名チェック",
+                "DevStudioから登録できる未登録名を選択してください。",
+                parent=self)
+            return
+        if not messagebox.askyesno(
+                "画像検知をソースへ登録",
+                "次の{}件を、開いているソースへ登録しますか？\n\n{}\n\n"
+                "既存の画像検知設定は保持され、ソースは未保存状態になります。".format(
+                    len(names), "\n".join(names)), parent=self):
+            return
+        source = self.editor.get("1.0", "end-1c")
+        try:
+            updated, added = merge_library_targets_into_source(
+                source, self._read_image_library(), names)
+        except (SyntaxError, ValueError) as error:
+            messagebox.showwarning("画像検知をソースへ登録", str(error), parent=self)
+            return
+        self.editor.delete("1.0", "end")
+        self.editor.insert("1.0", updated)
+        self.editor_dirty = True
+        self.editor.edit_modified(False)
+        if self.active_editor_tab in self.editor_documents:
+            self.editor_documents[self.active_editor_tab].update(
+                {"content": updated, "dirty": True})
+        self.update_editor_view()
+        self.status.set("DevStudioから画像検知{}件をソースへ登録しました。保存してください。".format(len(added)))
+        self.debounce(
+            "image_reference_after_apply", 100,
+            lambda: self.run_image_reference_check(silent=True))
 
     def _build_image_health_tab(self, parent):
         self.image_health_reference = tk.StringVar(value="1280x720")
@@ -2107,7 +2915,9 @@ class DevStudio(tk.Tk):
         ttk.Button(right, text="ソース ⇄ 画像検知記録：差分チェック・同期",
                    command=self.open_image_detection_sync_mode).pack(fill="x", pady=(0, 3))
         ttk.Button(right, text="ソース → 画像検知記録へ直接更新", command=self.load_image_detection_from_source).pack(fill="x", pady=(0, 6))
-        self.refresh_image_library_workspace()
+        # 247+ registered targets create many Tk rows.  Populate them only
+        # when the image-library workspace is actually opened.
+        self._image_library_workspace_loaded = False
 
     def open_image_detection_sync_mode(self):
         dialog = tk.Toplevel(self); dialog.title("画像検知：差分チェック・双方向同期")
@@ -2287,7 +3097,9 @@ class DevStudio(tk.Tk):
         ttk.Label(form, text="名前:").grid(column=0, row=0, padx=6, pady=4, sticky="w")
         ttk.Entry(form, textvariable=self.fragment_name).grid(column=1, row=0, padx=6, pady=4, sticky="ew")
         ttk.Label(form, text="タグ:").grid(column=0, row=1, padx=6, pady=4, sticky="nw")
-        self.fragment_tag_picker = TagPicker(form, self.fragment_tag_choices, initial=["image"])
+        self.fragment_tag_picker = TagPicker(
+            form, self.fragment_tag_choices, initial=["image"],
+            defer_choices=True)
         self.fragment_tag_picker.grid(column=1, columnspan=3, row=1, padx=6, pady=4, sticky="nsew")
         ttk.Label(form, text="保存フォルダ:").grid(column=0, row=2, padx=6, pady=4, sticky="w")
         ttk.Entry(form, textvariable=self.fragment_folder).grid(column=1, row=2, padx=6, pady=4, sticky="ew")
@@ -2310,6 +3122,31 @@ class DevStudio(tk.Tk):
             column=1, row=6, padx=6, pady=(0, 2), sticky="nw")
         fragment_editor_frame = ttk.Frame(form)
         fragment_editor_frame.grid(column=1, row=6, padx=6, pady=(24, 4), sticky="nsew")
+        fragment_search = ttk.Frame(fragment_editor_frame)
+        fragment_search.pack(side="top", fill="x", pady=(0, 3))
+        self.fragment_search_scope = tk.StringVar(value="関数・処理コード")
+        self.fragment_search_query = tk.StringVar()
+        self.fragment_search_case = tk.BooleanVar(value=False)
+        self.fragment_search_status = tk.StringVar(value="0件")
+        ttk.Label(fragment_search, text="範囲内検索:").pack(side="left")
+        ttk.Combobox(
+            fragment_search, state="readonly", width=17,
+            textvariable=self.fragment_search_scope,
+            values=("Imports", "クラス変数", "初期化コード",
+                    "関数・処理コード", "すべて")).pack(side="left", padx=3)
+        self.fragment_search_entry = ttk.Entry(
+            fragment_search, textvariable=self.fragment_search_query)
+        self.fragment_search_entry.pack(side="left", fill="x", expand=True, padx=3)
+        ttk.Checkbutton(
+            fragment_search, text="大文字区別",
+            variable=self.fragment_search_case,
+            command=self._refresh_fragment_search).pack(side="left", padx=2)
+        ttk.Button(fragment_search, text="▲前", width=6,
+                   command=lambda: self._move_fragment_search(-1)).pack(side="left", padx=1)
+        ttk.Button(fragment_search, text="次▼", width=6,
+                   command=lambda: self._move_fragment_search(1)).pack(side="left", padx=1)
+        ttk.Label(fragment_search, textvariable=self.fragment_search_status,
+                  width=10, anchor="e").pack(side="left", padx=(3, 0))
         self.fragment_line_numbers = tk.Text(fragment_editor_frame, width=6, padx=4, takefocus=0, state="disabled",
                                              wrap="none", background="#252526", foreground="#858585",
                                              selectbackground="#264f78", cursor="arrow",
@@ -2326,12 +3163,39 @@ class DevStudio(tk.Tk):
         self.fragment_body.configure(
             yscrollcommand=lambda first, last: self._sync_fragment_scroll(fragment_y, first, last),
             xscrollcommand=fragment_x.set)
-        for editor in (self.fragment_imports, self.fragment_class_vars, self.fragment_initializer, self.fragment_body):
+        fragment_scopes = {
+            self.fragment_imports: "Imports",
+            self.fragment_class_vars: "クラス変数",
+            self.fragment_initializer: "初期化コード",
+            self.fragment_body: "関数・処理コード",
+        }
+        for editor in fragment_scopes:
             editor.bind("<Tab>", lambda event, widget=editor: self._python_editor_tab(widget))
             editor.bind("<Shift-Tab>", lambda event, widget=editor: self._python_editor_shift_tab(widget))
             editor.bind("<Return>", lambda event, widget=editor: self._python_editor_newline(widget))
+            self._register_find_editor(
+                editor, "サンプル関数: " + fragment_scopes[editor])
+            editor.tag_configure("fragment_search_match", background="#fff2a8", foreground="#202020")
+            editor.tag_configure("fragment_search_current", background="#ffad42", foreground="#202020")
+        self._fragment_search_results = []
+        self._fragment_search_index = -1
+        self.fragment_search_query.trace_add(
+            "write", lambda *_args: self.debounce(
+                "fragment_range_search", 100, self._refresh_fragment_search))
+        self.fragment_search_scope.trace_add(
+            "write", lambda *_args: self.after_idle(self._refresh_fragment_search))
+        self.fragment_search_entry.bind(
+            "<Return>", lambda event: (self._move_fragment_search(1), "break")[1])
+        self.fragment_search_entry.bind(
+            "<Shift-Return>", lambda event: (self._move_fragment_search(-1), "break")[1])
         self.fragment_body.bind("<<Modified>>", self._fragment_editor_modified)
         self.fragment_body.bind("<KeyRelease>", lambda event: self.after_idle(self._update_fragment_line_numbers))
+        for editor in fragment_scopes:
+            editor.bind(
+                "<KeyRelease>",
+                lambda event: self.debounce(
+                    "fragment_range_search", 100, self._refresh_fragment_search),
+                add="+")
         self.fragment_line_numbers.bind("<Button-1>", self._fragment_line_select_start)
         self.fragment_line_numbers.bind("<B1-Motion>", self._fragment_line_select_drag)
         self.fragment_line_numbers.bind("<MouseWheel>", lambda event: self.fragment_body.yview_scroll(-1 if event.delta > 0 else 1, "units"))
@@ -2345,11 +3209,33 @@ class DevStudio(tk.Tk):
         ttk.Button(helpers, text="クラス変数例を追加", command=self.insert_fragment_class_var_example).pack(fill="x", padx=4, pady=(2, 4))
         ttk.Button(helpers, text="初期化例を追加", command=self.insert_fragment_initializer_example).pack(fill="x", padx=4, pady=(2, 4))
         ttk.Button(helpers, text="フォルダー比較・同期", command=self.open_sample_function_check_mode).pack(fill="x", padx=4, pady=(8, 4))
+        self.fragment_dependency_frame = ttk.Labelframe(
+            form, text="依存グループの関数（__supportは初期化・状態辞書の設定です）")
+        self.fragment_dependency_frame.grid(
+            column=1, columnspan=3, row=7, padx=6, pady=(2, 4), sticky="ew")
+        self.fragment_dependency_notice = tk.StringVar()
+        ttk.Label(
+            self.fragment_dependency_frame,
+            textvariable=self.fragment_dependency_notice,
+            foreground="#b00020").pack(side="left", padx=5)
+        self.fragment_dependency_function_choice = tk.StringVar()
+        self.fragment_dependency_function_combo = ttk.Combobox(
+            self.fragment_dependency_frame, state="readonly", width=46,
+            textvariable=self.fragment_dependency_function_choice)
+        self.fragment_dependency_function_combo.pack(
+            side="left", fill="x", expand=True, padx=5, pady=4)
+        ttk.Button(
+            self.fragment_dependency_frame, text="選択した関数を変更",
+            command=self.open_selected_dependency_fragment).pack(
+                side="right", padx=5, pady=4)
+        self.fragment_dependency_function_combo.bind(
+            "<Double-1>", lambda _event: self.open_selected_dependency_fragment())
+        self.fragment_dependency_frame.grid_remove()
         self.fragment_save_button = ttk.Button(form, text="サンプルとして保存", command=self.create_fragment_from_tab)
-        self.fragment_save_button.grid(column=1, row=7, padx=6, pady=8, sticky="e")
-        ttk.Button(form, text="サンプルライブラリを開く", command=self.open_fragment_library).grid(column=0, row=7, padx=6, pady=8, sticky="w")
+        self.fragment_save_button.grid(column=1, row=8, padx=6, pady=8, sticky="e")
+        ttk.Button(form, text="サンプルライブラリを開く", command=self.open_fragment_library).grid(column=0, row=8, padx=6, pady=8, sticky="w")
         registered = ttk.Frame(form)
-        registered.grid(column=2, columnspan=2, row=7, padx=6, pady=8, sticky="e")
+        registered.grid(column=2, columnspan=2, row=8, padx=6, pady=8, sticky="e")
         self.registered_fragment_choice = tk.StringVar()
         ttk.Label(registered, text="登録済みサンプル関数:").pack(side="left", padx=(0, 3))
         self.registered_fragment_combo = ttk.Combobox(registered, textvariable=self.registered_fragment_choice, state="readonly", width=34)
@@ -2357,6 +3243,10 @@ class DevStudio(tk.Tk):
         ttk.Button(registered, text="変更", command=self.edit_registered_fragment).pack(side="left", padx=2)
         ttk.Button(registered, text="削除", command=self.delete_registered_fragment).pack(side="left", padx=2)
         ttk.Button(registered, text="新規へ戻る", command=self.cancel_fragment_edit).pack(side="left", padx=2)
+        ttk.Button(registered, text="VS Codeで開く",
+                   command=self.open_fragment_in_vscode).pack(side="left", padx=(8, 2))
+        ttk.Button(registered, text="外部変更を再読込",
+                   command=self.reload_fragment_external_changes).pack(side="left", padx=2)
         form.columnconfigure(1, weight=1)
         form.rowconfigure(6, weight=1)
 
@@ -2448,6 +3338,92 @@ class DevStudio(tk.Tk):
         self._python_editor_select_lines(self.fragment_body, self._fragment_line_anchor, self._fragment_line_at(event.y))
         return "break"
 
+    def _fragment_search_widgets(self):
+        return {
+            "Imports": self.fragment_imports,
+            "クラス変数": self.fragment_class_vars,
+            "初期化コード": self.fragment_initializer,
+            "関数・処理コード": self.fragment_body,
+        }
+
+    def _focus_fragment_search(self, widget, scope):
+        self.fragment_search_scope.set(scope)
+        try:
+            selected = widget.get("sel.first", "sel.last")
+        except tk.TclError:
+            selected = ""
+        if selected and "\n" not in selected:
+            self.fragment_search_query.set(selected)
+        self.fragment_search_entry.focus_set()
+        self.fragment_search_entry.selection_range(0, "end")
+        self._refresh_fragment_search()
+        return "break"
+
+    def _refresh_fragment_search(self):
+        if not hasattr(self, "fragment_search_query"):
+            return
+        widgets = self._fragment_search_widgets()
+        for widget in widgets.values():
+            widget.tag_remove("fragment_search_match", "1.0", "end")
+            widget.tag_remove("fragment_search_current", "1.0", "end")
+        query = self.fragment_search_query.get()
+        self._fragment_search_results = []
+        self._fragment_search_index = -1
+        if not query:
+            self.fragment_search_status.set("0件")
+            return
+        selected_scope = self.fragment_search_scope.get()
+        targets = list(widgets.items()) if selected_scope == "すべて" else [
+            (selected_scope, widgets[selected_scope])]
+        for scope, widget in targets:
+            start = "1.0"
+            while True:
+                count = tk.IntVar(value=0)
+                index = widget.search(
+                    query, start, stopindex="end",
+                    nocase=not self.fragment_search_case.get(), count=count)
+                if not index:
+                    break
+                length = max(1, int(count.get()))
+                end = "{}+{}c".format(index, length)
+                widget.tag_add("fragment_search_match", index, end)
+                self._fragment_search_results.append((scope, widget, index, end))
+                start = end
+        if not self._fragment_search_results:
+            self.fragment_search_status.set("0件")
+            return
+        self._show_fragment_search_result(0, focus=False)
+
+    def _show_fragment_search_result(self, index, focus=True):
+        if not self._fragment_search_results:
+            self.fragment_search_status.set("0件")
+            return
+        self._fragment_search_index = index % len(self._fragment_search_results)
+        for widget in self._fragment_search_widgets().values():
+            widget.tag_remove("fragment_search_current", "1.0", "end")
+        scope, widget, start, end = self._fragment_search_results[
+            self._fragment_search_index]
+        widget.tag_add("fragment_search_current", start, end)
+        widget.tag_raise("fragment_search_current")
+        if focus:
+            widget.mark_set("insert", start)
+            widget.see(start)
+            widget.focus_set()
+        self.fragment_search_status.set(
+            "{}/{}".format(
+                self._fragment_search_index + 1,
+                len(self._fragment_search_results)))
+        self.status.set("サンプル関数検索: {} / {}".format(
+            scope, self.fragment_search_status.get()))
+
+    def _move_fragment_search(self, direction):
+        if not self._fragment_search_results:
+            self._refresh_fragment_search()
+            if not self._fragment_search_results:
+                return
+        self._show_fragment_search_result(
+            self._fragment_search_index + int(direction))
+
     def insert_fragment_function_skeleton(self):
         name = python_identifier(self.fragment_name.get()) + "_helper"
         self.fragment_body.insert("insert", "\n\ndef {}(self, frame=None):\n    \"\"\"Reusable helper / 再利用ヘルパー。\"\"\"\n    # TODO: implement\n    return None\n".format(name))
@@ -2473,25 +3449,279 @@ class DevStudio(tk.Tk):
     def open_sample_function_check_mode(self):
         dialog = tk.Toplevel(self)
         dialog.title("サンプル関数チェックモード")
-        dialog.geometry("1050x650")
+        dialog.geometry("1150x760")
+        dialog.minsize(760, 520)
         dialog.transient(self)
         folder_var = tk.StringVar(value=self.fragment_folder.get() or self.fragment_root())
+        source_path_var = tk.StringVar(value=(
+            self.current_path if self.current_path and
+            str(self.current_path).lower().endswith(".py") else ""))
         search_var = tk.StringVar()
+        differences_only_var = tk.BooleanVar(value=False)
+        hide_missing_source_var = tk.BooleanVar(value=False)
         summary_var = tk.StringVar(value="")
+        source_mode_var = tk.StringVar(value="")
         top = ttk.Frame(dialog); top.pack(fill="x", padx=7, pady=7)
         ttk.Label(top, text="比較フォルダー:").pack(side="left")
         ttk.Entry(top, textvariable=folder_var).pack(side="left", fill="x", expand=True, padx=4)
         ttk.Label(top, text="関数検索:").pack(side="left", padx=(8, 2))
         ttk.Entry(top, textvariable=search_var, width=24).pack(side="left", padx=2)
-        state = {"comparisons": [], "visible": {}}
-        tree = ttk.Treeview(dialog, columns=("status", "path"), show="tree headings", selectmode="extended")
+        ttk.Checkbutton(
+            top, text="差分ありのみ表示", variable=differences_only_var,
+            command=lambda: populate()).pack(side="left", padx=(6, 2))
+        ttk.Checkbutton(
+            top, text="ソース側未登録を非表示",
+            variable=hide_missing_source_var,
+            command=lambda: populate()).pack(side="left", padx=(6, 2))
+        source_bar = ttk.Frame(dialog); source_bar.pack(fill="x", padx=7, pady=(0, 4))
+        ttk.Label(source_bar, text="比較ソース:").pack(side="left")
+        ttk.Entry(source_bar, textvariable=source_path_var).pack(
+            side="left", fill="x", expand=True, padx=4)
+        ttk.Label(source_bar, textvariable=source_mode_var).pack(
+            side="right", padx=(7, 2))
+        ttk.Button(
+            source_bar, text="ディスクから再読込",
+            command=lambda: reload_comparison_source()).pack(
+                side="right", padx=2)
+        ttk.Button(source_bar, text="選択", command=lambda: choose_source()).pack(side="left", padx=2)
+        backup_root = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "Backups",
+            "SampleFunctionSync")
+        latest_backup = latest_sample_sync_backup(backup_root)
+        backup_status_var = tk.StringVar(
+            value=("復元可能: " + os.path.basename(os.path.dirname(latest_backup))
+                   if latest_backup else "一括反映履歴なし"))
+        state = {"comparisons": [], "visible": {}, "source": "",
+                 "source_path": "", "last_backup": latest_backup,
+                 "reselect_name": ""}
+        content = ttk.Panedwindow(dialog, orient="vertical")
+        content.pack(fill="both", expand=True, padx=7, pady=4)
+        tree_frame = ttk.Frame(content)
+        diff_frame = ttk.LabelFrame(content, text="選択した関数の差分")
+        content.add(tree_frame, weight=3)
+        content.add(diff_frame, weight=2)
+
+        tree = ttk.Treeview(tree_frame, columns=("status", "path"),
+                            show="tree headings", selectmode="extended")
         tree.heading("#0", text="関数名"); tree.heading("status", text="状態"); tree.heading("path", text="サンプル関数ファイル")
         tree.column("#0", width=330); tree.column("status", width=150); tree.column("path", width=520)
-        tree.pack(fill="both", expand=True, padx=7, pady=4)
+        tree_y_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree_x_scroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=tree_y_scroll.set, xscrollcommand=tree_x_scroll.set)
+        tree.grid(column=0, row=0, sticky="nsew")
+        tree_y_scroll.grid(column=1, row=0, sticky="ns")
+        tree_x_scroll.grid(column=0, row=1, sticky="ew")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
         tree.tag_configure("different", foreground="#b36b00")
+        tree.tag_configure("name_different", foreground="#8a4d00")
         tree.tag_configure("missing_source", foreground="#a00000")
         tree.tag_configure("duplicate", foreground="#a00000")
-        status_labels = {"match": "一致", "different": "不一致", "missing_source": "ソース側に未登録", "duplicate": "サンプル側で重複"}
+        status_labels = {
+            "match": "一致", "different": "処理不一致",
+            "name_different": "関数名不一致",
+            "missing_source": "ソース側に未登録",
+            "duplicate": "サンプル側で重複"}
+
+        def item_status_label(item):
+            if item.get("status") != "duplicate":
+                return status_labels[item["status"]]
+            return ("サンプル側で重複（同内容）"
+                    if item.get("duplicate_kind") == "same"
+                    else "サンプル側で重複（内容差あり）")
+
+        diff_header = ttk.Frame(diff_frame)
+        diff_header.pack(fill="x", padx=5, pady=(4, 2))
+        diff_status_var = tk.StringVar(value="一覧から関数を1件選択すると差分を表示します。")
+        ttk.Label(diff_header, textvariable=diff_status_var).pack(
+            side="left", fill="x", expand=True)
+        diff_position_var = tk.StringVar(value="")
+        ttk.Label(diff_header, textvariable=diff_position_var).pack(
+            side="right", padx=3)
+        ttk.Button(diff_header, text="次の差分▼",
+                   command=lambda: move_diff_change(1)).pack(side="right", padx=2)
+        ttk.Button(diff_header, text="▲前の差分",
+                   command=lambda: move_diff_change(-1)).pack(side="right", padx=2)
+        source_to_sample_button = ttk.Button(
+            diff_header, text="この差分を 現在ソース → サンプル関数",
+            state="disabled", command=lambda: source_to_library(True))
+        source_to_sample_button.pack(side="right", padx=3)
+        sample_to_source_button = ttk.Button(
+            diff_header, text="この差分を サンプル関数 → 現在ソース",
+            state="disabled", command=lambda: library_to_source(True))
+        sample_to_source_button.pack(side="right", padx=3)
+        merge_name_body_button = ttk.Button(
+            diff_header, text="名前=サンプル・処理=ソース",
+            state="disabled", command=lambda: merge_names_and_source_bodies(True))
+        merge_name_body_button.pack(side="right", padx=3)
+
+        duplicate_compare_bar = ttk.Frame(diff_frame)
+        duplicate_compare_bar.pack(fill="x", padx=5, pady=(0, 3))
+        ttk.Label(duplicate_compare_bar, text="重複サンプル比較:").pack(
+            side="left", padx=(0, 3))
+        duplicate_count_var = tk.StringVar(value="サンプル関数: 0件")
+        ttk.Label(
+            duplicate_compare_bar, textvariable=duplicate_count_var,
+            foreground="#174a7e").pack(side="left", padx=(0, 5))
+        duplicate_left_var = tk.StringVar(value="")
+        duplicate_right_var = tk.StringVar(value="")
+        duplicate_left_stats_var = tk.StringVar(value="")
+        duplicate_right_stats_var = tk.StringVar(value="")
+        duplicate_left_combo = ttk.Combobox(
+            duplicate_compare_bar, textvariable=duplicate_left_var,
+            state="disabled", width=52)
+        duplicate_right_combo = ttk.Combobox(
+            duplicate_compare_bar, textvariable=duplicate_right_var,
+            state="disabled", width=52)
+        duplicate_left_combo.pack(side="left", fill="x", expand=True, padx=2)
+        ttk.Label(duplicate_compare_bar, text="⇔").pack(side="left", padx=2)
+        duplicate_right_combo.pack(side="left", fill="x", expand=True, padx=2)
+        duplicate_left_open = ttk.Button(
+            duplicate_compare_bar, text="左をVSCode", state="disabled",
+            command=lambda: open_duplicate_in_vscode("left"))
+        duplicate_right_open = ttk.Button(
+            duplicate_compare_bar, text="右をVSCode", state="disabled",
+            command=lambda: open_duplicate_in_vscode("right"))
+        duplicate_left_open.pack(side="left", padx=2)
+        duplicate_right_open.pack(side="left", padx=2)
+        duplicate_left_edit = ttk.Button(
+            duplicate_compare_bar, text="左を編集", state="disabled",
+            command=lambda: edit_duplicate_sample("left"))
+        duplicate_right_edit = ttk.Button(
+            duplicate_compare_bar, text="右を編集", state="disabled",
+            command=lambda: edit_duplicate_sample("right"))
+        duplicate_left_edit.pack(side="left", padx=2)
+        duplicate_right_edit.pack(side="left", padx=2)
+        duplicate_compare_state = {"item": None, "fragments": {}}
+
+        duplicate_stats_bar = ttk.Frame(diff_frame)
+        duplicate_stats_bar.pack(fill="x", padx=5, pady=(0, 3))
+        ttk.Label(
+            duplicate_stats_bar, textvariable=duplicate_left_stats_var,
+            foreground="#174a7e", anchor="w").pack(
+                side="left", fill="x", expand=True, padx=(0, 6))
+        ttk.Label(
+            duplicate_stats_bar, textvariable=duplicate_right_stats_var,
+            foreground="#174a7e", anchor="w").pack(
+                side="left", fill="x", expand=True, padx=(6, 0))
+
+        duplicate_reflect_bar = ttk.Frame(diff_frame)
+        duplicate_reflect_bar.pack(fill="x", padx=5, pady=(0, 4))
+        duplicate_reflect_label = ttk.Label(
+            duplicate_reflect_bar,
+            text=("サンプル関数同士の操作です（現在ソースは変更しません）。"
+                  "片方だけを採用して重複を破棄、またはマージ編集を選べます。"),
+            foreground="#c00000")
+        duplicate_reflect_label.pack(side="left", padx=(0, 8))
+
+        duplicate_action_bar = ttk.Frame(diff_frame)
+        duplicate_action_bar.pack(fill="x", padx=5, pady=(0, 4))
+        duplicate_left_to_right = ttk.Button(
+            duplicate_action_bar, text="左だけ採用 → 右サンプルを破棄",
+            state="disabled",
+            command=lambda: discard_duplicate_sample("left", "right"))
+        duplicate_right_to_left = ttk.Button(
+            duplicate_action_bar, text="右だけ採用 → 左サンプルを破棄",
+            state="disabled",
+            command=lambda: discard_duplicate_sample("right", "left"))
+        duplicate_left_to_right.pack(side="left", padx=3)
+        duplicate_right_to_left.pack(side="left", padx=3)
+        duplicate_merge_to_right = ttk.Button(
+            duplicate_action_bar, text="左と右をマージ編集 → 右へ保存",
+            state="disabled",
+            command=lambda: edit_duplicate_sample(
+                "right", merge_from_side="left"))
+        duplicate_merge_to_left = ttk.Button(
+            duplicate_action_bar, text="左と右をマージ編集 → 左へ保存",
+            state="disabled",
+            command=lambda: edit_duplicate_sample(
+                "left", merge_from_side="right"))
+        duplicate_merge_to_right.pack(side="left", padx=(12, 3))
+        duplicate_merge_to_left.pack(side="left", padx=3)
+
+        diff_body = ttk.Frame(diff_frame)
+        diff_body.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+        diff_panes = ttk.Panedwindow(diff_body, orient="horizontal")
+        diff_panes.grid(column=0, row=0, sticky="nsew")
+        left_diff_frame = ttk.Frame(diff_panes)
+        right_diff_frame = ttk.Frame(diff_panes)
+        diff_panes.add(left_diff_frame, weight=1)
+        diff_panes.add(right_diff_frame, weight=1)
+        left_diff_title = tk.StringVar(value="現在ソース")
+        right_diff_title = tk.StringVar(value="サンプル関数")
+        ttk.Label(left_diff_frame, textvariable=left_diff_title,
+                  anchor="w").grid(column=0, row=0, sticky="ew", padx=3)
+        ttk.Label(right_diff_frame, textvariable=right_diff_title,
+                  anchor="w").grid(column=0, row=0, sticky="ew", padx=3)
+        diff_font = tkfont.nametofont("TkFixedFont")
+        left_diff_text = tk.Text(
+            left_diff_frame, wrap="none", state="disabled", height=12,
+            font=diff_font, background="#ffffff", foreground="#202020")
+        right_diff_text = tk.Text(
+            right_diff_frame, wrap="none", state="disabled", height=12,
+            font=diff_font, background="#ffffff", foreground="#202020")
+        left_diff_x = ttk.Scrollbar(
+            left_diff_frame, orient="horizontal", command=left_diff_text.xview)
+        right_diff_x = ttk.Scrollbar(
+            right_diff_frame, orient="horizontal", command=right_diff_text.xview)
+        left_diff_text.configure(xscrollcommand=left_diff_x.set)
+        right_diff_text.configure(xscrollcommand=right_diff_x.set)
+        left_diff_text.grid(column=0, row=1, sticky="nsew")
+        right_diff_text.grid(column=0, row=1, sticky="nsew")
+        left_diff_x.grid(column=0, row=2, sticky="ew")
+        right_diff_x.grid(column=0, row=2, sticky="ew")
+        for pane_frame in (left_diff_frame, right_diff_frame):
+            pane_frame.columnconfigure(0, weight=1)
+            pane_frame.rowconfigure(1, weight=1)
+        diff_scroll_state = {"syncing": False}
+
+        def move_diff_y(*args):
+            left_diff_text.yview(*args)
+            right_diff_text.yview(*args)
+
+        diff_y_scroll = ttk.Scrollbar(
+            diff_body, orient="vertical", command=move_diff_y)
+        diff_y_scroll.grid(column=1, row=0, sticky="ns", pady=(20, 0))
+
+        def sync_diff_y(other, first, last):
+            diff_y_scroll.set(first, last)
+            if diff_scroll_state["syncing"]:
+                return
+            diff_scroll_state["syncing"] = True
+            try:
+                other.yview_moveto(first)
+            finally:
+                diff_scroll_state["syncing"] = False
+
+        left_diff_text.configure(
+            yscrollcommand=lambda first, last: sync_diff_y(
+                right_diff_text, first, last))
+        right_diff_text.configure(
+            yscrollcommand=lambda first, last: sync_diff_y(
+                left_diff_text, first, last))
+
+        def wheel_diff(event):
+            units = -1 if event.delta > 0 else 1
+            left_diff_text.yview_scroll(units, "units")
+            right_diff_text.yview_scroll(units, "units")
+            return "break"
+
+        left_diff_text.bind("<MouseWheel>", wheel_diff)
+        right_diff_text.bind("<MouseWheel>", wheel_diff)
+        diff_body.columnconfigure(0, weight=1)
+        diff_body.rowconfigure(0, weight=1)
+        for widget in (left_diff_text, right_diff_text):
+            widget.tag_configure("diff_gutter", foreground="#777777",
+                                 background="#f2f2f2")
+            widget.tag_configure("diff_marker", foreground="#b36b00",
+                                 background="#fff2cc")
+            widget.tag_configure("diff_current_marker", foreground="#ffffff",
+                                 background="#2878c8")
+            widget.tag_configure("diff_note", foreground="#555555")
+        left_diff_text.tag_configure(
+            "diff_changed", foreground="#8a1010", background="#ffc7ce")
+        right_diff_text.tag_configure(
+            "diff_changed", foreground="#126b12", background="#c6efce")
 
         def dialog_alive():
             try: return bool(dialog.winfo_exists())
@@ -2505,22 +3735,127 @@ class DevStudio(tk.Tk):
             state["visible"] = {}
             counts = {key: 0 for key in status_labels}
             shown = 0
+            reselect_iid = ""
             for item in state["comparisons"]:
                 counts[item["status"]] += 1
+                if differences_only_var.get() and item["status"] == "match":
+                    continue
+                if hide_missing_source_var.get() and \
+                        item["status"] == "missing_source":
+                    continue
                 paths = ", ".join(os.path.relpath(value["path"], root) for value in item["fragments"])
-                searchable = "{} {} {}".format(item["name"], paths, status_labels[item["status"]]).casefold()
+                sample_name = item.get("sample_name", item["name"])
+                display_name = ("{} → {}".format(sample_name, item["name"])
+                                if sample_name != item["name"] else item["name"])
+                searchable = "{} {} {} {}".format(
+                    display_name, item["name"], paths,
+                    item_status_label(item)).casefold()
                 if needle and needle not in searchable:
                     continue
-                iid = tree.insert("", "end", text=item["name"],
-                                  values=(status_labels[item["status"]], paths), tags=(item["status"],))
+                iid = tree.insert("", "end", text=display_name,
+                                  values=(item_status_label(item), paths),
+                                  tags=(item["status"],))
                 state["visible"][iid] = item
+                if item["name"] == state.get("reselect_name", ""):
+                    reselect_iid = iid
                 shown += 1
-            summary_var.set("表示{} / 全{}件 / 一致{} / 不一致{} / 未登録{} / 重複{}".format(
+            summary_var.set("表示{} / 全{}件 / 一致{} / 処理差{} / 名前差{} / 未登録{} / 重複{}".format(
                 shown, len(state["comparisons"]), counts["match"], counts["different"],
+                counts["name_different"],
                 counts["missing_source"], counts["duplicate"]))
+            if reselect_iid:
+                state["reselect_name"] = ""
+                tree.selection_set(reselect_iid)
+                tree.focus(reselect_iid)
+                tree.see(reselect_iid)
+            show_selected_diff()
+
+        def comparison_source():
+            root, folder = self.fragment_root(), folder_var.get()
+            editor_source = self.editor.get("1.0", "end-1c")
+            editor_path = os.path.abspath(self.current_path) if self.current_path else ""
+            selected_path = source_path_var.get().strip()
+            if not selected_path:
+                origins = sample_sync_source_paths(root, folder)
+                if len(origins) == 1:
+                    selected_path = origins[0]
+                    source_path_var.set(selected_path)
+                elif len(origins) > 1:
+                    raise ValueError(
+                        "元ソースが複数あります。比較ソースを選択してください。")
+            selected_abs = os.path.abspath(selected_path) if selected_path else ""
+            if selected_abs:
+                source, source_mode = comparison_source_text(
+                    selected_abs, editor_path, editor_source,
+                    self.editor_dirty)
+                same_editor = bool(editor_path) and (
+                    os.path.normcase(editor_path) ==
+                    os.path.normcase(selected_abs))
+                # A clean editor can safely follow an external file update.
+                # Keeping it synchronized also prevents a later Save from
+                # reviving the old function definitions.
+                if same_editor and source_mode == "disk" and \
+                        source != editor_source:
+                    self.set_editor_content(source, selected_abs)
+            else:
+                try:
+                    tree_value = ast.parse(editor_source)
+                except SyntaxError:
+                    tree_value = None
+                if tree_value is None or not any(
+                        isinstance(node, ast.ClassDef) for node in tree_value.body):
+                    raise ValueError(
+                        "比較する元ソースを選択してください。\n"
+                        "サンプルに元ソース情報があれば自動選択します。")
+                source, selected_abs = editor_source, editor_path
+                source_mode = "editor"
+            # Produce the specific class error before starting the worker.
+            tree_value = ast.parse(source)
+            if not any(isinstance(node, ast.ClassDef) for node in tree_value.body):
+                raise ValueError("比較ソース内にクラスがありません。")
+            return source, selected_abs, source_mode
+
+        def reload_comparison_source():
+            selected = source_path_var.get().strip()
+            if not selected:
+                messagebox.showwarning(
+                    "サンプル関数チェック", "比較ソースを選択してください。",
+                    parent=dialog)
+                return
+            selected_abs = os.path.abspath(selected)
+            editor_path = (os.path.abspath(self.current_path)
+                           if self.current_path else "")
+            same_editor = bool(editor_path) and (
+                os.path.normcase(editor_path) ==
+                os.path.normcase(selected_abs))
+            if same_editor and self.editor_dirty and not messagebox.askyesno(
+                    "比較ソースを再読込",
+                    "未保存のエディタ編集があります。破棄してディスク上の内容を再読込しますか？",
+                    parent=dialog):
+                return
+            try:
+                source, _ = comparison_source_text(
+                    selected_abs, editor_path,
+                    self.editor.get("1.0", "end-1c"), editor_dirty=False)
+            except OSError as error:
+                messagebox.showwarning(
+                    "サンプル関数チェック", str(error), parent=dialog)
+                return
+            if same_editor:
+                self.set_editor_content(source, selected_abs)
+            refresh()
 
         def refresh():
-            source, root, folder = self.editor.get("1.0", "end-1c"), self.fragment_root(), folder_var.get()
+            root, folder = self.fragment_root(), folder_var.get()
+            try:
+                source, source_path, source_mode = comparison_source()
+            except (OSError, SyntaxError, ValueError) as error:
+                messagebox.showwarning("サンプル関数チェック", str(error), parent=dialog)
+                return
+            state["source"], state["source_path"] = source, source_path
+            source_mode_var.set(
+                "比較元: 未保存のエディタ内容" if source_mode == "editor"
+                else "比較元: ディスク再読込済み")
             def completed(comparisons):
                 if not dialog_alive(): return
                 state["comparisons"] = comparisons
@@ -2528,15 +3863,783 @@ class DevStudio(tk.Tk):
             def failed(error):
                 if dialog_alive(): messagebox.showwarning("サンプル関数チェック", str(error), parent=dialog)
             self.run_background("sample_function_check", "サンプル関数を比較中",
-                                lambda: compare_sample_function_folder(source, root, folder), completed, failed)
+                                lambda: compare_sample_function_folder(
+                                    source, root, folder, source_path), completed, failed)
+
+        def choose_source():
+            initial = source_path_var.get().strip() or self.root_dir.get()
+            selected = filedialog.askopenfilename(
+                parent=dialog,
+                initialdir=os.path.dirname(initial) if os.path.isfile(initial) else initial,
+                filetypes=(("Python", "*.py"), ("すべて", "*.*")))
+            if selected:
+                source_path_var.set(selected)
+                refresh()
 
         def choose_folder():
             selected = filedialog.askdirectory(parent=dialog, initialdir=folder_var.get() or self.fragment_root())
             if selected:
-                folder_var.set(selected); self.fragment_folder.set(selected); refresh()
+                folder_var.set(selected)
+                self.fragment_folder.set(selected)
+                # Let the newly selected folder infer its recorded origin.
+                if not (self.current_path and str(self.current_path).lower().endswith(".py")):
+                    source_path_var.set("")
+                refresh()
 
         def selected_items():
             return [state["visible"][iid] for iid in tree.selection() if iid in state["visible"]]
+
+        diff_change_state = {"rows": [], "index": -1}
+
+        def move_diff_change(direction):
+            changed_rows = diff_change_state["rows"]
+            if not changed_rows:
+                diff_position_var.set("差分0件")
+                return
+            diff_change_state["index"] = (
+                diff_change_state["index"] + int(direction)) % len(changed_rows)
+            row_number = changed_rows[diff_change_state["index"]]
+            for widget in (left_diff_text, right_diff_text):
+                widget.configure(state="normal")
+                widget.tag_remove("diff_current_marker", "1.0", "end")
+                widget.tag_add(
+                    "diff_current_marker", "{}.0".format(row_number),
+                    "{}.1".format(row_number))
+                widget.configure(state="disabled")
+                widget.see("{}.0".format(row_number))
+            diff_position_var.set(
+                "差分 {}/{}".format(
+                    diff_change_state["index"] + 1, len(changed_rows)))
+
+        def render_diff_rows(rows):
+            for widget in (left_diff_text, right_diff_text):
+                widget.configure(state="normal")
+                widget.delete("1.0", "end")
+            for row_index, row in enumerate(rows, 1):
+                changed = row["kind"] != "equal"
+                marker = "!" if changed else " "
+                for side, widget in (("left", left_diff_text),
+                                     ("right", right_diff_text)):
+                    number = row[side + "_line"]
+                    number_text = "" if number is None else str(number)
+                    prefix = "{} {:>5} │ ".format(marker, number_text)
+                    line_index = "{}.0".format(row_index)
+                    widget.insert("end", prefix + row[side] + "\n")
+                    widget.tag_add(
+                        "diff_marker" if changed else "diff_gutter",
+                        line_index, "{}+1c".format(line_index))
+                    widget.tag_add(
+                        "diff_gutter", "{}+1c".format(line_index),
+                        "{}+{}c".format(line_index, len(prefix)))
+                    for start, end in row[side + "_spans"]:
+                        widget.tag_add(
+                            "diff_changed",
+                            "{}+{}c".format(line_index, len(prefix) + start),
+                            "{}+{}c".format(line_index, len(prefix) + end))
+            diff_change_state["rows"] = [
+                index for index, row in enumerate(rows, 1)
+                if row["kind"] != "equal"]
+            diff_change_state["index"] = -1
+            diff_position_var.set(
+                "差分{}件".format(len(diff_change_state["rows"])))
+            if not rows:
+                for widget in (left_diff_text, right_diff_text):
+                    widget.insert("1.0", "差分はありません。", "diff_note")
+            for widget in (left_diff_text, right_diff_text):
+                widget.configure(state="disabled")
+                widget.yview_moveto(0.0)
+                widget.xview_moveto(0.0)
+            if diff_change_state["rows"]:
+                move_diff_change(1)
+
+        def set_diff_message(message):
+            left_diff_title.set("現在ソース")
+            right_diff_title.set("サンプル関数")
+            diff_change_state["rows"] = []
+            diff_change_state["index"] = -1
+            diff_position_var.set("")
+            for widget in (left_diff_text, right_diff_text):
+                widget.configure(state="normal")
+                widget.delete("1.0", "end")
+                widget.insert("1.0", message, "diff_note")
+                widget.configure(state="disabled")
+
+        def clear_duplicate_comparison():
+            duplicate_compare_state["item"] = None
+            duplicate_compare_state["fragments"] = {}
+            duplicate_left_var.set("")
+            duplicate_right_var.set("")
+            duplicate_left_stats_var.set("")
+            duplicate_right_stats_var.set("")
+            duplicate_count_var.set("サンプル関数: 0件")
+            duplicate_left_combo.configure(state="disabled", values=())
+            duplicate_right_combo.configure(state="disabled", values=())
+            duplicate_left_open.configure(state="disabled")
+            duplicate_right_open.configure(state="disabled")
+            duplicate_left_edit.configure(state="disabled")
+            duplicate_right_edit.configure(state="disabled")
+            duplicate_left_to_right.configure(state="disabled")
+            duplicate_right_to_left.configure(state="disabled")
+            duplicate_merge_to_right.configure(state="disabled")
+            duplicate_merge_to_left.configure(state="disabled")
+
+        def render_duplicate_comparison(*_args):
+            item = duplicate_compare_state.get("item")
+            fragments_by_label = duplicate_compare_state.get("fragments", {})
+            left = fragments_by_label.get(duplicate_left_var.get())
+            right = fragments_by_label.get(duplicate_right_var.get())
+            if not item or not left or not right:
+                return
+            labels = list(fragments_by_label)
+            left_index = labels.index(duplicate_left_var.get()) + 1
+            right_index = labels.index(duplicate_right_var.get()) + 1
+            duplicate_count_var.set(
+                "サンプル関数: {}件（左 {}/{}・右 {}/{}）".format(
+                    len(labels), left_index, len(labels),
+                    right_index, len(labels)))
+            left_path = os.path.relpath(
+                left["path"], self.fragment_root())
+            right_path = os.path.relpath(
+                right["path"], self.fragment_root())
+            left_name = left.get(
+                "sample_name", item.get("sample_name", item["name"]))
+            right_name = right.get(
+                "sample_name", item.get("sample_name", item["name"]))
+            try:
+                with open(left["path"], "r", encoding="utf-8") as stream:
+                    left_stats = fragment_function_stats(stream.read(), left_name)
+                with open(right["path"], "r", encoding="utf-8") as stream:
+                    right_stats = fragment_function_stats(stream.read(), right_name)
+            except (OSError, SyntaxError, ValueError):
+                left_stats = {"function_count": "?", "reference_count": "?"}
+                right_stats = {"function_count": "?", "reference_count": "?"}
+            left_diff_title.set("左サンプル: " + left_path)
+            right_diff_title.set("右サンプル: " + right_path)
+            duplicate_left_stats_var.set(
+                "左参照: {} / ファイル内サンプル関数: {}件 / 対象関数参照: {}件".format(
+                    left_path, left_stats["function_count"],
+                    left_stats["reference_count"]))
+            duplicate_right_stats_var.set(
+                "右参照: {} / ファイル内サンプル関数: {}件 / 対象関数参照: {}件".format(
+                    right_path, right_stats["function_count"],
+                    right_stats["reference_count"]))
+            render_diff_rows(side_by_side_diff_rows(
+                left.get("text", ""), right.get("text", "")))
+            detail = ("同内容" if item.get("duplicate_kind") == "same"
+                      else "内容差あり")
+            diff_status_var.set(
+                "{}: 重複サンプル同士を比較中（{}）".format(
+                    item["name"], detail))
+
+        def configure_duplicate_comparison(item):
+            source_record = item.get("source")
+            source_normalized = (
+                source_record.get("normalized", "") if source_record else "")
+            labels = []
+            fragments_by_label = {}
+            for fragment in item.get("fragments", []):
+                matches = bool(source_record) and (
+                    fragment.get("comparison_normalized", "") ==
+                    source_normalized)
+                relation = "ソース一致" if matches else "内容差あり"
+                relative = os.path.relpath(
+                    fragment["path"], self.fragment_root())
+                try:
+                    with open(fragment["path"], "r", encoding="utf-8") as stream:
+                        stats = fragment_function_stats(
+                            stream.read(), fragment.get(
+                                "sample_name",
+                                item.get("sample_name", item["name"])))
+                    count_label = "{}関数/{}参照".format(
+                        stats["function_count"], stats["reference_count"])
+                except (OSError, SyntaxError, ValueError):
+                    count_label = "件数不明"
+                label = "[{}・{}] {}".format(
+                    relation, count_label, relative)
+                labels.append(label)
+                fragments_by_label[label] = fragment
+            duplicate_compare_state["item"] = item
+            duplicate_compare_state["fragments"] = fragments_by_label
+            duplicate_count_var.set("サンプル関数: {}件".format(len(labels)))
+            duplicate_left_combo.configure(state="readonly", values=labels)
+            duplicate_right_combo.configure(state="readonly", values=labels)
+            duplicate_left_open.configure(state="normal")
+            duplicate_right_open.configure(state="normal")
+            duplicate_left_edit.configure(state="normal")
+            duplicate_right_edit.configure(state="normal")
+            duplicate_left_to_right.configure(state="normal")
+            duplicate_right_to_left.configure(state="normal")
+            duplicate_merge_to_right.configure(state="normal")
+            duplicate_merge_to_left.configure(state="normal")
+            duplicate_left_var.set(labels[0] if labels else "")
+            duplicate_right_var.set(
+                labels[1] if len(labels) > 1 else (labels[0] if labels else ""))
+            render_duplicate_comparison()
+
+        def open_duplicate_in_vscode(side):
+            label = (duplicate_left_var.get() if side == "left"
+                     else duplicate_right_var.get())
+            fragment = duplicate_compare_state.get("fragments", {}).get(label)
+            if not fragment:
+                return
+            if not self._open_path_in_vscode(
+                    fragment["path"], fragment.get("start", 0) + 1):
+                messagebox.showwarning(
+                    "VSCode", "VSCodeでファイルを開けませんでした。",
+                    parent=dialog)
+
+        def edit_duplicate_sample(side, merge_from_side=None):
+            label = (duplicate_left_var.get() if side == "left"
+                     else duplicate_right_var.get())
+            fragment = duplicate_compare_state.get("fragments", {}).get(label)
+            item = duplicate_compare_state.get("item")
+            if not fragment or not item:
+                return
+            merge_source = None
+            if merge_from_side:
+                merge_label = (duplicate_left_var.get()
+                               if merge_from_side == "left"
+                               else duplicate_right_var.get())
+                merge_source = duplicate_compare_state.get(
+                    "fragments", {}).get(merge_label)
+                if not merge_source:
+                    return
+                if os.path.abspath(merge_source["path"]) == os.path.abspath(
+                        fragment["path"]):
+                    messagebox.showinfo(
+                        "サンプル関数のマージ編集",
+                        "左右に同じサンプルが選択されています。",
+                        parent=dialog)
+                    return
+            path = fragment["path"]
+            function_name = fragment.get(
+                "sample_name", item.get("sample_name", item["name"]))
+            editor_window = tk.Toplevel(dialog)
+            editor_window.title(
+                ("サンプル関数をマージ編集 - " if merge_source else
+                 "サンプル関数を手動編集 - ") + function_name)
+            editor_window.geometry("1180x720" if merge_source else "980x680")
+            editor_window.transient(dialog)
+            header = ttk.Frame(editor_window)
+            header.pack(fill="x", padx=8, pady=(8, 3))
+            ttk.Label(
+                header, text=os.path.relpath(path, self.fragment_root()),
+                anchor="w").pack(side="left", fill="x", expand=True)
+            ttk.Label(
+                header,
+                text=("左の参照内容を見ながら、右の統合結果を編集します。"
+                      if merge_source else
+                      "差分画面を残したまま、この関数だけ編集します。"),
+                foreground="#174a7e").pack(side="right")
+            body = ttk.Frame(editor_window)
+            body.pack(fill="both", expand=True, padx=8, pady=4)
+            edit_container = body
+            if merge_source:
+                merge_panes = ttk.Panedwindow(body, orient="horizontal")
+                merge_panes.pack(fill="both", expand=True)
+                reference_frame = ttk.LabelFrame(
+                    merge_panes, text="反映元（参照専用）")
+                edit_container = ttk.LabelFrame(
+                    merge_panes, text="マージ結果（ここを編集して反映先へ保存）")
+                merge_panes.add(reference_frame, weight=1)
+                merge_panes.add(edit_container, weight=1)
+                reference_text = tk.Text(
+                    reference_frame, wrap="none",
+                    font=tkfont.nametofont("TkFixedFont"))
+                reference_y = ttk.Scrollbar(
+                    reference_frame, orient="vertical",
+                    command=reference_text.yview)
+                reference_x = ttk.Scrollbar(
+                    reference_frame, orient="horizontal",
+                    command=reference_text.xview)
+                reference_text.configure(
+                    yscrollcommand=reference_y.set,
+                    xscrollcommand=reference_x.set)
+                reference_text.grid(column=0, row=0, sticky="nsew")
+                reference_y.grid(column=1, row=0, sticky="ns")
+                reference_x.grid(column=0, row=1, sticky="ew")
+                reference_frame.columnconfigure(0, weight=1)
+                reference_frame.rowconfigure(0, weight=1)
+                source_name = merge_source.get(
+                    "sample_name", item.get("sample_name", item["name"]))
+                reference = merge_source.get("text", "")
+                if source_name != function_name:
+                    reference = rename_source_functions(
+                        reference, {source_name: function_name},
+                        require_definitions=True)
+                reference_text.insert("1.0", reference)
+                reference_text.configure(state="disabled")
+            edit_text = tk.Text(
+                edit_container, wrap="none", undo=True,
+                font=tkfont.nametofont("TkFixedFont"))
+            edit_y = ttk.Scrollbar(edit_container, orient="vertical",
+                                   command=edit_text.yview)
+            edit_x = ttk.Scrollbar(edit_container, orient="horizontal",
+                                   command=edit_text.xview)
+            edit_text.configure(yscrollcommand=edit_y.set,
+                                xscrollcommand=edit_x.set)
+            edit_text.grid(column=0, row=0, sticky="nsew")
+            edit_y.grid(column=1, row=0, sticky="ns")
+            edit_x.grid(column=0, row=1, sticky="ew")
+            edit_container.columnconfigure(0, weight=1)
+            edit_container.rowconfigure(0, weight=1)
+            edit_text.insert("1.0", fragment.get("text", ""))
+            edit_status = tk.StringVar(value="")
+            merge_diff_status = tk.StringVar(value="")
+            footer = ttk.Frame(editor_window)
+            footer.pack(fill="x", padx=8, pady=(3, 8))
+            ttk.Label(footer, textvariable=edit_status,
+                      foreground="#a00000").pack(side="left")
+
+            if merge_source:
+                merge_diff_state = {
+                    "rows": [], "index": -1, "after_id": None}
+                reference_text.tag_configure(
+                    "merge_changed", foreground="#8a1010",
+                    background="#ffc7ce")
+                edit_text.tag_configure(
+                    "merge_changed", foreground="#126b12",
+                    background="#c6efce")
+                for widget in (reference_text, edit_text):
+                    widget.tag_configure(
+                        "merge_current", background="#fff2cc",
+                        relief="solid", borderwidth=1)
+
+                def mark_merge_line(widget, line_number, spans, tag):
+                    if line_number is None:
+                        return
+                    line_start = "{}.0".format(line_number)
+                    if spans:
+                        for start, end in spans:
+                            widget.tag_add(
+                                tag,
+                                "{}+{}c".format(line_start, start),
+                                "{}+{}c".format(line_start, end))
+                    else:
+                        widget.tag_add(
+                            tag, line_start, "{}.end+1c".format(line_number))
+
+                def refresh_merge_diff():
+                    merge_diff_state["after_id"] = None
+                    right_value = edit_text.get("1.0", "end-1c")
+                    rows = side_by_side_diff_rows(reference, right_value)
+                    changed = [row for row in rows if row["kind"] != "equal"]
+                    for widget in (reference_text, edit_text):
+                        widget.tag_remove("merge_changed", "1.0", "end")
+                        widget.tag_remove("merge_current", "1.0", "end")
+                    for row in changed:
+                        mark_merge_line(
+                            reference_text, row["left_line"],
+                            row["left_spans"], "merge_changed")
+                        mark_merge_line(
+                            edit_text, row["right_line"],
+                            row["right_spans"], "merge_changed")
+                    merge_diff_state["rows"] = changed
+                    merge_diff_state["index"] = -1
+                    merge_diff_status.set(
+                        "差分{}行（赤=反映元、緑=マージ結果）".format(
+                            len(changed)))
+
+                def schedule_merge_diff(_event=None):
+                    if not edit_text.edit_modified():
+                        return
+                    edit_text.edit_modified(False)
+                    previous = merge_diff_state.get("after_id")
+                    if previous:
+                        try:
+                            editor_window.after_cancel(previous)
+                        except tk.TclError:
+                            pass
+                    merge_diff_state["after_id"] = editor_window.after(
+                        180, refresh_merge_diff)
+
+                def move_merge_diff(direction):
+                    rows = merge_diff_state["rows"]
+                    if not rows:
+                        merge_diff_status.set("差分0行")
+                        return
+                    merge_diff_state["index"] = (
+                        merge_diff_state["index"] + int(direction)) % len(rows)
+                    selected = rows[merge_diff_state["index"]]
+                    for widget, key in (
+                            (reference_text, "left_line"),
+                            (edit_text, "right_line")):
+                        widget.tag_remove("merge_current", "1.0", "end")
+                        line_number = selected[key]
+                        if line_number is not None:
+                            widget.tag_add(
+                                "merge_current",
+                                "{}.0".format(line_number),
+                                "{}.end+1c".format(line_number))
+                            widget.see("{}.0".format(line_number))
+                    merge_diff_status.set(
+                        "差分 {}/{}（赤=反映元、緑=マージ結果）".format(
+                            merge_diff_state["index"] + 1, len(rows)))
+
+                ttk.Label(
+                    footer, textvariable=merge_diff_status,
+                    foreground="#174a7e").pack(side="left", padx=(12, 3))
+                ttk.Button(
+                    footer, text="▲ 前の差分",
+                    command=lambda: move_merge_diff(-1)).pack(
+                        side="left", padx=2)
+                ttk.Button(
+                    footer, text="次の差分 ▼",
+                    command=lambda: move_merge_diff(1)).pack(
+                        side="left", padx=2)
+                edit_text.edit_modified(False)
+                edit_text.bind("<<Modified>>", schedule_merge_diff)
+                refresh_merge_diff()
+
+            def save_manual_edit():
+                try:
+                    with open(path, "r", encoding="utf-8") as stream:
+                        current_fragment = stream.read()
+                    updated_fragment = replace_fragment_function_text(
+                        current_fragment, function_name,
+                        edit_text.get("1.0", "end-1c"))
+                    backup = create_sample_sync_backup(
+                        state.get("source_path", ""), state.get("source", ""),
+                        state.get("comparisons", []), [item["name"]],
+                        backup_root)
+                    temporary = path + ".manual-edit.tmp"
+                    with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
+                        stream.write(updated_fragment)
+                    os.replace(temporary, path)
+                except (OSError, SyntaxError, ValueError) as error:
+                    edit_status.set(str(error))
+                    return
+                state["last_backup"] = backup["manifest_path"]
+                backup_status_var.set(
+                    "復元可能: {} / {}".format(
+                        backup["created"],
+                        "サンプル関数のマージ編集" if merge_source
+                        else "手動編集"))
+                self._fragment_catalog_cache = None
+                self.refresh_index()
+                self.refresh_registered_fragment_choices()
+                editor_window.destroy()
+                state["reselect_name"] = item["name"]
+                refresh()
+                self.status.set(
+                    "{} を{}保存しました。再チェック済みです。".format(
+                        function_name,
+                        "マージ編集して" if merge_source else "手動"))
+
+            ttk.Button(
+                footer,
+                text=("マージ結果を反映先へ保存して再チェック"
+                      if merge_source else "保存して再チェック"),
+                       command=save_manual_edit).pack(side="right", padx=3)
+            ttk.Button(footer, text="キャンセル",
+                       command=editor_window.destroy).pack(side="right", padx=3)
+
+        def discard_duplicate_sample(keep_side, discard_side):
+            """Keep one duplicate and remove the other registration/definition."""
+            variables = {
+                "left": duplicate_left_var,
+                "right": duplicate_right_var,
+            }
+            fragments_by_label = duplicate_compare_state.get("fragments", {})
+            item = duplicate_compare_state.get("item")
+            keep_fragment = fragments_by_label.get(variables[keep_side].get())
+            discard_fragment = fragments_by_label.get(
+                variables[discard_side].get())
+            if not item or not keep_fragment or not discard_fragment:
+                return
+            if item.get("status") != "duplicate" or \
+                    len(item.get("fragments", [])) < 2:
+                messagebox.showwarning(
+                    "重複サンプルの再チェック",
+                    "現在の一覧情報では重複ではありません。再チェックしてから操作してください。",
+                    parent=dialog)
+                return
+            keep_path = os.path.abspath(keep_fragment["path"])
+            discard_path = os.path.abspath(discard_fragment["path"])
+            if keep_path == discard_path:
+                messagebox.showinfo(
+                    "重複サンプルの破棄",
+                    "左右に同じサンプルが選択されています。",
+                    parent=dialog)
+                return
+            discard_name = discard_fragment.get(
+                "sample_name", item.get("sample_name", item["name"]))
+            keep_name = keep_fragment.get(
+                "sample_name", item.get("sample_name", item["name"]))
+            try:
+                with open(keep_path, "r", encoding="utf-8") as stream:
+                    keep_source = stream.read()
+                with open(discard_path, "r", encoding="utf-8") as stream:
+                    discard_source = stream.read()
+                keep_records = sample_sync_function_records(
+                    keep_source, class_only=False)
+                records = sample_sync_function_records(
+                    discard_source, class_only=False)
+                if keep_name not in keep_records:
+                    raise ValueError(
+                        "採用対象の関数が見つかりません: " + keep_name)
+                if discard_name not in records:
+                    raise ValueError(
+                        "破棄対象の関数が見つかりません: " + discard_name)
+                stats = fragment_function_stats(discard_source, discard_name)
+
+                canonical_name = item["name"]
+                keep_function = keep_records[keep_name]["text"]
+                discard_function = records[discard_name]["text"]
+                if keep_name != canonical_name:
+                    keep_function = rename_source_functions(
+                        keep_function, {keep_name: canonical_name},
+                        require_definitions=True)
+                if discard_name != canonical_name:
+                    discard_function = rename_source_functions(
+                        discard_function, {discard_name: canonical_name},
+                        require_definitions=True)
+                normalize = lambda value: "\n".join(
+                    line.rstrip() for line in
+                    textwrap.dedent(value).strip().splitlines())
+                same_content = (
+                    normalize(keep_function) == normalize(discard_function))
+            except (OSError, SyntaxError, ValueError) as error:
+                messagebox.showerror(
+                    "重複サンプルの破棄", str(error), parent=dialog)
+                return
+
+            catalog_record = None
+            if len(records) == 1:
+                for catalog_item in self.fragment_catalog():
+                    try:
+                        metadata, _, metadata_path, body_path = load_fragment(
+                            self.fragment_root(), catalog_item["id"])
+                    except (OSError, ValueError, KeyError):
+                        continue
+                    if os.path.normcase(os.path.abspath(body_path)) == \
+                            os.path.normcase(discard_path):
+                        catalog_record = {
+                            "id": catalog_item["id"],
+                            "metadata": metadata,
+                            "metadata_path": metadata_path,
+                            "body_path": body_path,
+                        }
+                        break
+                if catalog_record is None:
+                    messagebox.showerror(
+                        "重複サンプルの破棄",
+                        "単独サンプルの登録情報を特定できないため破棄できません。",
+                        parent=dialog)
+                    return
+
+            keep_label = os.path.relpath(keep_path, self.fragment_root())
+            discard_label = os.path.relpath(discard_path, self.fragment_root())
+            if len(records) > 1:
+                removal_detail = (
+                    "破棄先は複数関数ファイルのため、対象関数の定義だけを削除します。")
+            else:
+                removal_detail = (
+                    "破棄先は単独サンプルのため、登録情報とファイルを削除します。")
+            duplicate_result = (
+                "重複再チェック: 同じ検知名・同内容の重複です。"
+                if same_content else
+                "重複再チェック: 同じ検知名ですが、関数内容には差があります。")
+            reference_warning = ""
+            if stats["reference_count"]:
+                reference_warning = (
+                    "\n\n注意: 破棄先ファイル内に対象関数への参照が{}件あります。"
+                    "採用側のサンプルも同時に使用してください。".format(
+                        stats["reference_count"]))
+            if not messagebox.askyesno(
+                    "重複サンプルを1つにする",
+                    "現在ソースは変更しません。復元用バックアップを作成します。\n\n"
+                    "{}\n\n採用して残す: {}\n破棄する: {}\n\n{}{}\n\n"
+                    "この重複サンプルを破棄しますか？".format(
+                        duplicate_result, keep_label, discard_label,
+                        removal_detail, reference_warning),
+                    parent=dialog):
+                return
+
+            sample_lists_path = self.sample_lists_path()
+            extra_paths = ([sample_lists_path]
+                           if os.path.isfile(sample_lists_path) else [])
+            backup = None
+            try:
+                backup = create_sample_sync_backup(
+                    state.get("source_path", ""), state.get("source", ""),
+                    state.get("comparisons", []), [item["name"]],
+                    backup_root, extra_paths=extra_paths)
+                if len(records) > 1:
+                    updated = remove_fragment_function_text(
+                        discard_source, discard_name)
+                    temporary = discard_path + ".discard-duplicate.tmp"
+                    with open(temporary, "w", encoding="utf-8",
+                              newline="\n") as stream:
+                        stream.write(updated)
+                    os.replace(temporary, discard_path)
+                else:
+                    fragment_id = catalog_record["id"]
+                    lists = self._read_sample_lists()
+                    for sample_list in lists["lists"].values():
+                        sample_list["members"] = [
+                            member for member in sample_list["members"]
+                            if not (member.get("type") == "fragment" and
+                                    member.get("id") == fragment_id)]
+                    if os.path.isfile(catalog_record["body_path"]):
+                        os.remove(catalog_record["body_path"])
+                    if os.path.isfile(catalog_record["metadata_path"]):
+                        os.remove(catalog_record["metadata_path"])
+                    self._write_sample_lists(lists)
+                    try:
+                        os.rmdir(os.path.dirname(
+                            catalog_record["metadata_path"]))
+                    except OSError:
+                        pass
+            except (OSError, SyntaxError, ValueError, KeyError) as error:
+                if backup:
+                    try:
+                        restore_sample_sync_backup(backup["manifest_path"])
+                    except (OSError, ValueError, KeyError):
+                        pass
+                messagebox.showerror(
+                    "重複サンプルの破棄", str(error), parent=dialog)
+                return
+
+            state["last_backup"] = backup["manifest_path"]
+            backup_status_var.set(
+                "復元可能: {} / 重複サンプルを1件破棄".format(
+                    backup["created"]))
+            self._fragment_catalog_cache = None
+            self.refresh_index()
+            self.refresh_registered_fragment_choices()
+            self.refresh_sample_apply_lists()
+            self.refresh_sample_lists_tab(
+                select=self.sample_list_name.get().strip())
+            self.refresh_catalog_tag_choices()
+            self.rebuild_catalog_folder_tree()
+            state["reselect_name"] = item["name"]
+            refresh()
+            self.status.set(
+                "採用側を残し、重複サンプルを1件破棄しました。"
+                "現在ソースは変更していません。")
+
+        def reflect_duplicate_sample(source_side, target_side):
+            variables = {
+                "left": duplicate_left_var,
+                "right": duplicate_right_var,
+            }
+            fragments_by_label = duplicate_compare_state.get("fragments", {})
+            item = duplicate_compare_state.get("item")
+            source_fragment = fragments_by_label.get(
+                variables[source_side].get())
+            target_fragment = fragments_by_label.get(
+                variables[target_side].get())
+            if not item or not source_fragment or not target_fragment:
+                return
+            source_path = source_fragment["path"]
+            target_path = target_fragment["path"]
+            if os.path.abspath(source_path) == os.path.abspath(target_path):
+                messagebox.showinfo(
+                    "サンプル関数の反映",
+                    "左右に同じサンプルが選択されています。",
+                    parent=dialog)
+                return
+            source_name = source_fragment.get(
+                "sample_name", item.get("sample_name", item["name"]))
+            target_name = target_fragment.get(
+                "sample_name", item.get("sample_name", item["name"]))
+            source_label = os.path.relpath(source_path, self.fragment_root())
+            target_label = os.path.relpath(target_path, self.fragment_root())
+            if not messagebox.askyesno(
+                    "サンプル関数の反映（完全置換）",
+                    "マージ処理ではありません。現在ソースも変更しません。\n\n"
+                    "反映元を採用し、反映先の現在の関数内容を破棄して完全置換します。\n"
+                    "反映先のサンプル登録・ファイル自体は残ります。\n"
+                    "反映元: {}\n反映先: {}\n\n"
+                    "反映先を完全置換しますか？".format(
+                        source_label, target_label),
+                    parent=dialog):
+                return
+            try:
+                with open(target_path, "r", encoding="utf-8") as stream:
+                    target_source = stream.read()
+                updated_target = reflect_fragment_function_text(
+                    source_fragment.get("text", ""), source_name,
+                    target_source, target_name)
+                backup = create_sample_sync_backup(
+                    state.get("source_path", ""), state.get("source", ""),
+                    state.get("comparisons", []), [item["name"]],
+                    backup_root)
+                temporary = target_path + ".sample-reflect.tmp"
+                with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
+                    stream.write(updated_target)
+                os.replace(temporary, target_path)
+            except (OSError, SyntaxError, ValueError) as error:
+                messagebox.showerror(
+                    "サンプル関数の反映", str(error), parent=dialog)
+                return
+            state["last_backup"] = backup["manifest_path"]
+            backup_status_var.set(
+                "復元可能: {} / サンプル関数を完全置換".format(
+                    backup["created"]))
+            self._fragment_catalog_cache = None
+            self.refresh_index()
+            self.refresh_registered_fragment_choices()
+            state["reselect_name"] = item["name"]
+            refresh()
+            self.status.set(
+                "選択したサンプル関数を反対側へ反映し、関数全体を置換しました。"
+                "現在ソースは変更していません。")
+
+        duplicate_left_combo.bind(
+            "<<ComboboxSelected>>", render_duplicate_comparison)
+        duplicate_right_combo.bind(
+            "<<ComboboxSelected>>", render_duplicate_comparison)
+
+        def show_selected_diff(*_args):
+            items = selected_items()
+            sample_to_source_button.configure(state="disabled")
+            source_to_sample_button.configure(state="disabled")
+            merge_name_body_button.configure(state="disabled")
+            if len(items) != 1:
+                clear_duplicate_comparison()
+                message = "一覧から関数を1件選択すると差分を表示します。" if not items else \
+                    "差分表示は1件ずつです（現在{}件選択）。".format(len(items))
+                diff_status_var.set(message)
+                set_diff_message(message)
+                return
+            item = items[0]
+            fragments = item.get("fragments", [])
+            if item["status"] == "duplicate" or len(fragments) > 1:
+                configure_duplicate_comparison(item)
+                return
+            clear_duplicate_comparison()
+            source_record = item.get("source")
+            source_text = source_record.get("text", "") if source_record else ""
+            sample_text = fragments[0].get("text", "") if fragments else ""
+            path = fragments[0].get("path", "") if fragments else ""
+            try:
+                path_label = os.path.relpath(path, self.fragment_root()) if path else "サンプルなし"
+            except ValueError:
+                path_label = path or "サンプルなし"
+            left_diff_title.set(
+                "左: 現在ソース（赤=ソースのみ）: {}".format(item["name"]))
+            right_diff_title.set(
+                "右: サンプル関数（緑=サンプルのみ）: {}".format(path_label))
+            render_diff_rows(side_by_side_diff_rows(source_text, sample_text))
+            if item["status"] == "missing_source":
+                diff_status_var.set("{}: 現在ソースに未登録。緑色部分をソースへ追加できます。".format(
+                    item["name"]))
+                sample_to_source_button.configure(state="normal")
+            elif item["status"] == "different":
+                diff_status_var.set("{}: 赤＝現在ソースのみ／緑＝サンプル関数のみ".format(item["name"]))
+                sample_to_source_button.configure(state="normal")
+                source_to_sample_button.configure(state="normal")
+                if item.get("sample_name", item["name"]) != item["name"]:
+                    merge_name_body_button.configure(state="normal")
+            elif item["status"] == "name_different":
+                diff_status_var.set(
+                    "{}: 処理は一致。サンプル名をソースへ反映できます。".format(
+                        item["name"]))
+                merge_name_body_button.configure(state="normal")
+            else:
+                diff_status_var.set("{}: 一致（反映不要）".format(item["name"]))
 
         def mismatch_names(for_source, selected_only=False):
             allowed = ("different", "missing_source") if for_source else ("different",)
@@ -2548,10 +4651,11 @@ class DevStudio(tk.Tk):
             if not names:
                 messagebox.showinfo("サンプル関数チェック", "ソースへ反映する不一致はありません。", parent=dialog); return
             if not messagebox.askyesno("サンプル関数 → ソース", "{}件の関数を現在のソースへ反映しますか？".format(len(names)), parent=dialog): return
-            source, comparisons = self.editor.get("1.0", "end-1c"), list(state["comparisons"])
+            source, comparisons = state["source"], list(state["comparisons"])
+            target_path = state.get("source_path", "")
             def completed(updated):
                 if not dialog_alive(): return
-                self.set_editor_content(updated, self.current_path)
+                self.set_editor_content(updated, target_path or self.current_path)
                 self.editor_dirty = True; self.update_editor_view(); refresh()
                 self.status.set("サンプル関数からソースへ{}件反映しました。保存してください。".format(len(names)))
             self.run_background("sample_to_source", "サンプル関数をソースへ反映中",
@@ -2562,7 +4666,7 @@ class DevStudio(tk.Tk):
             if not names:
                 messagebox.showinfo("サンプル関数チェック", "サンプル関数へ反映する不一致はありません。", parent=dialog); return
             if not messagebox.askyesno("ソース → サンプル関数", "{}件のサンプル関数を現在のソース内容で更新しますか？".format(len(names)), parent=dialog): return
-            source, comparisons = self.editor.get("1.0", "end-1c"), list(state["comparisons"])
+            source, comparisons = state["source"], list(state["comparisons"])
             def completed(changed):
                 if not dialog_alive(): return
                 refresh(); self.refresh_index(); self.refresh_registered_fragment_choices()
@@ -2570,10 +4674,188 @@ class DevStudio(tk.Tk):
             self.run_background("source_to_samples", "ソース内容をサンプル関数へ反映中",
                                 lambda: update_sample_function_fragments(source, comparisons, names), completed)
 
-        def fragment_id_for(item):
-            if len(item.get("fragments", [])) != 1:
+        def merge_names_and_source_bodies(selected_only=False):
+            candidates = selected_items() if selected_only else state["comparisons"]
+            items = [
+                item for item in candidates
+                if item.get("source") and len(item.get("fragments", [])) == 1 and
+                item.get("status") in ("different", "name_different")]
+            if not items:
+                messagebox.showinfo(
+                    "関数名と処理を統合",
+                    "名前または処理を統合する対象はありません。",
+                    parent=dialog)
+                return
+            names = [item["name"] for item in items]
+            mappings = [
+                ("{} → {} / 処理はソース".format(
+                    item["name"], item["sample_name"])
+                 if item.get("sample_name", item["name"]) != item["name"]
+                 else "{} / 名前はそのまま・処理はソース".format(
+                    item["name"]))
+                for item in items]
+            preview = "\n".join(mappings[:15])
+            if len(mappings) > 15:
+                preview += "\nほか{}件".format(len(mappings) - 15)
+            if not messagebox.askyesno(
+                    "関数名と処理を統合",
+                    "関数名はサンプル側、処理内容はソース側を採用します。\n"
+                    "ソース内の関数定義と全参照も変更します。\n\n{}\n\n"
+                    "対象: {}関数 / 改名: {}関数 / サンプル更新: {}ファイル\n"
+                    "反映前に自動バックアップし、失敗時は自動復元します。\n\n"
+                    "一括反映しますか？".format(
+                        preview, len(items),
+                        sum(item.get("sample_name", item["name"]) != item["name"]
+                            for item in items),
+                        len({item["fragments"][0]["path"] for item in items})),
+                    parent=dialog):
+                return
+            source = state["source"]
+            comparisons = list(state["comparisons"])
+            target_path = state.get("source_path", "")
+
+            def worker():
+                backup = create_sample_sync_backup(
+                    target_path, source, comparisons, names, backup_root)
+                result = merge_sample_names_with_source_bodies(
+                    source, comparisons, names)
+                return result, backup
+
+            def completed(payload):
+                if not dialog_alive():
+                    return
+                result, backup = payload
+                updated_source, changed_paths, mapping = result
+                state["last_backup"] = backup["manifest_path"]
+                backup_status_var.set(
+                    "復元可能: {} / {}関数".format(
+                        backup["created"], len(backup.get("names", []))))
+                self.set_editor_content(
+                    updated_source, target_path or self.current_path)
+                self.editor_dirty = True
+                self.update_editor_view()
+                self._fragment_catalog_cache = None
+                self.refresh_index()
+                self.refresh_registered_fragment_choices()
+                refresh()
+                self.status.set(
+                    "サンプル名を{}関数のソース定義・参照へ反映し、"
+                    "ソース処理でサンプル{}ファイルを更新しました。"
+                    " ソースを保存してください。".format(
+                        len(mapping), len(changed_paths)))
+
+            self.run_background(
+                "merge_sample_names_source_bodies",
+                "サンプル名とソース処理を統合中",
+                worker, completed,
+                lambda error: messagebox.showerror(
+                    "関数名と処理を統合", str(error), parent=dialog))
+
+        def rollback_last_batch():
+            manifest_path = state.get("last_backup", "")
+            if not manifest_path or not os.path.isfile(manifest_path):
+                messagebox.showinfo(
+                    "一括反映を戻す", "復元できる一括反映履歴はありません。",
+                    parent=dialog)
+                return
+            if not messagebox.askyesno(
+                    "一括反映を戻す",
+                    "直前の一括反映前のサンプルとソース内容へ戻します。\n"
+                    "ソースは編集タブに未保存状態で開くため、確認後に保存できます。\n\n"
+                    "復元しますか？", parent=dialog):
+                return
+
+            def completed(result):
+                if not dialog_alive():
+                    return
+                source_text, source_path, manifest = result
+                self.set_editor_content(
+                    source_text, source_path or self.current_path)
+                self.editor_dirty = True
+                self.update_editor_view()
+                self._fragment_catalog_cache = None
+                self.refresh_index()
+                self.refresh_registered_fragment_choices()
+                refresh()
+                backup_status_var.set(
+                    "復元済み: {}".format(manifest.get("created", "")))
+                self.status.set(
+                    "直前の一括反映前へ復元しました。"
+                    " ソースは確認後に保存してください。")
+
+            self.run_background(
+                "rollback_sample_function_batch", "一括反映前へ復元中",
+                lambda: restore_sample_sync_backup(manifest_path), completed,
+                lambda error: messagebox.showerror(
+                    "一括反映を戻す", str(error), parent=dialog))
+
+        def choose_fragment_path(item, title="編集するサンプルを選択"):
+            fragments = list(item.get("fragments", []))
+            if not fragments:
+                return ""
+            if len(fragments) == 1:
+                return fragments[0]["path"]
+            picker = tk.Toplevel(dialog)
+            picker.title(title)
+            picker.geometry("820x300")
+            picker.transient(dialog)
+            picker.grab_set()
+            ttk.Label(
+                picker,
+                text="重複しているサンプルを個別に選択してください。"
+            ).pack(fill="x", padx=8, pady=(8, 4))
+            choices = ttk.Treeview(
+                picker, columns=("source", "path"), show="headings",
+                selectmode="browse")
+            choices.heading("source", text="現在ソースとの関係")
+            choices.heading("path", text="サンプル関数ファイル")
+            choices.column("source", width=170, anchor="center")
+            choices.column("path", width=610)
+            choices.pack(fill="both", expand=True, padx=8, pady=4)
+            by_iid = {}
+            source_record = item.get("source")
+            source_normalized = (
+                source_record.get("normalized", "") if source_record else "")
+            for fragment in fragments:
+                matches = bool(source_record) and (
+                    fragment.get("comparison_normalized", "") ==
+                    source_normalized)
+                iid = choices.insert(
+                    "", "end",
+                    values=("ソースと一致" if matches else "内容差あり",
+                            os.path.relpath(
+                                fragment["path"], self.fragment_root())))
+                by_iid[iid] = fragment["path"]
+            result = {"path": ""}
+
+            def accept(*_args):
+                selection = choices.selection()
+                if not selection:
+                    return
+                result["path"] = by_iid[selection[0]]
+                picker.destroy()
+
+            buttons = ttk.Frame(picker)
+            buttons.pack(fill="x", padx=8, pady=(0, 8))
+            ttk.Button(buttons, text="選択", command=accept).pack(
+                side="right", padx=3)
+            ttk.Button(buttons, text="キャンセル", command=picker.destroy).pack(
+                side="right", padx=3)
+            first = choices.get_children()
+            if first:
+                choices.selection_set(first[0])
+                choices.focus(first[0])
+            choices.bind("<Double-1>", accept)
+            dialog.wait_window(picker)
+            return result["path"]
+
+        def fragment_id_for(item, selected_path=""):
+            if selected_path:
+                wanted = os.path.abspath(selected_path)
+            elif len(item.get("fragments", [])) == 1:
+                wanted = os.path.abspath(item["fragments"][0]["path"])
+            else:
                 return None
-            wanted = os.path.abspath(item["fragments"][0]["path"])
             for catalog_item in self.fragment_catalog():
                 try:
                     _, _, _, body_path = load_fragment(self.fragment_root(), catalog_item["id"])
@@ -2587,11 +4869,41 @@ class DevStudio(tk.Tk):
             items = selected_items()
             if len(items) != 1:
                 messagebox.showinfo("関数置換", "編集するサンプル関数を1つ選択してください。", parent=dialog); return
-            fragment_id = fragment_id_for(items[0])
+            selected_path = choose_fragment_path(items[0])
+            if not selected_path:
+                return
+            fragment_id = fragment_id_for(items[0], selected_path)
             if not fragment_id:
                 messagebox.showwarning("関数置換", "サンプル関数の登録情報を特定できません。", parent=dialog); return
             dialog.destroy()
             self.load_fragment_for_editing(fragment_id)
+
+        def open_selected_in_vscode():
+            items = selected_items()
+            if len(items) != 1:
+                messagebox.showinfo(
+                    "関数編集", "開くサンプル関数を1つ選択してください。",
+                    parent=dialog)
+                return
+            selected_path = choose_fragment_path(
+                items[0], "VSCodeで開くサンプルを選択")
+            if not selected_path:
+                return
+            line = 1
+            try:
+                with open(selected_path, "r", encoding="utf-8") as stream:
+                    fragment_source = stream.read()
+                records = sample_sync_function_records(
+                    fragment_source, class_only=False)
+                sample_name = items[0].get("sample_name", items[0]["name"])
+                if sample_name in records:
+                    line = records[sample_name]["start"] + 1
+            except (OSError, SyntaxError, ValueError):
+                pass
+            if not self._open_path_in_vscode(selected_path, line):
+                messagebox.showwarning(
+                    "VSCode", "VSCodeでファイルを開けませんでした。",
+                    parent=dialog)
 
         def delete_selected():
             items = selected_items()
@@ -2857,23 +5169,39 @@ class DevStudio(tk.Tk):
         ttk.Button(top, text="フォルダー選択", command=choose_folder).pack(side="left", padx=2)
         ttk.Button(top, text="再チェック", command=refresh).pack(side="left", padx=2)
         search_var.trace_add("write", lambda *args: self.debounce("sample_function_search", 120, populate))
+        tree.bind("<<TreeviewSelect>>", show_selected_diff, add="+")
         selected_actions = ttk.Frame(dialog); selected_actions.pack(fill="x", padx=7, pady=(2, 0))
+        ttk.Button(
+            selected_actions, text="選択分を安全に一括反映",
+            command=lambda: merge_names_and_source_bodies(True)).pack(
+                side="left", padx=3)
+        ttk.Button(
+            selected_actions, text="表示中の差分を全選択",
+            command=lambda: tree.selection_set([
+                iid for iid, item in state["visible"].items()
+                if item.get("status") != "match"])).pack(side="left", padx=3)
         ttk.Button(selected_actions, text="関数を選んで置換...",
                    command=open_replacement_picker).pack(side="left", padx=3)
-        ttk.Button(selected_actions, text="選択 サンプル関数 → 現在ソース",
-                   command=lambda: library_to_source(True)).pack(side="left", padx=3)
-        ttk.Button(selected_actions, text="選択 現在ソース → サンプル関数",
-                   command=lambda: source_to_library(True)).pack(side="left", padx=3)
         ttk.Button(selected_actions, text="選択サンプルを使用箇所すべてへ反映",
                    command=apply_to_all_usages).pack(side="left", padx=3)
         ttk.Button(selected_actions, text="編集", command=edit_selected).pack(side="right", padx=3)
+        ttk.Button(selected_actions, text="VSCodeで開く",
+                   command=open_selected_in_vscode).pack(side="right", padx=3)
         ttk.Button(selected_actions, text="削除", command=delete_selected).pack(side="right", padx=3)
+        safety_row = ttk.Frame(dialog); safety_row.pack(fill="x", padx=7, pady=(3, 0))
+        ttk.Label(safety_row, textvariable=backup_status_var,
+                  foreground="#174a7e").pack(side="left")
+        ttk.Button(safety_row, text="直前の一括反映を戻す",
+                   command=rollback_last_batch).pack(side="right", padx=3)
         bottom = ttk.Frame(dialog); bottom.pack(fill="x", padx=7, pady=7)
         ttk.Label(bottom, textvariable=summary_var).pack(side="left")
         ttk.Button(bottom, text="画像検知も ソース → 登録設定", command=lambda: (
             self.image_library_apply_target.set("ソース編集"), self.load_image_detection_from_source())).pack(side="right", padx=3)
         ttk.Button(bottom, text="不一致をすべて ソース → サンプル関数", command=source_to_library).pack(side="right", padx=3)
         ttk.Button(bottom, text="不一致をすべて サンプル関数 → ソース", command=library_to_source).pack(side="right", padx=3)
+        ttk.Button(
+            bottom, text="安全に一括反映（名前=サンプル / 処理=ソース）",
+            command=merge_names_and_source_bodies).pack(side="right", padx=3)
         refresh()
 
     def create_fragment_from_tab(self):
@@ -2906,7 +5234,8 @@ class DevStudio(tk.Tk):
         if any(not isinstance(node, (ast.Import, ast.ImportFrom)) for node in import_tree.body):
             messagebox.showwarning("Fragment", "Importsにはimport文またはfrom ... import ...文だけを入力してください。", parent=self)
             return
-        initializer = textwrap.dedent(self.fragment_initializer.get("1.0", "end-1c")).strip("\n")
+        initializer = normalize_python_indentation(textwrap.dedent(
+            self.fragment_initializer.get("1.0", "end-1c"))).strip("\n")
         if initializer:
             try:
                 compile("def _sample_initializer(self):\n" + textwrap.indent(initializer, "    ") + "\n",
@@ -2922,24 +5251,51 @@ class DevStudio(tk.Tk):
                     "fragment": os.path.basename(body_path)}
         if existing.get("target"):
             metadata["target"] = existing["target"]
+        # Dependency support samples are editable too.  Keep their grouping
+        # metadata when imports, initializer or class variables are changed.
+        if existing.get("dependency_group"):
+            metadata["dependency_group"] = existing["dependency_group"]
+        # Samples registered from a source function keep their origin across
+        # later edits.  The comparison/sync screen needs both the source path
+        # and the original function name, especially when the sample was
+        # registered under a different name.
+        if existing.get("source"):
+            metadata["source"] = existing["source"]
+        body_content = normalize_python_indentation(
+            self.fragment_body.get("1.0", "end-1c"))
+        try:
+            compile(body_content, body_path, "exec")
+        except SyntaxError as error:
+            messagebox.showwarning(
+                "Fragment",
+                "?????????Python??????????????????\n{}".format(error),
+                parent=self)
+            return
+        current_body = self.fragment_body.get("1.0", "end-1c")
+        if body_content != current_body:
+            cursor = self.fragment_body.index("insert")
+            self.fragment_body.delete("1.0", "end")
+            self.fragment_body.insert("1.0", body_content)
+            self.fragment_body.mark_set("insert", cursor)
+            self._update_fragment_line_numbers()
         try:
             os.makedirs(root, exist_ok=True)
             with open(metadata_path, "w", encoding="utf-8", newline="\n") as file:
                 json.dump(metadata, file, ensure_ascii=False, indent=2)
             with open(body_path, "w", encoding="utf-8", newline="\n") as file:
-                file.write(self.fragment_body.get("1.0", "end-1c") + "\n")
+                file.write(body_content.rstrip("\n") + "\n")
         except OSError as error:
             messagebox.showerror("Fragment", str(error), parent=self)
             return
+        self._fragment_loaded_body = body_content
         self.refresh_index()
         self.show_file(body_path)
         self.status.set(self.ui_text(("Updated" if self.editing_fragment_id else "Created") + " sample function: " + metadata["name"],
                                      ("サンプル関数を更新しました: " if self.editing_fragment_id else "サンプル関数を登録しました: ") + metadata["name"]))
-        self.fragment_tag_picker.refresh_choices()
-        self.refresh_catalog_tag_choices()
-        self.rebuild_catalog_folder_tree()
-        self.refresh_registered_fragment_choices(select=self.editing_fragment_id)
-        self.refresh_sample_lists_tab(select=self.sample_list_name.get().strip())
+        self.refresh_fragment_catalog_background(
+            select=self.editing_fragment_id)
+        self._sample_lists_refresh_deferred = \
+            self.sample_list_name.get().strip()
 
     def fragment_tag_choices(self):
         return [tag for item in self.fragment_catalog() for tag in item.get("tags", [])]
@@ -2949,17 +5305,63 @@ class DevStudio(tk.Tk):
         self.registered_fragment_items = items
         labels = ["{}  ({})".format(item.get("name", item["id"]), item["id"]) for item in items]
         if hasattr(self, "registered_fragment_combo"):
-            self.registered_fragment_combo.configure(values=labels)
+            display_labels = labels or ["（登録済みサンプル関数はありません）"]
+            self.registered_fragment_combo.configure(values=display_labels)
             target = select or self.editing_fragment_id
             index = next((i for i, item in enumerate(items) if item["id"] == target), None)
-            if index is not None: self.registered_fragment_choice.set(labels[index])
-        if hasattr(self, "sample_preview_fragment_combo"):
-            self._refresh_preview_fragment_choices()
+            if index is not None:
+                self.registered_fragment_choice.set(labels[index])
+            elif self.registered_fragment_choice.get() not in display_labels:
+                self.registered_fragment_choice.set(display_labels[0])
+        # The sample-list preview worker also prepares its fragment choices;
+        # doing it here would synchronously resolve and reread the whole list.
+
+    def refresh_fragment_catalog_background(self, select=None):
+        """Scan the sample-function library without blocking Tk startup."""
+        root = self.fragment_root()
+        if self._fragment_catalog_cache is not None:
+            self.refresh_registered_fragment_choices(select=select)
+            return False
+        if select:
+            self._fragment_catalog_pending_select = select
+        if "fragment_catalog" in self.background_tasks:
+            return False
+        if hasattr(self, "registered_fragment_combo"):
+            self.registered_fragment_choice.set("（サンプル関数を読み込み中…）")
+            self.registered_fragment_combo.configure(
+                values=("（サンプル関数を読み込み中…）",))
+
+        def completed(items):
+            if os.path.abspath(root) != os.path.abspath(self.fragment_root()):
+                return
+            self._fragment_catalog_cache = list(items)
+            pending_select = getattr(
+                self, "_fragment_catalog_pending_select", "") or select
+            self._fragment_catalog_pending_select = ""
+            self.refresh_registered_fragment_choices(select=pending_select)
+            editing_metadata = getattr(
+                self, "_editing_fragment_metadata", None)
+            if (self.editing_fragment_id and
+                    isinstance(editing_metadata, dict) and
+                    editing_metadata.get("dependency_group")):
+                self._refresh_dependency_fragment_editor(
+                    self.editing_fragment_id, editing_metadata)
+            if hasattr(self, "fragment_tag_picker"):
+                self.fragment_tag_picker.refresh_choices()
+            if (hasattr(self, "sample_lists_workspace") and
+                    self.workspace_tabs.select() == str(self.sample_lists_workspace)):
+                self.refresh_catalog_tag_choices()
+                self.rebuild_catalog_folder_tree()
+                self.refresh_sample_catalog()
+
+        return self.run_background(
+            "fragment_catalog", "サンプル関数一覧を読み込み中",
+            lambda: catalog(root), completed, busy_cursor=False)
 
     def _registered_fragment_id(self):
         value = self.registered_fragment_choice.get()
         labels = [str(item) for item in self.registered_fragment_combo.cget("values")]
-        try: return self.registered_fragment_items[labels.index(value)]["id"]
+        try: return getattr(self, "registered_fragment_items", [])[labels.index(value)]["id"]
         except (ValueError, IndexError): return None
 
     def edit_registered_fragment(self):
@@ -2972,12 +5374,18 @@ class DevStudio(tk.Tk):
 
     def cancel_fragment_edit(self):
         self.editing_fragment_id = None
+        self._editing_fragment_metadata = None
+        self._fragment_loaded_body = ""
         self.fragment_name.set("new_fragment")
         self.fragment_tag_picker.set_tags([])
         self.fragment_folder.set(self.fragment_root())
         for widget in (self.fragment_imports, self.fragment_class_vars, self.fragment_initializer, self.fragment_body): widget.delete("1.0", "end")
         self.fragment_body.insert("1.0", "# @pokedev-fragment: new_fragment\n# Inserted into the selected Step user block.\n")
+        self._refresh_fragment_search()
         self.fragment_save_button.configure(text="サンプルとして保存")
+        if hasattr(self, "fragment_dependency_frame"):
+            self.fragment_dependency_items = []
+            self.fragment_dependency_frame.grid_remove()
         self.status.set(self.ui_text("New sample-function mode", "サンプル関数の新規登録モード"))
 
     def delete_fragment(self, fragment_id):
@@ -3113,14 +5521,79 @@ class DevStudio(tk.Tk):
             return
         self.load_fragment_for_editing(self.sample_catalog_items[selected[0]]["id"])
 
+    def _refresh_dependency_fragment_editor(self, fragment_id, metadata):
+        frame = getattr(self, "fragment_dependency_frame", None)
+        if frame is None:
+            return
+        group = metadata.get("dependency_group")
+        if not isinstance(group, dict):
+            self.fragment_dependency_items = []
+            self.fragment_dependency_function_choice.set("")
+            self.fragment_dependency_function_combo.configure(values=())
+            frame.grid_remove()
+            return
+        items = []
+        try:
+            lists = self._read_sample_lists().get("lists", {})
+            catalog_by_id = {
+                item["id"]: item
+                for item in (self._fragment_catalog_cache or [])}
+            for list_name, value in lists.items():
+                members = value.get("members", []) if isinstance(value, dict) else []
+                if not any(
+                        member.get("type") == "fragment" and
+                        member.get("id") == fragment_id
+                        for member in members if isinstance(member, dict)):
+                    continue
+                for member in members:
+                    if (not isinstance(member, dict) or
+                            member.get("type") != "fragment" or
+                            member.get("id") == fragment_id or
+                            not member.get("function")):
+                        continue
+                    item = catalog_by_id.get(member.get("id"), {})
+                    label = "{}  ({})".format(
+                        member["function"],
+                        item.get("name", member.get("id", "")))
+                    items.append({
+                        "label": label, "id": member.get("id"),
+                        "function": member["function"], "list": list_name})
+        except (OSError, ValueError, KeyError):
+            items = []
+        self.fragment_dependency_items = items
+        labels = [item["label"] for item in items]
+        self.fragment_dependency_function_combo.configure(values=labels)
+        self.fragment_dependency_function_choice.set(labels[0] if labels else "")
+        self.fragment_dependency_notice.set(
+            "関数本体は下の一覧から開きます（{}件）".format(len(items)))
+        frame.grid()
+
+    def open_selected_dependency_fragment(self):
+        labels = [item["label"] for item in getattr(
+            self, "fragment_dependency_items", [])]
+        try:
+            index = labels.index(self.fragment_dependency_function_choice.get())
+            fragment_id = self.fragment_dependency_items[index]["id"]
+        except (ValueError, IndexError, KeyError):
+            messagebox.showinfo(
+                "依存グループ", "変更する依存関数を選択してください。",
+                parent=self)
+            return
+        self.load_fragment_for_editing(fragment_id)
+
     def load_fragment_for_editing(self, fragment_id):
         try:
             metadata, body, metadata_path, body_path = load_fragment(self.fragment_root(), fragment_id)
         except (OSError, ValueError, KeyError) as error:
             messagebox.showerror("Fragment", str(error), parent=self); return
         self.editing_fragment_id = fragment_id
+        self._editing_fragment_metadata = dict(metadata)
         self.fragment_name.set(metadata.get("name", ""))
-        self.fragment_tag_picker.set_tags(metadata.get("tags", []))
+        # Opening one sample must not scan every registered sample merely to
+        # rebuild tag suggestions.  The catalog refresh below does that off
+        # the UI thread.
+        self.fragment_tag_picker.set_tags(
+            metadata.get("tags", []), refresh_choices=False)
         self.fragment_folder.set(os.path.dirname(metadata_path))
         imports = metadata.get("imports", [])
         if not imports:
@@ -3132,9 +5605,19 @@ class DevStudio(tk.Tk):
         self.fragment_initializer.delete("1.0", "end")
         self.fragment_initializer.insert("1.0", metadata.get("initializer", ""))
         self.fragment_body.delete("1.0", "end"); self.fragment_body.insert("1.0", body)
+        self._fragment_loaded_body = self.fragment_body.get("1.0", "end-1c")
+        self._refresh_fragment_search()
         self.fragment_save_button.configure(text="変更を保存")
+        self._refresh_dependency_fragment_editor(fragment_id, metadata)
         self.workspace_tabs.select(self.sample_functions_workspace)
-        self.status.set(self.ui_text("Loaded sample function for editing: ", "サンプル関数の変更モードに入りました: ") + metadata.get("name", body_path))
+        if self._fragment_catalog_cache is None:
+            self.refresh_fragment_catalog_background(select=fragment_id)
+        if metadata.get("dependency_group"):
+            self.status.set(
+                "依存グループ設定を開きました。関数本体は上の一覧から変更できます: " +
+                metadata.get("name", body_path))
+        else:
+            self.status.set(self.ui_text("Loaded sample function for editing: ", "サンプル関数の変更モードに入りました: ") + metadata.get("name", body_path))
 
     def add_catalog_sample_to_list(self):
         selected = self.sample_catalog_list.curselection(); name = self.sample_list_name.get().strip()
@@ -3204,16 +5687,61 @@ class DevStudio(tk.Tk):
 
     def refresh_sample_list_preview(self, event=None):
         name = self.sample_list_name.get().strip()
-        self._refresh_preview_fragment_choices()
-        try:
-            text = self._sample_program_source(name)
-            compile(text, "<sample-list-preview>", "exec")
-        except (OSError, ValueError, KeyError) as error:
-            text = "Preview error: " + str(error)
-        except SyntaxError as error:
-            text = "Preview syntax error: " + str(error)
-        self.sample_list_preview.configure(state="normal"); self.sample_list_preview.delete("1.0", "end")
-        self.sample_list_preview.insert("1.0", text); self.sample_list_preview.configure(state="disabled")
+        if not name:
+            return
+        self.sample_list_preview.configure(state="normal")
+        self.sample_list_preview.delete("1.0", "end")
+        self.sample_list_preview.insert("1.0", "プレビューを生成中です...\n")
+        self.sample_list_preview.configure(state="disabled")
+        fragment_root = self.fragment_root()
+        library_path = os.path.join(fragment_root, "sample_lists.json")
+        image_library_path = self._image_library_config_path()
+        cached_catalog = list(self._fragment_catalog_cache or [])
+
+        def worker():
+            try:
+                data = load_library(library_path)
+                image_library = load_image_library(image_library_path)
+                text = self._sample_program_source(
+                    name, fragment_root=fragment_root, data=data,
+                    image_library=image_library)
+                compile(text, "<sample-list-preview>", "exec")
+                catalog_items = cached_catalog or catalog(fragment_root)
+                catalog_by_id = {item["id"]: item for item in catalog_items}
+                members = resolve_members(data, name)
+                item_ids = [
+                    member["id"] for member in members
+                    if member["id"] in catalog_by_id]
+                labels = ["{}  ({})".format(
+                    catalog_by_id[item_id].get("name", item_id), item_id)
+                    for item_id in item_ids]
+                return text, item_ids, labels
+            except (OSError, ValueError, KeyError) as error:
+                return "Preview error: " + str(error), [], []
+            except SyntaxError as error:
+                return "Preview syntax error: " + str(error), [], []
+
+        def completed(result):
+            text, item_ids, labels = result
+            # A different list may have been selected while this large preview
+            # was being composed.  Never overwrite that newer selection.
+            if self.sample_list_name.get().strip() != name:
+                self.after_idle(self.refresh_sample_list_preview)
+                return
+            self.sample_preview_fragment_items = item_ids
+            self.sample_preview_fragment_combo.configure(values=labels)
+            current = self.sample_preview_fragment_choice.get()
+            if current not in labels:
+                self.sample_preview_fragment_choice.set(
+                    labels[0] if labels else "")
+            self.sample_list_preview.configure(state="normal")
+            self.sample_list_preview.delete("1.0", "end")
+            self.sample_list_preview.insert("1.0", text)
+            self.sample_list_preview.configure(state="disabled")
+
+        self.run_background(
+            "sample_list_preview", "サンプルリストのプレビューを生成中",
+            worker, completed)
 
     def _refresh_preview_fragment_choices(self):
         if not hasattr(self, "sample_preview_fragment_combo"): return
@@ -3283,6 +5811,9 @@ class DevStudio(tk.Tk):
         preview_x = ttk.Scrollbar(preview_pane, orient="horizontal", command=self.sample_list_preview.xview)
         preview_x.pack(fill="x")
         self.sample_list_preview.configure(yscrollcommand=preview_y.set, xscrollcommand=preview_x.set)
+        self._register_find_editor(
+            self.sample_list_preview, "サンプルリストのプレビュー",
+            replace=False)
 
         ttk.Label(controls, text="登録済みサンプルリスト（版付きJSON・入れ子対応）").grid(column=0, columnspan=3, row=0, padx=6, pady=(0, 4), sticky="w")
         ttk.Label(controls, text="リスト名:").grid(column=0, row=1, padx=6, pady=3, sticky="w")
@@ -3295,6 +5826,10 @@ class DevStudio(tk.Tk):
         self.sample_lists_tree.bind("<<ListboxSelect>>", self.load_selected_sample_list)
         ttk.Button(controls, text="新規作成 / 更新", command=self.create_sample_list).grid(column=1, row=4, padx=3, pady=3, sticky="ew")
         ttk.Button(controls, text="リスト削除", command=self.delete_sample_list).grid(column=2, row=4, padx=3, pady=3, sticky="ew")
+        ttk.Button(
+            controls, text="登録元Commandsとの差分・選択反映",
+            command=self.open_sample_origin_sync).grid(
+                column=0, row=4, padx=3, pady=3, sticky="ew")
         ttk.Label(controls, text="リストタグ:").grid(column=0, columnspan=3, row=5, padx=6, pady=(5, 2), sticky="w")
         self.sample_list_tag_picker = TagPicker(controls, self.sample_list_tag_choices)
         self.sample_list_tag_picker.grid(column=0, columnspan=3, row=6, padx=6, pady=3, sticky="nsew")
@@ -3382,11 +5917,244 @@ class DevStudio(tk.Tk):
         self.refresh_sample_lists_tab(select=name)
         self.status.set(self.ui_text("Created/updated sample list: ", "サンプルリストを作成・更新しました: ") + name)
 
+    def open_sample_origin_sync(self):
+        selected = self.sample_lists_tree.curselection()
+        name = (self.sample_lists_tree.get(selected[0]) if selected else
+                self.sample_list_name.get().strip())
+        data = self._read_sample_lists()
+        if not name or name not in data["lists"]:
+            messagebox.showinfo(
+                "登録元Commands同期", "サンプルリストを選択してください。",
+                parent=self)
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("登録元Commandsとの差分・選択反映 - " + name)
+        dialog.geometry("1280x780")
+        dialog.minsize(850, 560)
+        dialog.transient(self)
+        state = {"rows": [], "items": {}, "backup": ""}
+        summary = tk.StringVar(value="登録元を確認中…")
+
+        help_text = (
+            "サンプルリストに記録された登録元Commandsと関数単位で比較します。"
+            "反映は選択関数の完全置換です。未選択の関数と他の流用先は変更しません。")
+        ttk.Label(dialog, text=help_text, foreground="#174a7e",
+                  wraplength=1180, justify="left").pack(
+                      fill="x", padx=8, pady=(8, 3))
+        ttk.Label(dialog, textvariable=summary).pack(
+            fill="x", padx=8, pady=(0, 4))
+
+        tree_frame = ttk.Frame(dialog)
+        tree_frame.pack(fill="both", expand=True, padx=8, pady=4)
+        tree = ttk.Treeview(
+            tree_frame, columns=("status", "origin", "sample"),
+            show="tree headings", selectmode="extended", height=12)
+        tree.heading("#0", text="登録元関数")
+        tree.heading("status", text="状態")
+        tree.heading("origin", text="登録元Commands")
+        tree.heading("sample", text="使用サンプル")
+        tree.column("#0", width=250)
+        tree.column("status", width=135)
+        tree.column("origin", width=500)
+        tree.column("sample", width=360)
+        tree_y = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree_x = ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=tree_y.set, xscrollcommand=tree_x.set)
+        tree.grid(column=0, row=0, sticky="nsew")
+        tree_y.grid(column=1, row=0, sticky="ns")
+        tree_x.grid(column=0, row=1, sticky="ew")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+        tree.tag_configure("different", foreground="#b05a00")
+        tree.tag_configure("missing_source", foreground="#8a4d00")
+        tree.tag_configure("missing_origin", foreground="#a00000")
+        tree.tag_configure("invalid_origin", foreground="#a00000")
+        tree.tag_configure("binding_conflict", foreground="#a00000")
+        labels = {
+            "match": "一致", "different": "処理不一致",
+            "missing_source": "登録元に関数なし",
+            "missing_origin": "登録元ファイルなし",
+            "invalid_origin": "登録元解析エラー",
+            "binding_conflict": "同一登録先で競合",
+            "duplicate_binding": "同じ登録先を参照",
+        }
+
+        diff = ttk.Panedwindow(dialog, orient="horizontal")
+        diff.pack(fill="both", expand=True, padx=8, pady=4)
+        left_frame, right_frame = ttk.Frame(diff), ttk.Frame(diff)
+        diff.add(left_frame, weight=1); diff.add(right_frame, weight=1)
+        ttk.Label(left_frame, text="登録元Commands（赤）").pack(anchor="w")
+        ttk.Label(right_frame, text="サンプル関数（緑）").pack(anchor="w")
+        left = tk.Text(left_frame, wrap="none", state="disabled",
+                       font=self.code_font, height=13)
+        right = tk.Text(right_frame, wrap="none", state="disabled",
+                        font=self.code_font, height=13)
+        left.pack(fill="both", expand=True); right.pack(fill="both", expand=True)
+        left.tag_configure("changed", background="#ffc7ce", foreground="#8a1010")
+        right.tag_configure("changed", background="#c6efce", foreground="#126b12")
+        left.tag_configure("missing", background="#f2f2f2", foreground="#888888")
+        right.tag_configure("missing", background="#f2f2f2", foreground="#888888")
+
+        def render_row(row):
+            for widget in (left, right):
+                widget.configure(state="normal")
+                widget.delete("1.0", "end")
+            for value in side_by_side_diff_rows(
+                    row.get("source_text", ""), row.get("comparison_text", "")):
+                left_line = ("{:>5}  {}\n".format(
+                    value["left_line"] or "", value["left"]))
+                right_line = ("{:>5}  {}\n".format(
+                    value["right_line"] or "", value["right"]))
+                left.insert("end", left_line,
+                            "changed" if value["kind"] != "equal" else ())
+                right.insert("end", right_line,
+                             "changed" if value["kind"] != "equal" else ())
+            for widget in (left, right):
+                widget.configure(state="disabled")
+
+        def selected_rows():
+            return [state["items"][iid] for iid in tree.selection()
+                    if iid in state["items"]]
+
+        def on_select(event=None):
+            rows = selected_rows()
+            if rows:
+                render_row(rows[0])
+        tree.bind("<<TreeviewSelect>>", on_select)
+
+        def refresh():
+            try:
+                rows = compare_sample_list_origins(
+                    self.fragment_root(), self._read_sample_lists(), name)
+            except (OSError, SyntaxError, ValueError, KeyError) as error:
+                messagebox.showerror("登録元Commands同期", str(error), parent=dialog)
+                return
+            state["rows"] = rows
+            state["items"] = {}
+            tree.delete(*tree.get_children())
+            for row in rows:
+                iid = tree.insert(
+                    "", "end", text=row["origin_function"],
+                    values=(labels.get(row["status"], row["status"]),
+                            row["origin_path"] or "（未記録）",
+                            row["sample_id"]), tags=(row["status"],))
+                state["items"][iid] = row
+            counts = {}
+            for row in rows:
+                counts[row["status"]] = counts.get(row["status"], 0) + 1
+            summary.set("登録元{}ファイル / 関数{}件: {}".format(
+                len({row["origin_path"] for row in rows if row["origin_path"]}),
+                len(rows), ", ".join(
+                    "{} {}件".format(labels.get(key, key), value)
+                    for key, value in sorted(counts.items()))))
+            for iid, row in state["items"].items():
+                if row["status"] in ("different", "missing_source"):
+                    tree.selection_add(iid)
+            on_select()
+
+        def dirty_paths():
+            result = set()
+            self.capture_active_editor_document()
+            for document in self.editor_documents.values():
+                if document.get("dirty") and document.get("path"):
+                    result.add(os.path.normcase(os.path.abspath(document["path"])))
+            return result
+
+        def reload_changed_editor(paths):
+            changed = {os.path.normcase(os.path.abspath(path)) for path in paths}
+            for tab_id, document in self.editor_documents.items():
+                path = document.get("path")
+                if not path or os.path.normcase(os.path.abspath(path)) not in changed:
+                    continue
+                with open(path, "r", encoding="utf-8-sig") as stream:
+                    document.update({"content": stream.read(), "dirty": False})
+                if tab_id == self.active_editor_tab:
+                    self.load_editor_document(tab_id)
+
+        def apply_selected():
+            rows = selected_rows()
+            rows = [row for row in rows if row["status"] in (
+                "different", "missing_source")]
+            if not rows:
+                messagebox.showinfo(
+                    "登録元Commands同期", "反映対象の差分を選択してください。",
+                    parent=dialog); return
+            targets = {os.path.normcase(os.path.abspath(row["origin_path"]))
+                       for row in rows if row["origin_path"]}
+            overlapping = targets & dirty_paths()
+            if overlapping:
+                messagebox.showwarning(
+                    "登録元Commands同期",
+                    "保存していない登録元Commandsがあります。先に保存してください。\n" +
+                    "\n".join(sorted(overlapping)), parent=dialog)
+                return
+            if not messagebox.askyesno(
+                    "サンプル → 登録元Commands",
+                    "選択した{}関数を{}ファイルへ反映しますか？\n"
+                    "反映前バックアップを作成します。".format(
+                        len(rows), len(targets)), parent=dialog):
+                return
+            backup_root = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "Backups",
+                "SampleOriginSync")
+            try:
+                result = apply_sample_list_to_origins(
+                    state["rows"], [row["key"] for row in rows],
+                    backup_root, name)
+            except (OSError, SyntaxError, ValueError) as error:
+                messagebox.showerror("登録元Commands同期", str(error), parent=dialog)
+                return
+            if result.get("backup"):
+                state["backup"] = result["backup"]["manifest_path"]
+                restore_button.configure(state="normal")
+            reload_changed_editor(result["changed"])
+            self.status.set("サンプルから登録元Commandsへ{}関数反映しました。".format(
+                result["functions"]))
+            refresh()
+
+        def restore_last():
+            if not state["backup"]:
+                return
+            if not messagebox.askyesno(
+                    "登録元Commands同期の復元",
+                    "直前の反映前へ登録元Commandsを戻しますか？", parent=dialog):
+                return
+            try:
+                manifest = restore_origin_sync_backup(state["backup"])
+                paths = [entry["path"] for entry in manifest.get("files", [])]
+                reload_changed_editor(paths)
+            except (OSError, ValueError) as error:
+                messagebox.showerror("登録元Commands同期", str(error), parent=dialog)
+                return
+            restore_button.configure(state="disabled")
+            state["backup"] = ""
+            refresh()
+
+        actions = ttk.Frame(dialog)
+        actions.pack(fill="x", padx=8, pady=(3, 8))
+        ttk.Button(actions, text="再チェック", command=refresh).pack(side="left")
+        ttk.Button(
+            actions, text="差分をすべて選択",
+            command=lambda: [tree.selection_add(iid) for iid, row in
+                             state["items"].items() if row["status"] in
+                             ("different", "missing_source")]).pack(
+                                 side="left", padx=3)
+        restore_button = ttk.Button(
+            actions, text="直前の反映を復元", command=restore_last,
+            state="disabled")
+        restore_button.pack(side="right", padx=3)
+        ttk.Button(
+            actions, text="選択したサンプルを登録元へ反映",
+            command=apply_selected).pack(side="right", padx=3)
+        refresh()
+
     def sample_list_tag_choices(self):
         data = self._read_sample_lists()
         return [tag for item in data["lists"].values() for tag in item.get("tags", [])]
 
-    def refresh_sample_lists_tab(self, select=None, member=None):
+    def refresh_sample_lists_tab(self, select=None, member=None,
+                                 render_preview=True, refresh_catalog=True):
         if not hasattr(self, "sample_lists_tree"):
             return
         data = self._read_sample_lists(); lists = data["lists"]
@@ -3408,9 +6176,11 @@ class DevStudio(tk.Tk):
             self.sample_program_combo.configure(values=sorted(lists))
         if hasattr(self, "sample_list_tag_picker"):
             self.sample_list_tag_picker.refresh_choices()
-        self.refresh_sample_catalog()
+        if refresh_catalog:
+            self.refresh_sample_catalog()
         if target:
-            self._display_sample_list(target, member)
+            self._display_sample_list(
+                target, member, render_preview=render_preview)
         elif hasattr(self, "sample_list_preview"):
             self.sample_list_preview.configure(state="normal")
             self.sample_list_preview.delete("1.0", "end")
@@ -3424,7 +6194,8 @@ class DevStudio(tk.Tk):
         name = self.sample_lists_tree.get(selected[0])
         self._display_sample_list(name)
 
-    def _display_sample_list(self, name, selected_member=None):
+    def _display_sample_list(self, name, selected_member=None,
+                             render_preview=True):
         item = self._read_sample_lists()["lists"].get(name, {"tags": [], "members": []}); values = item["members"]
         self.sample_list_name.set(name)
         self.sample_list_tag_picker.set_tags(item.get("tags", []))
@@ -3441,7 +6212,15 @@ class DevStudio(tk.Tk):
                 self.sample_member_list.insert("end", "{}: {}".format(kind, value["id"]))
             if selected_member is not None and 0 <= selected_member < len(values):
                 self.sample_member_list.selection_set(selected_member); self.sample_member_list.see(selected_member)
-        self.refresh_sample_list_preview()
+        if render_preview:
+            self.refresh_sample_list_preview()
+        else:
+            self._sample_lists_refresh_deferred = name
+            self.sample_list_preview.configure(state="normal")
+            self.sample_list_preview.delete("1.0", "end")
+            self.sample_list_preview.insert(
+                "1.0", "サンプルリストを開いたときにプレビューを生成します。\n")
+            self.sample_list_preview.configure(state="disabled")
 
     def delete_sample_list(self):
         selected = self.sample_lists_tree.curselection()
@@ -3460,13 +6239,15 @@ class DevStudio(tk.Tk):
         self.refresh_sample_lists_tab()
         self.sample_list_details.set(self.ui_text("Deleted sample list: ", "サンプルリストを削除しました: ") + name)
 
-    def refresh_sample_apply_lists(self):
+    def refresh_sample_apply_lists(self, include_images=True):
         if not hasattr(self, "sample_apply_list"):
             return
         self.sample_apply_list.delete(0, "end")
         for name in sorted(self._read_sample_lists()["lists"]):
             self.sample_apply_list.insert("end", name)
-        self.refresh_sample_apply_image_tree()
+        if include_images:
+            self.refresh_sample_apply_image_tree()
+            self._sample_apply_images_loaded = True
 
     def refresh_sample_apply_image_tree(self):
         if not hasattr(self, "sample_apply_image_tree"):
@@ -3546,11 +6327,11 @@ class DevStudio(tk.Tk):
         self._apply_image_code_to_editor(self.editor, code)
         self.status.set("Apply Sample Listから{}件の画像検知を反映しました。".format(len(targets)))
 
-    def _image_code_for_target_names(self, target_names):
+    def _image_code_for_target_names(self, target_names, data=None):
         names = list(dict.fromkeys(str(name) for name in target_names if str(name).strip()))
         if not names:
             return ""
-        data = self._read_image_library()
+        data = self._read_image_library() if data is None else data
         names = [name for name in names if name in data["targets"]]
         if not names:
             return ""
@@ -3581,9 +6362,36 @@ class DevStudio(tk.Tk):
             messagebox.showerror(self.ui_text("Sample list", "サンプルリスト"), str(error), parent=self); return
         source = self.editor.get("1.0", "end-1c")
         conflicts = detect_conflicts(source, preview)
+        function_comparison = compare_preview_functions(source, preview)
+        support_comparison = compare_preview_support(source, preview)
+        function_differences = [
+            row for row in function_comparison
+            if row["status"] in ("different", "duplicate")]
+        support_differences = [
+            row for row in support_comparison if row["status"] == "different"]
+        if function_differences or support_differences:
+            details = []
+            if function_differences:
+                details.append("関数: " + ", ".join(
+                    row["name"] for row in function_differences))
+            if support_differences:
+                details.append("初期化・変数: " + ", ".join(
+                    row["name"] for row in support_differences))
+            if messagebox.askyesno(
+                    "サンプルリストの差分確認が必要",
+                    "既存ソースと内容が異なるため自動反映しません。\n\n{}\n\n"
+                    "サンプル関数チェックを開きますか？".format("\n".join(details)),
+                    parent=self):
+                self.open_sample_function_check_mode()
+            return
         image_targets = preview.get("image_targets", [])
         image_code = self._image_code_for_target_names(image_targets)
         missing_image_targets = self._missing_image_target_names(image_targets)
+        external_variables = preview.get("external_class_variables", [])
+        missing_external_variables = [
+            variable for variable in external_variables
+            if not re.search(
+                r"(?m)^\s*" + re.escape(variable) + r"\s*=", source)]
         summary = self.ui_text(
             "Apply '{}':\n\n{}\n\nConflicts / changes are shown before insertion. Continue?",
             "「{}」を反映します。\n\n{}\n\n競合・変更内容を確認して挿入を続けますか？").format(
@@ -3593,9 +6401,25 @@ class DevStudio(tk.Tk):
             summary += "\n\n必要な画像検知{}件も同時に反映します。".format(len(image_targets))
         if missing_image_targets:
             summary += "\n画像ライブラリ未登録（例外判定として保持）: " + ", ".join(missing_image_targets)
+        if missing_external_variables:
+            if image_code:
+                summary += (
+                    "\n画像検知側で管理する設定を同時生成: " +
+                    ", ".join(missing_external_variables))
+            else:
+                summary += (
+                    "\n注意: 別途登録が必要な外部設定: " +
+                    ", ".join(missing_external_variables))
         if not messagebox.askyesno(self.ui_text("Apply sample list", "サンプルリストの反映"), summary, parent=self):
             return
-        merged = merge_preview(source, preview, name)
+        try:
+            merged, _support_rows = merge_preview_support_safely(source, preview)
+            merged, _function_rows = merge_preview_functions_safely(
+                merged, preview, name)
+        except (SyntaxError, ValueError) as error:
+            messagebox.showwarning(
+                "サンプルリストの安全反映", str(error), parent=self)
+            return
         self.editor.delete("1.0", "end"); self.editor.insert("1.0", merged)
         if image_code:
             self._apply_image_code_to_editor(self.editor, image_code)
@@ -3640,6 +6464,8 @@ class DevStudio(tk.Tk):
         self.sample_program_editor.bind("<Tab>", self._sample_program_tab)
         self.sample_program_editor.bind("<Shift-Tab>", self._sample_program_shift_tab)
         self.sample_program_editor.bind("<Return>", self._sample_program_newline)
+        self._register_find_editor(
+            self.sample_program_editor, "サンプルプログラム")
         self.sample_program_line_numbers.bind("<Button-1>", self._sample_program_line_select_start)
         self.sample_program_line_numbers.bind("<B1-Motion>", self._sample_program_line_select_drag)
         self.sample_program_line_numbers.bind("<MouseWheel>", lambda event: self.sample_program_editor.yview_scroll(-1 if event.delta > 0 else 1, "units"))
@@ -3740,9 +6566,11 @@ class DevStudio(tk.Tk):
         if not line: return
         self._sample_program_select_lines(max(1, int(line)), max(1, int(line)))
 
-    def _sample_program_source(self, name):
-        data = self._read_sample_lists()
-        preview = compose_preview(self.fragment_root(), data, name)
+    def _sample_program_source(self, name, fragment_root=None, data=None,
+                               image_library=None):
+        fragment_root = fragment_root or self.fragment_root()
+        data = self._read_sample_lists() if data is None else data
+        preview = compose_preview(fragment_root, data, name)
         safe = python_identifier(name) + "SampleCommand"
         imports = self._generated_region("IMPORTS", "\n".join(preview["imports"]), "")
         variables = self._generated_region("CLASS_VARIABLES", "\n".join("    " + line for line in preview["class_variables"]), "    ")
@@ -3750,14 +6578,15 @@ class DevStudio(tk.Tk):
         initializers = self._generated_region("INITIALIZERS", initializer_body or "        pass", "        ")
         step_blocks, helper_blocks = [], []
         for member in resolve_members(data, name):
-            metadata, body, _, _ = load_fragment(self.fragment_root(), member["id"])
+            metadata, body, _, _ = load_fragment(fragment_root, member["id"])
             if metadata.get("target") == "step_user_block":
                 step_blocks.append(self._fragment_region(member["id"], body, "        "))
             else:
                 helper_blocks.append(self._fragment_region(member["id"], body, "    "))
         step_source = "\n".join(step_blocks)
         helper_source = "\n".join(helper_blocks)
-        image_code = self._image_code_for_target_names(preview.get("image_targets", []))
+        image_code = self._image_code_for_target_names(
+            preview.get("image_targets", []), data=image_library)
         image_import = ("from LocalFunction.ImageDetection import SimilarityHistory, detect_image\n"
                         if image_code else "")
         image_source = textwrap.indent(image_code.rstrip(), "    ") + "\n\n" if image_code else ""
@@ -4235,6 +7064,7 @@ class DevStudio(tk.Tk):
             messagebox.showwarning("画像検知", "先に対象エディタへコマンドを作成または読込してください。", parent=self); return False
         preserved_user = self._extract_image_check_user(source)
         if preserved_user is not None: code = self._replace_image_check_user(code, textwrap.dedent(preserved_user))
+        code = preserve_library_import_block(code, source)
         import_line = "from LocalFunction.ImageDetection import SimilarityHistory, detect_image"
         if import_line not in source:
             class_at = source.find("class "); source = source[:class_at] + import_line + "\n\n" + source[class_at:]
@@ -4555,11 +7385,17 @@ class DevStudio(tk.Tk):
         self.load_current_todo()
         if self.find_text.get():
             self.debounce("editor_find_count", 120, self.refresh_find_count)
-        if self.completion_mode.get() == "右タブ":
+        if (self.completion_mode.get() == "右タブ" and
+                hasattr(self, "completion_tab") and
+                self.right_tabs.select() == str(self.completion_tab)):
             self.debounce("editor_completion_tab", 80, self.refresh_completion)
         if hasattr(self, "source_functions_tab") and \
                 self.right_tabs.select() == str(self.source_functions_tab):
             self.debounce("source_function_editor_tab", 80, self.refresh_source_functions)
+        if hasattr(self, "image_reference_tab"):
+            self.debounce(
+                "image_reference_open", 350,
+                lambda: self.run_image_reference_check(silent=True))
 
     def todo_storage_path(self):
         return os.path.join(os.path.dirname(__file__), "source_todos.json")
@@ -4788,11 +7624,16 @@ class DevStudio(tk.Tk):
     def open_current_in_vscode(self):
         if not self.current_path:
             messagebox.showinfo("VS Code", "先にソースファイルを保存してください。", parent=self); return
+        line = int(self.editor.index("insert").split(".")[0])
+        if self._open_path_in_vscode(self.current_path, line):
+            self.status.set("VS Codeで開きました: {} 行{}".format(
+                os.path.basename(self.current_path), line))
+
+    def _open_path_in_vscode(self, path, line=1):
         executable = self.vscode_executable or self.find_vscode_executable()
         if not executable:
             messagebox.showwarning("VS Code", "VS Codeが見つかりません。", parent=self); return
-        line = int(self.editor.index("insert").split(".")[0])
-        target = "{}:{}".format(os.path.abspath(self.current_path), line)
+        target = "{}:{}".format(os.path.abspath(path), max(1, int(line)))
         try:
             if executable.lower().endswith((".cmd", ".bat")):
                 command = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", executable, "--goto", target]
@@ -4800,8 +7641,51 @@ class DevStudio(tk.Tk):
             else:
                 subprocess.Popen([executable, "--goto", target])
         except OSError as error:
-            messagebox.showerror("VS Code", str(error), parent=self); return
-        self.status.set("VS Codeで開きました: {} 行{}".format(os.path.basename(self.current_path), line))
+            messagebox.showerror("VS Code", str(error), parent=self)
+            return False
+        return True
+
+    def open_fragment_in_vscode(self):
+        if not self.editing_fragment_id:
+            messagebox.showinfo(
+                "VS Code", "先に登録済みサンプル関数を変更画面で開いてください。",
+                parent=self)
+            return
+        try:
+            _, _, _, body_path = load_fragment(
+                self.fragment_root(), self.editing_fragment_id)
+        except (OSError, ValueError, KeyError) as error:
+            messagebox.showerror("VS Code", str(error), parent=self)
+            return
+        current = self.fragment_body.get("1.0", "end-1c")
+        if current != self._fragment_loaded_body and not messagebox.askyesno(
+                "VS Code",
+                "DevStudio側に未保存の変更があります。\n"
+                "VS Codeでは最後に保存した内容を開きます。\n\nそれでも開きますか？",
+                parent=self):
+            return
+        line = int(self.fragment_body.index("insert").split(".")[0])
+        if self._open_path_in_vscode(body_path, line):
+            self.status.set(
+                "VS Codeでサンプル関数を開きました。保存後は「外部変更を再読込」を押してください: {}".format(
+                    os.path.basename(body_path)))
+
+    def reload_fragment_external_changes(self):
+        if not self.editing_fragment_id:
+            messagebox.showinfo(
+                "外部変更を再読込",
+                "先に登録済みサンプル関数を変更画面で開いてください。",
+                parent=self)
+            return
+        current = self.fragment_body.get("1.0", "end-1c")
+        if current != self._fragment_loaded_body and not messagebox.askyesno(
+                "外部変更を再読込",
+                "DevStudio側の未保存変更を破棄して、外部エディタの内容を再読込しますか？",
+                parent=self):
+            return
+        fragment_id = self.editing_fragment_id
+        self.load_fragment_for_editing(fragment_id)
+        self.status.set("VS Code等の外部変更を再読込しました。")
 
     def on_editor_tab_changed(self, event=None):
         if self._switching_editor_tab:
@@ -4860,6 +7744,11 @@ class DevStudio(tk.Tk):
             self.update_editor_view()
             if self.find_text.get():
                 self.debounce("editor_find_count", 120, self.refresh_find_count)
+            if hasattr(self, "image_reference_tab") and \
+                    self.right_tabs.select() == str(self.image_reference_tab):
+                self.debounce(
+                    "image_reference_edit", 650,
+                    lambda: self.run_image_reference_check(silent=True))
 
     def update_editor_view(self):
         title = self.current_path or "Unsaved output"
@@ -4945,9 +7834,29 @@ class DevStudio(tk.Tk):
 
     def _write_editor(self, path):
         self.save_current_todo(silent=True)
+        original = self.editor.get("1.0", "end-1c")
+        try:
+            source = normalize_and_compile_python(original, path)
+        except SyntaxError as error:
+            messagebox.showerror(
+                "Save",
+                "Python?????????????????\n"
+                "? {}: {}".format(
+                    getattr(error, "lineno", "?"),
+                    getattr(error, "msg", str(error))))
+            if getattr(error, "lineno", None):
+                self.editor.mark_set("insert", "{}.0".format(error.lineno))
+                self.editor.see("{}.0".format(error.lineno))
+            return False
+        if source != original:
+            cursor = self.editor.index("insert")
+            self.editor.delete("1.0", "end")
+            self.editor.insert("1.0", source)
+            self.editor.mark_set("insert", cursor)
+            self.status.set("??Tab???????4??????????")
         try:
             with open(path, "w", encoding="utf-8", newline="\n") as handle:
-                handle.write(self.editor.get("1.0", "end-1c"))
+                handle.write(source)
         except OSError as error:
             messagebox.showerror("Save", str(error))
             return False
@@ -4956,7 +7865,7 @@ class DevStudio(tk.Tk):
         self.editor.edit_modified(False)
         if self.active_editor_tab in self.editor_documents:
             document = self.editor_documents[self.active_editor_tab]
-            document.update({"path": path, "content": self.editor.get("1.0", "end-1c"), "dirty": False})
+            document.update({"path": path, "content": source, "dirty": False})
         self.update_editor_view()
         self.load_current_todo()
         self.status.set("Saved " + path)
@@ -4984,15 +7893,97 @@ class DevStudio(tk.Tk):
         entry.bind("<Return>", apply_line)
         entry.focus_set()
 
+    def _register_find_editor(self, editor, label, replace=True):
+        self._find_editors[editor] = {
+            "label": str(label), "replace": bool(replace)}
+        editor.bind(
+            "<FocusIn>",
+            lambda _event, widget=editor: self._select_find_editor(widget),
+            add="+")
+        if self._find_target_editor is None:
+            self._find_target_editor = editor
+
+    def _select_find_editor(self, editor):
+        if editor not in self._find_editors:
+            return
+        self._find_target_editor = editor
+        self.find_target_text.set(
+            "対象: " + self._find_editors[editor]["label"])
+        if self.find_text.get():
+            self.debounce(
+                "editor_find_count", 50, self.refresh_find_count)
+
+    def _current_tab_find_editors(self):
+        try:
+            workspace = self.workspace_tabs.select()
+        except tk.TclError:
+            return []
+        if workspace == str(getattr(self, "source_workspace", "")):
+            return [widget for widget in (
+                getattr(self, "editor", None),
+                getattr(self, "todo_editor", None)) if widget is not None]
+        if workspace == str(getattr(self, "operation_workspace", "")):
+            operation = getattr(self, "operation_session_workspace", None)
+            if operation is None:
+                return []
+            widgets = [
+                operation.intermediate_text, operation.final_text,
+                operation.diff_text, operation.vision_sample_text,
+                operation.intermediate_history_diff_text]
+            try:
+                selected = operation.code_tabs.select()
+                visible = [widget for widget in widgets
+                           if str(widget.master) == selected]
+                return visible or widgets
+            except tk.TclError:
+                return widgets
+        if workspace == str(getattr(self, "command_recording_workspace", "")):
+            studio = getattr(self, "command_recording_studio", None)
+            return [studio.source_text] if studio is not None else []
+        if workspace == str(getattr(self, "sample_functions_workspace", "")):
+            return [widget for widget in (
+                getattr(self, "fragment_imports", None),
+                getattr(self, "fragment_class_vars", None),
+                getattr(self, "fragment_initializer", None),
+                getattr(self, "fragment_body", None)) if widget is not None]
+        if workspace == str(getattr(self, "sample_lists_workspace", "")):
+            return [getattr(self, "sample_list_preview", None)]
+        if workspace == str(getattr(self, "sample_program_workspace", "")):
+            return [getattr(self, "sample_program_editor", None)]
+        return []
+
+    def _active_find_editor(self):
+        candidates = [widget for widget in self._current_tab_find_editors()
+                      if widget is not None]
+        target = self._find_target_editor
+        if target not in candidates:
+            target = candidates[0] if candidates else getattr(self, "editor", None)
+            if target is not None:
+                self._select_find_editor(target)
+        return target
+
+    def focus_current_tab_find(self, event=None):
+        focus = self.focus_get()
+        candidates = self._current_tab_find_editors()
+        if focus in candidates:
+            self._select_find_editor(focus)
+        else:
+            self._active_find_editor()
+        self.find_entry.focus_set()
+        self.find_entry.selection_range(0, "end")
+        return "break"
+
     def _find_matches(self):
+        editor = self._active_find_editor()
         needle = self.find_text.get()
-        if not needle:
+        if not needle or editor is None:
             return []
         matches = []
         start = "1.0"
         count = tk.IntVar(value=0)
         while True:
-            found = self.editor.search(needle, start, stopindex="end", nocase=True, count=count)
+            found = editor.search(
+                needle, start, stopindex="end", nocase=True, count=count)
             if not found:
                 break
             length = count.get()
@@ -5004,79 +7995,104 @@ class DevStudio(tk.Tk):
         return matches
 
     def refresh_find_count(self):
-        self.editor.tag_remove("find", "1.0", "end")
+        editor = self._active_find_editor()
+        if editor is None:
+            self.find_result_text.set("0 / 0")
+            return
+        editor.tag_remove("find", "1.0", "end")
         total = len(self._find_matches())
         self.find_result_text.set("0 / {}".format(total))
 
     def _show_find_match(self, matches, index):
-        self.editor.tag_remove("find", "1.0", "end")
+        editor = self._active_find_editor()
+        if editor is None:
+            return
+        editor.tag_remove("find", "1.0", "end")
         if not matches:
             self.find_result_text.set("0 / 0")
             return
         index %= len(matches)
         found, end = matches[index]
-        self.editor.tag_configure("find", background="#515c6a")
-        self.editor.tag_add("find", found, end)
-        self.editor.mark_set("insert", end)
-        self.editor.see(found)
-        self.editor.focus_set()
+        editor.tag_configure("find", background="#515c6a")
+        editor.tag_add("find", found, end)
+        editor.mark_set("insert", end)
+        editor.see(found)
+        editor.focus_set()
         self.find_result_text.set("{} / {}".format(index + 1, len(matches)))
 
     def find_next(self):
+        editor = self._active_find_editor()
+        if editor is None:
+            return
         matches = self._find_matches()
         if not matches:
             self._show_find_match([], 0)
             return
-        ranges = self.editor.tag_ranges("find")
+        ranges = editor.tag_ranges("find")
         if ranges:
-            current = self.editor.index(ranges[0])
+            current = editor.index(ranges[0])
             index = next((i + 1 for i, item in enumerate(matches)
-                          if self.editor.compare(item[0], "==", current)), 0)
+                          if editor.compare(item[0], "==", current)), 0)
         else:
-            cursor = self.editor.index("insert")
+            cursor = editor.index("insert")
             index = next((i for i, item in enumerate(matches)
-                          if self.editor.compare(item[0], ">=", cursor)), 0)
+                          if editor.compare(item[0], ">=", cursor)), 0)
         self._show_find_match(matches, index)
 
     def find_previous(self):
+        editor = self._active_find_editor()
+        if editor is None:
+            return
         matches = self._find_matches()
         if not matches:
             self._show_find_match([], 0)
             return
-        ranges = self.editor.tag_ranges("find")
+        ranges = editor.tag_ranges("find")
         if ranges:
-            current = self.editor.index(ranges[0])
+            current = editor.index(ranges[0])
             index = next((i - 1 for i, item in enumerate(matches)
-                          if self.editor.compare(item[0], "==", current)), len(matches) - 1)
+                          if editor.compare(item[0], "==", current)), len(matches) - 1)
         else:
-            cursor = self.editor.index("insert")
+            cursor = editor.index("insert")
             candidates = [i for i, item in enumerate(matches)
-                          if self.editor.compare(item[0], "<", cursor)]
+                          if editor.compare(item[0], "<", cursor)]
             index = candidates[-1] if candidates else len(matches) - 1
         self._show_find_match(matches, index)
 
     def replace_one(self):
+        editor = self._active_find_editor()
         needle = self.find_text.get()
-        if not needle:
+        if not needle or editor is None:
             return
-        ranges = self.editor.tag_ranges("find")
+        if not self._find_editors.get(editor, {}).get("replace", True):
+            self.status.set("現在の検索対象は読み取り専用です。")
+            return
+        ranges = editor.tag_ranges("find")
         if ranges:
-            self.editor.delete(ranges[0], ranges[1])
-            self.editor.insert(ranges[0], self.replace_text.get())
+            editor.delete(ranges[0], ranges[1])
+            editor.insert(ranges[0], self.replace_text.get())
         self.find_next()
 
     def replace_all(self):
+        editor = self._active_find_editor()
         needle = self.find_text.get()
-        if not needle:
+        if not needle or editor is None:
             return
-        content = self.editor.get("1.0", "end-1c")
+        if not self._find_editors.get(editor, {}).get("replace", True):
+            self.status.set("現在の検索対象は読み取り専用です。")
+            return
+        content = editor.get("1.0", "end-1c")
         count = content.lower().count(needle.lower())
         if not count:
             return
         content = re.sub(re.escape(needle), self.replace_text.get(), content, flags=re.IGNORECASE)
-        self.set_editor_content(content, self.current_path)
-        self.editor_dirty = True
-        self.update_editor_view()
+        if editor is self.editor:
+            self.set_editor_content(content, self.current_path)
+            self.editor_dirty = True
+            self.update_editor_view()
+        else:
+            editor.delete("1.0", "end")
+            editor.insert("1.0", content)
         self.status.set("Replaced {} occurrence(s)".format(count))
 
     def check_syntax(self):
@@ -5202,7 +8218,9 @@ class DevStudio(tk.Tk):
                 for filename in filenames:
                     path = os.path.join(directory, filename)
                     self.local_tree.insert(parent, "end", text=filename, values=(path,))
-        self.run_background("local_explorer", "コマンド一覧を更新中", worker, completed)
+        self.run_background(
+            "local_explorer", "コマンド一覧を更新中", worker, completed,
+            busy_cursor=False)
 
     def open_local_tree_file(self, event=None):
         selected = self.local_tree.selection()
@@ -5351,7 +8369,9 @@ class DevStudio(tk.Tk):
             self.files, self.fragments, self.index_errors = files, fragments, errors
             self.tree.delete(*self.tree.get_children())
             self._populate_index_tree(indexed_root, files, 0, {"": ""})
-        self.run_background("refresh_index", "ソース索引を更新中", worker, completed)
+        self.run_background(
+            "refresh_index", "ソース索引を更新中", worker, completed,
+            busy_cursor=False)
 
     def _populate_index_tree(self, root, files, offset, nodes):
         """Populate large indexes in batches so Tk can process events between chunks."""
@@ -5534,6 +8554,29 @@ class DevStudio(tk.Tk):
             self._write_editor(path)
 
 
-if __name__ == "__main__":
+def startup_arguments(arguments):
     default_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    DevStudio(sys.argv[1] if len(sys.argv) > 1 else default_root).mainloop()
+    root, operation_session, command_recording = default_root, "", ""
+    index = 0
+    while index < len(arguments):
+        value = arguments[index]
+        if value == "--operation-session" and index + 1 < len(arguments):
+            operation_session = arguments[index + 1]
+            index += 2
+            continue
+        if value == "--command-recording" and index + 1 < len(arguments):
+            command_recording = arguments[index + 1]
+            index += 2
+            continue
+        if not value.startswith("--"):
+            root = value
+        index += 1
+    return (os.path.abspath(root),
+            os.path.abspath(operation_session) if operation_session else "",
+            os.path.abspath(command_recording) if command_recording else "")
+
+
+if __name__ == "__main__":
+    startup_root, startup_session, startup_recording = startup_arguments(sys.argv[1:])
+    DevStudio(startup_root, operation_session=startup_session,
+              command_recording=startup_recording).mainloop()

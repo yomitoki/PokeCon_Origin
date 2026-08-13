@@ -11,6 +11,7 @@ import uuid
 
 
 REGISTRY_VERSION = 1
+DEVICE_KINDS = ("camera", "serial", "audio")
 
 
 def default_window_activity_registry_path():
@@ -197,6 +198,41 @@ def read_active_input_sets(path, exclude_token="", identity_provider=None):
         str(item.get("input_set", "")).casefold(), int(item.get("pid", 0))))
 
 
+def canonical_device_key(kind, value):
+    """Return a stable comparison key for a shared runtime device."""
+    kind = str(kind or "").strip().lower()
+    if kind not in DEVICE_KINDS:
+        return ""
+    value = " ".join(str(value or "").strip().split()).casefold()
+    return "{}:{}".format(kind, value) if value else ""
+
+
+def device_usage_conflicts(entries, kind, key):
+    """Return other live entries which published the same device key."""
+    kind = str(kind or "").strip().lower()
+    key = canonical_device_key(kind, str(key or "").split(":", 1)[-1]) \
+        if not str(key or "").startswith(str(kind) + ":") else str(key)
+    if not key:
+        return []
+    result = []
+    for entry in entries or []:
+        devices = entry.get("devices", {}) if isinstance(entry, dict) else {}
+        device = devices.get(kind, {}) if isinstance(devices, dict) else {}
+        if isinstance(device, dict) and str(device.get("key", "")) == key:
+            result.append(entry)
+    return result
+
+
+def main_resource_conflicts(entries):
+    """Return live PokeCon processes which currently own the main-tool role."""
+    result = []
+    for entry in entries or []:
+        resource = entry.get("resource", {}) if isinstance(entry, dict) else {}
+        if isinstance(resource, dict) and bool(resource.get("main_effective", False)):
+            result.append(entry)
+    return result
+
+
 class ActiveInputSetRegistry:
     """Own one process entry and update it when the active InputSet changes."""
 
@@ -222,18 +258,33 @@ class ActiveInputSetRegistry:
                 for token, entry in live.items()
             }
             if input_set:
-                stored[self.token] = {
+                existing = dict(stored.get(self.token, {}))
+                existing.update({
                     "pid": self.pid,
                     "process_identity": str(self.process_identity),
                     "input_set": input_set,
                     "combined_set": str(combined_set or "").strip(),
                     "profile": self.profile,
-                    "started_at": self.started_at,
+                    "started_at": str(existing.get("started_at", self.started_at)),
                     "updated_at": _utc_now_text(),
-                }
+                })
+                stored[self.token] = existing
                 self.closed = False
             else:
-                stored.pop(self.token, None)
+                existing = dict(stored.get(self.token, {}))
+                devices = existing.get("devices", {})
+                has_runtime_state = bool(
+                    (isinstance(devices, dict) and devices)
+                    or existing.get("last_focused_ns") is not None)
+                if has_runtime_state:
+                    existing.update({
+                        "input_set": "",
+                        "combined_set": "",
+                        "updated_at": _utc_now_text(),
+                    })
+                    stored[self.token] = existing
+                else:
+                    stored.pop(self.token, None)
             data["entries"] = stored
             _write_unlocked(self.path, data)
 
@@ -270,6 +321,86 @@ class ActiveInputSetRegistry:
             stored[self.token] = existing
             data["entries"] = stored
             _write_unlocked(self.path, data)
+
+    def set_device(self, kind, key="", label=""):
+        """Publish or clear one hardware selection without losing focus data."""
+        kind = str(kind or "").strip().lower()
+        if kind not in DEVICE_KINDS:
+            raise ValueError("Unknown device kind: " + kind)
+        normalized_key = str(key or "").strip()
+        with _registry_lock(self.path):
+            data = _read_unlocked(self.path)
+            live = _live_entries(data["entries"], self.identity_provider)
+            stored = {
+                token: {field: value for field, value in entry.items() if field != "token"}
+                for token, entry in live.items()
+            }
+            existing = dict(stored.get(self.token, {}))
+            existing.update({
+                "pid": self.pid,
+                "process_identity": str(self.process_identity),
+                "input_set": str(existing.get("input_set", "")),
+                "combined_set": str(existing.get("combined_set", "")),
+                "profile": self.profile,
+                "started_at": str(existing.get("started_at", self.started_at)),
+                "updated_at": _utc_now_text(),
+            })
+            devices = dict(existing.get("devices", {})) \
+                if isinstance(existing.get("devices"), dict) else {}
+            if normalized_key:
+                devices[kind] = {"key": normalized_key, "label": str(label or "")}
+            else:
+                devices.pop(kind, None)
+            existing["devices"] = devices
+            stored[self.token] = existing
+            data["entries"] = stored
+            self.closed = False
+            _write_unlocked(self.path, data)
+
+    def set_resource_state(self, enabled=True, target_percent=90,
+                           main_requested=False, protected=False,
+                           throttle="normal", cpu_percent=None):
+        """Publish load-control state and atomically claim the unique main role."""
+        with _registry_lock(self.path):
+            data = _read_unlocked(self.path)
+            live = _live_entries(data["entries"], self.identity_provider)
+            stored = {
+                token: {field: value for field, value in entry.items() if field != "token"}
+                for token, entry in live.items()
+            }
+            other_main = any(
+                token != self.token
+                and isinstance(entry.get("resource"), dict)
+                and bool(entry["resource"].get("main_effective", False))
+                for token, entry in stored.items()
+            )
+            existing = dict(stored.get(self.token, {}))
+            existing.update({
+                "pid": self.pid,
+                "process_identity": str(self.process_identity),
+                "input_set": str(existing.get("input_set", "")),
+                "combined_set": str(existing.get("combined_set", "")),
+                "profile": self.profile,
+                "started_at": str(existing.get("started_at", self.started_at)),
+                "updated_at": _utc_now_text(),
+            })
+            main_effective = bool(main_requested and not other_main)
+            resource = {
+                "enabled": bool(enabled),
+                "target_percent": int(target_percent),
+                "main_requested": bool(main_requested),
+                "main_effective": main_effective,
+                "protected": bool(protected),
+                "throttle": str(throttle or "normal"),
+            }
+            if cpu_percent is not None:
+                resource["cpu_percent"] = round(float(cpu_percent), 1)
+            existing["resource"] = resource
+            stored[self.token] = existing
+            data["entries"] = stored
+            self.closed = False
+            _write_unlocked(self.path, data)
+            return main_effective
 
     def is_last_focused(self):
         entries = self.entries(include_self=True)

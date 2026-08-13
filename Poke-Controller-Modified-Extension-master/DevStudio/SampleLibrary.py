@@ -11,6 +11,39 @@ import os
 SCHEMA_VERSION = 2
 
 
+def _node_end_line(node, lines):
+    end = getattr(node, "end_lineno", None)
+    if end is not None:
+        return end
+    compound_nodes = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef,
+                      ast.If, ast.For, ast.While, ast.Try, ast.With)
+    if not isinstance(node, compound_nodes):
+        balance = 0
+        for index in range(node.lineno - 1, len(lines)):
+            value = lines[index]
+            balance += sum(value.count(mark) for mark in "([{")
+            balance -= sum(value.count(mark) for mark in ")]}")
+            if balance <= 0 and not value.rstrip().endswith("\\"):
+                return index + 1
+        return len(lines)
+    header_end = node.lineno - 1
+    balance = 0
+    for index in range(node.lineno - 1, len(lines)):
+        value = lines[index]
+        balance += sum(value.count(mark) for mark in "([{")
+        balance -= sum(value.count(mark) for mark in ")]}")
+        if balance <= 0 and value.rstrip().endswith(":"):
+            header_end = index
+            break
+    for index in range(header_end + 1, len(lines)):
+        value = lines[index]
+        stripped = value.strip()
+        if stripped and not stripped.startswith("#") and \
+                len(value) - len(value.lstrip(" \t")) <= node.col_offset:
+            return index
+    return len(lines)
+
+
 def _literal_string(node):
     """Return a string AST literal across Python 3.7 through 3.14."""
     constant_type = getattr(ast, "Constant", ())
@@ -40,11 +73,23 @@ def normalize_library(value):
                 if isinstance(member, str):
                     member = {"type": "fragment", "id": member}
                 if isinstance(member, dict) and member.get("type") in ("fragment", "list") and member.get("id"):
-                    members.append({"type": member["type"], "id": str(member["id"])})
+                    normalized_member = {
+                        "type": member["type"], "id": str(member["id"])}
+                    if member["type"] == "fragment" and member.get("function"):
+                        normalized_member["function"] = str(member["function"])
+                    if member["type"] == "fragment" and member.get("origin_path"):
+                        normalized_member["origin_path"] = str(member["origin_path"])
+                    if member["type"] == "fragment" and member.get("origin_function"):
+                        normalized_member["origin_function"] = str(
+                            member["origin_function"])
+                    members.append(normalized_member)
             result["lists"][str(name)] = {
                 "tags": [str(tag) for tag in item.get("tags", []) if str(tag).strip()],
                 "members": members,
             }
+            if item.get("origin_path"):
+                result["lists"][str(name)]["origin_path"] = str(
+                    item["origin_path"])
         return result
     result = empty_library()
     for name, members in value.items():
@@ -135,21 +180,58 @@ def load_fragment(fragment_root, fragment_id):
 
 def compose_preview(fragment_root, data, list_name):
     imports, variables, initializers, bodies, included = [], [], [], [], []
-    for member in resolve_members(data, list_name):
+    external_variables = []
+    members = resolve_members(data, list_name)
+    dependency_support = False
+    for member in members:
+        if member.get("function"):
+            continue
+        metadata, _body, _, _ = load_fragment(fragment_root, member["id"])
+        if metadata.get("dependency_group"):
+            dependency_support = True
+            break
+    for member in members:
         metadata, body, _, _ = load_fragment(fragment_root, member["id"])
-        imports.extend(metadata.get("imports", []))
-        variables.extend(metadata.get("class_variables", []))
-        initializer = metadata.get("initializer", "")
-        if str(initializer).strip():
-            initializers.append(str(initializer).rstrip())
-        bodies.append(body.rstrip())
-        included.append(metadata.get("name", member["id"]))
+        external_variables.extend(metadata.get("external_class_variables", []))
+        external_variables.extend(
+            metadata.get("dependency_group", {}).get(
+                "external_class_variables", []))
+        function_name = str(member.get("function", "")).strip()
+        # A dependency-group support fragment contains the exact imports and
+        # initialization for the whole group.  Function-scoped references then
+        # contribute only their selected function body; importing their parent
+        # fragment metadata would reintroduce unrelated state and duplicates.
+        body_only = bool(function_name and dependency_support)
+        if not body_only:
+            imports.extend(metadata.get("imports", []))
+            variables.extend(metadata.get("class_variables", []))
+            initializer = metadata.get("initializer", "")
+            if str(initializer).strip():
+                initializers.append(str(initializer).rstrip())
+        if function_name:
+            tree = ast.parse(body)
+            node = next((value for value in tree.body
+                         if isinstance(value, (ast.FunctionDef, ast.AsyncFunctionDef)) and
+                         value.name == function_name), None)
+            if node is None:
+                raise ValueError(
+                    "サンプル内に指定関数がありません: {} / {}".format(
+                        member["id"], function_name))
+            lines = body.splitlines(True)
+            selected_body = "".join(
+                lines[node.lineno - 1:_node_end_line(node, lines)])
+            bodies.append(selected_body.rstrip())
+            included.append(function_name)
+        elif body.strip() and not body.lstrip().startswith("# Support settings"):
+            bodies.append(body.rstrip())
+            included.append(metadata.get("name", member["id"]))
     return {
         "imports": list(dict.fromkeys(imports)),
         "class_variables": list(dict.fromkeys(variables)),
         "initializers": initializers,
         "bodies": bodies,
         "included": included,
+        "external_class_variables": list(dict.fromkeys(external_variables)),
         "image_targets": image_targets_from_bodies(bodies),
     }
 

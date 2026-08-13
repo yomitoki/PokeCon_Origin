@@ -158,7 +158,21 @@ class PythonCommand(CommandBase.Command):
                     self.LINE_text(f"{self.app_name} (profile:{self.profilename})\n{self.cur_command_name} started.")
                 if self.isDiscordNotStart:
                     self.discord_text(f"{self.app_name} (profile:{self.profilename})\n{self.cur_command_name} started.")
-                self.do()
+                while True:
+                    try:
+                        self.do()
+                        break
+                    except StopThread:
+                        raise
+                    except Exception as command_error:
+                        try:
+                            from CommandRunOptions import perform_failure_save_recovery
+                            retry = perform_failure_save_recovery(
+                                self, command_error)
+                        except (ImportError, TypeError, ValueError):
+                            retry = False
+                        if not retry:
+                            raise
                 self.finish()
         except StopThread:
             print("-- finished successfully. --")

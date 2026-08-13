@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 COMMAND_INPUT_SET_VARIABLES = frozenset((
@@ -14,6 +14,9 @@ COMMAND_INPUT_SET_VARIABLES = frozenset((
     "image_match_debug_command", "image_match_debug_output",
     "command_watch_enabled", "command_watch_command", "command_watch_target",
     "step_debug_skip_confirm",
+    "operation_capture_output_dir", "operation_capture_include_audio",
+    "operation_capture_auto_controller", "operation_gamepad_profile_name",
+    "operation_capture_last_session",
 ))
 
 
@@ -37,7 +40,8 @@ def strip_commands_from_snapshot(snapshot):
     result = copy.deepcopy(snapshot) if isinstance(snapshot, dict) else {}
     result["commands_enabled"] = False
     for key in ("command_selection", "shortcuts", "commands_assist",
-                "command_watch_variables", "controller_recordings"):
+                "command_watch_variables", "controller_recordings",
+                "operation_capture"):
         result.pop(key, None)
     values = result.get("values")
     if isinstance(values, dict):
@@ -56,18 +60,24 @@ def strip_commands_from_snapshot(snapshot):
     return result
 
 
-# Persist user choices only.  Status text, active recording/controller flags,
-# dialog fields and discovered hardware labels are intentionally excluded.
+# Persist user choices only. Status text, active recording state, dialog
+# fields and discovered hardware labels are excluded. Manual Control's
+# explicitly selected enabled/permission state belongs to each InputSet.
 INPUT_SET_VARIABLES = (
     # Camera / display
     "is_show_realtime", "is_show_value", "is_show_guide", "is_show_serial",
-    "is_use_keyboard", "fps", "show_size", "video_source", "window_capture_mode",
+    "fps", "show_size", "video_source", "window_capture_mode",
     "last_active_preview_full_fps",
+    # Multi-instance resource control
+    "resource_control_enabled", "resource_cpu_target", "resource_main_tool",
     # Audio
     "audio_input", "audio_gain", "audio_filter_camera", "audio_auto_start",
     "audio_monitor_mode",
-    # Serial / manual control (authorization remains session-only)
-    "serial_data_format_name", "pc_gamepad", "is_record_Pro_Controller",
+    # Serial / Manual Control
+    "serial_data_format_name", "is_use_keyboard",
+    "is_use_left_stick_mouse", "is_use_right_stick_mouse",
+    "pc_gamepad", "is_record_Pro_Controller", "is_use_Pro_Controller",
+    "pc_gamepad_input_enabled",
     # Analysis
     "vision_mode", "image_assist_enabled", "image_assist_output",
     "image_assist_game_tag", "image_assist_console_tag", "image_assist_filter_mode",
@@ -75,7 +85,7 @@ INPUT_SET_VARIABLES = (
     "image_detection_monitor_search", "image_detection_monitor_target",
     "image_detection_monitor_variant", "image_detection_monitor_enabled",
     "image_detection_monitor_interval", "image_detection_monitor_output",
-    "image_detection_monitor_output_tag",
+    "image_detection_monitor_output_tag", "image_detection_monitor_value_timeout",
     "object_detection_roi", "object_detection_threshold", "object_detection_scale_variation",
     # Recording
     "record_mode", "record_output_dir", "record_template_path", "record_threshold",
@@ -85,7 +95,12 @@ INPUT_SET_VARIABLES = (
     "record_output_value", "record_output_detection",
     "record_monitor_chunk_seconds", "record_monitor_keep_steps",
     "record_monitor_loop_cycles", "record_monitor_long_seconds",
+    "record_monitor_failure_tail_seconds",
     "record_monitor_auto_arm", "record_monitor_confirm_delete_on_stop",
+    # Long-form PC-controller + video authoring session
+    "operation_capture_output_dir", "operation_capture_include_audio",
+    "operation_capture_auto_controller", "operation_gamepad_profile_name",
+    "operation_capture_last_session",
     # Area Capture
     "area_capture_roi", "area_capture_output_target", "area_capture_step",
     "area_capture_background", "area_capture_active", "area_capture_detection_scope",
@@ -107,6 +122,32 @@ INPUT_SET_VARIABLES = (
     "panel_ratio", "right_panel_ratio", "area_size", "show_software_controller",
     "pos_software_controller", "pos_dialogue_buttons",
 )
+
+
+OUTPUT_LAYOUT_VARIABLES = frozenset((
+    "side_width_balance", "panel_ratio", "right_panel_ratio",
+))
+
+
+RESOURCE_INPUT_SET_DEFAULTS = {
+    "resource_control_enabled": True,
+    "resource_cpu_target": 90,
+    "resource_main_tool": False,
+}
+
+
+def snapshot_values_with_defaults(snapshot):
+    """Return stored tab values without inheriting another InputSet's state.
+
+    Resource control was added after complete InputSet snapshots existed.  A
+    missing Resource key must therefore use a safe per-set default instead of
+    leaving the previously loaded InputSet's Tk variable unchanged.
+    """
+    values = snapshot.get("values", {}) if isinstance(snapshot, dict) else {}
+    result = copy.deepcopy(values) if isinstance(values, dict) else {}
+    for name, value in RESOURCE_INPUT_SET_DEFAULTS.items():
+        result.setdefault(name, value)
+    return result
 
 
 def has_complete_snapshot(input_set):
@@ -176,8 +217,24 @@ def sync_quick_actions(data, input_set_name, snapshot):
     return True
 
 
-def sync_command_start_overrides(data, input_set_name, overrides):
-    """Save normal Commands start positions separately from Step-debug rules."""
+def sync_output_layout(data, input_set_name, values):
+    """Continuously save the log-boundary sliders into the loaded InputSet."""
+    if not isinstance(data, dict) or not input_set_name or not isinstance(values, dict):
+        return False
+    item = data.get("input_sets", {}).get(input_set_name)
+    if not isinstance(item, dict) or not isinstance(item.get("all_tabs"), dict):
+        return False
+    saved_values = item["all_tabs"].setdefault("values", {})
+    if not isinstance(saved_values, dict):
+        return False
+    for name in OUTPUT_LAYOUT_VARIABLES:
+        if name in values:
+            saved_values[name] = copy.deepcopy(values[name])
+    return True
+
+
+def sync_command_start_overrides(data, input_set_name, overrides, favorites=None):
+    """Save Commands run ranges/favorites separately from Step-debug rules."""
     if not isinstance(data, dict) or not input_set_name or not isinstance(overrides, dict):
         return False
     item = data.get("input_sets", {}).get(input_set_name)
@@ -189,4 +246,11 @@ def sync_command_start_overrides(data, input_set_name, overrides):
     item.setdefault("commands_assist", {})["start_overrides"] = saved
     if isinstance(item.get("all_tabs"), dict):
         item["all_tabs"].setdefault("commands_assist", {})["start_overrides"] = copy.deepcopy(saved)
+    if isinstance(favorites, dict):
+        saved_favorites = copy.deepcopy(favorites)
+        item.setdefault("commands_assist", {})["run_favorites"] = saved_favorites
+        if isinstance(item.get("all_tabs"), dict):
+            item["all_tabs"].setdefault(
+                "commands_assist", {})["run_favorites"] = copy.deepcopy(
+                    saved_favorites)
     return True

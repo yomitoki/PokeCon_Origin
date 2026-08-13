@@ -45,6 +45,10 @@ def select_game_input_profile(self, profile_index=0):
         )
     self.game_input_profile_index = profile_index
     self.game_input_map = self.game_input_profiles[profile_index]
+    if not isinstance(getattr(self, 'game_image_profiles', None), dict):
+        self.game_image_profiles = {
+            'switch': {}, 'steam': {}, 'ps4': {}, 'keyboard': {},
+        }
 
 
 def set_game_input_mapping(self, controller_input, *keyboard_keys):
@@ -57,8 +61,186 @@ def set_game_input_mapping(self, controller_input, *keyboard_keys):
     self.game_input_map[str(controller_input)] = keys
 
 
+def set_game_image_mapping(self, platform_name, logical_name, platform_image_name):
+    """論理画像名を機種別画像名へ差し替える。空文字なら共通名へ戻す。"""
+    platform_name = str(platform_name).strip().lower()
+    if platform_name not in ('switch', 'steam', 'ps4', 'keyboard'):
+        raise ValueError("未対応の画像プロファイルです: " + platform_name)
+    profiles = getattr(self, 'game_image_profiles', None)
+    if not isinstance(profiles, dict):
+        self.game_image_profiles = {
+            'switch': {}, 'steam': {}, 'ps4': {}, 'keyboard': {},
+        }
+    profile = self.game_image_profiles.setdefault(platform_name, {})
+    logical_name = str(logical_name)
+    if platform_image_name is None or str(platform_image_name) == '':
+        profile.pop(logical_name, None)
+    else:
+        profile[logical_name] = str(platform_image_name)
+
+
+def game_image_target(self, logical_name, platform_name=None):
+    """共通論理名を、登録があれば現在機種専用の画像名へ解決する。"""
+    logical_name = str(logical_name)
+    platform_name = str(
+        platform_name or getattr(self, 'game_input_target', 'switch')
+    ).strip().lower()
+    profiles = getattr(self, 'game_image_profiles', {})
+    profile = profiles.get(platform_name, {}) if isinstance(profiles, dict) else {}
+    return str(profile.get(logical_name, logical_name))
+
+
+def game_image_check(self, logical_name, nocheckflag=1):
+    """初期状態は全機種共通、必要になった画像だけ機種別名で検知する。"""
+    return self.image_check(
+        self.game_image_target(logical_name), nocheckflag
+    )
+
+
+def game_input_state(self, controller_inputs, duration=0.1, wait=0.1):
+    """複数の意味付き入力をSwitchまたはPCキーへ同時に送る。"""
+    # Keep this fragment safe even in an older local sample manifest whose
+    # import list predates portable stick input.
+    from Commands.Keys import Button, Direction, Hat, Stick
+
+    if isinstance(controller_inputs, str):
+        controller_inputs = [controller_inputs]
+    input_names = [str(value) for value in controller_inputs]
+    if not input_names:
+        if wait > 0:
+            self.wait(wait)
+        return
+
+    target = str(self.game_input_target).strip().lower()
+
+    def exact_stick(value):
+        """Parse a generated Lstick@angle/magnitude portable token."""
+        for prefix, stick in (('Lstick@', Stick.LEFT), ('Rstick@', Stick.RIGHT)):
+            if not value.startswith(prefix):
+                continue
+            try:
+                angle_text, magnitude_text = value[len(prefix):].split('/', 1)
+                return stick, float(angle_text) % 360.0, max(
+                    0.0, min(1.0, float(magnitude_text)))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def eight_way_stick_name(value):
+        parsed = exact_stick(value)
+        if parsed is None:
+            return value
+        stick, angle, _magnitude = parsed
+        directions = (
+            'right', 'up_right', 'up', 'up_left',
+            'left', 'down_left', 'down', 'down_right',
+        )
+        prefix = 'Lstick' if stick == Stick.LEFT else 'Rstick'
+        return '{}_{}'.format(
+            prefix, directions[int((angle + 22.5) // 45.0) % 8])
+    if target == 'switch':
+        switch_inputs = {
+            'Lbutton_up': Hat.TOP,
+            'Lbutton_up_right': Hat.TOP_RIGHT,
+            'Lbutton_right': Hat.RIGHT,
+            'Lbutton_down_right': Hat.BTM_RIGHT,
+            'Lbutton_down': Hat.BTM,
+            'Lbutton_down_left': Hat.BTM_LEFT,
+            'Lbutton_left': Hat.LEFT,
+            'Lbutton_up_left': Hat.TOP_LEFT,
+            'A': Button.A, 'B': Button.B, 'X': Button.X, 'Y': Button.Y,
+            'L': Button.L, 'R': Button.R, 'ZL': Button.ZL, 'ZR': Button.ZR,
+            'PLUS': Button.PLUS, 'MINUS': Button.MINUS,
+            'LCLICK': Button.LCLICK, 'RCLICK': Button.RCLICK,
+            'HOME': Button.HOME, 'CAPTURE': Button.CAPTURE,
+            'Lstick_right': Direction(Stick.LEFT, 0),
+            'Lstick_up_right': Direction(Stick.LEFT, 45),
+            'Lstick_up': Direction(Stick.LEFT, 90),
+            'Lstick_up_left': Direction(Stick.LEFT, 135),
+            'Lstick_left': Direction(Stick.LEFT, 180),
+            'Lstick_down_left': Direction(Stick.LEFT, 225),
+            'Lstick_down': Direction(Stick.LEFT, 270),
+            'Lstick_down_right': Direction(Stick.LEFT, 315),
+            'Rstick_right': Direction(Stick.RIGHT, 0),
+            'Rstick_up_right': Direction(Stick.RIGHT, 45),
+            'Rstick_up': Direction(Stick.RIGHT, 90),
+            'Rstick_up_left': Direction(Stick.RIGHT, 135),
+            'Rstick_left': Direction(Stick.RIGHT, 180),
+            'Rstick_down_left': Direction(Stick.RIGHT, 225),
+            'Rstick_down': Direction(Stick.RIGHT, 270),
+            'Rstick_down_right': Direction(Stick.RIGHT, 315),
+        }
+        switch_values = []
+        missing = []
+        for name in input_names:
+            parsed = exact_stick(name)
+            if parsed is not None:
+                stick, angle, magnitude = parsed
+                switch_values.append(Direction(
+                    stick, angle, magnification=magnitude))
+            elif name in switch_inputs:
+                switch_values.append(switch_inputs[name])
+            else:
+                missing.append(name)
+        if missing:
+            raise ValueError("未対応のSwitch入力名です: " + ", ".join(missing))
+        self.press(switch_values, duration=duration, wait=wait)
+        return
+
+    if target not in ('steam', 'ps4', 'keyboard'):
+        raise ValueError("未対応の入力先です: " + str(self.game_input_target))
+    # Keyboard-backed targets cannot express arbitrary analogue values.  They
+    # intentionally fall back to the nearest of their editable eight-way keys.
+    input_names = [eight_way_stick_name(name) for name in input_names]
+    # Initial cross-platform defaults.  game_input_profiles or
+    # set_game_input_mapping() always takes precedence, so these remain freely
+    # editable after generation.
+    default_keys = {
+        'Lbutton_up': ['up'], 'Lbutton_up_right': ['up', 'right'],
+        'Lbutton_right': ['right'], 'Lbutton_down_right': ['down', 'right'],
+        'Lbutton_down': ['down'], 'Lbutton_down_left': ['down', 'left'],
+        'Lbutton_left': ['left'], 'Lbutton_up_left': ['up', 'left'],
+        'Lstick_up': ['w'], 'Lstick_up_right': ['w', 'd'],
+        'Lstick_right': ['d'], 'Lstick_down_right': ['s', 'd'],
+        'Lstick_down': ['s'], 'Lstick_down_left': ['s', 'a'],
+        'Lstick_left': ['a'], 'Lstick_up_left': ['w', 'a'],
+        'Rstick_up': ['i'], 'Rstick_up_right': ['i', 'l'],
+        'Rstick_right': ['l'], 'Rstick_down_right': ['k', 'l'],
+        'Rstick_down': ['k'], 'Rstick_down_left': ['k', 'j'],
+        'Rstick_left': ['j'], 'Rstick_up_left': ['i', 'j'],
+        'A': ['enter'], 'B': ['esc'], 'X': ['x'], 'Y': ['y'],
+        'L': ['q'], 'R': ['e'], 'ZL': ['z'], 'ZR': ['c'],
+        'PLUS': ['enter'], 'MINUS': ['tab'],
+        'LCLICK': ['v'], 'RCLICK': ['b'],
+        'HOME': ['home'], 'CAPTURE': ['f12'],
+    }
+    missing = [name for name in input_names
+               if name not in self.game_input_map and name not in default_keys]
+    if missing:
+        raise ValueError(
+            "プロファイル{}に入力名がありません: {}".format(
+                self.game_input_profile_index, ", ".join(missing)
+            )
+        )
+    keys = []
+    for input_name in input_names:
+        mapped_keys = (self.game_input_map[input_name]
+                       if input_name in self.game_input_map
+                       else default_keys[input_name])
+        for key in mapped_keys:
+            if key not in keys:
+                keys.append(key)
+    if len(keys) > 5:
+        raise ValueError("同時入力へ割り当てられるキーボードキーは最大5個です。")
+    padded_keys = keys + [''] * (5 - len(keys))
+    self.steam_keyboard_press(
+        padded_keys[0], padded_keys[1], padded_keys[2],
+        padded_keys[3], padded_keys[4], duration=duration, wait=wait,
+    )
+
+
 def game_input(self, controller_input, duration=0.1, wait=0.1):
-    """コントローラー名をSteam等のキー入力またはSwitch入力へ振り分ける。
+    """1個のコントローラー名をgame_input_state()へ渡す互換API。
 
     使用例:
         self.game_input('Lbutton_down')
@@ -67,53 +249,6 @@ def game_input(self, controller_input, duration=0.1, wait=0.1):
     INPUT_TARGETがswitchならPokeCon標準のSwitch入力を使用する。
     steam、ps4、keyboardなら選択中プロファイルの最大5キーを同時入力する。
     """
-    target = str(self.game_input_target).strip().lower()
-    input_name = str(controller_input)
-
-    if target == 'switch':
-        switch_inputs = {
-            'Lbutton_up': Hat.TOP,
-            'Lbutton_down': Hat.BTM,
-            'Lbutton_left': Hat.LEFT,
-            'Lbutton_right': Hat.RIGHT,
-            'A': Button.A,
-            'B': Button.B,
-            'X': Button.X,
-            'Y': Button.Y,
-            'L': Button.L,
-            'R': Button.R,
-            'ZL': Button.ZL,
-            'ZR': Button.ZR,
-            'PLUS': Button.PLUS,
-            'MINUS': Button.MINUS,
-            'HOME': Button.HOME,
-            'CAPTURE': Button.CAPTURE,
-        }
-        if input_name not in switch_inputs:
-            raise ValueError("未対応のSwitch入力名です: " + input_name)
-        self.press(switch_inputs[input_name], duration=duration, wait=wait)
-        return
-
-    if target not in ('steam', 'ps4', 'keyboard'):
-        raise ValueError("未対応の入力先です: " + str(self.game_input_target))
-
-    if input_name not in self.game_input_map:
-        raise ValueError(
-            "プロファイル{}に入力名がありません: {}".format(
-                self.game_input_profile_index, input_name
-            )
-        )
-
-    keys = list(self.game_input_map[input_name])
-    if len(keys) > 5:
-        raise ValueError("同時入力へ割り当てられるキーボードキーは最大5個です。")
-    padded_keys = keys + [''] * (5 - len(keys))
-    self.steam_keyboard_press(
-        padded_keys[0],
-        padded_keys[1],
-        padded_keys[2],
-        padded_keys[3],
-        padded_keys[4],
-        duration=duration,
-        wait=wait,
+    return self.game_input_state(
+        [controller_input], duration=duration, wait=wait
     )

@@ -4,10 +4,16 @@ from __future__ import annotations
 from typing import List, TYPE_CHECKING
 
 import pygame
-import numpy as np
 import datetime
+import math
 import time
+import threading
 from logging import getLogger, DEBUG, NullHandler
+
+from OperationGamepadMap import (DEFAULT_MAPPING, controls_for_token,
+                                 gamepad_axis_token,
+                                 normalize_gamepad_mapping,
+                                 opposite_axis_tokens)
 
 if TYPE_CHECKING:
     from Commands.Sender import Sender
@@ -16,63 +22,41 @@ if TYPE_CHECKING:
 class ProController:
     flag_procon = False
     ACTIVITY_NOTIFICATION_IDLE_SECONDS = 10 * 60
+    # State-change packets are cheap.  Polling at 240 Hz keeps the controller
+    # side below one display frame of latency without sending duplicate serial
+    # traffic or involving Tk's event loop.
+    POLL_HZ = 240
+
+    CONTROL_BITS = {
+        "Y": 2, "B": 3, "A": 4, "X": 5, "L": 6, "R": 7,
+        "ZL": 8, "ZR": 9, "MINUS": 10, "PLUS": 11,
+        "LCLICK": 12, "RCLICK": 13, "HOME": 14, "CAPTURE": 15,
+    }
+    DPAD_BITS = {"DPAD_UP": 1, "DPAD_RIGHT": 2,
+                  "DPAD_DOWN": 4, "DPAD_LEFT": 8}
 
     def __init__(self, joystick_index=0, input_enabled_event=None, activity_callback=None,
-                 state_callback=None):
+                 state_callback=None, input_callback=None, control_mapping=None,
+                 physical_input_callback=None):
         self.joystick_index = max(0, int(joystick_index))
         self.input_enabled_event = input_enabled_event
         self.activity_callback = activity_callback
         self.state_callback = state_callback
+        self.input_callback = input_callback
+        self.physical_input_callback = physical_input_callback
+        self._mapping_lock = threading.RLock()
+        self.control_mapping = normalize_gamepad_mapping(
+            control_mapping if control_mapping is not None else DEFAULT_MAPPING)
+        self._active_axis_tokens = {}
+        self._axis_suppressed_tokens = {}
+        self._preview_axis_tokens = {}
+        self._preview_axis_suppressed_tokens = {}
+        self._polled_button_states = {}
+        self._polled_hat_states = {}
+        self._neutral_blocker_state = ""
+        self._axis_rebaseline_pending = True
         self.last_activity_at = None
         self.joystick_instance_id = None
-        self.axis_dict = {
-            0: "L-X",
-            1: "L-Y",
-            2: "R-X",
-            3: "R-Y",
-            4: "ZL",
-            5: "ZR",
-        }
-
-        self.button_dict = {
-            0: "A",
-            1: "B",
-            2: "X",
-            3: "Y",
-            4: "MINUS",
-            5: "HOME",
-            6: "PLUS",
-            7: "LSTICK",
-            8: "RSTICK",
-            9: "L",
-            10: "R",
-            11: "UP",
-            12: "DOWN",
-            13: "LEFT",
-            14: "RIGHT",
-            15: "CAPTURE",
-        }
-
-        self.button_dict_shift = {
-            0: 4,
-            1: 3,
-            2: 5,
-            3: 2,
-            4: 10,
-            # The physical Guide/Home button is reserved by Steam on Windows.
-            # Do not forward it to Switch; Steam may also handle it globally.
-            6: 11,
-            7: 12,
-            8: 13,
-            9: 6,
-            10: 7,
-            11: 0,
-            12: 2,
-            13: 3,
-            14: 1,
-            15: 15,
-        }
-
         self.hat_dict = {
             0: 8,  # center
             1: 0,  # up
@@ -108,6 +92,131 @@ class ProController:
         self._logger.setLevel(DEBUG)
         self._logger.propagate = True
 
+    def set_control_mapping(self, mapping):
+        """Replace the physical-button map without restarting the bridge."""
+        with self._mapping_lock:
+            self.control_mapping = normalize_gamepad_mapping(mapping)
+            self.bits_16 &= 3
+            self.hat_status = 0
+            self._active_axis_tokens.clear()
+            self._axis_suppressed_tokens.clear()
+            self._preview_axis_tokens.clear()
+            self._preview_axis_suppressed_tokens.clear()
+            self.flag_print = True
+            self._axis_rebaseline_pending = True
+
+    def mapped_axis_indices(self):
+        indices = set()
+        with self._mapping_lock:
+            sources = tuple(self.control_mapping.values())
+        for source in sources:
+            if source.startswith("axis:"):
+                try:
+                    indices.add(int(source.split(":", 1)[1][:-1]))
+                except (ValueError, IndexError):
+                    pass
+        return indices
+
+    def stabilize_mapped_axis_baselines(self, joystick):
+        """Learn trigger rest values after SDL has finished initializing them."""
+        for index in self.mapped_axis_indices():
+            if index < joystick.get_numaxes():
+                self.axis_baseline[index] = float(joystick.get_axis(index))
+        self._axis_rebaseline_pending = False
+
+    def report_physical_input(self, token, pressed):
+        if self.physical_input_callback is None:
+            return
+        try:
+            self.physical_input_callback(str(token), bool(pressed))
+        except Exception as error:
+            self._logger.debug("Physical input callback failed: %s", error)
+
+    def _apply_physical(self, token, pressed):
+        with self._mapping_lock:
+            controls = controls_for_token(self.control_mapping, token)
+        for control in controls:
+            if control in self.CONTROL_BITS:
+                mask = 1 << self.CONTROL_BITS[control]
+                if pressed:
+                    self.bits_16 |= mask
+                else:
+                    self.bits_16 &= ~mask
+            elif control in self.DPAD_BITS:
+                mask = self.DPAD_BITS[control]
+                if pressed:
+                    self.hat_status |= mask
+                else:
+                    self.hat_status &= ~mask
+        if controls:
+            self.flag_print = True
+        self.report_physical_input(token, pressed)
+
+    def poll_digital_states(self, joystick, forward=False, report=True):
+        """Poll buttons/hats so mapping preview cannot lose short SDL events."""
+        for index in range(joystick.get_numbuttons()):
+            current = bool(joystick.get_button(index))
+            if index not in self._polled_button_states:
+                self._polled_button_states[index] = current
+                continue
+            previous = self._polled_button_states[index]
+            if current != previous:
+                token = "button:{}".format(index)
+                if forward:
+                    self._apply_physical(token, current)
+                elif report:
+                    self.report_physical_input(token, current)
+                self._polled_button_states[index] = current
+
+        for index in range(joystick.get_numhats()):
+            x, y = joystick.get_hat(index)
+            current = set()
+            if y > 0: current.add("hat:up")
+            if y < 0: current.add("hat:down")
+            if x > 0: current.add("hat:right")
+            if x < 0: current.add("hat:left")
+            if index not in self._polled_hat_states:
+                self._polled_hat_states[index] = current
+                continue
+            previous = self._polled_hat_states[index]
+            for token in previous - current:
+                if forward:
+                    self._apply_physical(token, False)
+                elif report:
+                    self.report_physical_input(token, False)
+            for token in current - previous:
+                if forward:
+                    self._apply_physical(token, True)
+                elif report:
+                    self.report_physical_input(token, True)
+            self._polled_hat_states[index] = current
+
+    def physical_token_is_mapped(self, token):
+        with self._mapping_lock:
+            return bool(controls_for_token(self.control_mapping, token))
+
+    @staticmethod
+    def _axis_transition(index, current, active, suppressed, callback,
+                         allow_opposite=None):
+        previous = active.get(index, "")
+        if previous and previous != current:
+            callback(previous, False)
+            if (opposite_axis_tokens(previous, current)
+                    and not (allow_opposite is not None and allow_opposite(current))):
+                suppressed[index] = current
+        if not current:
+            suppressed.pop(index, None)
+        elif index in suppressed and current != suppressed[index]:
+            suppressed.pop(index, None)
+        if current == suppressed.get(index):
+            current = ""
+        if current and current != previous:
+            callback(current, True)
+        if current:
+            active[index] = current
+        else:
+            active.pop(index, None)
+
     @staticmethod
     def devices():
         """Return connected PC gamepads."""
@@ -132,16 +241,21 @@ class ProController:
 
     def joystick_move_detection(self, joystick: pygame.Joystick):
         axis_count = joystick.get_numaxes()
+        mapped_button_axes = self.mapped_axis_indices()
 
         def axis(index):
             return joystick.get_axis(index) if index < axis_count else 0.0
 
         def axis_from_neutral(index):
+            # A trigger can be reported on an axis that another controller uses
+            # for a stick. Once taught as a button, do not also move that stick.
+            if index in mapped_button_axes:
+                return 0.0
             value = float(axis(index)) - float(self.axis_baseline.get(index, 0.0))
             return max(-1.0, min(1.0, value))
 
         # Lstickの位置を確認する。
-        if np.sqrt(axis_from_neutral(0) ** 2 + axis_from_neutral(1) ** 2) < 0.35:
+        if math.hypot(axis_from_neutral(0), axis_from_neutral(1)) < 0.35:
             self.stick_status_new[0] = 128
             self.stick_status_new[1] = 128
         else:
@@ -158,7 +272,7 @@ class ProController:
             self.bits_16 = self.bits_16 | 2
 
         # Rstickの位置を確認する。
-        if np.sqrt(axis_from_neutral(2) ** 2 + axis_from_neutral(3) ** 2) < 0.35:
+        if math.hypot(axis_from_neutral(2), axis_from_neutral(3)) < 0.35:
             self.stick_status_new[2] = 128
             self.stick_status_new[3] = 128
         else:
@@ -204,44 +318,32 @@ class ProController:
                 continue
             if event.type == pygame.JOYAXISMOTION:
                 axis_index = int(event.dict["axis"])
-                if axis_index < 4:
-                    if abs(event.dict["value"]) < 0.3:
-                        pass
-                    else:
-                        pass
-                elif axis_index in (4, 5):
-                    self.flag_print = True
-                    baseline = self.trigger_baseline.get(axis_index, event.dict["value"])
-                    if abs(float(event.dict["value"]) - baseline) >= 0.5:
-                        self.bits_16 = self.bits_16 | (1 << (axis_index + 4))
-                    else:
-                        self.bits_16 = self.bits_16 & ~(1 << (axis_index + 4))
-            elif event.type == pygame.JOYBUTTONDOWN:
-                button = int(event.dict["button"])
-                shift = self.button_dict_shift.get(button)
-                if shift is None:
-                    self._logger.debug("Ignore unmapped gamepad button: %s", button)
-                    continue
-                self.flag_print = True
-                if button <= 10 or button == 15:
-                    self.bits_16 = self.bits_16 | (1 << shift)
-                else:
-                    self.hat_status = self.hat_status | (1 << shift)
-            elif event.type == pygame.JOYBUTTONUP:
-                button = int(event.dict["button"])
-                shift = self.button_dict_shift.get(button)
-                if shift is None:
-                    continue
-                self.flag_print = True
-                if button <= 10 or button == 15:
-                    self.bits_16 = self.bits_16 & ~(1 << shift)
-                else:
-                    self.hat_status = self.hat_status & ~(1 << shift)
-            elif event.type == pygame.JOYHATMOTION:
-                x, y = event.value
-                self.hat_status = ((1 if y > 0 else 0) | (4 if y < 0 else 0)
-                                   | (2 if x > 0 else 0) | (8 if x < 0 else 0))
-                self.flag_print = True
+                current = gamepad_axis_token(
+                    axis_index, event.dict["value"],
+                    self.axis_baseline.get(axis_index, 0.0))
+                self._axis_transition(
+                    axis_index, current, self._active_axis_tokens,
+                    self._axis_suppressed_tokens, self._apply_physical,
+                    allow_opposite=self.physical_token_is_mapped)
+
+    def report_only_events(self, events: List[pygame.Event]):
+        """Publish raw presses for the mapping screen while Serial input is off."""
+        for event in events:
+            if (hasattr(event, "instance_id") and self.joystick_instance_id is not None
+                    and int(event.instance_id) != self.joystick_instance_id):
+                continue
+            if (not hasattr(event, "instance_id") and hasattr(event, "joy")
+                    and int(event.joy) != self.joystick_index):
+                continue
+            if event.type == pygame.JOYAXISMOTION:
+                index = int(event.dict["axis"])
+                current = gamepad_axis_token(
+                    index, event.dict["value"], self.axis_baseline.get(index, 0.0))
+                self._axis_transition(
+                    index, current, self._preview_axis_tokens,
+                    self._preview_axis_suppressed_tokens,
+                    self.report_physical_input,
+                    allow_opposite=self.physical_token_is_mapped)
 
     def send_message(self, ser: Sender, flag_record: bool):
         # 送信するバイナリデータ生成
@@ -251,8 +353,11 @@ class ProController:
         sent = False
         if self.flag_print and self.old_message != self.message:
             self.time0 = datetime.datetime.today()
-            ser.writeRow_wo_perf_counter(self.message, is_show=False)
+            # PC gamepad packets are manual input and must not queue behind a
+            # Commands/software-controller override.
+            ser.writeRow_wo_perf_counter(self.message, is_show=False, priority=True)
             sent = True
+            self.report_input(self.message)
 
             # 記録モードになっている場合のみ
             if flag_record:
@@ -279,6 +384,15 @@ class ProController:
         if self.state_callback is not None:
             self.state_callback(state)
 
+    def report_input(self, message):
+        if self.input_callback is None:
+            return
+        try:
+            self.input_callback(str(message), time.monotonic())
+        except Exception as error:
+            # Capturing authoring metadata must never interrupt live control.
+            self._logger.warning("PC gamepad input callback failed: %s", error)
+
     def suspend_input(self, ser: Sender, flag_record: bool):
         """Release Switch controls once, then discard input while permission is off."""
         self.bits_16 = 0
@@ -288,7 +402,8 @@ class ProController:
         self.stick_bits = " 80 80 80 80"
         self.message = "0x0003 8 80 80 80 80"
         self.time0 = datetime.datetime.today()
-        ser.writeRow_wo_perf_counter(self.message, is_show=False)
+        ser.writeRow_wo_perf_counter(self.message, is_show=False, priority=True)
+        self.report_input(self.message)
         if flag_record:
             self.record_message(False)
         self.old_message = self.message
@@ -298,19 +413,26 @@ class ProController:
 
     def joystick_is_neutral(self, joystick: pygame.Joystick):
         """Require a stable neutral pad before forwarding a newly enabled input."""
-        for index in range(min(4, joystick.get_numaxes())):
+        return not self.joystick_neutral_blocker(joystick)
+
+    def joystick_neutral_blocker(self, joystick: pygame.Joystick):
+        """Return the physical input that is preventing the safety gate."""
+        # Axes explicitly taught as buttons/triggers are calibrated separately
+        # and never block the neutral safety gate. Their +/- direction is used
+        # only when the operation profile maps that token to a Switch control.
+        mapped_button_axes = self.mapped_axis_indices()
+        mapped_axes = set(range(min(4, joystick.get_numaxes()))) - mapped_button_axes
+        for index in mapped_axes:
+            if index >= joystick.get_numaxes():
+                continue
             baseline = float(self.axis_baseline.get(index, 0.0))
             if abs(float(joystick.get_axis(index)) - baseline) >= 0.3:
-                return False
-        # Unmapped Guide/vendor buttons can be reported as permanently held by
-        # Steam virtual devices. They must not block the safety gate forever.
-        for index in self.button_dict_shift:
-            if index < joystick.get_numbuttons() and joystick.get_button(index):
-                return False
-        for index in range(joystick.get_numhats()):
-            if joystick.get_hat(index) != (0, 0):
-                return False
-        return True
+                return "axis:{}".format(index)
+        # Buttons and hats are event-driven. Their startup events are cleared
+        # before entering ready state, so a driver-reported held button cannot
+        # be forwarded and must not keep the whole controller disabled. Once
+        # released and pressed again, a fresh event is handled normally.
+        return ""
 
     def record_message(self, flag_force_write: bool):
         # バイナリデータを追加する。
@@ -324,7 +446,8 @@ class ProController:
 
     def end_sequence(self, ser: Sender, flag_record: bool):
         self.message = "0x0003 8 80 80 80 80"
-        ser.writeRow_wo_perf_counter(self.message, is_show=False)
+        ser.writeRow_wo_perf_counter(self.message, is_show=False, priority=True)
+        self.report_input(self.message)
         if flag_record:
             self.record_message(True)
             self.f.close()
@@ -346,10 +469,7 @@ class ProController:
             index: float(joystick.get_axis(index))
             for index in range(joystick.get_numaxes())
         }
-        self.trigger_baseline = {
-            index: float(joystick.get_axis(index))
-            for index in (4, 5) if index < joystick.get_numaxes()
-        }
+        self.poll_digital_states(joystick, forward=False, report=False)
         self._logger.info("PC gamepad selected: index=%s instance=%s name=%s axes=%s buttons=%s hats=%s",
                           self.joystick_index, self.joystick_instance_id, joystick.get_name(),
                           joystick.get_numaxes(), joystick.get_numbuttons(), joystick.get_numhats())
@@ -378,31 +498,50 @@ class ProController:
                         pygame.event.clear()
                         self.report_state("waiting_neutral")
                     if self.awaiting_neutral:
-                        if self.joystick_is_neutral(joystick):
+                        # SDL/XInput trigger axes often start at 0 and settle at
+                        # -1 after the first event pump. Relearn only axes that
+                        # are mapped as buttons while Serial output is gated.
+                        self.stabilize_mapped_axis_baselines(joystick)
+                        # Treat whatever the driver reports at startup as the
+                        # non-forwarded baseline. Fresh changes after ready are
+                        # polled and delivered even if SDL events were cleared.
+                        self.poll_digital_states(joystick, forward=False, report=False)
+                        blocker = self.joystick_neutral_blocker(joystick)
+                        if not blocker:
                             self.neutral_poll_count += 1
                             if self.neutral_poll_count >= 3:
                                 self.awaiting_neutral = False
                                 pygame.event.clear()
+                                self._neutral_blocker_state = ""
                                 self.report_state("ready")
                         else:
                             self.neutral_poll_count = 0
+                            if blocker != self._neutral_blocker_state:
+                                self._neutral_blocker_state = blocker
+                                self.report_state("waiting_neutral:" + blocker)
                         previously_enabled = enabled
-                        clock.tick(120)
+                        clock.tick(self.POLL_HZ)
                         continue
+                    if self._axis_rebaseline_pending:
+                        self.stabilize_mapped_axis_baselines(joystick)
                     # L/R-Stick and button/hat input are evaluated only while
                     # Camera > Display Settings grants explicit permission.
                     self.joystick_move_detection(joystick)
                     self.event_check(events)
+                    self.poll_digital_states(joystick, forward=True, report=True)
                     if self.send_message(ser, flag_record):
                         self.report_activity()
-                elif previously_enabled:
+                else:
+                    self.report_only_events(events)
+                    self.poll_digital_states(joystick, forward=False, report=True)
+                if not enabled and previously_enabled:
                     # Release any held Switch input exactly once when permission
                     # is revoked, preventing a stuck button or stick direction.
                     self.suspend_input(ser, flag_record)
                     self.report_state("disabled")
                 previously_enabled = enabled
                 # Avoid consuming a CPU core while retaining responsive input.
-                clock.tick(120)
+                clock.tick(self.POLL_HZ)
                 # print("4")
         except Exception as error:
             self._logger.warning("PC gamepad bridge stopped: %s", error)

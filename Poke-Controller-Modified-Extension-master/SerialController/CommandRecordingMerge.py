@@ -66,6 +66,51 @@ def _ordered_unique(values):
     return result
 
 
+def _event_offset(event, chunk):
+    keys = ("video_time", "chunk_time", "elapsed") if chunk.get("merged") \
+        else ("chunk_time", "elapsed", "video_time")
+    for key in keys:
+        try:
+            if event.get(key) not in (None, ""):
+                return max(0.0, float(event[key]))
+        except (TypeError, ValueError):
+            pass
+    try:
+        event_wall = datetime.datetime.fromisoformat(str(event.get("time", "")))
+        chunk_wall = datetime.datetime.fromisoformat(str(chunk.get("started_wall", "")))
+        return max(0.0, (event_wall - chunk_wall).total_seconds())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _copy_timeline_snapshot(event, source_dir, building, prefix):
+    location = event.get("location")
+    if not isinstance(location, dict):
+        return event
+    relative = str(location.get("snapshot", "") or "")
+    if not relative:
+        return event
+    source = os.path.abspath(os.path.join(source_dir, relative))
+    try:
+        if os.path.commonpath([source_dir, source]) != source_dir:
+            return event
+    except ValueError:
+        return event
+    if not os.path.isfile(source):
+        return event
+    target_relative = os.path.join(
+        "source_snapshots", "{}_{}".format(prefix, os.path.basename(source)))
+    target = os.path.join(building, target_relative)
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    if not os.path.isfile(target):
+        shutil.copy2(source, target)
+    updated = dict(event)
+    updated_location = dict(location)
+    updated_location["snapshot"] = target_relative
+    updated["location"] = updated_location
+    return updated
+
+
 def merge_command_recording_chunks(chunks, output_root, session_id,
                                    ffmpeg_path=None, run_command=None,
                                    now=None):
@@ -141,17 +186,31 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
 
         step_output = os.path.join(building, "steps.jsonl")
         with open(step_output, "w", encoding="utf-8", newline="\n") as target:
-            for source in source_dirs:
+            video_offset = 0.0
+            for chunk_index, (source, chunk) in enumerate(
+                    zip(source_dirs, chunks), start=1):
                 path = os.path.join(source, "steps.jsonl")
                 try:
                     with open(path, "r", encoding="utf-8") as stream:
-                        value = stream.read()
-                    if value:
-                        target.write(value)
-                        if not value.endswith("\n"):
+                        for text in stream:
+                            try:
+                                event = json.loads(text)
+                            except ValueError:
+                                continue
+                            if not isinstance(event, dict):
+                                continue
+                            event["video_time"] = round(
+                                video_offset + _event_offset(event, chunk), 6)
+                            event["chunk_index"] = chunk_index
+                            event["source_chunk_id"] = str(chunk.get("id", ""))
+                            event = _copy_timeline_snapshot(
+                                event, source, building,
+                                "{:03d}".format(chunk_index))
+                            json.dump(event, target, ensure_ascii=False)
                             target.write("\n")
                 except OSError:
-                    continue
+                    pass
+                video_offset += _chunk_duration(chunk)
 
         log_output = os.path.join(building, "commands.log")
         with open(log_output, "w", encoding="utf-8", newline="\n") as target:
@@ -174,6 +233,16 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
             started = time.monotonic()
         states = _ordered_unique(
             state for chunk in chunks for state in chunk.get("states", []))
+        sources = []
+        for chunk_index, (source_dir, chunk) in enumerate(
+                zip(source_dirs, chunks), start=1):
+            descriptor = dict(chunk.get("source", {}) or {})
+            if descriptor:
+                copied = _copy_timeline_snapshot(
+                    {"location": descriptor}, source_dir, building,
+                    "{:03d}".format(chunk_index)).get("location", descriptor)
+                if copied not in sources:
+                    sources.append(copied)
         chunk_id = "merged-{}-{}".format(session_id, uuid.uuid4().hex)
         runtime_chunk = {
             "id": chunk_id,
@@ -192,6 +261,8 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
             "merged": True,
             "source_chunk_ids": [str(chunk.get("id", "")) for chunk in chunks],
             "duration_saved": duration,
+            "source": dict(sources[0]) if sources else {},
+            "sources": sources,
         }
         metadata = {key: value for key, value in runtime_chunk.items()
                     if key not in ("started", "ended", "session_dir")}

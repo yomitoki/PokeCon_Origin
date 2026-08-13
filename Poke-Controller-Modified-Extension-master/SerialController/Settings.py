@@ -41,6 +41,12 @@ class GuiSettings:
         self.show_size = tk.StringVar(value=self.setting["General Setting"].get("show_size"))
         self.last_active_preview_full_fps = self.setting.getboolean(
             "General Setting", "last_active_preview_full_fps", fallback=False)
+        self.resource_control_enabled = self.setting.getboolean(
+            "Resource Control", "enabled", fallback=True)
+        self.resource_cpu_target = self.setting.getint(
+            "Resource Control", "cpu_target", fallback=90)
+        self.resource_main_tool = self.setting.getboolean(
+            "Resource Control", "main_tool", fallback=False)
         self.is_show_realtime = tk.BooleanVar(value=self.setting["General Setting"].getboolean("is_show_realtime"))
         self.is_show_value = tk.BooleanVar(value=self.setting["General Setting"].getboolean("is_show_value"))
         self.is_show_guide = tk.BooleanVar(value=self.setting["General Setting"].getboolean("is_show_guide"))
@@ -182,6 +188,16 @@ class GuiSettings:
         self.record_variable_start = self.setting.get("Recording", "variable_start", fallback="")
         self.record_variable_stop = self.setting.get("Recording", "variable_stop", fallback="")
         self.record_variable_rules = self.setting.get("Recording", "variable_rules", fallback="[]")
+        self.operation_capture_output_dir = self.setting.get(
+            "Operation Capture", "output_dir", fallback="")
+        self.operation_capture_include_audio = self.setting.getboolean(
+            "Operation Capture", "include_audio", fallback=True)
+        self.operation_capture_auto_controller = self.setting.getboolean(
+            "Operation Capture", "auto_controller", fallback=True)
+        self.operation_capture_gamepad_profile = self.setting.get(
+            "Operation Capture", "gamepad_profile", fallback="")
+        self.operation_capture_last_session = self.setting.get(
+            "Operation Capture", "last_session", fallback="")
         self.area_capture_roi = self.setting.get("Area Capture", "roi", fallback="0,0,0,0")
         self.area_capture_output_target = self.setting.get("Area Capture", "output_target", fallback="Output#1")
         self.area_capture_background = self.setting.get("Area Capture", "background", fallback="#ffffff")
@@ -332,6 +348,9 @@ class GuiSettings:
             "show_software_controller": True,
         }
         self.setting["Audio"] = {"input_device": "", "gain": "100", "filter_camera": False, "auto_start": False}
+        self.setting["Resource Control"] = {
+            "enabled": True, "cpu_target": 90, "main_tool": False,
+        }
         self.setting["Analysis"] = {
             "vision_mode": "default",
             "image_assist_enabled": False,
@@ -351,6 +370,10 @@ class GuiSettings:
             "min_free_gb": "5.0", "max_disk_usage_percent": "95.0",
             "variable_command": "", "variable_name": "current_step",
             "variable_start": "", "variable_stop": "", "variable_rules": "[]",
+        }
+        self.setting["Operation Capture"] = {
+            "output_dir": "", "include_audio": True,
+            "auto_controller": True, "gamepad_profile": "", "last_session": "",
         }
         self.setting["Area Capture"] = {
             "roi": "0,0,0,0", "output_target": "Output#1", "background": "#ffffff", "active": True,
@@ -455,6 +478,11 @@ class GuiSettings:
             "filter_camera": self.audio_filter_camera,
             "auto_start": self.audio_auto_start,
         }
+        self.setting["Resource Control"] = {
+            "enabled": self.resource_control_enabled,
+            "cpu_target": self.resource_cpu_target,
+            "main_tool": self.resource_main_tool,
+        }
         self.setting["Analysis"] = {
             "vision_mode": self.vision_mode,
             "image_assist_enabled": self.image_assist_enabled,
@@ -486,6 +514,13 @@ class GuiSettings:
             "variable_start": self.record_variable_start,
             "variable_stop": self.record_variable_stop,
             "variable_rules": self.record_variable_rules,
+        }
+        self.setting["Operation Capture"] = {
+            "output_dir": self.operation_capture_output_dir,
+            "include_audio": self.operation_capture_include_audio,
+            "auto_controller": self.operation_capture_auto_controller,
+            "gamepad_profile": self.operation_capture_gamepad_profile,
+            "last_session": self.operation_capture_last_session,
         }
         self.setting["Area Capture"] = {
             "roi": self.area_capture_roi, "output_target": self.area_capture_output_target,

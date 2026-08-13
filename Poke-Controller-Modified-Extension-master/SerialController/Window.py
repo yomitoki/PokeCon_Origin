@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import difflib
+import hashlib
 import json
 import datetime
 import inspect
@@ -21,6 +23,7 @@ import threading
 import time
 import types
 import webbrowser
+from collections import deque
 from pathlib import Path
 import tkinter.ttk as ttk
 import tkinter.messagebox as tkmsg
@@ -47,20 +50,40 @@ from VisionAutomation import VisionAutomation
 from AudioMonitor import AudioMonitor
 from ImageAnalysisAssist import ImageAnalysisAssist
 from ImageDetectionMonitor import (crop_search_region, filter_target_names,
+                                   format_show_value_entries,
                                    load_detection_library, match_variant,
+                                   padded_search_crop,
+                                   prune_show_value_entries,
+                                   update_show_value_entries,
                                    resolve_template_path)
 from AnalysisRules import AnalysisRuleEngine, ANALYSIS_TYPES, CONDITION_TYPES
 from ObjectDetectionAssist import ObjectDetectionAssistWindow
 from DiskSpaceGuard import disk_space_violations
 from Recording import CaptureRecorder
-from CommandMonitorRecording import (CommandStateTimeline,
+from CommandMonitorRecording import (CommandInputActivityTracker,
+                                     CommandStateTimeline, DarkStillFrameDetector,
+                                     command_source_descriptor,
+                                     execution_location_key,
+                                     failure_evidence_end,
                                      historical_retention_ids,
+                                     runtime_execution_location,
                                      runtime_state_snapshot, state_path_text,
                                      temporary_chunk_ids_for_session)
 from CommandRecordingMerge import merge_command_recording_chunks
+from OperationCaptureSession import (OperationCaptureSession,
+                                     find_paused_session,
+                                     finalize_operation_session,
+                                     operation_input_source_is_recordable,
+                                     paused_session_names,
+                                     remove_session_directory)
+from OperationGamepadMap import (OperationGamepadMapDialog,
+                                 OperationGamepadProfileStore)
 from AutomationTriggers import (StableRuleEvaluator, discover_state_values,
                                 discover_state_variables, resolve_command_value)
 from CommandStartOverride import apply_command_start_override
+from CommandRunOptions import (apply_command_run_options,
+                               discover_command_run_options,
+                               preserve_location_selection)
 from ControllerInputLog import rotate_log_range, python_replacement_body, replay_recording
 from StepDebugAssist import (DELETE_OPERATION_CODE, derive_follow_step_rule,
                              extract_step_method, execute_operation,
@@ -78,14 +101,22 @@ from InputSetData import (COMMAND_INPUT_SET_VARIABLES, INPUT_SET_VARIABLES,
                           SCHEMA_VERSION,
                           has_complete_snapshot, legacy_combined_snapshot,
                           input_set_commands_enabled, strip_commands_from_snapshot,
+                          snapshot_values_with_defaults,
                           sync_command_start_overrides, sync_commands_assist_rules,
+                          sync_output_layout,
                           sync_quick_actions,
                           sync_step_debug_rules)
 from InputSetRuntimeRegistry import (ActiveInputSetRegistry,
+                                     canonical_device_key,
                                      default_window_activity_registry_path,
+                                     device_usage_conflicts,
+                                     main_resource_conflicts,
                                      read_active_input_sets)
+from ResourceControl import (SystemCpuSampler, clamp_cpu_target,
+                             resource_throttle_level, throttle_multiplier)
 from SharedDebugLibrary import (SharedDebugConflictError, default_library_path,
                                 read_shared_debug, write_shared_debug)
+from SoftwareControllerState import SoftwareControllerState
 from PIL import Image, ImageTk, ImageDraw, ImageFont
 from KeyConfig import PokeKeycon
 from Keyboard import SwitchKeyboardController
@@ -126,9 +157,23 @@ class PokeControllerApp:
         self._pending_command_text_lock = threading.Lock()
         self._command_text_last_prune = 0.0
         self._command_text_last_scroll = {"Output#1": 0.0, "Output#2": 0.0}
-        self._pending_image_detection_value = None
+        self._pending_image_detection_values = {}
         self._pending_image_detection_value_queued = False
         self._pending_image_detection_value_lock = threading.Lock()
+        self._image_detection_value_entries = {}
+        self._image_detection_value_rendered_output = None
+        self._image_detection_value_rendered_text = ""
+        self._image_detection_value_next_prune = 0.0
+        self._pending_analysis_rule_results = None
+        self._pending_analysis_rule_results_queued = False
+        self._pending_analysis_rule_results_lock = threading.Lock()
+        self._pending_image_assist_results = None
+        self._pending_image_assist_results_queued = False
+        self._pending_image_assist_results_lock = threading.Lock()
+        self._resource_status_refresh_queued = False
+        self._resource_status_refresh_lock = threading.Lock()
+        self._preview_status_refresh_queued = False
+        self._preview_status_refresh_lock = threading.Lock()
         runtime_label = os.environ.get("POKECON_RUNTIME_LABEL", "").strip()
         runtime_suffix = f" [{runtime_label}]" if runtime_label else ""
         self.root.title(f"{Constant.NAME} ver.{Constant.VERSION} (profile: {args.profile}){runtime_suffix}")
@@ -151,6 +196,33 @@ class PokeControllerApp:
         self.vision = VisionAutomation(os.path.join("Commands", "PythonCommands", "Samples", "vision_rules.json"))
         self.audio_monitor = AudioMonitor()
         self.recorder = CaptureRecorder()
+        # Long-form operation authoring uses its own clean 1280x720 recorder.
+        # It must not change the normal/Commands-monitor recording modes.
+        self.operation_recorder = CaptureRecorder()
+        self.operation_capture_session = None
+        self._operation_gamepad_dialog = None
+        self._active_operation_gamepad_mapping = {}
+        self._operation_finalize_thread = None
+        self._operation_latest_pause_image = ""
+        self._operation_discard_paths = set()
+        self._operation_disk_last_check = 0.0
+        self._operation_disk_last_ok = True
+        self._operation_disk_interrupt_queued = False
+        self._operation_input_queue = queue.Queue()
+        self._operation_input_accepting = False
+        self._operation_input_writer = threading.Thread(
+            target=self._operation_input_writer_loop, daemon=True,
+            name="OperationInputWriter")
+        self._operation_input_writer.start()
+        # Commands recording trace events are written off the camera/Tk path.
+        # A long scenario can produce thousands of source-line links without
+        # adding synchronous disk I/O to controller or preview processing.
+        self._command_trace_queue = queue.Queue()
+        self._command_monitor_lock = threading.Lock()
+        self._command_trace_writer = threading.Thread(
+            target=self._command_trace_writer_loop, daemon=True,
+            name="CommandRecordingTraceWriter")
+        self._command_trace_writer.start()
         self.record_trigger_rules = []
         self.record_cleanup_rules = []
         self.record_variable_rules = []
@@ -169,6 +241,8 @@ class PokeControllerApp:
 
         self.procon = None
         self.pro_controller_thread = None
+        self._pc_gamepad_restart_pending = False
+        self._pc_gamepad_restore_after_command = False
         self.object_detection_assist_window = None
         self._initial_video_open_thread = None
         self._initial_serial_open_thread = None
@@ -190,6 +264,9 @@ class PokeControllerApp:
         self.profile = profile
         self._active_input_set_registry = None
         self._startup_selected_combined_name = ""
+        self._startup_skip_hardware = False
+        self._confirmed_shared_device_keys = set()
+        self._published_device_usage = {}
         self._window_activity_registry = None
         self._window_activity_registry_lock = threading.Lock()
         self._window_activity_stop = threading.Event()
@@ -198,6 +275,15 @@ class PokeControllerApp:
         self._last_active_preview_owner = True
         self._last_active_preview_status_value = None
         self._last_focus_mark_monotonic = 0.0
+        self._resource_cpu_sampler = SystemCpuSampler()
+        self._resource_cpu_percent = None
+        self._resource_throttle_level = "normal"
+        self._resource_main_effective = False
+        self._resource_main_open_downgraded = False
+        self._resource_protected_until = 0.0
+        self._resource_control_config = {
+            "enabled": True, "target_percent": 90, "main_requested": False,
+        }
         Command.app_name = f"{Constant.NAME} ver.{Constant.VERSION}"
         Command.profilename = profile
 
@@ -295,7 +381,9 @@ class PokeControllerApp:
         self.camera_name_label.grid(column="0", padx="5", pady="5", row="0", sticky="ew")
         self.camera_name_cb = ttk.Combobox(self.camera_settings_lf)
         self.camera_name_fromDLL = tk.StringVar(value="")
-        self.camera_name_cb.configure(state="normal", textvariable=self.camera_name_fromDLL)
+        self.camera_name_cb.configure(
+            state="normal", textvariable=self.camera_name_fromDLL,
+            postcommand=self._refresh_camera_usage_labels)
         self.camera_name_cb.grid(column="1", columnspan="9", padx="5", pady="5", row="0", sticky="ew")
         self.camera_name_cb.bind("<<ComboboxSelected>>", self.set_cameraid, add="")
         self.video_source = tk.StringVar(value="Capture device")
@@ -307,8 +395,9 @@ class PokeControllerApp:
         self.video_source_cb.grid(column=1, columnspan=2, row=2, padx=5, pady=5, sticky="w")
         self.video_source_cb.bind("<<ComboboxSelected>>", lambda event: self.apply_video_source())
         self.window_source = tk.StringVar()
-        self.window_source_cb = ttk.Combobox(self.camera_settings_lf, state="readonly", width=55,
-                                              textvariable=self.window_source)
+        self.window_source_cb = ttk.Combobox(
+            self.camera_settings_lf, state="readonly", width=55,
+            textvariable=self.window_source, postcommand=self.refresh_window_sources)
         self.window_source_cb.grid(column=3, columnspan=5, row=2, padx=5, pady=5, sticky="ew")
         ttk.Button(self.camera_settings_lf, text="Refresh windows", command=self.refresh_window_sources).grid(
             column=8, row=2, padx=3, pady=5)
@@ -332,10 +421,10 @@ class PokeControllerApp:
                 column=5, columnspan=5, row=3, padx=5, pady=(0, 5), sticky="w")
         self.last_active_preview_full_fps = tk.BooleanVar(value=False)
         self.last_active_preview_status = tk.StringVar(
-            value="複数起動時：最後に操作したPokeConは最大30fps表示を維持")
+            value="前面表示またはメインツールは最大30fps表示を維持")
         ttk.Checkbutton(
             self.camera_settings_lf,
-            text="最後に操作したPokeConは設定FPS（最大60）で表示",
+            text="前面表示またはメインツールは設定FPS（最大60）で表示",
             variable=self.last_active_preview_full_fps,
             command=self._refresh_preview_priority_status).grid(
                 column=0, columnspan=6, row=4, padx=5, pady=(0, 5), sticky="w")
@@ -398,8 +487,11 @@ class PokeControllerApp:
         ttk.Button(self.audio_lf, text="Refresh", command=self.refresh_audio_devices).grid(column=2, row=0, padx=5, pady=(3, 0))
         ttk.Label(self.audio_lf, text="Audio In:").grid(column=0, row=1, padx=(5, 2), pady=5, sticky="e")
         self.audio_input = tk.StringVar()
-        self.audio_input_cb = ttk.Combobox(self.audio_lf, textvariable=self.audio_input, width=100, state="readonly")
+        self.audio_input_cb = ttk.Combobox(
+            self.audio_lf, textvariable=self.audio_input, width=100, state="readonly",
+            postcommand=self.update_audio_input_list)
         self.audio_input_cb.grid(column=1, columnspan=4, row=1, padx=2, pady=5, sticky="ew")
+        self.audio_input_cb.bind("<<ComboboxSelected>>", self._on_audio_input_selected)
         self.audio_lf.columnconfigure(1, weight=1)
         self.audio_device_full_name = tk.StringVar(value="")
         ttk.Label(self.audio_lf, textvariable=self.audio_device_full_name, anchor="w", foreground="#404040").grid(
@@ -442,6 +534,45 @@ class PokeControllerApp:
         self._build_analysis_rules_ui()
         # self.camera_f.configure(height='200', width='200')    # removed
         self.controller_nb.add(self.camera_tab, padding="0", sticky="nsew", text="Camera")
+        self.resource_tab, self.resource_f = self._create_scrollable_tab()
+        resource_box = ttk.Labelframe(
+            self.resource_f, text="複数PokeConのPC負荷管理")
+        resource_box.pack(fill="x", padx=5, pady=5)
+        self.resource_control_enabled = tk.BooleanVar(value=True)
+        self.resource_cpu_target = tk.IntVar(value=90)
+        self.resource_main_tool = tk.BooleanVar(value=False)
+        self.resource_control_status = tk.StringVar(
+            value="CPU使用率を測定しています…")
+        ttk.Checkbutton(
+            resource_box, text="CPU目標を超えたとき、バックグラウンドPokeConを省負荷化",
+            variable=self.resource_control_enabled,
+            command=self._resource_config_changed).grid(
+                column=0, columnspan=4, row=0, padx=8, pady=(8, 4), sticky="w")
+        ttk.Label(resource_box, text="PC全体のCPU目標:").grid(
+            column=0, row=1, padx=(8, 3), pady=4, sticky="e")
+        resource_target = ttk.Spinbox(
+            resource_box, from_=50, to=95, increment=5, width=5,
+            textvariable=self.resource_cpu_target,
+            command=self._resource_config_changed)
+        resource_target.grid(column=1, row=1, padx=3, pady=4, sticky="w")
+        resource_target.bind("<Return>", self._resource_config_changed, add="+")
+        resource_target.bind("<FocusOut>", self._resource_config_changed, add="+")
+        ttk.Label(resource_box, text="%（80 / 90など）").grid(
+            column=2, row=1, padx=3, pady=4, sticky="w")
+        ttk.Checkbutton(
+            resource_box,
+            text="このInputSetをメインツールにする（同時に1つだけ・なるべく省負荷化しない）",
+            variable=self.resource_main_tool,
+            command=self._resource_main_changed).grid(
+                column=0, columnspan=4, row=2, padx=8, pady=4, sticky="w")
+        ttk.Label(
+            resource_box,
+            text=("Commands実行中、タブ切り替え・キー操作直後、Software-Controller操作中、"
+                  "録画中は保護されます。CPU目標は協調制御の目安で、他アプリの負荷は停止しません。"),
+            foreground="#174a7e", wraplength=900, justify="left").grid(
+                column=0, columnspan=4, row=3, padx=8, pady=(4, 2), sticky="w")
+        ttk.Label(resource_box, textvariable=self.resource_control_status).grid(
+            column=0, columnspan=4, row=4, padx=8, pady=(2, 8), sticky="w")
         self.area_capture_tab, self.area_capture_f = self._create_scrollable_tab()
         self.area_capture_lf = ttk.Labelframe(self.area_capture_f, text="Capture selected camera area")
         ttk.Label(self.area_capture_lf, text="ROI x,y,w,h:").grid(column=0, row=0, padx=5, pady=5, sticky="w")
@@ -475,6 +606,10 @@ class PokeControllerApp:
         self.area_capture_detection_scope = tk.StringVar(value="取得範囲内")
         self.area_capture_detection_output = tk.StringVar(value="Output#2")
         self.area_capture_held_image = None
+        # Keep the full still frame as well as the cropped template.  Without
+        # it, moving an edge after "hold" can change the ROI value but cannot
+        # redraw pixels that were outside the old crop.
+        self.area_capture_held_frame = None
         self.area_capture_test_running = False
         self.area_capture_test_after_id = None
         self.area_capture_test_stats = None
@@ -690,6 +825,11 @@ class PokeControllerApp:
         self.recording_mode_tabs.bind(
             "<<NotebookTabChanged>>", self._on_recording_mode_tab_changed, add="+")
         self.controller_nb.add(self.recording_tab, padding="0", sticky="nsew", text="Recording")
+        self.operation_capture_tab, self.operation_capture_f = self._create_scrollable_tab()
+        self._build_operation_capture_tab(self.operation_capture_f)
+        self.controller_nb.add(
+            self.operation_capture_tab, padding="0", sticky="nsew",
+            text="操作記録→Commands")
         self._build_input_set_tab()
         self.serial_tab, self.serial_f = self._create_scrollable_tab()
         self.settings_lf = ttk.Labelframe(self.serial_f)
@@ -738,7 +878,9 @@ class PokeControllerApp:
         self.serial_device_name_label.grid(column="0", padx="5", pady="5", row="1", sticky="ew")
         self.serial_device_name_cb = ttk.Combobox(self.settings_lf)
         self.serial_device_name = tk.StringVar(value="(未設定)")
-        self.serial_device_name_cb.configure(state="normal", textvariable=self.serial_device_name)
+        self.serial_device_name_cb.configure(
+            state="normal", textvariable=self.serial_device_name,
+            postcommand=self.locateDeviceCmbbox, width=90)
         self.serial_device_name_cb.grid(column="1", columnspan="6", padx="5", pady="5", row="1", sticky="ew")
         self.serial_device_name_cb.bind("<<ComboboxSelected>>", self.set_device, add="")
         self.scan_device_button = ttk.Button(self.settings_lf)
@@ -747,6 +889,7 @@ class PokeControllerApp:
         self.scan_device_button.configure(command=self.locateDeviceCmbbox)
         self.settings_lf.configure(text="Settings")
         self.settings_lf.grid(column="0", padx="5", row="0", sticky="ew")
+        self.serial_f.columnconfigure(0, weight=1)
         self.serial_data_lf = ttk.Labelframe(self.serial_f)
         self.serial_data_format_name_label = ttk.Label(self.serial_data_lf)
         self.serial_data_format_name_label.configure(anchor="center", text="Data Format: ")
@@ -782,6 +925,7 @@ class PokeControllerApp:
         self.use_keyboard_checkbox.configure(command=self.activateKeyboard)
         self.left_stick_mouse_checkbox = ttk.Checkbutton(self.software_lf)
         self.camera_lf.is_use_left_stick_mouse = tk.BooleanVar()  # modified(継承いじるの面倒なので暫定的にこのまま)
+        self.is_use_left_stick_mouse = self.camera_lf.is_use_left_stick_mouse
         self.left_stick_mouse_checkbox.configure(
             text="Use LStick Mouse", variable=self.camera_lf.is_use_left_stick_mouse
         )  # modified
@@ -789,6 +933,7 @@ class PokeControllerApp:
         self.left_stick_mouse_checkbox.configure(command=self.activate_Left_stick_mouse)
         self.right_stick_mouse_checkbox = ttk.Checkbutton(self.software_lf)
         self.camera_lf.is_use_right_stick_mouse = tk.BooleanVar()  # modified(継承いじるの面倒なので暫定的にこのまま)
+        self.is_use_right_stick_mouse = self.camera_lf.is_use_right_stick_mouse
         self.right_stick_mouse_checkbox.configure(
             text="Use RStick Mouse", variable=self.camera_lf.is_use_right_stick_mouse
         )  # modified
@@ -799,7 +944,9 @@ class PokeControllerApp:
         self.hardware_lf = ttk.Labelframe(self.manual_control_f)
         self.use_pro_controller_checkbox = ttk.Checkbutton(self.hardware_lf)
         self.is_use_Pro_Controller = tk.BooleanVar()  # modified
-        self.use_pro_controller_checkbox.configure(text="Hardware PCゲームパッド→Switch", variable=self.is_use_Pro_Controller)
+        self.use_pro_controller_checkbox.configure(
+            text="PCゲームパッド→Switchを有効化",
+            variable=self.is_use_Pro_Controller)
         self.use_pro_controller_checkbox.grid(column="0", padx="5", pady="5", row="0", sticky="ew")
         self.use_pro_controller_checkbox.configure(command=self.mode_change_Pro_Controller)
         self.record_pro_controller_checkbox = ttk.Checkbutton(self.hardware_lf)
@@ -809,13 +956,8 @@ class PokeControllerApp:
         )
         self.record_pro_controller_checkbox.grid(column="1", padx="5", pady="5", row="0", sticky="ew")
         self.record_pro_controller_checkbox.configure(command=self.record_Pro_Controller)
-        self.pc_gamepad_permission_checkbox = ttk.Checkbutton(
-            self.hardware_lf, text="PCゲームパッド→Switch入力許可",
-            variable=self.pc_gamepad_input_enabled, command=self.toggle_pc_gamepad_input)
-        self.pc_gamepad_permission_checkbox.grid(
-            column=0, columnspan=2, padx=5, pady=(0, 3), row=1, sticky="w")
         ttk.Label(self.hardware_lf, textvariable=self.pc_gamepad_input_status, width=24).grid(
-            column=2, columnspan=2, padx=5, pady=(0, 3), row=1, sticky="w")
+            column=0, columnspan=4, padx=5, pady=(0, 3), row=1, sticky="w")
         self.pc_gamepad = tk.StringVar(value="")
         self.pc_gamepad_cb = ttk.Combobox(self.hardware_lf, textvariable=self.pc_gamepad,
                                           state="readonly", width=42)
@@ -833,8 +975,9 @@ class PokeControllerApp:
         self.manual_control_f.configure(height="200", width="200")
         self.controller_nb.add(self.manual_control_tab, padding="0", text="Manual Control")
         self.command_start_overrides = {}
+        self.command_run_favorites = {}
         self._command_start_monitor_serial = 0
-        self.command_start_status = tk.StringVar(value="開始Step: 変更なし（Commands既定）")
+        self.command_start_status = tk.StringVar(value="Step実行設定: Commands既定")
         self.commands_tab, self.commands_f = self._create_scrollable_tab()
         self.select_commands_f = ttk.Frame(self.commands_f)
         self.command_nb = ttk.Notebook(self.select_commands_f)
@@ -859,7 +1002,7 @@ class PokeControllerApp:
         self.py_name = tk.StringVar(value="")
         self.py_cb.configure(state="readonly", textvariable=self.py_name)
         self.py_cb.grid(column="1", padx="5", pady="4", row="1", sticky="ew")
-        self.py_cb.bind("<<ComboboxSelected>>", lambda _event: self._refresh_command_start_status(), add="+")
+        self.py_cb.bind("<<ComboboxSelected>>", self._selected_command_run_changed, add="+")
         self.py_f.pack(fill="x", side="top")
         self.py_f.columnconfigure(1, weight=1)
         self.command_nb.add(self.py_f, padding="5", text="Python Command")
@@ -874,7 +1017,7 @@ class PokeControllerApp:
         self.sample_py_name = tk.StringVar(value="")
         self.sample_py_cb = ttk.Combobox(self.sample_py_f, state="readonly", textvariable=self.sample_py_name)
         self.sample_py_cb.grid(column="1", padx="5", pady="4", row="1", sticky="ew")
-        self.sample_py_cb.bind("<<ComboboxSelected>>", lambda _event: self._refresh_command_start_status(), add="+")
+        self.sample_py_cb.bind("<<ComboboxSelected>>", self._selected_command_run_changed, add="+")
         self.sample_py_f.pack(fill="x", side="top")
         self.sample_py_f.columnconfigure(1, weight=1)
         self.command_nb.add(self.sample_py_f, padding="5", text="Python Sample Command")
@@ -894,7 +1037,7 @@ class PokeControllerApp:
         self.mcu_name = tk.StringVar(value="")
         self.mcu_cb.configure(state="readonly", textvariable=self.mcu_name, validate="focusin")
         self.mcu_cb.grid(column="1", padx="5", pady="4", row="1", sticky="ew")
-        self.mcu_cb.bind("<<ComboboxSelected>>", lambda _event: self._refresh_command_start_status(), add="+")
+        self.mcu_cb.bind("<<ComboboxSelected>>", self._selected_command_run_changed, add="+")
         self.mcu_f.pack(fill="x", side="top")
         self.mcu_f.columnconfigure(1, weight=1)
         self.command_nb.add(self.mcu_f, padding="5", text="Mcu Command")
@@ -1002,14 +1145,12 @@ class PokeControllerApp:
         self.pause_button.configure(text="Pause")
         self.pause_button.grid(column="8", padx="10", pady="5", row="0", sticky="ew")
         self.pause_button.configure(command=self.pausePlay)
-        self.command_start_button = ttk.Button(
-            self.action_commands_f, text="開始Step設定…", command=self.open_command_start_settings)
-        self.command_start_button.grid(column="4", padx=(10, 4), pady=(0, 5), row="1", sticky="w")
         ttk.Label(self.action_commands_f, textvariable=self.command_start_status,
                   foreground="#174a7e").grid(
-                      column="5", columnspan="4", padx="5", pady=(0, 5), row="1", sticky="w")
+                      column="4", columnspan="5", padx="5", pady=(0, 5), row="1", sticky="w")
         self.action_commands_f.configure(height="200", width="200")
         self.action_commands_f.grid(column="0", row="1", sticky="e")
+
         self.commands_f.configure(height="200", width="500")
         self.controller_nb.add(self.commands_tab, padding="0", text="Commands")
         self.notification_tab, self.notification_f = self._create_scrollable_tab()
@@ -1303,6 +1444,10 @@ class PokeControllerApp:
         self._build_image_detection_monitor_tab()
         self._reorder_controller_tabs()
         self.root.bind_all("<MouseWheel>", self._scroll_tabs_with_wheel, add="+")
+        self.controller_nb.bind(
+            "<<NotebookTabChanged>>", self._note_resource_interaction, add="+")
+        self.root.bind_all("<ButtonPress>", self._note_resource_interaction, add="+")
+        self.root.bind_all("<KeyPress>", self._note_resource_interaction, add="+")
         if platform.system() == "Windows" or platform.system() == "Darwin":
             self.controller_nb.configure(height="150")
         else:
@@ -1657,6 +1802,13 @@ class PokeControllerApp:
         self.show_size.set(self.settings.show_size.get())
         self.last_active_preview_full_fps.set(
             bool(getattr(self.settings, "last_active_preview_full_fps", False)))
+        self.resource_control_enabled.set(
+            bool(getattr(self.settings, "resource_control_enabled", True)))
+        self.resource_cpu_target.set(clamp_cpu_target(
+            getattr(self.settings, "resource_cpu_target", 90)))
+        self.resource_main_tool.set(
+            bool(getattr(self.settings, "resource_main_tool", False)))
+        self._cache_resource_control_config()
         self.com_port.set(self.settings.com_port.get())
         self.com_port_name.set(self.settings.com_port_name.get())
         self.baud_rate.set(self.settings.baud_rate.get())
@@ -1756,6 +1908,17 @@ class PokeControllerApp:
         self._select_recording_mode_page()
         self.record_output_dir.set(self.settings.record_output_dir)
         self._apply_record_output_dir()
+        self.operation_capture_output_dir.set(
+            getattr(self.settings, "operation_capture_output_dir", ""))
+        self.operation_capture_include_audio.set(
+            getattr(self.settings, "operation_capture_include_audio", True))
+        self.operation_capture_auto_controller.set(
+            getattr(self.settings, "operation_capture_auto_controller", True))
+        self.operation_gamepad_profile_name.set(
+            getattr(self.settings, "operation_capture_gamepad_profile", ""))
+        self.refresh_operation_gamepad_profiles()
+        self.operation_capture_last_session.set(
+            getattr(self.settings, "operation_capture_last_session", ""))
         self.record_template_path.set(self.settings.record_template_path)
         self.record_threshold.set(self.settings.record_threshold)
         self.record_interval.set(self.settings.record_interval)
@@ -1805,6 +1968,7 @@ class PokeControllerApp:
         self._refresh_commands_assist_rule_list()
         self.configure_recording_rules()
         self.refresh_recording_presets()
+        self.refresh_operation_sessions()
         # Profile path is final now.  Prompt before camera/serial objects are
         # created so no device is opened with the previous profile's values.
         self.refresh_input_sets()
@@ -1906,16 +2070,22 @@ class PokeControllerApp:
         if platform.system() == "Windows" or platform.system() == "Darwin":
             try:
                 self.locateCameraCmbbox()
+                self.camera_name_cb.config(state="readonly")
                 self.camera_id_entry.config(state="disable")
             except Exception as e:
-                # Locate an entry instead whenever dll is not imported successfully
-                self.camera_name_fromDLL.set(
-                    "An error occurred when displaying the camera name in the Win/Mac environment."
-                )
                 self._logger.warning("An error occurred when displaying the camera name in the Win/Mac environment.")
                 self._logger.warning(e)
-                self.camera_name_cb.config(state="disable")
-                self.camera_id_entry.config(state="normal")
+                # DirectShow enumeration can succeed before a later selection
+                # step fails.  Do not disable a usable list in that case.
+                if getattr(self, "camera_dic", None):
+                    self.camera_name_cb.config(state="readonly")
+                    self.camera_id_entry.config(state="disable")
+                else:
+                    self.camera_name_fromDLL.set(
+                        "An error occurred when displaying the camera name in the Win/Mac environment."
+                    )
+                    self.camera_name_cb.config(state="disable")
+                    self.camera_id_entry.config(state="normal")
             try:
                 self.locateDeviceCmbbox()
                 self.set_init_device_name()
@@ -1939,10 +2109,12 @@ class PokeControllerApp:
                 self._apply_input_set_data(
                     input_item, open_hardware=False,
                     apply_serial=not isinstance(serial_override, dict))
-            if isinstance(serial_override, dict):
+            if isinstance(serial_override, dict) and not self._startup_skip_hardware:
                 # Schema 3 stores the Serial identity inside the InputSet's
                 # complete snapshot. Sender is created later by the worker.
                 self._apply_serial_input_set(serial_override)
+        if self._startup_skip_hardware:
+            self._apply_hardware_unconfigured_selection()
         # open up a camera
         self.camera = Camera(self.fps.get())
         self.refresh_window_sources()
@@ -1962,6 +2134,7 @@ class PokeControllerApp:
             self.com_port_entry["state"] = "normal"
 
         self.ser = Sender.Sender(self.is_show_serial)
+        self.ser.set_activity_callback(self._record_command_key_activity)
         # Opening a USB serial driver can block.  KeyPress may safely hold a
         # closed Sender until the background startup connection completes.
         self.keyPress = KeyPress(self.ser)
@@ -1983,8 +2156,12 @@ class PokeControllerApp:
         )
         self.preview.set_region_listener(self.receive_output_region)
         self.preview.set_frame_listener(self.analyse_live_frame)
+        self.preview.set_frame_work_provider(self._live_frame_analysis_active)
         self.preview.set_record_listener(self.process_recording_frame)
         self.preview.set_render_priority_provider(self._preview_render_priority)
+        self.preview.set_capture_work_provider(self._preview_capture_work_active)
+        self.preview.set_resource_multiplier_provider(
+            self._resource_preview_multiplier)
         self.image_analysis_assist = ImageAnalysisAssist(
             os.path.dirname(os.path.abspath(__file__)), self._queue_image_assist_results,
             max_candidates=self.image_assist_max_candidates.get())
@@ -2016,7 +2193,11 @@ class PokeControllerApp:
 
         # self.keys_software_controller = UnitCommand
         self.keys_software_controller = KeyPress(self.ser, priority=True)
-        self._software_controller_queue = queue.Queue()
+        # A queued item is only a version number for a complete state
+        # snapshot.  Old mouse-motion versions have no value once a newer
+        # state exists, so never let them accumulate behind serial I/O.
+        self._software_controller_queue = queue.Queue(maxsize=1)
+        self._software_controller_state = SoftwareControllerState()
         self._software_controller_paused_command = None
         self._software_controller_override_active = False
         self._software_controller_thread = threading.Thread(
@@ -2126,6 +2307,10 @@ class PokeControllerApp:
 
     def _start_initial_video_open(self):
         """Open the startup video source without blocking Tk's event loop."""
+        if self._startup_skip_hardware:
+            self._set_camera_unconfigured()
+            self.show_output("Analysis", text="Camera: 起動時の選択により未設定で開始しました。")
+            return
         if self._initial_video_open_thread is not None and self._initial_video_open_thread.is_alive():
             return
         source_type = self.video_source.get()
@@ -2133,6 +2318,15 @@ class PokeControllerApp:
         window_label = self.window_source.get()
         window_handle = getattr(self, "window_sources", {}).get(window_label)
         window_capture_mode = self._window_capture_mode_key()
+        key = self._camera_usage_key(
+            camera_id=camera_id, source_type=source_type, window_handle=window_handle)
+        label = window_label if source_type == "Window (Steam/game)" else \
+            str((self.camera_dic or {}).get(
+                camera_id, (self.camera_dic or {}).get(str(camera_id), "Camera ID {}".format(camera_id))))
+        if key and not self._confirm_shared_device("camera", key, label):
+            self._set_camera_unconfigured()
+            self.show_output("Analysis", text="Camera: 使用中のため反映しませんでした。")
+            return
 
         def worker():
             error = None
@@ -2157,6 +2351,7 @@ class PokeControllerApp:
 
     def _finish_initial_video_open(self, source_type, window_label, error):
         if error:
+            self._publish_device_usage("camera", "", "")
             self.show_output("Analysis", text="起動時の映像入力を開けませんでした: " + error)
             return
         if source_type == "Window (Steam/game)":
@@ -2165,10 +2360,16 @@ class PokeControllerApp:
             description = window_label
         else:
             description = "Camera ID {}".format(self.camera_id.get())
+        self._publish_device_usage(
+            "camera", self._camera_usage_key(source_type=source_type), description)
         self.show_output("Analysis", text="映像入力をバックグラウンドで開始しました: " + description)
 
     def _start_initial_serial_open(self):
         """Connect the saved serial device without blocking application startup."""
+        if self._startup_skip_hardware:
+            self._set_serial_unconfigured()
+            self.show_output("Analysis", text="Serial: 起動時の選択により未設定で開始しました。")
+            return
         if self.serial_device_name.get().strip() == "(未設定)":
             self.show_output("Analysis", text="Serial: 未設定のため起動時接続をスキップしました。")
             return
@@ -2177,6 +2378,12 @@ class PokeControllerApp:
         port_number = self.com_port.get()
         port_name = self.com_port_name.get()
         baud_rate = self.baud_rate.get()
+        key = self._serial_usage_key(port_number, port_name)
+        label = self._selected_serial_device_label()
+        if not self._confirm_shared_device("serial", key, label):
+            self._set_serial_unconfigured()
+            self.show_output("Analysis", text="Serial: 使用中のため反映しませんでした。")
+            return
 
         def worker():
             error = ""
@@ -2196,12 +2403,16 @@ class PokeControllerApp:
 
     def _finish_initial_serial_open(self, opened, port_number, baud_rate, error):
         if not opened:
+            self._publish_device_usage("serial", "", "")
             self.show_output("Analysis", text="起動時Serial接続失敗: " + error)
             return
         self.settings.com_port.set(port_number)
         self.settings.com_port_name.set(self.com_port_name.get())
         self.settings.baud_rate.set(baud_rate)
         self.settings.save()
+        self._publish_device_usage(
+            "serial", self._serial_usage_key(port_number, self.com_port_name.get()),
+            self._selected_serial_device_label())
         self.show_output("Analysis", text="Serialをバックグラウンドで接続しました: COM{}".format(port_number))
 
     def openCamera(self):
@@ -2212,15 +2423,28 @@ class PokeControllerApp:
                     "Analysis",
                     text="保存したゲームウィンドウが見つかりません。Camera Nameへは切り替えず、Window入力を停止しました。")
         else:
+            key = self._camera_usage_key()
+            label = str((self.camera_dic or {}).get(
+                self.camera_id.get(), (self.camera_dic or {}).get(
+                    str(self.camera_id.get()), "Camera ID {}".format(self.camera_id.get()))))
+            if not self._confirm_shared_device("camera", key, label):
+                return
             self.camera.openCamera(self.camera_id.get())
+            if self.camera.isOpened():
+                self._publish_device_usage("camera", key, label)
 
     def refresh_window_sources(self):
         self.window_sources = {}
         self.window_source_details = {}
+        usage_entries = self._other_device_usage_entries()
         for item in Camera.listWindows():
             state = " / minimized" if item.get("minimized") else ""
             process = item.get("process_name") or "unknown process"
-            label = "{}  [{}{} / HWND:{}]".format(item["title"], process, state, item["hwnd"])
+            base = "{}  [{}{} / HWND:{}]".format(
+                item["title"], process, state, item["hwnd"])
+            key = canonical_device_key(
+                "camera", "window-hwnd:{}".format(item["hwnd"]))
+            label = base + self._device_usage_suffix("camera", key, usage_entries)
             self.window_sources[label] = item["hwnd"]
             self.window_source_details[label] = item
         values = list(self.window_sources)
@@ -2253,8 +2477,7 @@ class PokeControllerApp:
         inputs = [item for item in inputs if not str(item).startswith("選択ゲーム音声 [PID:")]
         inputs.insert(0, value)
         self.all_audio_inputs = inputs
-        self.audio_input_cb.configure(values=inputs)
-        self.audio_input.set(value)
+        self._configure_audio_input_values(inputs, selected=value)
 
     def _window_capture_mode_key(self):
         value = str(self.window_capture_mode.get())
@@ -2278,7 +2501,17 @@ class PokeControllerApp:
 
     def apply_video_source(self, show_errors=True):
         if self.video_source.get() == "Capture device":
+            key = self._camera_usage_key()
+            label = str((self.camera_dic or {}).get(
+                self.camera_id.get(), (self.camera_dic or {}).get(
+                    str(self.camera_id.get()), "Camera ID {}".format(self.camera_id.get()))))
+            if not self._confirm_shared_device("camera", key, label):
+                return False
             self.camera.openCamera(self.camera_id.get())
+            if not self.camera.isOpened():
+                self._publish_device_usage("camera", "", "")
+                return False
+            self._publish_device_usage("camera", key, label)
             if hasattr(self, "audio_input_cb"):
                 self.refresh_audio_devices()
             self.show_output("Analysis", text="映像入力をキャプチャーデバイスへ切り替えました。")
@@ -2290,8 +2523,13 @@ class PokeControllerApp:
             hwnd = getattr(self, "window_sources", {}).get(self.window_source.get())
         if not hwnd:
             self.camera.destroy()
+            self._publish_device_usage("camera", "", "")
             if show_errors:
                 tkmsg.showwarning("Video input", "入力するゲームウィンドウを選択してください。")
+            return False
+        key = self._camera_usage_key(
+            source_type="Window (Steam/game)", window_handle=hwnd)
+        if not self._confirm_shared_device("camera", key, label):
             return False
         try:
             self.camera.setWindowCaptureMode(self._window_capture_mode_key())
@@ -2302,9 +2540,11 @@ class PokeControllerApp:
             self._select_window_process_audio()
             self.show_output("Analysis", text="ゲームウィンドウ映像入力を開始しました: {} / {}".format(
                 label, self.camera.window_capture_backend))
+            self._publish_device_usage("camera", key, label)
             return True
         except Exception as error:
             self.camera.destroy()
+            self._publish_device_usage("camera", "", "")
             if show_errors:
                 tkmsg.showerror("Video input", "ウィンドウ映像入力を開始できません。\n\n" + str(error))
             return False
@@ -2313,7 +2553,32 @@ class PokeControllerApp:
         if platform.system() != "Linux":
             self.camera_name_fromDLL.set(self.camera_dic[self.camera_id.get()])
 
+    def _refresh_camera_usage_labels(self):
+        if not self.camera_dic:
+            return
+        usage_entries = self._other_device_usage_entries()
+        labels = []
+        selected_index = None
+        self._camera_display_to_id = {}
+        for index, (key, value) in enumerate(self.camera_dic.items()):
+            base = "No." + str(key) + ": " + str(value)
+            conflicts = [] if value == "Disable" else device_usage_conflicts(
+                usage_entries, "camera", canonical_device_key("camera", value))
+            label = (
+                "No.{}: [使用中] {} [別PokeCon: {}]".format(
+                    key, value, self._device_conflict_owner_text(conflicts))
+                if conflicts else base)
+            labels.append(label)
+            self._camera_display_to_id[label] = key
+            self._camera_display_to_id[base] = key
+            if str(key) == str(self.camera_id.get()):
+                selected_index = index
+        self.camera_name_cb.configure(values=labels, state="readonly")
+        if selected_index is not None:
+            self.camera_name_cb.current(selected_index)
+
     def locateCameraCmbbox(self):
+        usage_entries = self._other_device_usage_entries()
         if platform.system() == "Windows":
             try:
                 import clr
@@ -2345,7 +2610,20 @@ class PokeControllerApp:
 
             disable_id = (max(list(self.camera_dic.keys())) + 1) if self.camera_dic else 0
             self.camera_dic[str(disable_id)] = "Disable"
-            self.camera_name_cb["values"] = ["No." + str(k) + ": " + v for k, v in self.camera_dic.items()]
+            labels = []
+            self._camera_display_to_id = {}
+            for key, value in self.camera_dic.items():
+                base = "No." + str(key) + ": " + value
+                conflicts = [] if value == "Disable" else device_usage_conflicts(
+                    usage_entries, "camera", canonical_device_key("camera", value))
+                label = (
+                    "No.{}: [使用中] {} [別PokeCon: {}]".format(
+                        key, value, self._device_conflict_owner_text(conflicts))
+                    if conflicts else base)
+                labels.append(label)
+                self._camera_display_to_id[label] = key
+                self._camera_display_to_id[base] = key
+            self.camera_name_cb.configure(values=labels, state="readonly")
             self._logger.debug(f"Camera list: {[device for device in self.camera_dic.values()]}")
             dev_num = len(self.camera_dic)
         elif platform.system() == "Darwin":
@@ -2358,7 +2636,20 @@ class PokeControllerApp:
             dev_num = len(self.camera_name_cb["values"])
             disable_id = (max(list(self.camera_dic.keys())) + 1) if self.camera_dic else 0
             self.camera_dic[str(disable_id)] = "Disable"
-            self.camera_name_cb["values"] = ["No." + str(k) + ": " + v for k, v in self.camera_dic.items()]
+            labels = []
+            self._camera_display_to_id = {}
+            for key, value in self.camera_dic.items():
+                base = "No." + str(key) + ": " + value
+                conflicts = [] if value == "Disable" else device_usage_conflicts(
+                    usage_entries, "camera", canonical_device_key("camera", value))
+                label = (
+                    "No.{}: [使用中] {} [別PokeCon: {}]".format(
+                        key, value, self._device_conflict_owner_text(conflicts))
+                    if conflicts else base)
+                labels.append(label)
+                self._camera_display_to_id[label] = key
+                self._camera_display_to_id[base] = key
+            self.camera_name_cb.configure(values=labels, state="readonly")
         else:
             return False
         if self.camera_id.get() > dev_num - 1:
@@ -2376,12 +2667,31 @@ class PokeControllerApp:
     def locateDeviceCmbbox(self):
         # ポート情報取得
         devices_list = list(list_ports.comports())
-        descriptions = [str(d.description) for d in devices_list]
-        def sort_key(value):
+        usage_entries = self._other_device_usage_entries()
+        def sort_key(port):
+            value = str(getattr(port, "device", ""))
             match = re.search(r"(?i)COM(\d+)", value)
             return (int(match.group(1)) if match else 10 ** 9, value.casefold())
-        self.serial_devices = sorted(descriptions, key=sort_key)
-        self.serial_device_name_cb["values"] = ["(未設定)"] + self.serial_devices
+        devices_list = sorted(devices_list, key=sort_key)
+        self.serial_devices = [str(port.description) for port in devices_list]
+        self._serial_display_details = {}
+        labels = ["(未設定)"]
+        for port in devices_list:
+            description = str(port.description)
+            device = str(getattr(port, "device", ""))
+            base = "{} [{}]".format(description, device) if device else description
+            key = canonical_device_key("serial", device or description)
+            label = base + self._device_usage_suffix("serial", key, usage_entries)
+            self._serial_display_details[label] = {
+                "description": description, "device": device, "key": key,
+            }
+            labels.append(label)
+        # Usage annotations include the other PokeCon's InputSet and PID.
+        # Widen the field/dropdown to keep that suffix visible, while capping
+        # it so an unusually long USB description does not exceed the screen.
+        longest = max((len(label) for label in labels), default=55)
+        self.serial_device_name_cb.configure(
+            values=labels, width=max(55, min(120, longest + 2)))
 
     def saveCapture(self):
         self.camera.saveCapture()
@@ -2464,7 +2774,11 @@ class PokeControllerApp:
 
     def area_capture_roi_changed(self, *_):
         """Typed ROI edits behave the same as a Shift-drag selection."""
-        if self.area_capture_active.get() and hasattr(self, "camera") and getattr(self.camera, "image_bgr", None) is not None:
+        should_refresh = self.area_capture_active.get() or \
+            getattr(self, "area_capture_held_image", None) is not None
+        if should_refresh and hasattr(self, "camera") and \
+                (getattr(self.camera, "image_bgr", None) is not None or
+                 getattr(self, "area_capture_held_frame", None) is not None):
             self.root.after_idle(self.preview_area_capture)
 
     def toggle_area_capture_active(self):
@@ -2519,7 +2833,9 @@ class PokeControllerApp:
         except ValueError as error:
             tkmsg.showwarning("Area Capture", str(error))
             return
-        self.area_capture_held_image = image[y:y + height, x:x + width].copy()
+        self.area_capture_held_frame = image.copy()
+        self.area_capture_held_image = \
+            self.area_capture_held_frame[y:y + height, x:x + width].copy()
         self.area_capture_held_roi = (x, y, width, height)
         self.area_capture_hold_button.configure(text="現在範囲を再取得")
         slot = self._area_capture_preview_slot()
@@ -2755,6 +3071,34 @@ class PokeControllerApp:
         if self.area_capture_held_image is None:
             tkmsg.showinfo("画像検知登録", "先に［現在範囲を仮保持］を押してください。")
             return
+        # Synchronize with the ROI currently shown in Area Capture.  A typed
+        # ROI edit can otherwise still be waiting in Tk's idle queue, leaving
+        # area_capture_held_roi one edit behind at registration time.
+        held_frame = getattr(self, "area_capture_held_frame", None)
+        if held_frame is None:
+            held_frame = getattr(self.camera, "image_bgr", None)
+        if held_frame is None:
+            tkmsg.showwarning("Area Capture", "Start the camera before registering an area.")
+            return
+        try:
+            selected_roi = self._area_capture_rect(held_frame)
+            x, y, width, height = selected_roi
+            registration_image = held_frame[y:y + height, x:x + width].copy()
+            arrow_margin = max(0, int(self.area_capture_step.get()))
+            registration_crop = padded_search_crop(
+                selected_roi, arrow_margin, held_frame.shape)
+            registration_roi_display = [
+                registration_crop[0], registration_crop[1],
+                registration_crop[2] - registration_crop[0],
+                registration_crop[3] - registration_crop[1],
+            ]
+        except (ValueError, tk.TclError) as error:
+            tkmsg.showwarning("Area Capture", str(error))
+            return
+        self.area_capture_held_roi = selected_roi
+        self.area_capture_held_image = registration_image
+        serial_root = os.path.dirname(os.path.abspath(__file__))
+        template_root = os.path.join(serial_root, "Template")
         dialog = tk.Toplevel(self.root)
         dialog.title("DevStudio用画像検知として登録")
         dialog.transient(self.root)
@@ -2771,8 +3115,47 @@ class PokeControllerApp:
                                                  ("説明:", description))):
             ttk.Label(dialog, text=label).grid(column=0, row=row, padx=8, pady=5, sticky="e")
             ttk.Entry(dialog, textvariable=variable, width=52).grid(column=1, row=row, padx=8, pady=5, sticky="ew")
+
+        ttk.Label(
+            dialog,
+            text="登録する検出ROI x,y,w,h: {} (Arrow move余白: {}px)".format(
+                ",".join(map(str, registration_roi_display)), arrow_margin),
+        ).grid(column=1, columnspan=2, row=7, padx=8, pady=(0, 3), sticky="w")
+
+        def choose_registration_folder():
+            from tkinter import filedialog
+            relative = folder.get().strip().replace("\\", "/")
+            candidate = os.path.abspath(os.path.join(
+                template_root, *[part for part in relative.split("/") if part]))
+            try:
+                inside_template = os.path.commonpath(
+                    (os.path.abspath(template_root), candidate)) == os.path.abspath(template_root)
+            except ValueError:
+                inside_template = False
+            initial = candidate if inside_template and os.path.isdir(candidate) else template_root
+            selected = filedialog.askdirectory(
+                parent=dialog, title="画像の保存フォルダを選択（Template以下）",
+                initialdir=initial, mustexist=True)
+            if not selected:
+                return
+            selected = os.path.abspath(selected)
+            try:
+                inside_template = os.path.commonpath(
+                    (os.path.abspath(template_root), selected)) == os.path.abspath(template_root)
+            except ValueError:
+                inside_template = False
+            if not inside_template:
+                tkmsg.showwarning(
+                    "画像検知登録", "SerialController/Template以下のフォルダを選択してください。",
+                    parent=dialog)
+                return
+            relative = os.path.relpath(selected, template_root).replace("\\", "/")
+            folder.set("" if relative == "." else relative)
+
+        ttk.Button(dialog, text="選択...", command=choose_registration_folder).grid(
+            column=2, row=1, padx=(0, 8), pady=5, sticky="w")
         ttk.Label(dialog, text="例: ZA_Story/Common（Templateフォルダ以下）").grid(
-            column=1, row=6, padx=8, pady=(0, 5), sticky="w")
+            column=1, columnspan=2, row=6, padx=8, pady=(0, 5), sticky="w")
 
         def save_registration():
             name = target_name.get().strip()
@@ -2780,11 +3163,9 @@ class PokeControllerApp:
             if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_+.-]*", name):
                 tkmsg.showwarning("画像検知登録", "画像検知名は英数字・_・+・.・-で指定してください。", parent=dialog)
                 return
-            if not parts or any(part in (".", "..") or re.search(r'[<>:"|?*]', part) for part in parts):
+            if any(part in (".", "..") or re.search(r'[<>:"|?*]', part) for part in parts):
                 tkmsg.showwarning("画像検知登録", "Template以下の安全なフォルダ名を指定してください。", parent=dialog)
                 return
-            serial_root = os.path.dirname(os.path.abspath(__file__))
-            template_root = os.path.join(serial_root, "Template")
             destination_dir = os.path.abspath(os.path.join(template_root, *parts))
             if os.path.commonpath((template_root, destination_dir)) != os.path.abspath(template_root):
                 tkmsg.showwarning("画像検知登録", "Templateフォルダ外には保存できません。", parent=dialog)
@@ -2810,7 +3191,7 @@ class PokeControllerApp:
             if existing:
                 suffix = datetime.datetime.now().strftime("_%Y%m%d_%H%M%S_%f")
                 image_path = os.path.join(destination_dir, name + suffix + ".png")
-            ok, encoded = cv2.imencode(".png", self.area_capture_held_image)
+            ok, encoded = cv2.imencode(".png", registration_image)
             if not ok:
                 tkmsg.showerror("画像検知登録", "画像をPNGへ変換できませんでした。", parent=dialog)
                 return
@@ -2819,11 +3200,7 @@ class PokeControllerApp:
             except OSError as error:
                 tkmsg.showerror("画像検知登録", str(error), parent=dialog)
                 return
-            try:
-                _, (x, y, width, height) = self._area_detection_region(getattr(self.camera, "image_bgr", None))
-            except ValueError as error:
-                tkmsg.showwarning("画像検知登録", str(error), parent=dialog)
-                return
+            x1, y1, x2, y2 = registration_crop
             portable_path = os.path.relpath(image_path, serial_root).replace("\\", "/")
             variant = {"template_path": portable_path,
                        "threshold": float(self.area_capture_detection_threshold.get()),
@@ -2832,7 +3209,7 @@ class PokeControllerApp:
                        "show_only_true_rect": False, "ms": 2000,
                        "match_color": self.area_capture_match_color.get(),
                        "no_match_color": self.area_capture_no_match_color.get(),
-                       "crop": [x, y, x + width, y + height]}
+                       "crop": [x1, y1, x2, y2]}
             entered_tags = [value.strip() for value in tags.get().split(",") if value.strip()]
             entered_game_tags = [value.strip() for value in game_tags.get().split(",") if value.strip()]
             entered_console_tags = [value.strip() for value in console_tags.get().split(",") if value.strip()]
@@ -2860,11 +3237,18 @@ class PokeControllerApp:
             except OSError as error:
                 tkmsg.showerror("画像検知登録", str(error), parent=dialog)
                 return
-            self.area_capture_status.set("DevStudio用画像検知を登録しました: " + name)
-            self.show_output("Analysis", text="画像検知ライブラリへ登録: {} ({})".format(name, portable_path))
+            crop_text = ",".join(map(str, registration_roi_display))
+            self.area_capture_status.set(
+                "DevStudio用画像検知を登録しました: {} / ROI {} / 余白 {}px".format(
+                    name, crop_text, arrow_margin))
+            self.show_output(
+                "Analysis",
+                text="画像検知ライブラリへ登録: {} ({})\nROI: {} / Arrow move 余白: {}px".format(
+                    name, portable_path, crop_text, arrow_margin))
             dialog.destroy()
 
-        ttk.Button(dialog, text="登録", command=save_registration).grid(column=1, row=7, padx=8, pady=8, sticky="e")
+        ttk.Button(dialog, text="登録", command=save_registration).grid(
+            column=1, columnspan=2, row=8, padx=8, pady=8, sticky="e")
         dialog.columnconfigure(1, weight=1)
 
     def open_image_detection_tuning(self):
@@ -3117,6 +3501,18 @@ class PokeControllerApp:
         self.preview_area_capture()
 
     def preview_area_capture(self):
+        held_frame = getattr(self, "area_capture_held_frame", None)
+        if self.area_capture_held_image is not None and held_frame is not None:
+            try:
+                held_x, held_y, held_width, held_height = \
+                    self._area_capture_rect(held_frame)
+            except ValueError:
+                return None
+            self.area_capture_held_roi = \
+                (held_x, held_y, held_width, held_height)
+            self.area_capture_held_image = held_frame[
+                held_y:held_y + held_height,
+                held_x:held_x + held_width].copy()
         if not self.area_capture_active.get():
             held = self.area_capture_held_image
             if held is not None:
@@ -3136,8 +3532,8 @@ class PokeControllerApp:
             self.preview.deleteImageRect("AreaCaptureROI")
             self.preview.ImgRect(x, y, x + width, y + height, "red", "AreaCaptureROI", 0, flag=False)
         live_crop = image[y:y + height, x:x + width].copy()
-        # Once held, the preview must remain a true still image.  A later
-        # click on the reacquire button explicitly replaces this snapshot.
+        # The complete frame is frozen while held, but the crop can still be
+        # adjusted from each edge.  Reacquire replaces the frozen frame.
         crop = self.area_capture_held_image.copy() if self.area_capture_held_image is not None else live_crop
         self.area_capture_status.set("仮保持した静止画を表示中" if self.area_capture_held_image is not None
                                      else "Area Capture preview: active")
@@ -3181,20 +3577,39 @@ class PokeControllerApp:
 
         canvas.bind("<MouseWheel>", scroll)
         canvas.bind("<Control-MouseWheel>", zoom)
-        ttk.Button(controls, text="−", width=3, command=lambda: button_zoom(0.8)).pack(side="left", padx=2)
-        ttk.Button(controls, text="+", width=3, command=lambda: button_zoom(1.25)).pack(side="left", padx=2)
-        ttk.Label(controls, text="Left edge").pack(side="left", padx=(10, 2))
-        ttk.Button(controls, text="<", width=3, command=lambda: button_resize("left", -1)).pack(side="left", padx=1)
-        ttk.Button(controls, text=">", width=3, command=lambda: button_resize("left", 1)).pack(side="left", padx=1)
-        ttk.Label(controls, text="Right edge").pack(side="left", padx=(6, 2))
-        ttk.Button(controls, text="<", width=3, command=lambda: button_resize("right", -1)).pack(side="left", padx=1)
-        ttk.Button(controls, text=">", width=3, command=lambda: button_resize("right", 1)).pack(side="left", padx=1)
-        ttk.Label(controls, text="Top edge").pack(side="left", padx=(6, 2))
-        ttk.Button(controls, text="^", width=3, command=lambda: button_resize("top", -1)).pack(side="left", padx=1)
-        ttk.Button(controls, text="v", width=3, command=lambda: button_resize("top", 1)).pack(side="left", padx=1)
-        ttk.Label(controls, text="Bottom edge").pack(side="left", padx=(6, 2))
-        ttk.Button(controls, text="^", width=3, command=lambda: button_resize("bottom", -1)).pack(side="left", padx=1)
-        ttk.Button(controls, text="v", width=3, command=lambda: button_resize("bottom", 1)).pack(side="left", padx=1)
+        # A single horizontal row is wider than an Output panel and used to
+        # hide the top/bottom controls.  Keep every edge visible in two rows.
+        horizontal_controls = ttk.Frame(controls)
+        horizontal_controls.grid(column=0, row=0, sticky="w")
+        vertical_controls = ttk.Frame(controls)
+        vertical_controls.grid(column=0, row=1, sticky="w", pady=(2, 0))
+
+        ttk.Label(horizontal_controls, text="ズーム").pack(side="left", padx=(2, 1))
+        ttk.Button(horizontal_controls, text="−", width=2,
+                   command=lambda: button_zoom(0.8)).pack(side="left", padx=1)
+        ttk.Button(horizontal_controls, text="+", width=2,
+                   command=lambda: button_zoom(1.25)).pack(side="left", padx=1)
+        ttk.Label(horizontal_controls, text="左端").pack(side="left", padx=(8, 1))
+        ttk.Button(horizontal_controls, text="←", width=2,
+                   command=lambda: button_resize("left", -1)).pack(side="left", padx=1)
+        ttk.Button(horizontal_controls, text="→", width=2,
+                   command=lambda: button_resize("left", 1)).pack(side="left", padx=1)
+        ttk.Label(horizontal_controls, text="右端").pack(side="left", padx=(6, 1))
+        ttk.Button(horizontal_controls, text="←", width=2,
+                   command=lambda: button_resize("right", -1)).pack(side="left", padx=1)
+        ttk.Button(horizontal_controls, text="→", width=2,
+                   command=lambda: button_resize("right", 1)).pack(side="left", padx=1)
+
+        ttk.Label(vertical_controls, text="上端").pack(side="left", padx=(2, 1))
+        ttk.Button(vertical_controls, text="↑", width=2,
+                   command=lambda: button_resize("top", -1)).pack(side="left", padx=1)
+        ttk.Button(vertical_controls, text="↓", width=2,
+                   command=lambda: button_resize("top", 1)).pack(side="left", padx=1)
+        ttk.Label(vertical_controls, text="下端").pack(side="left", padx=(8, 1))
+        ttk.Button(vertical_controls, text="↑", width=2,
+                   command=lambda: button_resize("bottom", -1)).pack(side="left", padx=1)
+        ttk.Button(vertical_controls, text="↓", width=2,
+                   command=lambda: button_resize("bottom", 1)).pack(side="left", padx=1)
         self.area_capture_inline[slot] = (holder, canvas)
         self.area_capture_inline_zoom[slot] = 1.0
         return holder, canvas
@@ -3256,6 +3671,7 @@ class PokeControllerApp:
             return
         dialog = tk.Toplevel(self.root)
         dialog.title("Area Capture preview / edit")
+        dialog.minsize(420, 300)
         slot = self._area_capture_preview_slot()
         zoom = tk.DoubleVar(value=self.area_capture_inline_zoom.get(slot, 1.0))
         canvas = tk.Canvas(dialog, width=640, height=420, background="#303030")
@@ -3286,6 +3702,10 @@ class PokeControllerApp:
             self.move_area_capture(dx * self.area_capture_step.get(), dy * self.area_capture_step.get())
             refresh()
 
+        def adjust_edge(edge, direction):
+            self.resize_area_capture(edge, direction)
+            refresh()
+
         def change_zoom(factor):
             zoom.set(max(0.25, min(8.0, zoom.get() * factor)))
             if slot:
@@ -3293,13 +3713,50 @@ class PokeControllerApp:
             self.preview_area_capture()
             refresh()
 
-        ttk.Button(dialog, text="−", command=lambda: change_zoom(0.8)).grid(column=0, row=0, padx=3, pady=4)
-        ttk.Label(dialog, textvariable=zoom).grid(column=1, row=0, padx=3)
-        ttk.Button(dialog, text="+", command=lambda: change_zoom(1.25)).grid(column=2, row=0, padx=3, pady=4)
-        ttk.Button(dialog, text="←", command=lambda: adjust(-1, 0)).grid(column=3, row=0, padx=3)
-        ttk.Button(dialog, text="↑", command=lambda: adjust(0, -1)).grid(column=4, row=0, padx=3)
-        ttk.Button(dialog, text="↓", command=lambda: adjust(0, 1)).grid(column=3, row=3, padx=3, pady=4)
-        ttk.Button(dialog, text="→", command=lambda: adjust(1, 0)).grid(column=4, row=3, padx=3, pady=4)
+        toolbar = ttk.Frame(dialog)
+        toolbar.grid(column=0, columnspan=6, row=0, sticky="ew", padx=3, pady=4)
+        ttk.Label(toolbar, text="ズーム").pack(side="left", padx=(2, 1))
+        ttk.Button(toolbar, text="−", width=3,
+                   command=lambda: change_zoom(0.8)).pack(side="left", padx=1)
+        ttk.Label(toolbar, textvariable=zoom).pack(side="left", padx=3)
+        ttk.Button(toolbar, text="+", width=3,
+                   command=lambda: change_zoom(1.25)).pack(side="left", padx=1)
+        ttk.Label(toolbar, text="範囲移動").pack(side="left", padx=(12, 2))
+        ttk.Button(toolbar, text="←", width=3,
+                   command=lambda: adjust(-1, 0)).pack(side="left", padx=1)
+        ttk.Button(toolbar, text="→", width=3,
+                   command=lambda: adjust(1, 0)).pack(side="left", padx=1)
+        ttk.Button(toolbar, text="↑", width=3,
+                   command=lambda: adjust(0, -1)).pack(side="left", padx=1)
+        ttk.Button(toolbar, text="↓", width=3,
+                   command=lambda: adjust(0, 1)).pack(side="left", padx=1)
+
+        edge_controls = ttk.Frame(dialog)
+        edge_controls.grid(column=0, columnspan=6, row=3, sticky="ew", padx=3, pady=4)
+        horizontal_edges = ttk.Frame(edge_controls)
+        horizontal_edges.pack(anchor="w")
+        vertical_edges = ttk.Frame(edge_controls)
+        vertical_edges.pack(anchor="w", pady=(2, 0))
+        ttk.Label(horizontal_edges, text="幅調整  左端").pack(side="left", padx=(2, 1))
+        ttk.Button(horizontal_edges, text="←", width=3,
+                   command=lambda: adjust_edge("left", -1)).pack(side="left", padx=1)
+        ttk.Button(horizontal_edges, text="→", width=3,
+                   command=lambda: adjust_edge("left", 1)).pack(side="left", padx=1)
+        ttk.Label(horizontal_edges, text="右端").pack(side="left", padx=(10, 1))
+        ttk.Button(horizontal_edges, text="←", width=3,
+                   command=lambda: adjust_edge("right", -1)).pack(side="left", padx=1)
+        ttk.Button(horizontal_edges, text="→", width=3,
+                   command=lambda: adjust_edge("right", 1)).pack(side="left", padx=1)
+        ttk.Label(vertical_edges, text="高さ調整 上端").pack(side="left", padx=(2, 1))
+        ttk.Button(vertical_edges, text="↑", width=3,
+                   command=lambda: adjust_edge("top", -1)).pack(side="left", padx=1)
+        ttk.Button(vertical_edges, text="↓", width=3,
+                   command=lambda: adjust_edge("top", 1)).pack(side="left", padx=1)
+        ttk.Label(vertical_edges, text="下端").pack(side="left", padx=(10, 1))
+        ttk.Button(vertical_edges, text="↑", width=3,
+                   command=lambda: adjust_edge("bottom", -1)).pack(side="left", padx=1)
+        ttk.Button(vertical_edges, text="↓", width=3,
+                   command=lambda: adjust_edge("bottom", 1)).pack(side="left", padx=1)
         refresh()
 
     def OpenCaptureDir(self):
@@ -3424,12 +3881,14 @@ class PokeControllerApp:
     def _reorder_controller_tabs(self):
         """Keep the frequently used tabs in the requested fixed order."""
         ordered = [
-            (self.input_set_f, "InputSet"), (self.camera_tab, "Camera"),
-            (self.audio_tab, "Audio"), (self.recording_tab, "Recording"),
-            (self.serial_tab, "Serial"), (self.manual_control_tab, "Manual Control"),
-            (self.area_capture_tab, "Area Capture"), (self.commands_tab, "Commands"),
-            (self.commands_assist_tab, "CommandsAssist"),
-            (self.image_detection_monitor_tab, "Image Detection"),
+             (self.input_set_f, "InputSet"), (self.camera_tab, "Camera"),
+             (self.resource_tab, "Resource"),
+             (self.audio_tab, "Audio"), (self.recording_tab, "Recording"),
+             (self.serial_tab, "Serial"), (self.manual_control_tab, "Manual Control"),
+             (self.area_capture_tab, "Area Capture"), (self.commands_tab, "Commands"),
+             (self.commands_assist_tab, "CommandsAssist"),
+             (self.operation_capture_tab, "操作記録→Commands"),
+             (self.image_detection_monitor_tab, "Image Detection"),
             (self.analysis_tab, "Analysis"),
             (self.object_detection_tab, "Object Detection"),
             (self.command_watch_tab, "Command Watch"),
@@ -3512,6 +3971,7 @@ class PokeControllerApp:
         self.image_detection_monitor_interval = tk.DoubleVar(value=0.5)
         self.image_detection_monitor_output = tk.StringVar(value="Output#2")
         self.image_detection_monitor_output_tag = tk.StringVar(value="ShowValue")
+        self.image_detection_monitor_value_timeout = tk.DoubleVar(value=5.0)
         self.image_detection_monitor_score = tk.DoubleVar(value=0.0)
         self.image_detection_monitor_score_text = tk.StringVar(value="---")
         self.image_detection_monitor_threshold_text = tk.StringVar(value="閾値: ---")
@@ -3673,24 +4133,35 @@ class PokeControllerApp:
         ttk.Entry(dialog, width=28,
                   textvariable=self.image_detection_monitor_output_tag).grid(
                       column=1, row=1, padx=8, pady=6, sticky="ew")
+        ttk.Label(dialog, text="更新なしで消すまで:").grid(
+            column=0, row=2, padx=8, pady=6, sticky="e")
+        timeout_row = ttk.Frame(dialog)
+        timeout_row.grid(column=1, row=2, padx=8, pady=6, sticky="w")
+        ttk.Spinbox(
+            timeout_row, from_=0.5, to=60.0, increment=0.5, width=7,
+            textvariable=self.image_detection_monitor_value_timeout).pack(side="left")
+        ttk.Label(timeout_row, text="秒").pack(side="left", padx=(3, 0))
         ttk.Label(
             dialog,
             text=("CameraタブのShow ValueがON、またはDevStudio登録の"
-                  "show_valueがONの検知結果を表示します。"),
+                  "show_valueがONの検知結果を、検知名ごとに並べて表示します。"),
             wraplength=440).grid(
-                column=0, columnspan=2, row=2, padx=8, pady=(3, 6), sticky="w")
+                column=0, columnspan=2, row=3, padx=8, pady=(3, 6), sticky="w")
 
         def apply_settings():
             output = self.image_detection_monitor_output.get()
+            self.image_detection_monitor_value_timeout.set(
+                self._image_detection_value_timeout_seconds())
             if output != "Disabled":
                 self._ensure_image_detection_monitor_output_visible(output)
             self.image_detection_monitor_status.set(
                 "Show Value出力先: {} / タグ: {}".format(
                     output, self.image_detection_monitor_output_tag.get().strip() or "ShowValue"))
+            self._refresh_image_detection_value_output(force=True)
             dialog.destroy()
 
         ttk.Button(dialog, text="反映", command=apply_settings).grid(
-            column=1, row=3, padx=8, pady=8, sticky="e")
+            column=1, row=4, padx=8, pady=8, sticky="e")
         dialog.columnconfigure(1, weight=1)
 
     def _ensure_image_detection_monitor_output_visible(self, output):
@@ -3718,6 +4189,7 @@ class PokeControllerApp:
         try:
             if self.image_detection_monitor_enabled.get():
                 self._queue_image_detection_monitor_match(False)
+            self._refresh_image_detection_value_output()
             self.root.after(100, self._image_detection_monitor_tick)
         except tk.TclError:
             pass
@@ -3730,6 +4202,8 @@ class PokeControllerApp:
             interval = max(0.2, float(self.image_detection_monitor_interval.get()))
         except (TypeError, ValueError, tk.TclError):
             interval = 0.5
+        if not force:
+            interval *= self._resource_preview_multiplier()
         if not force and now - self.image_detection_monitor_last_submit < interval:
             return
         variant = self._current_image_detection_monitor_variant()
@@ -3741,33 +4215,34 @@ class PokeControllerApp:
         if frame is None:
             self.image_detection_monitor_status.set("映像入力を待っています。")
             return
-        try:
-            source, offset = crop_search_region(frame, variant.get("crop", []))
-            serial_root = os.path.dirname(os.path.abspath(__file__))
-            path = resolve_template_path(serial_root, variant.get("template_path", ""))
-            modified = os.path.getmtime(path)
-            cached = self.image_detection_monitor_templates.get(path)
-            if cached is None or cached[0] != modified:
-                template = cv2.imread(path, cv2.IMREAD_COLOR)
-                self.image_detection_monitor_templates[path] = (modified, template)
-            else:
-                template = cached[1]
-            if template is None:
-                raise ValueError("登録画像を読み込めません: " + path)
-        except (OSError, ValueError, TypeError) as error:
-            self.image_detection_monitor_status.set(str(error))
-            return
-
         generation = self.image_detection_monitor_generation
+        variant = dict(variant)
+        serial_root = os.path.dirname(os.path.abspath(__file__))
         self.image_detection_monitor_worker_running = True
         self.image_detection_monitor_last_submit = now
 
         def worker():
             try:
-                detail = match_variant(source, template, dict(variant), offset)
+                # Cropping, disk access and decoding can all stall on USB or a
+                # busy disk.  Keep the complete measurement off Tk's thread.
+                source, offset = crop_search_region(
+                    frame, variant.get("crop", []))
+                path = resolve_template_path(
+                    serial_root, variant.get("template_path", ""))
+                modified = os.path.getmtime(path)
+                cached = self.image_detection_monitor_templates.get(path)
+                if cached is None or cached[0] != modified:
+                    template = cv2.imread(path, cv2.IMREAD_COLOR)
+                    self.image_detection_monitor_templates[path] = (
+                        modified, template)
+                else:
+                    template = cached[1]
+                if template is None:
+                    raise ValueError("登録画像を読み込めません: " + path)
+                detail = match_variant(source, template, variant, offset)
                 callback = lambda: self._finish_image_detection_monitor_match(
                     generation, target_name, detail)
-            except (ValueError, cv2.error) as error:
+            except (OSError, ValueError, TypeError, cv2.error) as error:
                 callback = lambda error=error: self._fail_image_detection_monitor_match(
                     generation, str(error))
             self._gui_action_queue.put(callback)
@@ -3943,6 +4418,24 @@ class PokeControllerApp:
             return False
         data = self._read_input_sets()
         if not sync_quick_actions(data, name, self._quick_actions_snapshot()):
+            return False
+        self._write_input_sets(data)
+        return True
+
+    def _sync_output_layout_to_active_input_set(self):
+        """Persist log divider positions when the user releases a slider."""
+        name = str(getattr(self, "_active_input_set_name", "") or "").strip()
+        if not name or not hasattr(self, "input_set_name"):
+            return False
+        if self.input_set_name.get().strip() != name:
+            return False
+        values = {
+            "side_width_balance": self.side_width_balance.get(),
+            "panel_ratio": self.panel_ratio.get(),
+            "right_panel_ratio": self.right_panel_ratio.get(),
+        }
+        data = self._read_input_sets()
+        if not sync_output_layout(data, name, values):
             return False
         self._write_input_sets(data)
         return True
@@ -5493,6 +5986,22 @@ class PokeControllerApp:
                     self.step_debug_next_state.set("")
                 self.commands_assist_status.set("Stepデバッグ停止中: {} :: {}".format(
                     pending["variable"], pending["state"]))
+                chunk = getattr(self, "_command_monitor_current_chunk", None)
+                if chunk is not None:
+                    info = pending.get("info", {})
+                    location = {
+                        "file": os.path.abspath(str(info.get("file", "") or "")),
+                        "function": str(info.get("name", "")),
+                        "line": int(info.get("first_line", 0) or 0),
+                        "source": "Stepデバッグ停止地点",
+                    }
+                    self._write_command_monitor_event(
+                        chunk, runtime_state_snapshot(pending.get("command")),
+                        "step_debug_stop", location=location,
+                        extra={
+                            "stop_variable": str(pending.get("variable", "")),
+                            "stop_state": str(pending.get("state", "")),
+                        })
                 # This is the useful stop notification: always show the
                 # separate Step-debug window when execution reaches a stop.
                 self.open_step_debug_assist()
@@ -5579,20 +6088,553 @@ class PokeControllerApp:
                 continue
         return sorted(variables, key=str.casefold)
 
+    def _command_run_options(self, command_name):
+        """Discover start/end/debug metadata without constructing Commands."""
+        empty = {"enabled": False, "locations": [], "debug_options": [],
+                 "save_recovery": {"available": False, "method": ""}}
+        for command_class in self._command_classes(command_name):
+            try:
+                path = inspect.getsourcefile(command_class)
+                if not path or not os.path.isfile(path):
+                    continue
+                with open(path, "r", encoding="utf-8-sig") as stream:
+                    return discover_command_run_options(
+                        stream.read(), class_name=command_class.__name__)
+            except (OSError, SyntaxError, TypeError, ValueError):
+                continue
+        return empty
+
+    def _prompt_command_run_settings(self, command_instance):
+        """Show the Commands-owned Step selector after Start was requested."""
+        command_name = str(getattr(command_instance, "NAME", "") or "")
+        options = self._command_run_options(command_name)
+        locations = list(options.get("locations", []))
+        if not options.get("enabled") or not locations:
+            return True
+
+        result = {"start": False}
+        saved = copy.deepcopy(self.command_start_overrides.get(command_name, {}))
+        dialog = tk.Toplevel(self.root)
+        dialog.title("{} - Step実行設定".format(command_name))
+        dialog.geometry("1020x720")
+        dialog.minsize(820, 580)
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        search = tk.StringVar()
+        group = tk.StringVar(value="すべて")
+        start_value = tk.StringVar()
+        end_value = tk.StringVar(value="（終了場所を指定しない）")
+        favorite_value = tk.StringVar()
+        description = tk.StringVar()
+        filter_status = tk.StringVar()
+        user_number = tk.IntVar(value=int(saved.get(
+            "save_delete_user_number", 0) or 0))
+        retry = tk.BooleanVar(value=bool(saved.get("retry_on_failure", False)))
+        retries = tk.IntVar(value=max(1, int(saved.get("max_retries", 1) or 1)))
+        debug_vars = {}
+        display_to_location = {
+            self._command_run_location_display(item): item for item in locations}
+
+        ttk.Label(
+            dialog, text="Startが押されました。実行する範囲を選択してください。",
+            foreground="#174a7e").pack(anchor="w", padx=10, pady=(10, 5))
+        filter_box = ttk.Labelframe(dialog, text="検索・フィルター")
+        filter_box.pack(fill="x", padx=10, pady=5)
+        ttk.Label(filter_box, text="文字検索:").grid(
+            column=0, row=0, padx=5, pady=5, sticky="e")
+        ttk.Entry(filter_box, textvariable=search).grid(
+            column=1, row=0, padx=5, pady=5, sticky="ew")
+        ttk.Label(filter_box, text="章／Stepグループ（任意）:").grid(
+            column=2, row=0, padx=5, pady=5, sticky="e")
+        raw_groups = sorted(
+            {str(item.get("group", "")) for item in locations},
+            key=str.casefold)
+        group_display_to_raw = {"すべて": ""}
+        for raw_group in raw_groups:
+            display_group = raw_group
+            if raw_group.startswith("STATE_") and raw_group.endswith("_FUNCTION"):
+                display_group = raw_group[len("STATE_"):-len("_FUNCTION")]
+            if display_group in group_display_to_raw:
+                display_group = "{} ({})".format(display_group, raw_group)
+            group_display_to_raw[display_group] = raw_group
+        group_cb = ttk.Combobox(
+            filter_box, state="readonly", textvariable=group,
+            values=list(group_display_to_raw), width=32)
+        group_cb.grid(column=3, row=0, padx=5, pady=5, sticky="ew")
+        ttk.Label(filter_box, textvariable=filter_status).grid(
+            column=4, row=0, padx=7, pady=5, sticky="w")
+        filter_box.columnconfigure(1, weight=1)
+        filter_box.columnconfigure(3, weight=1)
+
+        range_box = ttk.Labelframe(dialog, text="開始・終了場所")
+        range_box.pack(fill="x", padx=10, pady=5)
+        ttk.Label(range_box, text="開始:").grid(
+            column=0, row=0, padx=5, pady=5, sticky="e")
+        start_cb = ttk.Combobox(
+            range_box, state="readonly", width=78, textvariable=start_value)
+        start_cb.grid(column=1, row=0, padx=5, pady=5, sticky="ew")
+        ttk.Label(range_box, text="終了:").grid(
+            column=0, row=1, padx=5, pady=5, sticky="e")
+        end_cb = ttk.Combobox(
+            range_box, state="readonly", width=78, textvariable=end_value)
+        end_cb.grid(column=1, row=1, padx=5, pady=5, sticky="ew")
+        ttk.Label(
+            range_box, textvariable=description, justify="left",
+            foreground="#174a7e", wraplength=930).grid(
+                column=0, columnspan=2, row=2, padx=7, pady=(0, 6), sticky="w")
+        range_box.columnconfigure(1, weight=1)
+
+        favorite_box = ttk.Labelframe(dialog, text="お気に入り（Commandsごと・最大10件）")
+        favorite_box.pack(fill="x", padx=10, pady=5)
+        favorite_cb = ttk.Combobox(
+            favorite_box, state="readonly", width=48,
+            textvariable=favorite_value)
+        favorite_cb.grid(column=0, row=0, padx=5, pady=5, sticky="ew")
+
+        option_box = ttk.Labelframe(dialog, text="デバッグ・失敗時再実行")
+        option_box.pack(fill="both", expand=True, padx=10, pady=5)
+        debug_frame = ttk.Frame(option_box)
+        debug_frame.pack(fill="x", padx=5, pady=3)
+        saved_debug = saved.get("debug", {})
+        for index, item in enumerate(options.get("debug_options", [])):
+            attribute = str(item.get("attribute", item.get("id", "")))
+            value = tk.BooleanVar(value=bool(
+                saved_debug.get(attribute, item.get("default", False))))
+            debug_vars[attribute] = value
+            ttk.Checkbutton(
+                debug_frame, text=str(item.get("label", attribute)),
+                variable=value).grid(
+                    column=index % 4, row=index // 4,
+                    padx=5, pady=3, sticky="w")
+        if not debug_vars:
+            ttk.Label(debug_frame, text="選択可能なデバッグ項目はありません。").grid(
+                column=0, row=0, padx=5, pady=3, sticky="w")
+        recovery = options.get("save_recovery", {})
+        recovery_row = ttk.Frame(option_box)
+        recovery_row.pack(fill="x", padx=5, pady=4)
+        ttk.Label(recovery_row, text="セーブ削除ユーザー番号:").pack(
+            side="left", padx=(0, 3))
+        ttk.Spinbox(recovery_row, from_=0, to=99, width=6,
+                    textvariable=user_number).pack(side="left", padx=3)
+        retry_cb = ttk.Checkbutton(
+            recovery_row, text="失敗時にセーブを削除して再実行", variable=retry)
+        retry_cb.pack(side="left", padx=10)
+        ttk.Label(recovery_row, text="再試行:").pack(side="left", padx=(8, 2))
+        ttk.Spinbox(recovery_row, from_=1, to=10, width=5,
+                    textvariable=retries).pack(side="left", padx=2)
+        if not recovery.get("available"):
+            retry.set(False)
+            retry_cb.configure(state="disabled")
+            ttk.Label(
+                option_box,
+                text="このCommandsはセーブ削除関数を公開していないため、失敗時再実行は使用できません。",
+                foreground="#8a4d00").pack(anchor="w", padx=10, pady=(0, 5))
+
+        def find_display(location):
+            location = location or {}
+            return next((display for display, item in display_to_location.items()
+                         if item.get("id") == location.get("id")), "")
+
+        def refresh_description(_event=None):
+            start = display_to_location.get(start_value.get(), {})
+            end = display_to_location.get(end_value.get(), {})
+            description.set("開始: {}\n終了: {}".format(
+                start.get("description") or start.get("label") or "未選択",
+                end.get("description") or end.get("label") or "指定なし"))
+
+        def refresh_filter(*_args):
+            needle = search.get().strip().casefold()
+            selected_group = group_display_to_raw.get(group.get(), "")
+            visible = []
+            for display, item in display_to_location.items():
+                haystack = "{} {} {} {}".format(
+                    display, item.get("description", ""),
+                    item.get("variable", ""), item.get("value", ""))
+                if selected_group and str(item.get("group", "")) != selected_group:
+                    continue
+                if needle and needle not in haystack.casefold():
+                    continue
+                visible.append(display)
+            start_cb.configure(values=visible)
+            end_cb.configure(values=["（終了場所を指定しない）"] + visible)
+            filter_status.set("{} / {}件".format(len(visible), len(locations)))
+            # Filtering is only for finding the next choice. Keep selections
+            # made under another chapter/search even when currently hidden.
+            start_value.set(preserve_location_selection(
+                start_value.get(), visible))
+            end_value.set(preserve_location_selection(
+                end_value.get(), visible, "（終了場所を指定しない）"))
+            refresh_description()
+
+        def current_config():
+            start = copy.deepcopy(display_to_location.get(start_value.get(), {}))
+            end = copy.deepcopy(display_to_location.get(end_value.get(), {}))
+            if not start:
+                return None
+            return {
+                "variable": start.get("variable", "")
+                            if start.get("mode") == "state" else "",
+                "state": start.get("value", "")
+                         if start.get("mode") == "state" else "",
+                "start": start, "end": end,
+                "debug": {name: bool(value.get())
+                          for name, value in debug_vars.items()},
+                "save_delete_user_number": max(0, int(user_number.get() or 0)),
+                "retry_on_failure": bool(retry.get() and recovery.get("available")),
+                "recovery_method": str(recovery.get("method", "")),
+                "max_retries": max(1, int(retries.get() or 1)),
+                # This popup itself is the Start confirmation.
+                "confirm": False,
+            }
+
+        def apply_config(config):
+            nonlocal saved_debug
+            if not isinstance(config, dict):
+                return
+            start_value.set(find_display(config.get("start")))
+            end_value.set(find_display(config.get("end")) or
+                          "（終了場所を指定しない）")
+            saved_debug = config.get("debug", {})
+            for name, value in debug_vars.items():
+                value.set(bool(saved_debug.get(name, False)))
+            user_number.set(int(config.get("save_delete_user_number", 0) or 0))
+            retry.set(bool(config.get("retry_on_failure", False)
+                           and recovery.get("available")))
+            retries.set(max(1, int(config.get("max_retries", 1) or 1)))
+            refresh_description()
+
+        def favorites():
+            return self.command_run_favorites.setdefault(command_name, [])
+
+        def refresh_favorites(select_name=""):
+            names = [str(item.get("name", "")) for item in favorites()]
+            favorite_cb.configure(values=names,
+                                  state="readonly" if names else "disabled")
+            chosen = select_name or favorite_value.get()
+            favorite_value.set(chosen if chosen in names else
+                               (names[0] if names else ""))
+
+        def selected_favorite():
+            return next((item for item in favorites()
+                         if str(item.get("name", "")) == favorite_value.get()), None)
+
+        def load_favorite():
+            item = selected_favorite()
+            if item:
+                apply_config(copy.deepcopy(item.get("config", {})))
+
+        def add_favorite():
+            from tkinter import simpledialog
+            config = current_config()
+            if not config:
+                return
+            if len(favorites()) >= 10:
+                tkmsg.showwarning(
+                    "Step実行お気に入り", "最大10件です。不要な項目を削除してください。",
+                    parent=dialog)
+                return
+            name = simpledialog.askstring(
+                "Step実行お気に入り", "登録名:",
+                initialvalue="設定{}".format(len(favorites()) + 1), parent=dialog)
+            name = str(name or "").strip()
+            if not name:
+                return
+            if any(str(item.get("name", "")) == name for item in favorites()):
+                tkmsg.showwarning(
+                    "Step実行お気に入り", "同名が登録済みです。上書き変更を使用してください。",
+                    parent=dialog)
+                return
+            favorites().append({"name": name, "config": config})
+            self._sync_command_start_overrides_to_active_input_set()
+            refresh_favorites(name)
+
+        def update_favorite():
+            item = selected_favorite()
+            config = current_config()
+            if item is None or not config:
+                return
+            item["config"] = config
+            self._sync_command_start_overrides_to_active_input_set()
+
+        def delete_favorite():
+            item = selected_favorite()
+            if item is None:
+                return
+            if tkmsg.askyesno(
+                    "Step実行お気に入り",
+                    "お気に入り「{}」を削除しますか？".format(item.get("name", "")),
+                    parent=dialog):
+                favorites().remove(item)
+                if not favorites():
+                    self.command_run_favorites.pop(command_name, None)
+                self._sync_command_start_overrides_to_active_input_set()
+                refresh_favorites()
+
+        ttk.Button(favorite_box, text="呼出", command=load_favorite).grid(
+            column=1, row=0, padx=3, pady=5)
+        ttk.Button(favorite_box, text="新規登録", command=add_favorite).grid(
+            column=2, row=0, padx=3, pady=5)
+        ttk.Button(favorite_box, text="上書き変更", command=update_favorite).grid(
+            column=3, row=0, padx=3, pady=5)
+        ttk.Button(favorite_box, text="削除", command=delete_favorite).grid(
+            column=4, row=0, padx=3, pady=5)
+        favorite_box.columnconfigure(0, weight=1)
+
+        def finish(mode):
+            if mode == "apply":
+                config = current_config()
+                if not config:
+                    tkmsg.showwarning(
+                        "Step実行設定", "開始場所を選択してください。", parent=dialog)
+                    return
+                self.command_start_overrides[command_name] = config
+                self._sync_command_start_overrides_to_active_input_set()
+                result["start"] = True
+            elif mode == "default":
+                self.command_start_overrides.pop(command_name, None)
+                self._sync_command_start_overrides_to_active_input_set()
+                result["start"] = True
+            dialog.destroy()
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=10, pady=(5, 10))
+        ttk.Button(buttons, text="キャンセル", command=lambda: finish("cancel")).pack(
+            side="right", padx=4)
+        ttk.Button(buttons, text="Commands既定で開始",
+                   command=lambda: finish("default")).pack(side="right", padx=4)
+        ttk.Button(buttons, text="この設定で開始",
+                   command=lambda: finish("apply")).pack(side="right", padx=4)
+        dialog.protocol("WM_DELETE_WINDOW", lambda: finish("cancel"))
+        search.trace_add("write", refresh_filter)
+        group_cb.bind("<<ComboboxSelected>>", refresh_filter)
+        start_cb.bind("<<ComboboxSelected>>", refresh_description)
+        end_cb.bind("<<ComboboxSelected>>", refresh_description)
+        refresh_filter()
+        apply_config(saved if saved else {"start": locations[0]})
+        refresh_favorites()
+        self.root.wait_window(dialog)
+        self._refresh_command_start_status()
+        return bool(result["start"])
+
+    def _selected_command_run_changed(self, _event=None):
+        self._refresh_command_start_status()
+        self._refresh_inline_command_run_panel()
+
+    @staticmethod
+    def _command_run_location_display(item):
+        description = str(item.get("description", "") or "").strip()
+        # State dictionaries are an implementation detail. Users select the
+        # Step name directly; the hidden variable is applied automatically.
+        text = str(item.get("label", item.get("value", "")))
+        return text + (" — " + description if description else "")
+
+    def _refresh_inline_command_run_panel(self):
+        if not hasattr(self, "command_run_start_cb"):
+            return
+        command_name = self._selected_command_name()
+        options = self._command_run_options(command_name)
+        locations = options.get("locations", [])
+        self._command_run_inline_locations = {
+            self._command_run_location_display(item): item for item in locations}
+        displays = list(self._command_run_inline_locations)
+        self.command_run_start_cb.configure(
+            values=displays, state="readonly" if displays else "disabled")
+        self.command_run_end_cb.configure(
+            values=["（終了場所を指定しない）"] + displays,
+            state="readonly" if displays else "disabled")
+        saved = self.command_start_overrides.get(command_name, {})
+        saved_start = saved.get("start") or {}
+        saved_end = saved.get("end") or {}
+
+        def matching(location):
+            return next((display for display, item in
+                         self._command_run_inline_locations.items()
+                         if item.get("id") == location.get("id")), "")
+
+        start_display = matching(saved_start)
+        end_display = matching(saved_end)
+        self.command_run_start.set(
+            start_display or (displays[0] if displays else ""))
+        self.command_run_end.set(
+            end_display or "（終了場所を指定しない）")
+        favorites = self.command_run_favorites.get(command_name, [])
+        favorite_names = [str(item.get("name", "")) for item in favorites]
+        self.command_run_favorite_cb.configure(
+            values=favorite_names,
+            state="readonly" if favorite_names else "disabled")
+        if self.command_run_favorite.get() not in favorite_names:
+            self.command_run_favorite.set(favorite_names[0] if favorite_names else "")
+        self._refresh_inline_command_run_description()
+
+    def _refresh_inline_command_run_description(self, _event=None):
+        if not hasattr(self, "command_run_description"):
+            return
+        command_name = self._selected_command_name()
+        start = self._command_run_inline_locations.get(
+            self.command_run_start.get(), {})
+        end = self._command_run_inline_locations.get(
+            self.command_run_end.get(), {})
+        if not self._command_run_inline_locations:
+            self.command_run_description.set(
+                "{} はStep実行位置を公開していません。".format(
+                    command_name or "選択中Commands"))
+            return
+        parts = ["開始: {}".format(start.get("description") or
+                                   start.get("label") or "未選択")]
+        parts.append("終了: {}".format(
+            end.get("description") or end.get("label") or "指定なし"))
+        self.command_run_description.set(" / ".join(parts))
+
+    def _inline_command_run_config(self):
+        command_name = self._selected_command_name()
+        current = copy.deepcopy(
+            self.command_start_overrides.get(command_name, {}))
+        start = copy.deepcopy(self._command_run_inline_locations.get(
+            self.command_run_start.get(), {}))
+        end = copy.deepcopy(self._command_run_inline_locations.get(
+            self.command_run_end.get(), {}))
+        if not start:
+            return command_name, None
+        current.update({
+            "variable": start.get("variable", "")
+                        if start.get("mode") == "state" else "",
+            "state": start.get("value", "")
+                     if start.get("mode") == "state" else "",
+            "start": start, "end": end,
+        })
+        current.setdefault("debug", {})
+        current.setdefault("save_delete_user_number", 0)
+        current.setdefault("retry_on_failure", False)
+        current.setdefault("max_retries", 1)
+        current.setdefault("confirm", True)
+        return command_name, current
+
+    def apply_inline_command_run_settings(self):
+        command_name, config = self._inline_command_run_config()
+        if not command_name or not config:
+            tkmsg.showwarning(
+                "Step実行設定", "Step対応Commandsと開始場所を選択してください。",
+                parent=self.root)
+            return False
+        self.command_start_overrides[command_name] = config
+        saved = self._sync_command_start_overrides_to_active_input_set()
+        self._refresh_command_start_status()
+        self._refresh_inline_command_run_description()
+        if not saved:
+            self.show_output(
+                "Analysis", text="Step実行設定を作業中設定へ反映しました。InputSet登録時に保存されます。")
+        return True
+
+    def clear_inline_command_run_settings(self):
+        command_name = self._selected_command_name()
+        if not command_name:
+            return
+        self.command_start_overrides.pop(command_name, None)
+        self._sync_command_start_overrides_to_active_input_set()
+        self._refresh_command_start_status()
+        self._refresh_inline_command_run_panel()
+
+    def _selected_command_run_favorite(self):
+        command_name = self._selected_command_name()
+        name = self.command_run_favorite.get().strip()
+        return command_name, next((item for item in
+            self.command_run_favorites.get(command_name, [])
+            if str(item.get("name", "")) == name), None)
+
+    def add_command_run_favorite(self):
+        from tkinter import simpledialog
+        command_name, config = self._inline_command_run_config()
+        if not command_name or not config:
+            tkmsg.showwarning(
+                "Step実行お気に入り", "先にStep対応Commandsと開始場所を選択してください。",
+                parent=self.root)
+            return
+        favorites = self.command_run_favorites.setdefault(command_name, [])
+        if len(favorites) >= 10:
+            tkmsg.showwarning(
+                "Step実行お気に入り", "1つのCommandsにつき最大10件です。不要な項目を削除してください。",
+                parent=self.root)
+            return
+        name = simpledialog.askstring(
+            "Step実行お気に入り", "登録名:",
+            initialvalue="設定{}".format(len(favorites) + 1), parent=self.root)
+        name = str(name or "").strip()
+        if not name:
+            return
+        if any(str(item.get("name", "")) == name for item in favorites):
+            tkmsg.showwarning(
+                "Step実行お気に入り", "同じ名前が登録済みです。上書き変更を使用してください。",
+                parent=self.root)
+            return
+        favorites.append({"name": name, "config": config})
+        self.command_start_overrides[command_name] = copy.deepcopy(config)
+        self.command_run_favorite.set(name)
+        self._sync_command_start_overrides_to_active_input_set()
+        self._refresh_command_start_status()
+        self._refresh_inline_command_run_panel()
+
+    def load_command_run_favorite(self):
+        command_name, favorite = self._selected_command_run_favorite()
+        if favorite is None:
+            return
+        self.command_start_overrides[command_name] = copy.deepcopy(
+            favorite.get("config", {}))
+        self._sync_command_start_overrides_to_active_input_set()
+        self._refresh_command_start_status()
+        self._refresh_inline_command_run_panel()
+
+    def update_command_run_favorite(self):
+        command_name, favorite = self._selected_command_run_favorite()
+        _selected, config = self._inline_command_run_config()
+        if favorite is None or not config:
+            tkmsg.showwarning(
+                "Step実行お気に入り", "変更するお気に入りを選択してください。",
+                parent=self.root)
+            return
+        favorite["config"] = config
+        self.command_start_overrides[command_name] = copy.deepcopy(config)
+        self._sync_command_start_overrides_to_active_input_set()
+        self._refresh_command_start_status()
+        self._refresh_inline_command_run_panel()
+
+    def delete_command_run_favorite(self):
+        command_name, favorite = self._selected_command_run_favorite()
+        if favorite is None:
+            return
+        if not tkmsg.askyesno(
+                "Step実行お気に入り", "お気に入り「{}」を削除しますか？".format(
+                    favorite.get("name", "")), parent=self.root):
+            return
+        favorites = self.command_run_favorites.get(command_name, [])
+        favorites.remove(favorite)
+        if not favorites:
+            self.command_run_favorites.pop(command_name, None)
+        self.command_run_favorite.set("")
+        self._sync_command_start_overrides_to_active_input_set()
+        self._refresh_inline_command_run_panel()
+
     def _refresh_command_start_status(self):
         if not hasattr(self, "command_start_status"):
             return
         command = self._selected_command_name()
         config = self.command_start_overrides.get(command, {})
         if config:
-            self.command_start_status.set("開始Step: {} :: {}（{}）".format(
-                config.get("variable", ""), config.get("state", ""), command))
+            start = config.get("start") or {}
+            end = config.get("end") or {}
+            start_text = (start.get("label") or start.get("value") or
+                          config.get("state", ""))
+            end_text = end.get("label") or end.get("value") or "指定なし"
+            self.command_start_status.set(
+                "実行範囲: {} → {}（{}）".format(
+                    start_text or "Commands既定", end_text, command))
         elif self.command_start_overrides:
             self.command_start_status.set(
-                "開始Step: 選択Commandsは変更なし / 他{}件に設定あり".format(
+                "Step実行設定: 選択Commandsは既定 / 他{}件に設定あり".format(
                     len(self.command_start_overrides)))
         else:
-            self.command_start_status.set("開始Step: 変更なし（Commands既定）")
+            self.command_start_status.set("Step実行設定: Commands既定")
+        self._refresh_inline_command_run_panel()
 
     def _sync_command_start_overrides_to_active_input_set(self):
         name = str(getattr(self, "_active_input_set_name", "") or "").strip()
@@ -5601,18 +6643,27 @@ class PokeControllerApp:
         if self.input_set_name.get().strip() != name:
             return False
         data = self._read_input_sets()
-        if not sync_command_start_overrides(data, name, self.command_start_overrides):
+        if not sync_command_start_overrides(
+                data, name, self.command_start_overrides,
+                favorites=self.command_run_favorites):
             return False
         self._write_input_sets(data)
         return True
 
     def open_command_start_settings(self):
         if not getattr(self, "_commands_loaded", False):
-            tkmsg.showinfo("開始Step設定", "Commandsの読み込み完了後に設定してください。")
+            tkmsg.showinfo("Step実行設定", "Commandsの読み込み完了後に設定してください。")
             return
+        # Compatibility entry point for an old shortcut/menu. The former
+        # state-variable screen is retired; always use the Commands-owned
+        # Start popup where state variables are resolved internally.
+        self.assignCommand()
+        if self.cur_command is not None:
+            self._prompt_command_run_settings(self.cur_command)
+        return
         dialog = tk.Toplevel(self.root)
-        dialog.title("Commands 開始Step設定（Stepデバッグとは別設定）")
-        dialog.geometry("820x650")
+        dialog.title("選択中CommandsのStep実行詳細")
+        dialog.geometry("980x850")
         dialog.transient(self.root)
         dialog.grab_set()
 
@@ -5620,26 +6671,51 @@ class PokeControllerApp:
         variable = tk.StringVar()
         state = tk.StringVar()
         search = tk.StringVar()
+        start_location = tk.StringVar()
+        end_location = tk.StringVar(value="（終了場所を指定しない）")
+        location_description = tk.StringVar()
         confirm = tk.BooleanVar(value=True)
+        save_delete_user_number = tk.IntVar(value=0)
+        retry_on_failure = tk.BooleanVar(value=False)
+        max_retries = tk.IntVar(value=1)
+        recovery_status = tk.StringVar()
         current_text = tk.StringVar()
-        command_values = self._command_names_for_rules()[1:]
+        debug_vars = {}
+        location_by_display = {}
+        run_options = {"locations": [], "debug_options": [],
+                       "save_recovery": {"available": False, "method": ""}}
+        command_values = [command.get()] if command.get() else []
 
         ttk.Label(dialog, text=(
-            "通常のCommands Start時だけに使う開始位置です。Pythonソースは変更しません。\n"
-            "「init設定を削除」すると、Commands本来のinitから開始します。"),
+            "通常のCommands Start時だけに使う開始・終了位置です。Pythonソースは変更しません。\n"
+            "ZA状態辞書、Stepサンプル、番号付きルートを自動検出します。"),
             foreground="#174a7e", justify="left").pack(anchor="w", padx=10, pady=(10, 7))
         form = ttk.Frame(dialog)
         form.pack(fill="x", padx=10)
         ttk.Label(form, text="1. 対象Commands:").grid(column=0, row=0, padx=4, pady=5, sticky="e")
         command_combo = ttk.Combobox(
-            form, textvariable=command, values=command_values, width=62)
+            form, textvariable=command, values=command_values,
+            state="readonly", width=62)
         command_combo.grid(column=1, row=0, padx=4, pady=5, sticky="ew")
-        ttk.Label(form, text="2. 状態変数:").grid(column=0, row=1, padx=4, pady=5, sticky="e")
+        ttk.Label(form, text="2. 開始場所:").grid(column=0, row=1, padx=4, pady=5, sticky="e")
+        start_location_combo = ttk.Combobox(
+            form, textvariable=start_location, state="readonly", width=62)
+        start_location_combo.grid(column=1, row=1, padx=4, pady=5, sticky="ew")
+        ttk.Label(form, text="3. 終了場所:").grid(column=0, row=2, padx=4, pady=5, sticky="e")
+        end_location_combo = ttk.Combobox(
+            form, textvariable=end_location, state="readonly", width=62)
+        end_location_combo.grid(column=1, row=2, padx=4, pady=5, sticky="ew")
+        ttk.Label(form, text="4. 状態変数（詳細指定）:").grid(column=0, row=3, padx=4, pady=5, sticky="e")
         variable_combo = ttk.Combobox(form, textvariable=variable, width=62)
-        variable_combo.grid(column=1, row=1, padx=4, pady=5, sticky="ew")
-        ttk.Label(form, text="3. Step検索:").grid(column=0, row=2, padx=4, pady=5, sticky="e")
-        ttk.Entry(form, textvariable=search).grid(column=1, row=2, padx=4, pady=5, sticky="ew")
+        variable_combo.grid(column=1, row=3, padx=4, pady=5, sticky="ew")
+        ttk.Label(form, text="5. 場所／Step検索:").grid(column=0, row=4, padx=4, pady=5, sticky="e")
+        ttk.Entry(form, textvariable=search).grid(column=1, row=4, padx=4, pady=5, sticky="ew")
         form.columnconfigure(1, weight=1)
+
+        ttk.Label(
+            dialog, textvariable=location_description, foreground="#174a7e",
+            wraplength=930, justify="left").pack(
+                anchor="w", padx=14, pady=(0, 4))
 
         states_frame = ttk.Frame(dialog)
         states_frame.pack(fill="both", expand=True, padx=10, pady=5)
@@ -5668,13 +6744,79 @@ class PokeControllerApp:
         ttk.Label(dialog, textvariable=current_text, foreground="#555555").pack(
             anchor="w", padx=14, pady=(0, 4))
 
+        option_box = ttk.Labelframe(dialog, text="デバッグ・失敗時のセーブ削除再実行")
+        option_box.pack(fill="x", padx=10, pady=5)
+        debug_box = ttk.Frame(option_box)
+        debug_box.grid(column=0, columnspan=6, row=0, padx=5, pady=3, sticky="ew")
+        ttk.Label(option_box, text="セーブ削除用ユーザー番号:").grid(
+            column=0, row=1, padx=5, pady=4, sticky="e")
+        ttk.Spinbox(
+            option_box, from_=0, to=99, width=7,
+            textvariable=save_delete_user_number).grid(
+                column=1, row=1, padx=3, pady=4, sticky="w")
+        retry_check = ttk.Checkbutton(
+            option_box, text="失敗時にセーブを削除してやり直す",
+            variable=retry_on_failure)
+        retry_check.grid(column=2, row=1, padx=8, pady=4, sticky="w")
+        ttk.Label(option_box, text="再試行回数:").grid(
+            column=3, row=1, padx=3, pady=4, sticky="e")
+        ttk.Spinbox(
+            option_box, from_=1, to=10, width=6,
+            textvariable=max_retries).grid(
+                column=4, row=1, padx=3, pady=4, sticky="w")
+        ttk.Label(
+            option_box, textvariable=recovery_status,
+            foreground="#8a4d00").grid(
+                column=0, columnspan=6, row=2, padx=5, pady=(0, 4), sticky="w")
+        option_box.columnconfigure(5, weight=1)
+
         visible_states = []
+
+        def location_display(item):
+            description = str(item.get("description", "")).strip()
+            text = "{} / {}".format(item.get("group", ""), item.get("label", ""))
+            return text + (" — " + description if description else "")
+
+        def selected_location(value):
+            return location_by_display.get(value.get(), {})
+
+        def refresh_location_description(*_args):
+            start_item = selected_location(start_location)
+            end_item = selected_location(end_location)
+            parts = []
+            if start_item:
+                parts.append("開始: {}\n{}".format(
+                    start_item.get("label", ""),
+                    start_item.get("description", "説明なし") or "説明なし"))
+            if end_item:
+                parts.append("終了: {}\n{}".format(
+                    end_item.get("label", ""),
+                    end_item.get("description", "説明なし") or "説明なし"))
+            location_description.set("\n".join(parts))
+
+        def choose_start_location(_event=None):
+            item = selected_location(start_location)
+            if item and item.get("mode") == "state":
+                variable.set(str(item.get("variable", "")))
+                state.set(str(item.get("value", "")))
+                refresh_steps()
+            refresh_location_description()
+
+        def choose_end_location(_event=None):
+            refresh_location_description()
 
         def refresh_current():
             saved = self.command_start_overrides.get(command.get().strip(), {})
-            current_text.set("現在: {}".format(
-                "{} :: {}".format(saved.get("variable", ""), saved.get("state", ""))
-                if saved else "変更なし（Commands既定）"))
+            if saved:
+                start_saved = saved.get("start") or {}
+                end_saved = saved.get("end") or {}
+                current_text.set("現在: {} → {} / ユーザー{} / 失敗再実行{}".format(
+                    start_saved.get("label") or saved.get("state", "Commands既定"),
+                    end_saved.get("label") or "終了指定なし",
+                    saved.get("save_delete_user_number", 0),
+                    "ON" if saved.get("retry_on_failure") else "OFF"))
+            else:
+                current_text.set("現在: 変更なし（Commands既定）")
 
         def refresh_steps(*_args):
             all_values = self._state_value_candidates(command.get().strip(), variable.get().strip())
@@ -5684,11 +6826,56 @@ class PokeControllerApp:
             states.delete(0, "end")
             for value in visible_states:
                 states.insert("end", value)
+            needle = search.get().strip().casefold()
+            location_by_display.clear()
+            displays = []
+            for item in run_options.get("locations", []):
+                display = location_display(item)
+                location_by_display[display] = item
+                searchable = "{} {} {}".format(
+                    display, item.get("variable", ""), item.get("value", ""))
+                if needle and needle not in searchable.casefold():
+                    continue
+                displays.append(display)
+            start_location_combo.configure(values=displays)
+            end_location_combo.configure(
+                values=["（終了場所を指定しない）"] + displays)
+
+        def refresh_debug_options(saved):
+            for widget in debug_box.winfo_children():
+                widget.destroy()
+            debug_vars.clear()
+            saved_debug = saved.get("debug", {}) if isinstance(saved, dict) else {}
+            for column, item in enumerate(run_options.get("debug_options", [])):
+                attribute = str(item.get("attribute", item.get("id", "")))
+                value = tk.BooleanVar(value=bool(
+                    saved_debug.get(attribute, item.get("default", False))))
+                debug_vars[attribute] = value
+                ttk.Checkbutton(
+                    debug_box, text=str(item.get("label", attribute)),
+                    variable=value).grid(
+                        column=column, row=0, padx=5, pady=2, sticky="w")
+            if not debug_vars:
+                ttk.Label(debug_box, text="このCommandsに選択可能なデバッグ設定はありません。").grid(
+                    column=0, row=0, sticky="w")
+            recovery = run_options.get("save_recovery", {})
+            if recovery.get("available"):
+                retry_check.configure(state="normal")
+                recovery_status.set(
+                    "セーブ削除関数: {}（ユーザー番号を渡して実行）".format(
+                        recovery.get("method")))
+            else:
+                retry_on_failure.set(False)
+                retry_check.configure(state="disabled")
+                recovery_status.set(
+                    "セーブ削除関数が未登録のため、このCommandsでは失敗再実行をONにできません。")
 
         def refresh_variables(_event=None):
+            nonlocal run_options
             values = self._state_variable_candidates(command.get().strip())
             variable_combo.configure(values=values)
             saved = self.command_start_overrides.get(command.get().strip(), {})
+            run_options = self._command_run_options(command.get().strip())
             saved_variable = saved.get("variable", "")
             if saved_variable in values:
                 variable.set(saved_variable)
@@ -5697,8 +6884,32 @@ class PokeControllerApp:
             if saved and saved.get("state"):
                 state.set(saved.get("state"))
                 confirm.set(bool(saved.get("confirm", True)))
-            refresh_current()
+            save_delete_user_number.set(int(saved.get(
+                "save_delete_user_number", 0) or 0))
+            retry_on_failure.set(bool(saved.get("retry_on_failure", False)))
+            max_retries.set(max(1, int(saved.get(
+                "max_retries", run_options.get("save_recovery", {}).get(
+                    "max_retries", 1)) or 1)))
+            refresh_debug_options(saved)
             refresh_steps()
+            saved_start = saved.get("start") or {}
+            saved_end = saved.get("end") or {}
+            displays = list(location_by_display)
+            start_match = next((display for display in displays
+                                if location_by_display[display].get("id") ==
+                                saved_start.get("id")), "")
+            end_match = next((display for display in displays
+                              if location_by_display[display].get("id") ==
+                              saved_end.get("id")), "")
+            if start_match:
+                start_location.set(start_match)
+            elif displays and not saved:
+                start_location.set(displays[0])
+            else:
+                start_location.set("")
+            end_location.set(end_match or "（終了場所を指定しない）")
+            refresh_current()
+            refresh_location_description()
 
         def select_state(_event=None):
             selected = states.curselection()
@@ -5709,49 +6920,80 @@ class PokeControllerApp:
             command_name = command.get().strip()
             variable_name = variable.get().strip()
             state_name = state.get().strip()
-            if not command_name or not variable_name or not state_name:
-                tkmsg.showwarning("開始Step設定", "Commands、状態変数、Stepを選択してください。",
+            start_item = copy.deepcopy(selected_location(start_location))
+            end_item = copy.deepcopy(selected_location(end_location))
+            if not command_name:
+                tkmsg.showwarning("Step実行設定", "Commandsを選択してください。",
                                   parent=dialog)
                 return
-            if state_name not in self._state_value_candidates(command_name, variable_name):
-                tkmsg.showwarning("開始Step設定", "選択したStepが状態変数にありません。",
+            if not start_item and (not variable_name or not state_name):
+                tkmsg.showwarning("Step実行設定", "Commands、状態変数、Stepを選択してください。",
                                   parent=dialog)
                 return
-            self.command_start_overrides[command_name] = {
-                "variable": variable_name, "state": state_name,
+            if not start_item and state_name not in self._state_value_candidates(command_name, variable_name):
+                tkmsg.showwarning("Step実行設定", "選択したStepが状態変数にありません。",
+                                  parent=dialog)
+                return
+            if not start_item:
+                start_item = {
+                    "id": "state:{}:{}".format(variable_name, state_name),
+                    "mode": "state", "kind": "state",
+                    "variable": variable_name, "value": state_name,
+                    "label": state_name, "description": ""}
+            recovery = run_options.get("save_recovery", {})
+            config = {
+                "variable": (start_item.get("variable", "")
+                             if start_item.get("mode") == "state" else ""),
+                "state": (start_item.get("value", "")
+                          if start_item.get("mode") == "state" else ""),
+                "start": start_item,
+                "end": end_item,
+                "debug": {name: bool(value.get())
+                          for name, value in debug_vars.items()},
+                "save_delete_user_number": max(
+                    0, int(save_delete_user_number.get() or 0)),
+                "retry_on_failure": bool(
+                    retry_on_failure.get() and recovery.get("available")),
+                "recovery_method": str(recovery.get("method", "")),
+                "max_retries": max(1, int(max_retries.get() or 1)),
                 "confirm": bool(confirm.get()),
             }
+            self.command_start_overrides[command_name] = config
             saved = self._sync_command_start_overrides_to_active_input_set()
             self._refresh_command_start_status()
+            self._refresh_inline_command_run_panel()
             dialog.destroy()
             if not saved:
                 self.show_output(
-                    "Analysis", text="開始Stepは作業中設定へ反映しました。InputSetを新規登録すると保存されます。")
+                    "Analysis", text="Step実行設定は作業中設定へ反映しました。InputSet登録時に保存されます。")
 
         def clear():
             command_name = command.get().strip()
             if command_name not in self.command_start_overrides:
-                tkmsg.showinfo("開始Step設定", "このCommandsには削除するinit設定がありません。",
+                tkmsg.showinfo("Step実行設定", "このCommandsには削除する実行設定がありません。",
                                parent=dialog)
                 return
             if not tkmsg.askyesno(
-                    "init設定を削除",
-                    "{} の保存済み開始Step設定を削除しますか？\n\n"
+                    "Step実行設定を削除",
+                    "{} の保存済みStep実行設定を削除しますか？\n\n"
                     "削除後はCommands本来のinitから開始します。".format(command_name),
                     parent=dialog):
                 return
             self.command_start_overrides.pop(command_name, None)
             saved = self._sync_command_start_overrides_to_active_input_set()
             self._refresh_command_start_status()
+            self._refresh_inline_command_run_panel()
             dialog.destroy()
             if not saved:
                 self.show_output(
-                    "Analysis", text="init設定を削除しました。InputSetを新規登録すると保存されます。")
+                    "Analysis", text="Step実行設定を削除しました。InputSet登録時に保存されます。")
             else:
                 self.show_output(
-                    "Analysis", text="init設定をInputSetから削除しました: " + command_name)
+                    "Analysis", text="Step実行設定をInputSetから削除しました: " + command_name)
 
         command_combo.bind("<<ComboboxSelected>>", refresh_variables)
+        start_location_combo.bind("<<ComboboxSelected>>", choose_start_location)
+        end_location_combo.bind("<<ComboboxSelected>>", choose_end_location)
         variable_combo.bind("<<ComboboxSelected>>", refresh_steps)
         states.bind("<<ListboxSelect>>", select_state)
         search.trace_add("write", refresh_steps)
@@ -5759,8 +7001,8 @@ class PokeControllerApp:
         buttons.pack(fill="x", padx=10, pady=(5, 10))
         ttk.Button(buttons, text="詳しい使い方", command=self.open_command_start_guide).pack(
             side="left", padx=3)
-        ttk.Button(buttons, text="このStepから開始", command=save).pack(side="right", padx=3)
-        ttk.Button(buttons, text="init設定を削除", command=clear).pack(side="right", padx=3)
+        ttk.Button(buttons, text="この実行設定を保存", command=save).pack(side="right", padx=3)
+        ttk.Button(buttons, text="Commands既定へ戻す", command=clear).pack(side="right", padx=3)
         ttk.Button(buttons, text="キャンセル", command=dialog.destroy).pack(side="right", padx=3)
         refresh_variables()
 
@@ -5770,10 +7012,10 @@ class PokeControllerApp:
             with open(path, "r", encoding="utf-8") as stream:
                 content = stream.read()
         except OSError as error:
-            tkmsg.showerror("Commands 開始Step", str(error), parent=self.root)
+            tkmsg.showerror("Commands Step実行設定", str(error), parent=self.root)
             return
         dialog = tk.Toplevel(self.root)
-        dialog.title("Commands 開始Step設定 - 詳しい使い方")
+        dialog.title("Commands Step実行設定 - 詳しい使い方")
         dialog.geometry("780x600")
         dialog.transient(self.root)
         viewer = tk.Text(dialog, wrap="word", padx=12, pady=10)
@@ -5782,23 +7024,40 @@ class PokeControllerApp:
         viewer.configure(state="disabled")
         ttk.Button(dialog, text="閉じる", command=dialog.destroy).pack(pady=7)
 
-    def _confirm_command_start_override(self, command_name, variable, state):
+    def _confirm_command_start_override(self, command_name, variable, state,
+                                        config=None):
         """Return apply, ignore, or cancel from an explicit three-way dialog."""
         result = {"value": "cancel"}
         dialog = tk.Toplevel(self.root)
-        dialog.title("Commands 開始Step確認")
+        dialog.title("Commands Step実行確認")
         dialog.transient(self.root)
         dialog.resizable(False, False)
 
         ttk.Label(
             dialog,
-            text="{} に保存済みの開始Step設定があります。".format(command_name),
+            text="{} に保存済みのStep実行設定があります。".format(command_name),
             font=("", 10, "bold"),
         ).pack(anchor="w", padx=16, pady=(15, 7))
+        config = config or {}
+        start = config.get("start") or {}
+        end = config.get("end") or {}
+        debug_enabled = [name for name, enabled in
+                         (config.get("debug") or {}).items() if enabled]
+        detail = "開始: {}\n終了: {}".format(
+            start.get("label") or "{} :: {}".format(variable, state),
+            end.get("label") or "指定なし")
+        if start.get("description"):
+            detail += "\n開始説明: " + str(start.get("description"))
+        if end.get("description"):
+            detail += "\n終了説明: " + str(end.get("description"))
+        detail += "\nデバッグ: {}".format(
+            ", ".join(debug_enabled) if debug_enabled else "なし")
+        detail += "\nセーブ削除ユーザー: {} / 失敗再実行: {}".format(
+            config.get("save_delete_user_number", 0),
+            "ON" if config.get("retry_on_failure") else "OFF")
         ttk.Label(
             dialog,
-            text="{} :: {}\n\nゲーム画面もこのStepの開始状態になっていますか？".format(
-                variable, state),
+            text=detail + "\n\nゲーム画面も開始場所の状態になっていますか？",
             justify="left",
         ).pack(anchor="w", padx=16, pady=(0, 12))
 
@@ -5830,10 +7089,22 @@ class PokeControllerApp:
         config = self.command_start_overrides.get(command_name)
         if not isinstance(config, dict):
             return True
-        variable = str(config.get("variable", ""))
-        state = str(config.get("state", ""))
+        config = copy.deepcopy(config)
+        if not config.get("start") and config.get("variable") and config.get("state"):
+            config["start"] = {
+                "id": "state:{}:{}".format(
+                    config.get("variable"), config.get("state")),
+                "mode": "state", "kind": "state",
+                "variable": str(config.get("variable", "")),
+                "value": str(config.get("state", "")),
+                "label": str(config.get("state", "")),
+                "description": ""}
+        start = config.get("start") or {}
+        variable = str(start.get("variable", config.get("variable", "")))
+        state = str(start.get("value", config.get("state", "")))
         if config.get("confirm", True):
-            decision = self._confirm_command_start_override(command_name, variable, state)
+            decision = self._confirm_command_start_override(
+                command_name, variable, state, config=config)
             if decision == "cancel":
                 return False
             if decision == "ignore":
@@ -5842,16 +7113,16 @@ class PokeControllerApp:
                 if hasattr(command, "_command_start_override_context"):
                     del command._command_start_override_context
                 self.command_start_status.set(
-                    "今回だけ開始Step設定を無視: Commands本来のinitで開始")
+                    "今回だけStep実行設定を無視: Commands本来のinitで開始")
                 self.show_output(
                     "Analysis",
-                    text="今回だけ開始Step設定を無視し、Commands本来のinitで開始します: "
+                    text="今回だけStep実行設定を無視し、Commands本来のinitで開始します: "
                          + command_name)
                 return True
         try:
-            assignments = apply_command_start_override(command, variable, state)
+            assignments = apply_command_run_options(command, config)
         except (AttributeError, TypeError, ValueError) as error:
-            tkmsg.showerror("Commands 開始Step", "開始位置を設定できませんでした。\n{}".format(error),
+            tkmsg.showerror("Commands Step実行設定", "開始位置を設定できませんでした。\n{}".format(error),
                             parent=self.root)
             return False
         applied = " / ".join("{}={}".format(item["attribute"], item["value"])
@@ -5860,8 +7131,11 @@ class PokeControllerApp:
             "variable": variable,
             "state": state,
             "assignments": assignments,
+            "start": start,
+            "end": copy.deepcopy(config.get("end") or {}),
+            "end_seen": False,
         }
-        self.command_start_status.set("開始Step適用: " + applied)
+        self.command_start_status.set("Step実行設定適用: " + applied)
         self.show_output("Analysis", text="Commands開始位置を設定しました: " + applied)
         return True
 
@@ -5895,7 +7169,33 @@ class PokeControllerApp:
                     variable, current, progress, main_text))
         else:
             self.command_start_status.set(
-                "開始Step確認不可: {}（開始指定: {}）".format(variable, selected))
+                "Step実行位置を確認できません: {}（開始指定: {}）".format(variable, selected))
+
+        end = context.get("end") or {}
+        if end and end.get("mode") in ("state", "attribute"):
+            end_variable = str(end.get("variable", ""))
+            # Numbered-route Commands such as FRLG consume stop_flag inside
+            # the command itself. Other state/Step loops are stopped after the
+            # selected end location has run and transitions to the next value.
+            command_handles_end = bool(
+                end.get("end_variable") and
+                end.get("end_variable") != end_variable)
+            if not command_handles_end:
+                end_found, end_current, _end_actual = resolve_command_value(
+                    command, end_variable)
+                if end_found:
+                    at_end = str(end_current) == str(end.get("value", ""))
+                    if at_end:
+                        context["end_seen"] = True
+                    elif context.get("end_seen"):
+                        command.sendStopRequest()
+                        self.command_start_status.set(
+                            "終了場所まで完了: {}".format(
+                                end.get("label") or end.get("value")))
+                        self.show_output(
+                            "Analysis", text="Commands終了場所まで完了したため停止しました: " +
+                            str(end.get("label") or end.get("value")))
+                        return
 
         if bool(getattr(command, "alive", False)):
             self.root.after(250, lambda: self._poll_command_start_monitor(command, context, serial))
@@ -5912,7 +7212,9 @@ class PokeControllerApp:
                 path = inspect.getsourcefile(command_class)
                 if not path or not os.path.isfile(path):
                     continue
-                cache_key = (os.path.abspath(path), os.path.getmtime(path), target.upper())
+                absolute_path = os.path.abspath(path)
+                target_key = target.upper()
+                cache_key = (absolute_path, os.path.getmtime(path), target_key)
                 cached = self._state_value_cache.get(cache_key)
                 if cached is not None:
                     values.update(cached)
@@ -5920,7 +7222,17 @@ class PokeControllerApp:
                 with open(path, "r", encoding="utf-8-sig") as stream:
                     source = stream.read()
                 found = set(discover_state_values(source, target))
+                # A command reload changes mtime and used to leave the old AST
+                # result behind forever.  Retain only the current revision and
+                # a small cross-command working set.
+                for old_key in list(self._state_value_cache):
+                    if (old_key[0] == absolute_path
+                            and old_key[2] == target_key
+                            and old_key != cache_key):
+                        self._state_value_cache.pop(old_key, None)
                 self._state_value_cache[cache_key] = tuple(sorted(found))
+                while len(self._state_value_cache) > 128:
+                    self._state_value_cache.pop(next(iter(self._state_value_cache)))
                 values.update(found)
             except (OSError, SyntaxError, TypeError):
                 continue
@@ -6634,6 +7946,8 @@ class PokeControllerApp:
         self.image_match_debug_dialog = dialog
         self.image_match_debug_active = False
         self.image_match_debug_templates = {}
+        self.image_match_debug_worker_running = False
+        self.image_match_debug_generation = 0
         self.image_match_debug_command = tk.StringVar(value=self.py_cb.get() if hasattr(self, "py_cb") else "")
         self.image_match_debug_output = tk.StringVar(value="Output#2")
         self.image_match_debug_status = tk.StringVar(value="Select a command that implements get_detection_targets().")
@@ -6650,12 +7964,16 @@ class PokeControllerApp:
 
     def close_image_match_debug(self):
         self.image_match_debug_active = False
+        self.image_match_debug_generation = getattr(
+            self, "image_match_debug_generation", 0) + 1
         dialog = getattr(self, "image_match_debug_dialog", None)
         if dialog is not None and dialog.winfo_exists():
             dialog.destroy()
 
     def toggle_image_match_debug(self):
         self.image_match_debug_active = not self.image_match_debug_active
+        self.image_match_debug_generation = getattr(
+            self, "image_match_debug_generation", 0) + 1
         if self.image_match_debug_active:
             self.image_match_debug_button_popup.configure(text="Stop monitoring")
             self.poll_image_match_debug()
@@ -6666,22 +7984,40 @@ class PokeControllerApp:
         dialog = getattr(self, "image_match_debug_dialog", None)
         if not getattr(self, "image_match_debug_active", False) or dialog is None or not dialog.winfo_exists():
             return
-        try:
-            selected = self.image_match_debug_command.get()
-            command_class = next((item for item in list(getattr(self, "py_classes", [])) + list(getattr(self, "sample_py_classes", [])) if item.NAME == selected), None)
-            if command_class is None:
-                self.image_match_debug_status.set("Command was not found. Reload Commands and select it again.")
-            else:
+        delay = max(500, int(round(500 * self._resource_preview_multiplier())))
+        if getattr(self, "image_match_debug_worker_running", False):
+            self.root.after(delay, self.poll_image_match_debug)
+            return
+        selected = self.image_match_debug_command.get()
+        command_class = next((
+            item for item in list(getattr(self, "py_classes", [])) +
+            list(getattr(self, "sample_py_classes", []))
+            if item.NAME == selected), None)
+        frame = getattr(self.camera, "image_bgr", None)
+        if command_class is None:
+            self.image_match_debug_status.set(
+                "Command was not found. Reload Commands and select it again.")
+            self.root.after(delay, self.poll_image_match_debug)
+            return
+        if frame is None:
+            self.image_match_debug_status.set("Waiting for a camera frame.")
+            self.root.after(delay, self.poll_image_match_debug)
+            return
+
+        generation = self.image_match_debug_generation
+        output = self.image_match_debug_output.get()
+        self.image_match_debug_worker_running = True
+
+        def worker():
+            try:
                 targets = command_class.get_detection_targets()
-                frame = getattr(self.camera, "image_bgr", None)
-                if frame is None:
-                    self.image_match_debug_status.set("Waiting for a camera frame.")
-                elif not targets:
-                    self.image_match_debug_status.set("This command has no declared image targets.")
+                if not targets:
+                    result = ([], "This command has no declared image targets.")
                 else:
                     rows = ["[Image match debug] " + selected]
                     for target in targets:
-                        name = str(target.get("name", os.path.basename(target.get("path", "target"))))
+                        name = str(target.get(
+                            "name", os.path.basename(target.get("path", "target"))))
                         path = target.get("path", "")
                         image = self.image_match_debug_templates.get(path)
                         if image is None and path:
@@ -6692,36 +8028,66 @@ class PokeControllerApp:
                             continue
                         x, y, width, height = target.get("roi", (0, 0, 0, 0))
                         height_frame, width_frame = frame.shape[:2]
-                        reference_width, reference_height = target.get("reference_resolution", (0, 0))
-                        reference_width, reference_height = int(reference_width or 0), int(reference_height or 0)
+                        reference_width, reference_height = target.get(
+                            "reference_resolution", (0, 0))
+                        reference_width = int(reference_width or 0)
+                        reference_height = int(reference_height or 0)
                         scale_x = float(width_frame) / reference_width if reference_width else 1.0
                         scale_y = float(height_frame) / reference_height if reference_height else 1.0
-                        x, y = max(0, int(round(int(x) * scale_x))), max(0, int(round(int(y) * scale_y)))
-                        width = int(round(int(width) * scale_x)) if int(width) else (width_frame - x)
-                        height = int(round(int(height) * scale_y)) if int(height) else (height_frame - y)
-                        region = frame[y:min(height_frame, y + height), x:min(width_frame, x + width)]
+                        x = max(0, int(round(int(x) * scale_x)))
+                        y = max(0, int(round(int(y) * scale_y)))
+                        width = (int(round(int(width) * scale_x)) if int(width)
+                                 else width_frame - x)
+                        height = (int(round(int(height) * scale_y)) if int(height)
+                                  else height_frame - y)
+                        region = frame[
+                            y:min(height_frame, y + height),
+                            x:min(width_frame, x + width)]
                         if region.size == 0:
                             rows.append("{}: ROI is outside the camera frame".format(name))
                             continue
                         scaled_image = image
                         if reference_width or reference_height:
-                            scaled_image = cv2.resize(image, (max(1, int(round(image.shape[1] * scale_x))),
-                                                              max(1, int(round(image.shape[0] * scale_y)))))
+                            scaled_image = cv2.resize(image, (
+                                max(1, int(round(image.shape[1] * scale_x))),
+                                max(1, int(round(image.shape[0] * scale_y)))))
                         if target.get("grayscale", False):
                             region = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
-                            scaled_image = cv2.cvtColor(scaled_image, cv2.COLOR_BGR2GRAY)
-                        if region.shape[0] < scaled_image.shape[0] or region.shape[1] < scaled_image.shape[1]:
+                            scaled_image = cv2.cvtColor(
+                                scaled_image, cv2.COLOR_BGR2GRAY)
+                        if (region.shape[0] < scaled_image.shape[0] or
+                                region.shape[1] < scaled_image.shape[1]):
                             rows.append("{}: ROI is smaller than template".format(name))
                             continue
-                        _, score, _, _ = cv2.minMaxLoc(cv2.matchTemplate(region, scaled_image, cv2.TM_CCOEFF_NORMED))
+                        _, score, _, _ = cv2.minMaxLoc(cv2.matchTemplate(
+                            region, scaled_image, cv2.TM_CCOEFF_NORMED))
                         threshold = float(target.get("threshold", 0.8))
                         rows.append("{}: {:.1f}% / {:.1f}% {}".format(
-                            name, score * 100, threshold * 100, "MATCH" if score >= threshold else "NO MATCH"))
-                    self.show_output(self.image_match_debug_output.get(), text="\n".join(rows))
-                    self.image_match_debug_status.set("Monitoring {} target(s) every 0.5 s.".format(len(targets)))
-        except Exception as error:
-            self.image_match_debug_status.set("Image debug error: " + str(error))
-        self.root.after(500, self.poll_image_match_debug)
+                            name, score * 100, threshold * 100,
+                            "MATCH" if score >= threshold else "NO MATCH"))
+                    result = (
+                        rows,
+                        "Monitoring {} target(s) every {:.1f} s.".format(
+                            len(targets), delay / 1000.0))
+                callback = lambda: self._finish_image_match_debug(
+                    generation, output, result[0], result[1])
+            except Exception as error:
+                callback = lambda error=error: self._finish_image_match_debug(
+                    generation, output, [], "Image debug error: " + str(error))
+            self._gui_action_queue.put(callback)
+
+        threading.Thread(
+            target=worker, daemon=True, name="ImageMatchDebug").start()
+        self.root.after(delay, self.poll_image_match_debug)
+
+    def _finish_image_match_debug(self, generation, output, rows, status):
+        self.image_match_debug_worker_running = False
+        if (generation != getattr(self, "image_match_debug_generation", -1)
+                or not getattr(self, "image_match_debug_active", False)):
+            return
+        if rows:
+            self.show_output(output, text="\n".join(rows))
+        self.image_match_debug_status.set(status)
 
     def add_command_watch_variable(self):
         name = self.command_watch_variable.get().strip()
@@ -6773,7 +8139,7 @@ class PokeControllerApp:
             except tk.TclError:
                 pass
 
-    def open_dev_studio(self):
+    def open_dev_studio(self, operation_session=None, command_recording=None):
         """Launch the dependency-free PokeCon code search/merge helper."""
         project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         studio = os.path.join(project_dir, "DevStudio", "PokeConDevStudio.py")
@@ -6789,7 +8155,12 @@ class PokeControllerApp:
                 options["creationflags"] = (getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) |
                                              getattr(subprocess, "DETACHED_PROCESS", 0x00000008) |
                                              getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000))
-            subprocess.Popen([sys.executable, studio, project_dir], **options)
+            command = [sys.executable, studio, project_dir]
+            if operation_session:
+                command.extend(["--operation-session", os.path.abspath(operation_session)])
+            if command_recording:
+                command.extend(["--command-recording", os.path.abspath(command_recording)])
+            subprocess.Popen(command, **options)
             self.show_output("Analysis", text="PokeCon Dev Studio started in the background.")
         except OSError as error:
             tkmsg.showerror("PokeCon Dev Studio", "起動できませんでした。\n" + str(error))
@@ -6798,18 +8169,19 @@ class PokeControllerApp:
         if not self.com_port_name.get().strip() and int(self.com_port.get() or 0) == 0:
             self.serial_device_name.set("(未設定)")
             return
-        for d in self.serial_devices:
-            match = re.search(r"(?i)COM(\d+)", d)
+        for label, detail in getattr(self, "_serial_display_details", {}).items():
+            match = re.search(r"(?i)COM(\d+)", detail.get("device", ""))
             if match and int(self.com_port.get()) == int(match.group(1)):
-                self.serial_device_name.set(d)
+                self.serial_device_name.set(label)
                 break
 
     def set_cameraid(self, event=None):
-        keys = [k for k, v in self.camera_dic.items() if "No." + str(k) + ": " + v == self.camera_name_cb.get()]
-        if keys:
-            ret = keys[0]
-        else:
-            ret = None
+        selected = self.camera_name_cb.get()
+        ret = getattr(self, "_camera_display_to_id", {}).get(selected)
+        if ret is None:
+            keys = [k for k, v in self.camera_dic.items()
+                    if "No." + str(k) + ": " + v == selected]
+            ret = keys[0] if keys else None
         self.camera_id.set(ret)
         if hasattr(self, "audio_filter_camera") and self.audio_filter_camera.get():
             self.update_audio_input_list()
@@ -6822,10 +8194,15 @@ class PokeControllerApp:
             if hasattr(self, "ser"):
                 self.inactivateSerial()
             return
-        match = re.search(r"(?i)COM(\d+)", selected)
+        detail = getattr(self, "_serial_display_details", {}).get(selected, {})
+        raw = detail.get("description", selected)
+        device = detail.get("device", "")
+        match = re.search(r"(?i)COM(\d+)", device + " " + raw)
         if match:
             self.com_port.set(int(match.group(1)))
             self.com_port_name.set("")
+        elif device:
+            self.com_port_name.set(device)
 
     def set_serial_data_format(self, event=None):
         KeyPress.serial_data_format_name = self.serial_data_format_name.get()
@@ -6875,9 +8252,14 @@ class PokeControllerApp:
         if self.ser.isOpened():
             print("Port is already opened and being closed.")
             self.ser.closeSerial()
+            self._publish_device_usage("serial", "", "")
             self.keyPress = None
             self.activateSerial()
         else:
+            key = self._serial_usage_key()
+            label = self._selected_serial_device_label()
+            if not self._confirm_shared_device("serial", key, label):
+                return
             if self.ser.openSerial(self.com_port.get(), self.com_port_name.get(), self.baud_rate.get()):
                 print("COM Port " + str(self.com_port.get()) + " connected successfully")
                 self._logger.debug("COM Port " + str(self.com_port.get()) + " connected successfully")
@@ -6885,6 +8267,7 @@ class PokeControllerApp:
                 self.settings.com_port.set(self.com_port.get())
                 self.settings.baud_rate.set(self.baud_rate.get())
                 self.settings.save()
+                self._publish_device_usage("serial", key, label)
 
     def _update_sender_show_serial(self):
         sender = getattr(self, "ser", None)
@@ -6896,6 +8279,7 @@ class PokeControllerApp:
             print("Port is already opened and being closed.")
             self.ser.closeSerial()
             self.keyPress = None
+        self._publish_device_usage("serial", "", "")
 
     def activateKeyboard(self):
         if self.is_use_keyboard.get():
@@ -6971,6 +8355,7 @@ class PokeControllerApp:
                 return
         except tk.TclError:
             return
+        self._refresh_preview_priority_status()
         keys = getattr(self, "keys_software_controller", None)
         if (getattr(self, "_software_controller_override_active", False)
                 or (keys is not None and bool(getattr(keys, "holdButton", [])))):
@@ -6992,19 +8377,75 @@ class PokeControllerApp:
         except (OSError, TimeoutError, ValueError) as error:
             self._logger.warning("Could not publish PokeCon focus: %s", error)
 
+    def _queue_resource_status_refresh(self):
+        """Coalesce the half-second sampler while Tk is temporarily busy."""
+        with self._resource_status_refresh_lock:
+            if self._resource_status_refresh_queued:
+                return
+            self._resource_status_refresh_queued = True
+        self._gui_action_queue.put(self._drain_resource_status_refresh)
+
+    def _drain_resource_status_refresh(self):
+        with self._resource_status_refresh_lock:
+            self._resource_status_refresh_queued = False
+        self._refresh_resource_control_status()
+
+    def _queue_preview_status_refresh(self):
+        with self._preview_status_refresh_lock:
+            if self._preview_status_refresh_queued:
+                return
+            self._preview_status_refresh_queued = True
+        self._gui_action_queue.put(self._drain_preview_status_refresh)
+
+    def _drain_preview_status_refresh(self):
+        with self._preview_status_refresh_lock:
+            self._preview_status_refresh_queued = False
+        self._refresh_preview_priority_status()
+
     def _window_activity_monitor_loop(self):
         while not self._window_activity_stop.wait(0.5):
             try:
                 with self._window_activity_update_lock:
                     if self._window_activity_stop.is_set():
                         return
-                    owner = self._ensure_window_activity_registry().is_last_focused()
+                    registry = self._ensure_window_activity_registry()
+                    owner = registry.is_last_focused()
+                    cpu_percent = self._resource_cpu_sampler.sample()
+                    if cpu_percent is not None:
+                        self._resource_cpu_percent = cpu_percent
+                    config = dict(self._resource_control_config)
+                    protected = self._resource_runtime_protected()
+                    requested_main = bool(
+                        config.get("main_requested", False)
+                        and not self._resource_main_open_downgraded)
+                    # Publish first to atomically arbitrate the unique main
+                    # role. The tier below uses the role returned by the same
+                    # locked registry update on the next half-second at worst.
+                    effective_main = registry.set_resource_state(
+                        enabled=config.get("enabled", True),
+                        target_percent=config.get("target_percent", 90),
+                        main_requested=requested_main,
+                        protected=protected,
+                        throttle=self._resource_throttle_level,
+                        cpu_percent=self._resource_cpu_percent)
+                    level = resource_throttle_level(
+                        config.get("enabled", True), self._resource_cpu_percent,
+                        config.get("target_percent", 90),
+                        main_tool=effective_main, protected=protected)
             except (OSError, TimeoutError, ValueError) as error:
                 self._logger.warning("Could not read PokeCon focus owner: %s", error)
                 continue
+            status_changed = (
+                effective_main != self._resource_main_effective
+                or level != self._resource_throttle_level)
+            if effective_main != self._resource_main_effective:
+                self._queue_preview_status_refresh()
+            self._resource_main_effective = effective_main
+            self._resource_throttle_level = level
             if owner != self._last_active_preview_owner:
                 self._last_active_preview_owner = owner
-                self._gui_action_queue.put(self._refresh_preview_priority_status)
+            if status_changed or cpu_percent is not None:
+                self._queue_resource_status_refresh()
 
     def _start_window_activity_tracking(self):
         if self._window_activity_thread is not None:
@@ -7031,18 +8472,318 @@ class PokeControllerApp:
                     self._logger.warning("Could not unregister PokeCon focus: %s", error)
 
     def _preview_render_priority(self):
-        return (bool(self._last_active_preview_owner),
+        # CaptureArea separately detects actual foreground focus.  Only the
+        # explicit main-tool role may keep background preview priority.
+        return (bool(self._resource_main_effective),
                 bool(self.last_active_preview_full_fps.get()))
+
+    def _resource_runtime_protected(self):
+        if time.monotonic() < self._resource_protected_until:
+            return True
+        command = getattr(self, "cur_command", None)
+        worker = getattr(command, "thread", None) if command is not None else None
+        if worker is not None and worker.is_alive():
+            return True
+        return bool(
+            getattr(self.recorder, "active", False)
+            or getattr(self, "record_armed", False)
+            or getattr(self.operation_recorder, "active", False)
+            or getattr(self, "_software_controller_override_active", False)
+        )
+
+    def _resource_preview_multiplier(self):
+        if self._resource_runtime_protected():
+            return 1.0
+        return throttle_multiplier(self._resource_throttle_level)
+
+    def _note_resource_interaction(self, event=None):
+        self._resource_protected_until = max(
+            self._resource_protected_until, time.monotonic() + 3.0)
+
+    def _cache_resource_control_config(self):
+        try:
+            target = clamp_cpu_target(self.resource_cpu_target.get())
+        except tk.TclError:
+            target = 90
+        self._resource_control_config = {
+            "enabled": bool(self.resource_control_enabled.get()),
+            "target_percent": target,
+            "main_requested": bool(self.resource_main_tool.get()),
+        }
+
+    def _resource_config_changed(self, event=None):
+        target = clamp_cpu_target(self.resource_cpu_target.get())
+        if self.resource_cpu_target.get() != target:
+            self.resource_cpu_target.set(target)
+        self._cache_resource_control_config()
+        self._resource_protected_until = max(
+            self._resource_protected_until, time.monotonic() + 3.0)
+        self._refresh_resource_control_status()
+        self._sync_resource_control_to_active_input_set()
+
+    def _resource_main_changed(self):
+        if self.resource_main_tool.get():
+            conflicts = main_resource_conflicts(self._other_device_usage_entries())
+            if conflicts:
+                self.resource_main_tool.set(False)
+                tkmsg.showwarning(
+                    "メインツールは重複できません",
+                    "ほかのPokeConがメインツールとして動作中です。\n"
+                    "先にそのPokeConのメイン設定を解除するか終了してください。",
+                    parent=self.root)
+        self._resource_main_open_downgraded = False
+        self._resource_config_changed()
+
+    def _refresh_resource_control_status(self):
+        if not hasattr(self, "resource_control_status"):
+            return
+        cpu = self._resource_cpu_percent
+        cpu_text = "測定中" if cpu is None else "{:.1f}%".format(cpu)
+        if self._resource_main_effective:
+            role = "メインツール"
+        elif self.resource_main_tool.get() and self._resource_main_open_downgraded:
+            role = "通常（別のメインが起動中）"
+        elif self.resource_main_tool.get():
+            role = "通常（メイン役の取得待ち）"
+        elif self._resource_runtime_protected():
+            role = "操作保護中"
+        else:
+            role = "バックグラウンド"
+        names = {"normal": "通常", "light": "軽い省負荷",
+                 "medium": "省負荷", "strong": "強い省負荷"}
+        self.resource_control_status.set(
+            "CPU {} / 目標 {}% / 役割: {} / 現在: {}".format(
+                cpu_text, self._resource_control_config.get("target_percent", 90),
+                role, names.get(self._resource_throttle_level, "通常")))
+
+    @staticmethod
+    def _input_set_requests_main_resource(item):
+        if not isinstance(item, dict):
+            return False
+        snapshot = item.get("all_tabs", {})
+        values = snapshot.get("values", {}) if isinstance(snapshot, dict) else {}
+        return bool(values.get("resource_main_tool", False))
+
+    def _confirm_main_resource_input_set(self, item, name=""):
+        self._resource_main_open_downgraded = False
+        if not self._input_set_requests_main_resource(item):
+            return True
+        conflicts = main_resource_conflicts(self._other_device_usage_entries())
+        if not conflicts:
+            return True
+        opened = tkmsg.askyesno(
+            "メインツールが起動中です",
+            ("InputSet「{}」はメインツール設定ですが、ほかのPokeConがメインです。\n\n"
+             "「はい」: このPokeConは通常ツールとしてそのまま開く\n"
+             "「いいえ」: このInputSetを開かない").format(name or ""),
+            parent=self.root)
+        self._resource_main_open_downgraded = bool(opened)
+        return bool(opened)
+
+    def _sync_resource_control_to_active_input_set(self):
+        name = str(getattr(self, "_active_input_set_name", "") or "").strip()
+        if not name or not hasattr(self, "input_set_name") \
+                or self.input_set_name.get().strip() != name:
+            return False
+        data = self._read_input_sets()
+        item = data.get("input_sets", {}).get(name)
+        snapshot = item.get("all_tabs", {}) if isinstance(item, dict) else {}
+        values = snapshot.get("values", {}) if isinstance(snapshot, dict) else {}
+        if not isinstance(values, dict):
+            return False
+        values.update({
+            "resource_control_enabled": self.resource_control_enabled.get(),
+            "resource_cpu_target": clamp_cpu_target(self.resource_cpu_target.get()),
+            "resource_main_tool": self.resource_main_tool.get(),
+        })
+        self._write_input_sets(data)
+        return True
+
+    def _other_device_usage_entries(self):
+        try:
+            registry = getattr(self, "_window_activity_registry", None)
+            if registry is not None:
+                return registry.entries(include_self=False)
+            return read_active_input_sets(default_window_activity_registry_path())
+        except (OSError, TimeoutError, ValueError) as error:
+            self._logger.warning("Could not read shared device usage: %s", error)
+            return []
+
+    def _device_conflicts(self, kind, key):
+        return device_usage_conflicts(self._other_device_usage_entries(), kind, key)
+
+    @staticmethod
+    def _device_conflict_owner_text(entries):
+        owners = []
+        for entry in entries:
+            input_set = str(entry.get("input_set", "") or "").strip()
+            profile = str(entry.get("profile", "") or "").strip()
+            label = input_set or profile or "InputSet未選択"
+            owners.append("{} / PID {}".format(label, entry.get("pid", "?")))
+        return "、".join(owners)
+
+    def _confirm_shared_device(self, kind, key, label, parent=None):
+        if key in self._confirmed_shared_device_keys:
+            return True
+        conflicts = self._device_conflicts(kind, key)
+        if not conflicts:
+            return True
+        names = {"camera": "Camera", "serial": "Serial", "audio": "Audio"}
+        device_name = names.get(kind, kind)
+        owner = parent or self.root
+        dialog = tk.Toplevel(owner)
+        dialog.title("{}はほかのPokeConで使用中".format(device_name))
+        dialog.transient(owner)
+        dialog.resizable(False, False)
+        accepted_state = {"value": False}
+        ttk.Label(
+            dialog,
+            text=("{}\n\nほかのPokeConで使用中です: {}\n"
+                  "同じ機器をこのPokeConにも反映しますか？").format(
+                      label, self._device_conflict_owner_text(conflicts)),
+            justify="left", wraplength=620).pack(fill="x", padx=14, pady=(14, 8))
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=14, pady=(2, 14))
+
+        def finish(value):
+            accepted_state["value"] = bool(value)
+            dialog.destroy()
+
+        ttk.Button(buttons, text="それでも反映",
+                   command=lambda: finish(True)).pack(side="left", padx=(0, 6))
+        ttk.Button(buttons, text="反映しない",
+                   command=lambda: finish(False)).pack(side="left")
+        dialog.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+        dialog.update_idletasks()
+        dialog.wait_visibility()
+        dialog.lift()
+        dialog.grab_set()
+        dialog.wait_window()
+        accepted = accepted_state["value"]
+        if accepted:
+            self._confirmed_shared_device_keys.add(key)
+        return accepted
+
+    def _publish_device_usage(self, kind, key="", label=""):
+        state = (str(key or ""), str(label or ""))
+        if self._published_device_usage.get(kind) == state:
+            return
+        try:
+            self._ensure_window_activity_registry().set_device(kind, key, label)
+            self._published_device_usage[kind] = state
+        except (OSError, TimeoutError, ValueError) as error:
+            self._logger.warning("Could not publish %s usage: %s", kind, error)
+
+    def _device_usage_suffix(self, kind, key, entries=None):
+        conflicts = device_usage_conflicts(
+            self._other_device_usage_entries() if entries is None else entries,
+            kind, key)
+        if not conflicts:
+            return ""
+        return " [別PokeConで使用中: {}]".format(
+            self._device_conflict_owner_text(conflicts))
+
+    def _camera_usage_key(self, camera_id=None, source_type=None, window_handle=None):
+        source_type = source_type or self.video_source.get()
+        if source_type == "Window (Steam/game)":
+            handle = window_handle
+            if handle is None:
+                handle = getattr(self, "window_sources", {}).get(self.window_source.get())
+            return canonical_device_key("camera", "window-hwnd:{}".format(handle)) if handle else ""
+        camera_id = self.camera_id.get() if camera_id is None else camera_id
+        devices = self.camera_dic or {}
+        value = devices.get(camera_id, devices.get(str(camera_id), "Camera ID {}".format(camera_id)))
+        return canonical_device_key("camera", value)
+
+    def _serial_usage_key(self, port_number=None, port_name=None):
+        port_name = self.com_port_name.get() if port_name is None else port_name
+        port_number = self.com_port.get() if port_number is None else port_number
+        value = str(port_name or "").strip() or "COM{}".format(port_number)
+        return canonical_device_key("serial", value)
+
+    def _selected_serial_device_label(self):
+        selected = self.serial_device_name.get().strip()
+        detail = getattr(self, "_serial_display_details", {}).get(selected, {})
+        return str(detail.get("description", selected))
+
+    def _audio_usage_key(self, name=None):
+        return canonical_device_key(
+            "audio", self._selected_audio_device_name() if name is None else name)
+
+    def _set_camera_unconfigured(self):
+        if hasattr(self, "camera"):
+            self.camera.destroy()
+        self.camera_id.set(-1)
+        self.camera_name_fromDLL.set("(未設定)")
+        self._publish_device_usage("camera", "", "")
+
+    def _set_serial_unconfigured(self):
+        if hasattr(self, "ser"):
+            self.inactivateSerial()
+        self.serial_device_name.set("(未設定)")
+        self.com_port.set(0)
+        self.com_port_name.set("")
+
+    def _set_audio_unconfigured(self):
+        if hasattr(self, "audio_monitor"):
+            self.stop_audio_monitor()
+        self.audio_input.set("")
+        self.audio_auto_start.set(False)
+
+    def _apply_hardware_unconfigured_selection(self):
+        """Keep InputSet tab settings while showing all three devices as unset."""
+        self.video_source.set("Capture device")
+        self.camera_id.set(-1)
+        self.camera_name_fromDLL.set("(未設定)")
+        self.window_source.set("")
+        self.serial_device_name.set("(未設定)")
+        self.com_port.set(0)
+        self.com_port_name.set("")
+        self.audio_input.set("")
+        self.audio_auto_start.set(False)
+
+    def _preview_capture_work_active(self):
+        """Keep requested capture cadence only for an armed/active recorder."""
+        return bool(
+            getattr(self.recorder, "active", False)
+            or getattr(self, "record_armed", False)
+            or getattr(self.operation_recorder, "active", False)
+        )
+
+    def _live_frame_analysis_active(self):
+        assist = getattr(self, "image_assist_enabled", None)
+        if assist is not None and assist.get():
+            return True
+        rules_enabled = getattr(self, "analysis_rules_enabled", None)
+        if rules_enabled is not None and rules_enabled.get() and any(
+                item.get("enabled", True) for item in getattr(self, "analysis_rules", [])):
+            return True
+        vision = getattr(self, "vision", None)
+        if vision is not None:
+            rule = vision.modes.get(vision.current_mode, {})
+            if isinstance(rule, dict) and any(rule.values()):
+                return True
+        return False
 
     def _refresh_preview_priority_status(self):
         try:
             requested = max(1, int(self.fps.get()))
         except (tk.TclError, TypeError, ValueError):
             requested = 30
-        if self._last_active_preview_owner:
+        try:
+            foreground = self.root.focus_displayof() is not None
+        except tk.TclError:
+            foreground = False
+        if self._resource_main_effective:
+            label = "メイン表示"
+        elif foreground:
+            label = "前面表示"
+        else:
+            label = ""
+        if label:
             limit = min(60, requested) if self.last_active_preview_full_fps.get() \
                 else min(30, requested)
-            status = "優先表示：{}fps（録画fpsには影響なし）".format(limit)
+            status = "{}：{}fps（録画fpsには影響なし）".format(label, limit)
         else:
             status = "省負荷表示：5fps（録画fpsには影響なし）"
         if status != self._last_active_preview_status_value:
@@ -7065,6 +8806,7 @@ class PokeControllerApp:
         self.preview.ApplyRStickMouse()
 
     def run_ProController(self):
+        worker = threading.current_thread()
         if self.procon is not None:
             self.procon = None
         try:
@@ -7072,26 +8814,52 @@ class PokeControllerApp:
         except (ValueError, IndexError):
             joystick_index = 0
         try:
+            gamepad_mapping = dict(self._active_operation_gamepad_mapping)
+            if not gamepad_mapping:
+                data = self._operation_gamepad_profile_store().load()
+                gamepad_mapping = dict(
+                    data["profiles"][data["selected"]].get("mapping", {}))
             self.procon = ProController(
                 joystick_index,
                 input_enabled_event=self.pc_gamepad_input_event,
                 activity_callback=self._notify_pc_gamepad_activity,
                 state_callback=self._queue_pc_gamepad_state,
+                input_callback=self._record_operation_input,
+                control_mapping=gamepad_mapping,
+                physical_input_callback=self._queue_operation_gamepad_physical_input,
             )
             self.procon.controller_loop(self.ser, self.flag_record, self.ControllerLogDir)
         except Exception as error:
             self._logger.warning("PC gamepad bridge could not start: %s", error)
             self._gui_action_queue.put(
-                lambda message=str(error): self._recover_pc_gamepad_ui(message))
+                lambda message=str(error), owner=worker:
+                self._recover_pc_gamepad_ui(message, owner))
         finally:
-            self._gui_action_queue.put(self._pro_controller_thread_finished)
+            self._gui_action_queue.put(
+                lambda owner=worker: self._pro_controller_thread_finished(owner))
 
-    def _pro_controller_thread_finished(self):
+    def _pro_controller_thread_finished(self, worker=None):
+        # A stopped worker can report completion after its replacement has
+        # already started.  Never clear the newer bridge in that case.
+        if worker is not None and self.pro_controller_thread is not worker:
+            return
         self.pro_controller_thread = None
+        self.procon = None
+        if (self.is_use_Pro_Controller.get()
+                and self.pc_gamepad_input_enabled.get()):
+            self.pc_gamepad_input_status.set("ゲームパッド再接続中")
+            self._schedule_pc_gamepad_bridge_restart()
+        elif self.pc_gamepad_input_enabled.get():
+            self.pc_gamepad_input_status.set("入力許可中（Hardwareが停止中）")
 
-    def _recover_pc_gamepad_ui(self, message):
+    def _recover_pc_gamepad_ui(self, message, worker=None):
+        if worker is not None and self.pro_controller_thread is not worker:
+            return
         ProController.flag_procon = False
         self.is_use_Pro_Controller.set(False)
+        self.pc_gamepad_input_enabled.set(False)
+        self.pc_gamepad_input_event.clear()
+        self.pc_gamepad_input_status.set("操作停止中")
         self.record_pro_controller_checkbox["state"] = "normal"
         self.start_top_button["state"] = "normal"
         self.simplecon_top_button["state"] = "normal"
@@ -7106,20 +8874,60 @@ class PokeControllerApp:
     def toggle_pc_gamepad_input(self):
         if self.pc_gamepad_input_enabled.get():
             self.pc_gamepad_input_event.set()
-            self.pc_gamepad_input_status.set("ニュートラル確認中")
+            running = (self.pro_controller_thread is not None
+                       and self.pro_controller_thread.is_alive()
+                       and ProController.flag_procon)
+            if not self.is_use_Pro_Controller.get():
+                self.pc_gamepad_input_status.set("入力許可中（HardwareがOFF）")
+            elif not running:
+                self.pc_gamepad_input_status.set("ゲームパッド再接続中")
+                self._schedule_pc_gamepad_bridge_restart()
+            else:
+                self.pc_gamepad_input_status.set("ニュートラル確認中")
         else:
             self.pc_gamepad_input_event.clear()
             self.pc_gamepad_input_status.set("操作停止中（許可OFF）")
+
+    def _schedule_pc_gamepad_bridge_restart(self):
+        if self._pc_gamepad_restart_pending:
+            return
+        self._pc_gamepad_restart_pending = True
+        self.root.after(100, self._restart_pc_gamepad_bridge_if_requested)
+
+    def _restart_pc_gamepad_bridge_if_requested(self):
+        self._pc_gamepad_restart_pending = False
+        if (not self.is_use_Pro_Controller.get()
+                or not self.pc_gamepad_input_enabled.get()):
+            return
+        thread = self.pro_controller_thread
+        if thread is not None and thread.is_alive():
+            if ProController.flag_procon:
+                self.pc_gamepad_input_status.set("ニュートラル確認中")
+                return
+            # The previous SDL loop is still releasing the device.  Retry
+            # after it exits instead of leaving the checked UI disconnected.
+            self.pc_gamepad_input_status.set("前回の接続終了待ち")
+            self._schedule_pc_gamepad_bridge_restart()
+            return
+        self.mode_change_Pro_Controller()
 
     def _queue_pc_gamepad_state(self, state):
         self._gui_action_queue.put(
             lambda current=state: self._show_pc_gamepad_state(current))
 
     def _show_pc_gamepad_state(self, state):
-        if state == "ready" and self.pc_gamepad_input_enabled.get():
+        bridge_ready = (self.is_use_Pro_Controller.get()
+                        and self.pro_controller_thread is not None
+                        and self.pro_controller_thread.is_alive()
+                        and ProController.flag_procon)
+        if state == "ready" and self.pc_gamepad_input_enabled.get() and bridge_ready:
             self.pc_gamepad_input_status.set("操作可能（HOME無効）")
-        elif state == "waiting_neutral" and self.pc_gamepad_input_enabled.get():
-            self.pc_gamepad_input_status.set("ニュートラル確認中")
+        elif (state.startswith("waiting_neutral")
+              and self.pc_gamepad_input_enabled.get() and bridge_ready):
+            blocker = state.split(":", 1)[1] if ":" in state else ""
+            self.pc_gamepad_input_status.set(
+                "ニュートラル確認中：{}を離してください".format(blocker)
+                if blocker else "ニュートラル確認中")
         else:
             self.pc_gamepad_input_status.set("操作停止中（許可OFF）")
 
@@ -7161,33 +8969,52 @@ class PokeControllerApp:
         Command.pos_dialogue_buttons = self.pos_dialogue_buttons.get()
 
     def mode_change_Pro_Controller(self):
+        # Connection and forwarding permission are one user-facing state.
+        # Keeping two independent checkboxes allowed a checked-but-inactive
+        # combination after pause/re-enable.
+        requested = bool(self.is_use_Pro_Controller.get())
+        if requested and self._command_execution_active():
+            # Re-checking while Commands is still stopping used to create a
+            # bridge that looked ready but was competing with the Command.
+            self._pc_gamepad_restore_after_command = True
+            self.is_use_Pro_Controller.set(False)
+            self.pc_gamepad_input_enabled.set(False)
+            self.pc_gamepad_input_event.clear()
+            self.pc_gamepad_input_status.set("Commands終了後に自動で有効化します")
+            return
+        self.pc_gamepad_input_enabled.set(requested)
+        if requested:
+            self.pc_gamepad_input_event.set()
+        else:
+            self.pc_gamepad_input_event.clear()
+            self.pc_gamepad_input_status.set("操作停止中")
         if (self.is_use_Pro_Controller.get()
                 and self.pro_controller_thread is not None
                 and self.pro_controller_thread.is_alive()):
-            self.is_use_Pro_Controller.set(False)
-            tkmsg.showwarning(
-                "PCゲームパッド→Switch",
-                "前回の入力処理が終了中です。数秒後に再度有効にしてください。",
-            )
+            if ProController.flag_procon:
+                self.pc_gamepad_input_event.set() if self.pc_gamepad_input_enabled.get() \
+                    else self.pc_gamepad_input_event.clear()
+                return
+            self.pc_gamepad_input_status.set("前回の接続終了待ち")
+            self._schedule_pc_gamepad_bridge_restart()
             return
         if self.is_use_Pro_Controller.get():  # Proconでの操作を有効化する。
             if self.serial_data_format_name.get() == "3DS Controller":
                 self.is_use_Pro_Controller.set(False)
+                self.pc_gamepad_input_enabled.set(False)
+                self.pc_gamepad_input_event.clear()
+                self.pc_gamepad_input_status.set("操作停止中")
                 tkmsg.showwarning("PCゲームパッド→Switch",
                                   "この機能はSwitch用です。SerialタブのData FormatをDefaultへ変更してください。")
                 return
             self.refresh_pc_gamepads()
             if not self.pc_gamepad.get():
                 self.is_use_Pro_Controller.set(False)
+                self.pc_gamepad_input_enabled.set(False)
+                self.pc_gamepad_input_event.clear()
+                self.pc_gamepad_input_status.set("操作停止中")
                 tkmsg.showwarning("PCゲームパッド→Switch", "PCゲームパッドが見つかりません。接続後に再検索してください。")
                 return
-            if not self.pc_gamepad_input_enabled.get():
-                tkmsg.showwarning(
-                    "PCゲームパッド→Switch",
-                    "ゲームパッドは接続しますが、現在は入力が遮断されています。\n"
-                    "Cameraタブ → Display Settingsの\n"
-                    "「PCゲームパッド→Switch入力を許可」をチェックしてください。",
-                )
             try:
                 self.closingController()
             except Exception:
@@ -7199,6 +9026,9 @@ class PokeControllerApp:
             self.pro_controller_thread = threading.Thread(
                 target=self.run_ProController, daemon=True, name="PCGamepadToSwitch")
             self.pro_controller_thread.start()
+            self.pc_gamepad_input_status.set(
+                "ニュートラル確認中" if self.pc_gamepad_input_enabled.get()
+                else "操作停止中（許可OFF）")
             self.start_top_button["state"] = "disabled"
             self.simplecon_top_button["state"] = "disabled"
 
@@ -7207,6 +9037,24 @@ class PokeControllerApp:
             self.record_pro_controller_checkbox["state"] = "normal"
             self.start_top_button["state"] = "normal"
             self.simplecon_top_button["state"] = "normal"
+
+    def _suspend_pc_gamepad_for_command(self):
+        """Temporarily stop manual input while Commands owns the controller."""
+        self._pc_gamepad_restore_after_command = bool(
+            self._pc_gamepad_restore_after_command
+            or self.is_use_Pro_Controller.get())
+        self.is_use_Pro_Controller.set(False)
+        self.mode_change_Pro_Controller()
+
+    def _restore_pc_gamepad_after_command(self):
+        if not self._pc_gamepad_restore_after_command:
+            return
+        if self._command_execution_active():
+            self.root.after(100, self._restore_pc_gamepad_after_command)
+            return
+        self._pc_gamepad_restore_after_command = False
+        self.is_use_Pro_Controller.set(True)
+        self.mode_change_Pro_Controller()
 
     def record_Pro_Controller(self):
         self.flag_record = self.is_record_Pro_Controller.get()
@@ -7465,6 +9313,7 @@ class PokeControllerApp:
         self.assignCommand()
         self.refresh_command_watch_commands()
         self.refresh_commands_assist_commands()
+        self._refresh_command_start_status()
         reload_errors = []
         for label, loader in (("Python", self.py_loader),
                               ("Sample", self.sample_py_loader),
@@ -7555,7 +9404,10 @@ class PokeControllerApp:
         if self._pending_startup_snapshot:
             self._apply_all_tabs_snapshot(self._pending_startup_snapshot, runtime=True)
             self._pending_startup_snapshot = None
+            if self._startup_skip_hardware:
+                self._apply_hardware_unconfigured_selection()
         self._update_command_start_state()
+        self._refresh_command_start_status()
         if error:
             self.show_output(
                 "Analysis",
@@ -7789,6 +9641,7 @@ class PokeControllerApp:
         self.start_top_button["state"] = state
 
     def reloadCommands(self):
+        self._state_value_cache.clear()
         if not self._commands_loaded:
             self.show_output("Analysis", text="Commandsを読み込み中です。完了後に再読込してください。")
             return
@@ -7910,13 +9763,13 @@ class PokeControllerApp:
         if not self._commands_loaded:
             self.show_output("Analysis", text="Commandsをバックグラウンドで読み込み中です。")
             return
-        self.is_use_Pro_Controller.set(False)
-        self.mode_change_Pro_Controller()
         # set and init selected command
         self.assignCommand()
         if self.cur_command is None:
             print("No commands have been assigned yet.")
             self._logger.info("No commands have been assigned yet.")
+            return
+        if not self._prompt_command_run_settings(self.cur_command):
             return
         if not self._prepare_command_start_override(self.cur_command):
             return
@@ -7929,6 +9782,7 @@ class PokeControllerApp:
         if not self._install_function_replacement_mappings(self.cur_command):
             return
         self._install_step_debug_wrappers(self.cur_command)
+        self._suspend_pc_gamepad_for_command()
         self._auto_arm_command_monitor_recording()
         self.cur_command.start(self.ser, lambda: self.stopPlayPost(started_command))
         self._start_command_start_monitor(self.cur_command)
@@ -7959,11 +9813,11 @@ class PokeControllerApp:
             print("No commands have been assigned yet.")
             self._logger.info("No commands have been assigned yet.")
 
-        self.is_use_Pro_Controller.set(False)
-        self.mode_change_Pro_Controller()
         # set and init selected command
         flag = self.assignShortcutCommand(num)
         if flag:
+            if not self._prompt_command_run_settings(self.cur_command):
+                return
             if not self._prepare_command_start_override(self.cur_command):
                 return
             self._mark_active_input_set_commands_used()
@@ -7974,6 +9828,7 @@ class PokeControllerApp:
             if not self._install_function_replacement_mappings(self.cur_command):
                 return
             self._install_step_debug_wrappers(self.cur_command)
+            self._suspend_pc_gamepad_for_command()
             self._auto_arm_command_monitor_recording()
             self.cur_command.start(self.ser, lambda: self.stopPlayPost(started_command))
             self._start_command_start_monitor(self.cur_command)
@@ -8011,6 +9866,8 @@ class PokeControllerApp:
                 "処理途中のため、次回実行前にゲーム状態を確認してください。"):
             return
         self._request_command_monitor_stop_cleanup(command)
+        self._stop_command_monitor_capture_on_request(
+            command, "force_stop_requested")
         Command.isPause = False
         interrupted = False
         try:
@@ -8062,6 +9919,7 @@ class PokeControllerApp:
         self._logger.info(self.start_button["text"] + " " + self.cur_command.NAME)
         command = self.cur_command
         self._request_command_monitor_stop_cleanup(command)
+        self._stop_command_monitor_capture_on_request(command, "stop_requested")
         self.start_button.configure(state="disabled", text="Stopping...")
         self.start_top_button.configure(state="disabled", text="Stopping...")
 
@@ -8118,6 +9976,10 @@ class PokeControllerApp:
         self.shortcut_button_8["state"] = "normal"
         self.shortcut_button_9["state"] = "normal"
         self.shortcut_button_10["state"] = "normal"
+        # Commands has fully released Serial at this point.  Restore manual
+        # control only now, never while a Stop request is still pending.
+        if self._pc_gamepad_restore_after_command:
+            self.root.after(100, self._restore_pc_gamepad_after_command)
 
     def _drain_gui_actions(self):
         """Run worker callbacks on Tk's thread in small bounded batches."""
@@ -8148,7 +10010,10 @@ class PokeControllerApp:
         else:
             with merge_lock:
                 merging = bool(getattr(self, "_command_monitor_merge_active", 0))
-        return bool(getattr(self.recorder, "is_finalizing", False) or merging)
+        operation_thread = getattr(self, "_operation_finalize_thread", None)
+        return bool(getattr(self.recorder, "is_finalizing", False) or merging
+                    or getattr(self.operation_recorder, "is_finalizing", False)
+                    or (operation_thread is not None and operation_thread.is_alive()))
 
     def exit(self):
         """Avoid destroying the window while the background MP4 encoder runs."""
@@ -8169,6 +10034,13 @@ class PokeControllerApp:
             self.recorder.stop()
             if hasattr(self, "record_button"):
                 self.record_button.configure(text="Start recording")
+
+        operation_session = getattr(self, "operation_capture_session", None)
+        if operation_session is not None:
+            if operation_session.active:
+                self.pause_operation_capture(quiet=True)
+            operation_session.close()
+            self.ser.end_manual_override()
 
         if self._recording_background_work_active():
             if tkmsg.askyesno(
@@ -8227,6 +10099,11 @@ class PokeControllerApp:
             self.settings.show_size.set(self.show_size.get())
             self.settings.last_active_preview_full_fps = \
                 self.last_active_preview_full_fps.get()
+            self.settings.resource_control_enabled = \
+                self.resource_control_enabled.get()
+            self.settings.resource_cpu_target = clamp_cpu_target(
+                self.resource_cpu_target.get())
+            self.settings.resource_main_tool = self.resource_main_tool.get()
             self.settings.com_port.set(self.com_port.get())
             self.settings.com_port_name.set(self.com_port_name.get())
             self.settings.baud_rate.set(self.baud_rate.get())
@@ -8282,7 +10159,7 @@ class PokeControllerApp:
             self.settings.video_source = self.video_source.get()
             self.settings.window_capture_mode = self._window_capture_mode_key()
             self.settings.window_title, self.settings.window_process = self._selected_window_identity()
-            self.settings.audio_input = self.audio_input.get()
+            self.settings.audio_input = self._selected_audio_device_name()
             self.settings.audio_gain = self.audio_gain.get()
             self.settings.audio_filter_camera = self.audio_filter_camera.get()
             self.settings.audio_auto_start = self.audio_auto_start.get()
@@ -8315,6 +10192,16 @@ class PokeControllerApp:
             self.settings.record_variable_start = self.record_variable_start.get()
             self.settings.record_variable_stop = self.record_variable_stop.get()
             self.settings.record_variable_rules = json.dumps(self.record_variable_rules, ensure_ascii=False)
+            self.settings.operation_capture_output_dir = \
+                self.operation_capture_output_dir.get().strip()
+            self.settings.operation_capture_include_audio = \
+                self.operation_capture_include_audio.get()
+            self.settings.operation_capture_auto_controller = \
+                self.operation_capture_auto_controller.get()
+            self.settings.operation_capture_gamepad_profile = \
+                self.operation_gamepad_profile_name.get().strip()
+            self.settings.operation_capture_last_session = \
+                self.operation_capture_last_session.get().strip()
             self.settings.area_capture_roi = self.area_capture_roi.get()
             self.settings.area_capture_output_target = self.area_capture_output_target.get()
             self.settings.area_capture_background = self.area_capture_background.get()
@@ -8825,8 +10712,9 @@ class PokeControllerApp:
             try:
                 self.root.after_cancel(pending)
             except tk.TclError:
-                return
+                pass
         self._apply_panel_adjuster_geometry()
+        self._sync_output_layout_to_active_input_set()
 
     def _apply_panel_adjuster_geometry(self):
         """Update only grid weights and panel heights (no content reparenting)."""
@@ -9402,8 +11290,19 @@ class PokeControllerApp:
         return {"command_name": command_name, "values": values}
 
     def _queue_analysis_rule_results(self, results):
-        self._gui_action_queue.put(
-            lambda values=results: self._show_analysis_rule_results(values))
+        with self._pending_analysis_rule_results_lock:
+            self._pending_analysis_rule_results = results
+            if self._pending_analysis_rule_results_queued:
+                return
+            self._pending_analysis_rule_results_queued = True
+        self._gui_action_queue.put(self._drain_analysis_rule_results)
+
+    def _drain_analysis_rule_results(self):
+        with self._pending_analysis_rule_results_lock:
+            results = self._pending_analysis_rule_results
+            self._pending_analysis_rule_results = None
+            self._pending_analysis_rule_results_queued = False
+        self._show_analysis_rule_results(results or [])
 
     def _show_analysis_rule_results(self, results):
         if not self.analysis_rules_enabled.get():
@@ -9508,15 +11407,23 @@ class PokeControllerApp:
             column=0, row=5, padx=8, pady=5, sticky="e")
         ttk.Entry(dialog, textvariable=self.image_detection_monitor_output_tag,
                   width=30).grid(column=1, row=5, padx=8, pady=5, sticky="ew")
-        ttk.Label(dialog, text="候補数:").grid(column=0, row=6, padx=8, pady=5, sticky="e")
+        ttk.Label(dialog, text="Show Value更新なしで消すまで:").grid(
+            column=0, row=6, padx=8, pady=5, sticky="e")
+        show_timeout = ttk.Frame(dialog)
+        show_timeout.grid(column=1, row=6, padx=8, pady=5, sticky="w")
+        ttk.Spinbox(
+            show_timeout, from_=0.5, to=60.0, increment=0.5, width=8,
+            textvariable=self.image_detection_monitor_value_timeout).pack(side="left")
+        ttk.Label(show_timeout, text="秒").pack(side="left", padx=(3, 0))
+        ttk.Label(dialog, text="候補数:").grid(column=0, row=7, padx=8, pady=5, sticky="e")
         ttk.Spinbox(dialog, from_=3, to=20, increment=1, width=8,
                     textvariable=self.image_assist_max_candidates).grid(
-                        column=1, row=6, padx=8, pady=5, sticky="w")
+                        column=1, row=7, padx=8, pady=5, sticky="w")
         ttk.Label(
             dialog,
             text="ゲームタグ・ゲーム機タグは片方だけでも指定できます。Show Valueは画像検知結果の出力先です。",
             wraplength=480).grid(
-                column=0, columnspan=2, row=7, padx=8, pady=(3, 5), sticky="w")
+                column=0, columnspan=2, row=8, padx=8, pady=(3, 5), sticky="w")
 
         def apply_settings():
             game_tag = "" if self.image_assist_game_tag.get() == "すべて" else self.image_assist_game_tag.get()
@@ -9526,11 +11433,14 @@ class PokeControllerApp:
             except (TypeError, ValueError, tk.TclError):
                 candidate_count = 10
             self.image_assist_max_candidates.set(candidate_count)
+            self.image_detection_monitor_value_timeout.set(
+                self._image_detection_value_timeout_seconds())
             self.image_analysis_assist.set_filters(game_tag, console_tag, self.image_assist_filter_mode.get())
             self.image_analysis_assist.set_max_candidates(candidate_count)
             show_value_output = self.image_detection_monitor_output.get()
             if show_value_output != "Disabled":
                 self._ensure_image_detection_monitor_output_visible(show_value_output)
+            self._refresh_image_detection_value_output(force=True)
             logical_output = "Log: " + self.image_assist_output.get()
             if not any(value.get() == logical_output for value in self.panel_slots.values()):
                 preferred = {"Output#1": "right_top", "Output#2": "right_bottom",
@@ -9552,7 +11462,7 @@ class PokeControllerApp:
             dialog.destroy()
 
         ttk.Button(dialog, text="反映", command=apply_settings).grid(
-            column=1, row=8, padx=8, pady=8, sticky="e")
+            column=1, row=9, padx=8, pady=8, sticky="e")
         dialog.columnconfigure(1, weight=1)
 
     def toggle_image_analysis_assist(self):
@@ -9577,8 +11487,19 @@ class PokeControllerApp:
         self.image_assist_status.set("再読込済み" if self.image_assist_enabled.get() else "停止中")
 
     def _queue_image_assist_results(self, results):
-        self._gui_action_queue.put(
-            lambda values=results: self._show_image_assist_results(values))
+        with self._pending_image_assist_results_lock:
+            self._pending_image_assist_results = results
+            if self._pending_image_assist_results_queued:
+                return
+            self._pending_image_assist_results_queued = True
+        self._gui_action_queue.put(self._drain_image_assist_results)
+
+    def _drain_image_assist_results(self):
+        with self._pending_image_assist_results_lock:
+            results = self._pending_image_assist_results
+            self._pending_image_assist_results = None
+            self._pending_image_assist_results_queued = False
+        self._show_image_assist_results(results or [])
 
     def _show_image_assist_results(self, results):
         if not self.image_assist_enabled.get():
@@ -9773,6 +11694,8 @@ class PokeControllerApp:
         item = data.get("input_sets", {}).get(name)
         if not isinstance(item, dict):
             return False
+        if not input_set_commands_enabled(item):
+            return False
         self.input_set_include_commands.set(True)
         snapshot = self._all_tabs_snapshot(include_commands=True)
         selection = snapshot["command_selection"]
@@ -9809,6 +11732,7 @@ class PokeControllerApp:
         self.commands_assist_rules = []
         self.step_debug_rules = []
         self.command_start_overrides = {}
+        self.command_run_favorites = {}
         self.command_watch_enabled.set(False)
         self.command_watch_command.set("")
         self.command_watch_variables = []
@@ -9831,6 +11755,7 @@ class PokeControllerApp:
         self._refresh_commands_assist_rule_list()
         self._commands_assist_evaluator.reset()
         self._refresh_command_start_status()
+        self._refresh_inline_command_run_panel()
         self.reset_command_watch()
 
     def _input_sets_path(self):
@@ -10161,8 +12086,9 @@ class PokeControllerApp:
             "camera": self._current_camera_data(),
             "audio": {
                 "enabled": include_audio,
-                "device_name": self.audio_input.get() if include_audio else "",
-                "normalized_name": self._normalize_audio_device_name(self.audio_input.get()) if include_audio else "",
+                "device_name": self._selected_audio_device_name() if include_audio else "",
+                "normalized_name": self._normalize_audio_device_name(
+                    self._selected_audio_device_name()) if include_audio else "",
                 "gain": self.audio_gain.get(),
                 "filter_camera": self.audio_filter_camera.get(),
                 "auto_start": self.audio_auto_start.get(),
@@ -10180,18 +12106,27 @@ class PokeControllerApp:
             "all_tabs": snapshot,
         }
         if include_commands:
+            result["operation_capture"] = {
+                "output_dir": self.operation_capture_output_dir.get().strip(),
+                "include_audio": bool(self.operation_capture_include_audio.get()),
+                "auto_controller": bool(self.operation_capture_auto_controller.get()),
+                "gamepad_profile": self.operation_gamepad_profile_name.get().strip(),
+                "last_session": self.operation_capture_last_session.get().strip(),
+            }
             result["commands_assist"] = {
                 "enabled": self.commands_assist_enabled.get(),
                 "recovery_command": self.commands_assist_recovery_command.get(),
                 "rules": list(self.commands_assist_rules),
                 "step_debug_rules": list(self.step_debug_rules),
                 "start_overrides": dict(self.command_start_overrides),
+                "run_favorites": copy.deepcopy(self.command_run_favorites),
             }
             result["shared_debug"] = self._shared_debug_config()
         return result
 
     def _current_serial_data(self):
-        selected = self.serial_device_name.get().strip() if hasattr(self, "serial_device_name") else ""
+        selected = self._selected_serial_device_label() \
+            if hasattr(self, "serial_device_name") else ""
         if not selected or selected.startswith("("):
             return {"enabled": False}
         current_port = "COM{}".format(self.com_port.get())
@@ -10408,7 +12343,7 @@ class PokeControllerApp:
             self.com_port_name.set("")
             if hasattr(self, "ser"):
                 self.inactivateSerial()
-            return
+            return False
         self.baud_rate.set(str(saved.get("baud_rate", self.baud_rate.get())))
         self.serial_data_format_name.set(
             saved.get("data_format", self.serial_data_format_name.get()))
@@ -10453,10 +12388,14 @@ class PokeControllerApp:
                 "InputSet",
                 "登録したSerial Deviceを一意に検出できませんでした。\n"
                 "SerialタブでDevice Nameを選択し直し、InputSetを変更保存してください。")
-            return
+            return False
         port = matches[0]
         description = str(getattr(port, "description", saved.get("device_name", "")))
         device = str(getattr(port, "device", saved.get("port", "")))
+        usage_key = canonical_device_key("serial", device or description)
+        if not self._confirm_shared_device("serial", usage_key, description):
+            self._set_serial_unconfigured()
+            return False
         self.locateDeviceCmbbox()
         self.serial_device_name.set(description)
         match = re.search(r"(?i)COM(\d+)", device + " " + description)
@@ -10467,6 +12406,7 @@ class PokeControllerApp:
             self.com_port_name.set(device)
         if hasattr(self, "ser"):
             self.activateSerial()
+        return True
 
     def _apply_input_set_data(self, item, open_hardware=True, apply_serial=True):
         use_commands = input_set_commands_enabled(item)
@@ -10490,10 +12430,18 @@ class PokeControllerApp:
             else top_assist.get("start_overrides")
         self.command_start_overrides = dict(saved_start_overrides) \
             if use_commands and isinstance(saved_start_overrides, dict) else {}
+        saved_run_favorites = tab_assist.get("run_favorites") \
+            if isinstance(tab_assist.get("run_favorites"), dict) \
+            else top_assist.get("run_favorites")
+        self.command_run_favorites = copy.deepcopy(saved_run_favorites) \
+            if use_commands and isinstance(saved_run_favorites, dict) else {}
         self._refresh_command_start_status()
+        self._refresh_inline_command_run_panel()
         self._write_step_debug_rules()
         camera = item.get("camera", {})
         audio = item.get("audio", {})
+        camera_allowed = not self._startup_skip_hardware
+        audio_allowed = not self._startup_skip_hardware
         use_window_input = camera.get("source_type") == "Window (Steam/game)"
         self._set_window_capture_mode(camera.get("capture_mode", "client"))
         self.fps.set(str(camera.get("fps", self.fps.get())))
@@ -10509,7 +12457,31 @@ class PokeControllerApp:
             if self.camera_dic is None:
                 self.locateCameraCmbbox()
             camera_id = self._resolve_camera_id(camera)
-        if camera_id == -1:
+        if camera_allowed:
+            if use_window_input:
+                window_handle = getattr(self, "window_sources", {}).get(self.window_source.get())
+                camera_key = self._camera_usage_key(
+                    source_type="Window (Steam/game)", window_handle=window_handle)
+                camera_label = self.window_source.get() or camera.get("window_title", "Window")
+            elif camera_id is not None:
+                camera_key = self._camera_usage_key(
+                    camera_id=camera_id, source_type="Capture device")
+                camera_label = str((self.camera_dic or {}).get(
+                    camera_id, (self.camera_dic or {}).get(str(camera_id), "Camera ID {}".format(camera_id))))
+            else:
+                camera_key, camera_label = "", ""
+            if camera_key and not self._confirm_shared_device(
+                    "camera", camera_key, camera_label):
+                camera_allowed = False
+        if not camera_allowed:
+            if hasattr(self, "camera"):
+                self._set_camera_unconfigured()
+            else:
+                self.camera_id.set(-1)
+                self.camera_name_fromDLL.set("(未設定)")
+                self.window_source.set("")
+            camera_id = None
+        elif camera_id == -1:
             pass
         elif camera_id is None:
             tkmsg.showwarning("InputSet", "登録したカメラを検出できませんでした。Cameraタブで選択し直してください。")
@@ -10519,7 +12491,7 @@ class PokeControllerApp:
             self.camera_name_fromDLL.set((self.camera_dic or {}).get(camera_id, (self.camera_dic or {}).get(str(camera_id), "")))
         audio_enabled = audio.get("enabled", bool(audio.get("device_name")))
         self.input_set_include_audio.set(audio_enabled)
-        if audio_enabled:
+        if audio_enabled and audio_allowed:
             self.audio_filter_camera.set(audio.get("filter_camera", False))
             self.audio_auto_start.set(audio.get("running", audio.get("auto_start", False)))
             self.audio_gain.set(audio.get("gain", 100))
@@ -10527,12 +12499,18 @@ class PokeControllerApp:
             if camera.get("source_type") == "Window (Steam/game)":
                 # refresh_audio_devices has rebuilt the process source using
                 # the newly discovered PID; never restore the stale saved PID.
-                audio_name = self.audio_input.get()
+                audio_name = self._selected_audio_device_name()
             else:
                 audio_name = self._resolve_audio_name(
                     audio.get("device_name", ""), audio.get("normalized_name", ""))
             if audio_name:
-                self.audio_input.set(audio_name)
+                audio_key = canonical_device_key("audio", audio_name)
+                if self._confirm_shared_device("audio", audio_key, audio_name):
+                    self.audio_input.set(audio_name)
+                else:
+                    audio_allowed = False
+                    self.audio_input.set("")
+                    self.audio_auto_start.set(False)
             elif audio.get("device_name"):
                 tkmsg.showwarning("InputSet", "登録した音声デバイスを検出できませんでした。Audioタブで選択し直してください。")
         else:
@@ -10540,8 +12518,12 @@ class PokeControllerApp:
             self.audio_auto_start.set(False)
         # Missing means a legacy InputSet.  Preserve the Serial setting loaded
         # from settings.ini instead of treating legacy data as "未設定".
-        if apply_serial and "serial" in item:
+        if apply_serial and "serial" in item and not self._startup_skip_hardware:
             self._apply_serial_input_set(item.get("serial", {}))
+        elif self._startup_skip_hardware:
+            self.serial_device_name.set("(未設定)")
+            self.com_port.set(0)
+            self.com_port_name.set("")
         recording = item.get("recording")
         if isinstance(recording, dict):
             self._apply_recording_preset_data(recording)
@@ -10575,6 +12557,14 @@ class PokeControllerApp:
                 saved_quick = strip_commands_from_snapshot(
                     {"quick_actions": saved_quick}).get("quick_actions", saved_quick)
             self._apply_quick_actions_snapshot(saved_quick, refresh=open_hardware)
+        if not camera_allowed:
+            self.video_source.set("Capture device")
+            self.camera_id.set(-1)
+            self.camera_name_fromDLL.set("(未設定)")
+            self.window_source.set("")
+        if not audio_allowed:
+            self.audio_input.set("")
+            self.audio_auto_start.set(False)
         if open_hardware:
             # Camera identity and Video input are stored together, but the
             # dedicated camera section is authoritative. Apply it only after
@@ -10582,7 +12572,7 @@ class PokeControllerApp:
             # can never open before a saved Window input.
             self.fps.set(str(camera.get("fps", self.fps.get())))
             self.show_size.set(camera.get("show_size", self.show_size.get()))
-            if use_window_input:
+            if camera_allowed and use_window_input:
                 self.video_source.set("Window (Steam/game)")
                 self._set_window_capture_mode(camera.get("capture_mode", "client"))
                 self.saved_window_title = camera.get("window_title", "")
@@ -10596,12 +12586,19 @@ class PokeControllerApp:
                         "InputSet",
                         "登録したゲームウィンドウを検出できませんでした。\n"
                         "Camera Nameへは切り替えていません。ゲームを起動して再読込してください。")
-            elif camera_id is not None:
+            elif camera_allowed and camera_id is not None:
                 self.video_source.set("Capture device")
                 if hasattr(self, "camera"):
                     self.camera.fps = int(self.fps.get())
                     self.camera.openCamera(camera_id)
-            if audio.get("running", audio.get("auto_start", False)) and audio_enabled:
+                    if self.camera.isOpened():
+                        self._publish_device_usage(
+                            "camera", self._camera_usage_key(
+                                camera_id=camera_id, source_type="Capture device"),
+                            str((self.camera_dic or {}).get(
+                                camera_id, (self.camera_dic or {}).get(str(camera_id), camera_id))))
+            if (audio_allowed and audio.get("running", audio.get("auto_start", False))
+                    and audio_enabled):
                 self.root.after(100, self.start_audio_monitor)
             else:
                 self.stop_audio_monitor()
@@ -10618,6 +12615,13 @@ class PokeControllerApp:
             tkmsg.showwarning("InputSet", "呼び出す登録済みInputSetを選択してください。")
             return
         item = self._migrate_pending_step_debug_rules(name, item)
+        if not self._confirm_main_resource_input_set(item, name):
+            return
+        # A manually selected InputSet supersedes the deferred startup
+        # snapshot. Otherwise command loading may finish afterwards and put
+        # the startup set's Resource/main choice back into the UI.
+        self._pending_startup_snapshot = None
+        self._startup_skip_hardware = False
         self._set_active_input_set(name)
         self._apply_input_set_data(item)
         self._show_input_set_summary()
@@ -10649,6 +12653,10 @@ class PokeControllerApp:
         snapshot = item.get("all_tabs", {})
         if not use_commands:
             snapshot = strip_commands_from_snapshot(snapshot)
+        resource_values = snapshot_values_with_defaults(snapshot)
+        resource_text = "{}・CPU {}%".format(
+            "メイン" if resource_values.get("resource_main_tool") else "通常",
+            resource_values.get("resource_cpu_target", 90))
         quick = snapshot.get("quick_actions", item.get("quick_actions", {})) if isinstance(snapshot, dict) else {}
         quick_count = sum(len(quick.get(side, {}).get("items", []))
                           for side in ("left", "right") if isinstance(quick.get(side, {}), dict))
@@ -10665,11 +12673,11 @@ class PokeControllerApp:
                                  for key in ("python", "sample", "mcu")
                                  if command_selection.get(key)), "-")
         self.input_set_summary.set(
-            "全タブ保存: {} / Commands: {}{} / Quick: {}件 / Camera: {} ({}) / Audio: {} / Serial: {} / Recording: {} / Controller記録: {}件".format(
+            "全タブ保存: {} / Commands: {}{} / Resource: {} / Quick: {}件 / Camera: {} ({}) / Audio: {} / Serial: {} / Recording: {} / Controller記録: {}件".format(
                 "はい" if has_complete_snapshot(item) else "旧形式",
                 "使用" if use_commands else "なし",
                 " ({})".format(selected_command) if use_commands else "",
-                quick_count,
+                resource_text, quick_count,
                 camera.get("display_name", ""), identity, audio_text, serial_text,
                 recording_text, len(saved_recordings or {})))
 
@@ -10701,6 +12709,13 @@ class PokeControllerApp:
                 "end_y": getattr(preview, "touchscreen_end_y", self.touchscreen_end_y),
             },
             "recording": self._recording_preset_data(),
+            "operation_capture": {
+                "output_dir": self.operation_capture_output_dir.get().strip(),
+                "include_audio": bool(self.operation_capture_include_audio.get()),
+                "auto_controller": bool(self.operation_capture_auto_controller.get()),
+                "gamepad_profile": self.operation_gamepad_profile_name.get().strip(),
+                "last_session": self.operation_capture_last_session.get().strip(),
+            },
             "command_watch_variables": list(self.command_watch_variables),
             "command_selection": self._current_command_selection(),
             "shortcuts": {
@@ -10712,12 +12727,21 @@ class PokeControllerApp:
                                 "recovery_command": self.commands_assist_recovery_command.get(),
                                 "rules": list(self.commands_assist_rules),
                                 "step_debug_rules": list(self.step_debug_rules),
-                                "start_overrides": dict(self.command_start_overrides)},
+                                "start_overrides": dict(self.command_start_overrides),
+                                "run_favorites": copy.deepcopy(self.command_run_favorites)},
             "analysis_rules": list(self.analysis_rules),
             "controller_recordings": self._read_controller_recordings(),
             "quick_actions": self._quick_actions_snapshot(),
-            # Controller forwarding authorization intentionally remains session-only.
-            "manual_control": {"hardware_enabled": False, "input_permission": False},
+            "manual_control": {
+                "use_keyboard": bool(self.is_use_keyboard.get()),
+                "left_stick_mouse": bool(self.is_use_left_stick_mouse.get()),
+                "right_stick_mouse": bool(self.is_use_right_stick_mouse.get()),
+                "gamepad": self.pc_gamepad.get(),
+                "record_controller": bool(self.is_record_Pro_Controller.get()),
+                "hardware_enabled": bool(self.is_use_Pro_Controller.get()),
+                "input_permission": bool(self.pc_gamepad_input_enabled.get()),
+                "mapping_profile": self.operation_gamepad_profile_name.get().strip(),
+            },
         }
         return snapshot if include_commands else strip_commands_from_snapshot(snapshot)
 
@@ -10726,7 +12750,7 @@ class PokeControllerApp:
             return
         if commands_enabled is None:
             commands_enabled = bool(snapshot.get("commands_enabled", True))
-        values = snapshot.get("values", {})
+        values = snapshot_values_with_defaults(snapshot)
         for name, value in values.items():
             if not commands_enabled and name in COMMAND_INPUT_SET_VARIABLES:
                 continue
@@ -10736,6 +12760,8 @@ class PokeControllerApp:
                     variable.set(value)
                 except (tk.TclError, ValueError, TypeError):
                     self._logger.warning("InputSet value could not be restored: %s", name)
+        self._cache_resource_control_config()
+        self._refresh_resource_control_status()
         if hasattr(self, "image_detection_monitor_target_cb"):
             self._refresh_image_detection_monitor_choices()
         current_object_assist = self.object_detection_assist_window
@@ -10782,6 +12808,29 @@ class PokeControllerApp:
         recording = snapshot.get("recording")
         if isinstance(recording, dict):
             self._apply_recording_preset_data(recording)
+        operation_capture = snapshot.get("operation_capture")
+        if commands_enabled and isinstance(operation_capture, dict):
+            self.operation_capture_output_dir.set(
+                operation_capture.get("output_dir", self.operation_capture_output_dir.get()))
+            self.operation_capture_include_audio.set(
+                operation_capture.get("include_audio", self.operation_capture_include_audio.get()))
+            self.operation_capture_auto_controller.set(
+                operation_capture.get("auto_controller", self.operation_capture_auto_controller.get()))
+            self.refresh_operation_gamepad_profiles(
+                preferred=operation_capture.get(
+                    "gamepad_profile", self.operation_gamepad_profile_name.get()))
+            self.operation_capture_last_session.set(
+                operation_capture.get("last_session", self.operation_capture_last_session.get()))
+            self.refresh_operation_sessions()
+        elif not commands_enabled:
+            # Do not carry a previous Commands-authoring session into a
+            # Camera/Steam-only InputSet that deliberately owns no Commands data.
+            self.operation_capture_output_dir.set("")
+            self.operation_capture_include_audio.set(True)
+            self.operation_capture_auto_controller.set(True)
+            self.refresh_operation_gamepad_profiles()
+            self.operation_capture_last_session.set("")
+            self.refresh_operation_sessions()
         if commands_enabled:
             self.command_watch_variables = list(
                 snapshot.get("command_watch_variables", self.command_watch_variables))
@@ -10798,12 +12847,15 @@ class PokeControllerApp:
             if commands_enabled else []
         self.command_start_overrides = dict(assist.get("start_overrides", {})) \
             if commands_enabled and isinstance(assist.get("start_overrides"), dict) else {}
+        self.command_run_favorites = copy.deepcopy(assist.get("run_favorites", {})) \
+            if commands_enabled and isinstance(assist.get("run_favorites"), dict) else {}
         if commands_enabled and isinstance(assist.get("step_debug_rules"), list):
             self.step_debug_rules = list(assist.get("step_debug_rules", []))
             self._write_step_debug_rules()
         self._refresh_commands_assist_rule_list()
         self._commands_assist_evaluator.reset()
         self._refresh_command_start_status()
+        self._refresh_inline_command_run_panel()
         saved_analysis_rules = snapshot.get("analysis_rules")
         if isinstance(saved_analysis_rules, list):
             self.analysis_rules = list(saved_analysis_rules)
@@ -10822,8 +12874,27 @@ class PokeControllerApp:
             saved_quick = strip_commands_from_snapshot(
                 {"quick_actions": saved_quick}).get("quick_actions")
         self._apply_quick_actions_snapshot(saved_quick, refresh=False)
-        self.pc_gamepad_input_enabled.set(False)
-        self.is_use_Pro_Controller.set(False)
+        manual = snapshot.get("manual_control", {})
+        if isinstance(manual, dict):
+            self.is_use_keyboard.set(bool(manual.get(
+                "use_keyboard", self.is_use_keyboard.get())))
+            self.is_use_left_stick_mouse.set(bool(manual.get(
+                "left_stick_mouse", self.is_use_left_stick_mouse.get())))
+            self.is_use_right_stick_mouse.set(bool(manual.get(
+                "right_stick_mouse", self.is_use_right_stick_mouse.get())))
+            self.is_record_Pro_Controller.set(bool(manual.get(
+                "record_controller", self.is_record_Pro_Controller.get())))
+            self.is_use_Pro_Controller.set(bool(manual.get(
+                "hardware_enabled", self.is_use_Pro_Controller.get())))
+            self.pc_gamepad_input_enabled.set(bool(manual.get(
+                "input_permission", self.pc_gamepad_input_enabled.get())))
+            if manual.get("gamepad"):
+                self.pc_gamepad.set(str(manual.get("gamepad")))
+            if manual.get("mapping_profile"):
+                self.operation_gamepad_profile_name.set(str(
+                    manual.get("mapping_profile")))
+                self.refresh_operation_gamepad_profiles(
+                    preferred=self.operation_gamepad_profile_name.get())
         if not commands_enabled:
             self._clear_input_set_command_context()
         if runtime:
@@ -10846,6 +12917,24 @@ class PokeControllerApp:
                         pass
             if getattr(self, "keyPress", None) is not None:
                 self.activateKeyboard()
+            if hasattr(self, "preview"):
+                self.activate_Left_stick_mouse()
+                self.activate_Right_stick_mouse()
+            requested_gamepad = self.pc_gamepad.get()
+            self.refresh_pc_gamepads()
+            if requested_gamepad:
+                values = list(self.pc_gamepad_cb["values"])
+                if requested_gamepad in values:
+                    self.pc_gamepad.set(requested_gamepad)
+                else:
+                    self.pc_gamepad.set(requested_gamepad)
+                    if self.is_use_Pro_Controller.get():
+                        self.is_use_Pro_Controller.set(False)
+                        self.pc_gamepad_input_enabled.set(False)
+                        self.pc_gamepad_input_status.set(
+                            "保存済みゲームパッド未検出（設定名はInputSetに保持）")
+            if self.is_use_Pro_Controller.get():
+                self.mode_change_Pro_Controller()
             if commands_enabled:
                 selection = snapshot.get("command_selection", {})
                 for variable, key, values in (
@@ -10866,8 +12955,10 @@ class PokeControllerApp:
                            "default": self.input_recording_set_name.get().strip()}
         self._write_input_sets(data)
 
-    def _choose_combined_set_dialog(self, title, default_name="", full_only=False, allow_skip=True):
+    def _choose_combined_set_dialog(self, title, default_name="", full_only=False,
+                                    allow_skip=True, allow_without_devices=False):
         """Select a combined set while visibly distinguishing new/legacy data."""
+        self._last_combined_set_without_devices = False
         input_data = self._read_input_sets()
         combined = input_data.get("combined_sets", {})
         input_sets = input_data.get("input_sets", {})
@@ -10952,7 +13043,7 @@ class PokeControllerApp:
         tree.selection_set(selected_item)
         tree.focus(selected_item)
         tree.see(selected_item)
-        result = {"name": ""}
+        result = {"name": "", "without_devices": False}
 
         def use_selected(event=None):
             selected = tree.selection()
@@ -10961,9 +13052,21 @@ class PokeControllerApp:
             result["name"] = name_by_item.get(selected[0], "")
             dialog.destroy()
 
+        def use_selected_without_devices():
+            selected = tree.selection()
+            if not selected:
+                return
+            result["name"] = name_by_item.get(selected[0], "")
+            result["without_devices"] = True
+            dialog.destroy()
+
         buttons = ttk.Frame(dialog)
         buttons.pack(fill="x", padx=10, pady=(2, 10))
         ttk.Button(buttons, text="選択して読み込む", command=use_selected).pack(side="left", padx=(0, 5))
+        if allow_without_devices:
+            ttk.Button(
+                buttons, text="Camera・Serial・Audioを未設定で反映",
+                command=use_selected_without_devices).pack(side="left", padx=(0, 5))
         ttk.Button(buttons, text="スキップ" if allow_skip else "キャンセル",
                    command=dialog.destroy).pack(side="left")
         tree.bind("<Double-1>", use_selected)
@@ -10975,6 +13078,7 @@ class PokeControllerApp:
         dialog.grab_set()
         tree.focus_set()
         dialog.wait_window()
+        self._last_combined_set_without_devices = bool(result["without_devices"])
         return result["name"]
 
     def choose_full_input_recording_set(self):
@@ -11002,12 +13106,21 @@ class PokeControllerApp:
         if not enabled:
             return None
         name = self._choose_combined_set_dialog(
-            "起動時 InputSet（機器を開く前）", default_name, full_only=False, allow_skip=True)
+            "起動時 InputSet（機器を開く前）", default_name, full_only=False,
+            allow_skip=True, allow_without_devices=True)
         if not name:
+            return None
+        combined_item = data["combined_sets"].get(name)
+        input_name = str(combined_item.get("input_set", "")) \
+            if isinstance(combined_item, dict) else ""
+        input_item = data.get("input_sets", {}).get(input_name)
+        if not self._confirm_main_resource_input_set(input_item, input_name):
             return None
         self.input_recording_set_name.set(name)
         self._select_input_recording_set()
         self._startup_selected_combined_name = name
+        self._startup_skip_hardware = bool(
+            getattr(self, "_last_combined_set_without_devices", False))
         data["startup"] = {"prompt": True, "default": name}
         self._write_input_sets(data)
         return data["combined_sets"].get(name)
@@ -11067,7 +13180,13 @@ class PokeControllerApp:
             tkmsg.showerror("組み合わせセット", "参照しているInputSetがありません。")
             return
         input_name = str(item.get("input_set", ""))
+        if not self._confirm_main_resource_input_set(input_item, input_name):
+            return
+        # Do not let the asynchronous command-loader reapply the originally
+        # selected startup InputSet after this explicit selection.
+        self._pending_startup_snapshot = None
         input_item = self._migrate_pending_step_debug_rules(input_name, input_item)
+        self._startup_skip_hardware = False
         self._set_active_input_set(
             input_name, self.input_recording_set_name.get().strip())
         self.input_set_name.set(input_name)
@@ -11102,8 +13221,63 @@ class PokeControllerApp:
         else:
             self.update_audio_input_list()
 
+    def _selected_audio_device_name(self):
+        selected = self.audio_input.get()
+        return getattr(self, "_audio_display_to_name", {}).get(selected, selected)
+
+    def _configure_audio_input_values(self, inputs, selected=""):
+        raw_inputs = list(inputs or [])
+        usage_entries = self._other_device_usage_entries()
+        self._audio_display_to_name = {}
+        labels = []
+        for name in raw_inputs:
+            key = canonical_device_key("audio", name)
+            label = str(name) + self._device_usage_suffix(
+                "audio", key, usage_entries)
+            self._audio_display_to_name[label] = str(name)
+            self._audio_display_to_name[str(name)] = str(name)
+            labels.append(label)
+        self.audio_input_cb.configure(values=labels)
+        selected = str(selected or "")
+        if selected in raw_inputs:
+            self.audio_input.set(selected)
+        elif raw_inputs:
+            self.audio_input.set(raw_inputs[0])
+        else:
+            self.audio_input.set("")
+
+    def _on_audio_input_selected(self, _event=None):
+        selected = self._selected_audio_device_name()
+        if not selected:
+            return
+        key = canonical_device_key("audio", selected)
+        if self._confirm_shared_device("audio", key, selected):
+            # Keep the stored/runtime value free of the display-only suffix.
+            self.audio_input.set(selected)
+        else:
+            self.audio_input.set("")
+
+    def _confirm_selected_audio_for_use(self):
+        selected = self._selected_audio_device_name()
+        return (not selected or self._confirm_shared_device(
+            "audio", canonical_device_key("audio", selected), selected))
+
+    def _sync_audio_device_usage(self):
+        selected = self._selected_audio_device_name()
+        monitor_active = bool(
+            getattr(self.audio_monitor, "input_stream", None) is not None
+            or getattr(self.audio_monitor, "process_loopback", None))
+        recording_active = bool(
+            getattr(self.recorder, "active", False)
+            or getattr(self.operation_recorder, "active", False))
+        if selected and (monitor_active or recording_active):
+            self._publish_device_usage(
+                "audio", canonical_device_key("audio", selected), selected)
+        else:
+            self._publish_device_usage("audio", "", "")
+
     def _show_full_audio_device_name(self, *_):
-        self.audio_device_full_name.set(self.audio_input.get())
+        self.audio_device_full_name.set(self._selected_audio_device_name())
 
     def update_audio_input_list(self):
         """Optionally limit Audio In to devices similar to the selected camera."""
@@ -11111,14 +13285,12 @@ class PokeControllerApp:
 
         camera_name = self.camera_name_cb.get().lower()
         tokens = [word for word in re.split(r"[^a-z0-9]+", camera_name) if len(word) >= 3]
-        inputs = getattr(self, "all_audio_inputs", [])
+        inputs = list(getattr(self, "all_audio_inputs", []))
         if self.audio_filter_camera.get() and tokens:
             inputs = [name for name in inputs if any(token in name.lower() for token in tokens)]
-        self.audio_input_cb.configure(values=inputs)
-        if inputs and self.audio_input.get() not in inputs:
-            self.audio_input.set(inputs[0])
-        elif not inputs:
-            self.audio_input.set("")
+        selected = self._selected_audio_device_name()
+        self._configure_audio_input_values(
+            inputs, selected=selected if selected in inputs else (inputs[0] if inputs else ""))
 
     def match_camera_audio(self):
         """Select the audio device whose name best matches the camera name."""
@@ -11127,7 +13299,7 @@ class PokeControllerApp:
         camera_name = self.camera_name_cb.get().lower()
         # USB model words are more useful than generic words such as 'video'.
         tokens = [word for word in re.split(r"[^a-z0-9]+", camera_name) if len(word) >= 3]
-        candidates = list(self.audio_input_cb.cget("values"))
+        candidates = list(getattr(self, "all_audio_inputs", []))
         best = max(candidates, key=lambda name: sum(token in name.lower() for token in tokens), default=None)
         if best and any(token in best.lower() for token in tokens):
             self.audio_input.set(best)
@@ -11135,26 +13307,60 @@ class PokeControllerApp:
             tkmsg.showinfo("Capture audio", "カメラ名に一致する音声デバイスを見つけられませんでした。Audio Inから選択してください。")
 
     def start_audio_monitor(self):
+        selected = self._selected_audio_device_name()
+        if not selected:
+            return
+        key = canonical_device_key("audio", selected)
+        if not self._confirm_shared_device("audio", key, selected):
+            return
         try:
-            self.audio_monitor.start(self.audio_input.get(), gain_percent=self.audio_gain.get())
+            self.audio_monitor.start(selected, gain_percent=self.audio_gain.get())
             self.audio_start_button.configure(text="Audio running")
             self.audio_monitor_mode.set("Monitor")
+            self._publish_device_usage("audio", key, selected)
+            notice = str(getattr(
+                self.audio_monitor, "last_start_notice", "") or "")
+            if notice:
+                self.show_output("Analysis", text=notice)
         except Exception as error:
-            tkmsg.showerror("Capture audio", "音声デバイスを開始できません。sounddevice をインストールし、キャプチャーデバイスを選択してください。\n\n" + str(error))
+            self.audio_start_button.configure(text="Start audio")
+            self.audio_monitor_mode.set("No monitoring")
+            self._sync_audio_device_usage()
+            tkmsg.showerror(
+                "Capture audio", self.audio_monitor.failure_message(error),
+                parent=self.root)
 
     def start_audio_on_launch(self):
         """Automatic start should never show a modal error during launch."""
-        if not self.audio_auto_start.get() or not self.audio_input.get():
+        if self._startup_skip_hardware:
+            self._set_audio_unconfigured()
+            return
+        selected = self._selected_audio_device_name()
+        if not self.audio_auto_start.get() or not selected:
+            return
+        key = canonical_device_key("audio", selected)
+        if not self._confirm_shared_device("audio", key, selected):
+            self.audio_input.set("")
+            self.audio_auto_start.set(False)
             return
         try:
-            self.audio_monitor.start(self.audio_input.get(), gain_percent=self.audio_gain.get())
+            self.audio_monitor.start(selected, gain_percent=self.audio_gain.get())
             self.audio_start_button.configure(text="Audio running")
             self.audio_monitor_mode.set("Monitor")
+            self._publish_device_usage("audio", key, selected)
+            notice = str(getattr(
+                self.audio_monitor, "last_start_notice", "") or "")
+            if notice:
+                self.show_output("Analysis", text=notice)
         except Exception as error:
+            self.audio_start_button.configure(text="Start audio")
+            self.audio_monitor_mode.set("No monitoring")
+            self._sync_audio_device_usage()
             print("[AUDIO] Automatic start failed: " + str(error))
 
     def stop_audio_monitor(self):
         self.audio_monitor.stop()
+        self._sync_audio_device_usage()
         self.audio_start_button.configure(text="Start audio")
         self.audio_monitor_mode.set("No monitoring")
 
@@ -11243,11 +13449,1095 @@ class PokeControllerApp:
             "録画を中断しました" if was_active else "録画待機を解除しました")
         self.show_output("Analysis", text=message)
 
+    def _build_operation_capture_tab(self, parent):
+        """Build the single, ordered control surface for command authoring."""
+        self.operation_capture_output_dir = tk.StringVar(value="")
+        self.operation_capture_name = tk.StringVar(value="")
+        self.operation_capture_include_audio = tk.BooleanVar(value=True)
+        self.operation_capture_auto_controller = tk.BooleanVar(value=True)
+        self.operation_gamepad_profile_name = tk.StringVar(value="Default")
+        self.operation_capture_last_session = tk.StringVar(value="")
+        self.operation_capture_status = tk.StringVar(
+            value="停止中：①保存先を確認し、②開始を押してください。")
+        self.operation_capture_counts = tk.StringVar(value="区間 0 / 入力 0行 / 有効時間 0.0秒")
+        self._operation_last_counts = "区間 0 / 入力 0行 / 有効時間 0.0秒"
+        self._operation_session_rows = {}
+
+        ttk.Label(
+            parent,
+            text=("この画面だけで操作記録を完了できます。\n"
+                  "①保存先 → ②開始 → ③必要なら一時停止（停止画像を保存） → "
+                  "④画像確認後に再開 → ⑤完了 → ⑥DevStudioでCommands化"),
+            foreground="#174a7e", justify="left", wraplength=1080,
+        ).pack(fill="x", padx=10, pady=(10, 5))
+
+        settings = ttk.Labelframe(parent, text="① 保存設定（InputSetへ保存）")
+        settings.pack(fill="x", padx=8, pady=4)
+        ttk.Label(settings, text="保存フォルダ:").grid(
+            column=0, row=0, padx=(6, 2), pady=5, sticky="w")
+        ttk.Entry(settings, textvariable=self.operation_capture_output_dir, width=65).grid(
+            column=1, columnspan=4, row=0, padx=2, pady=5, sticky="ew")
+        ttk.Button(settings, text="選択...", command=self.choose_operation_capture_output_dir).grid(
+            column=5, row=0, padx=2, pady=5)
+        ttk.Button(settings, text="開く", command=self.open_operation_capture_output_dir).grid(
+            column=6, row=0, padx=2, pady=5)
+        ttk.Label(settings, text="記録名（任意／途中記録を選択可）:").grid(
+            column=0, row=1, padx=(6, 2), pady=5, sticky="w")
+        self.operation_capture_name_cb = ttk.Combobox(
+            settings, textvariable=self.operation_capture_name, width=28,
+            state="normal", postcommand=self.refresh_paused_operation_names)
+        self.operation_capture_name_cb.grid(
+            column=1, row=1, padx=2, pady=5, sticky="w")
+        self.operation_capture_name_cb.bind(
+            "<<ComboboxSelected>>", self.load_paused_operation_from_name)
+        ttk.Checkbutton(settings, text="ゲーム音声も記録",
+                        variable=self.operation_capture_include_audio,
+                        command=self._sync_operation_capture_to_active_input_set).grid(
+                            column=2, row=1, padx=8, pady=5, sticky="w")
+        ttk.Checkbutton(settings, text="PCゲームパッドを自動許可・接続",
+                        variable=self.operation_capture_auto_controller,
+                        command=self._sync_operation_capture_to_active_input_set).grid(
+                            column=3, columnspan=3, row=1, padx=8, pady=5, sticky="w")
+        ttk.Label(settings, text="ゲームパッド割り当て:").grid(
+            column=0, row=2, padx=(6, 2), pady=5, sticky="w")
+        self.operation_gamepad_profile_cb = ttk.Combobox(
+            settings, state="readonly", width=24,
+            textvariable=self.operation_gamepad_profile_name)
+        self.operation_gamepad_profile_cb.grid(
+            column=1, columnspan=2, row=2, padx=2, pady=5, sticky="w")
+        self.operation_gamepad_profile_cb.bind(
+            "<<ComboboxSelected>>", self._operation_gamepad_profile_selected)
+        ttk.Button(
+            settings, text="物理ボタン割り当て画面...",
+            command=self.open_operation_gamepad_settings).grid(
+                column=3, columnspan=3, row=2, padx=4, pady=5, sticky="w")
+        ttk.Label(
+            settings,
+            text="空欄の場合は通常Recordingとは別の SerialController/OperationSessions に保存します。",
+            foreground="#555555").grid(
+                column=1, columnspan=6, row=3, padx=2, pady=(0, 5), sticky="w")
+        settings.columnconfigure(1, weight=1)
+
+        actions = ttk.Labelframe(parent, text="②〜⑥ 記録操作")
+        actions.pack(fill="x", padx=8, pady=4)
+        self.operation_start_button = ttk.Button(
+            actions, text="② ● 開始", command=self.start_operation_capture)
+        self.operation_start_button.pack(side="left", padx=3, pady=7)
+        self.operation_pause_button = ttk.Button(
+            actions, text="③ 一時停止", command=self.pause_operation_capture, state="disabled")
+        self.operation_pause_button.pack(side="left", padx=3, pady=7)
+        self.operation_pause_image_button = ttk.Button(
+            actions, text="停止画像を確認", command=self.show_operation_pause_image, state="disabled")
+        self.operation_pause_image_button.pack(side="left", padx=3, pady=7)
+        self.operation_resume_button = ttk.Button(
+            actions, text="④ 画像確認して再開", command=self.resume_operation_capture,
+            state="disabled")
+        self.operation_resume_button.pack(side="left", padx=3, pady=7)
+        self.operation_complete_button = ttk.Button(
+            actions, text="⑤ ■ 完了・結合", command=self.complete_operation_capture,
+            state="disabled")
+        self.operation_complete_button.pack(side="left", padx=3, pady=7)
+        self.operation_discard_button = ttk.Button(
+            actions, text="一時停止記録を削除",
+            command=self.discard_operation_capture, state="disabled")
+        self.operation_discard_button.pack(side="left", padx=3, pady=7)
+        ttk.Button(actions, text="⑥ DevStudioで開く",
+                   command=self.open_selected_operation_in_dev_studio).pack(
+                       side="right", padx=3, pady=7)
+        ttk.Button(actions, text="使い方",
+                   command=self.open_operation_capture_guide).pack(
+                       side="right", padx=3, pady=7)
+
+        self.operation_capture_status_label = tk.Label(
+            parent, textvariable=self.operation_capture_status, anchor="w",
+            fg="#555555", justify="left")
+        self.operation_capture_status_label.pack(fill="x", padx=10, pady=(2, 0))
+        ttk.Label(parent, textvariable=self.operation_capture_counts).pack(
+            fill="x", padx=10, pady=(0, 4))
+
+        history = ttk.Labelframe(parent, text="保存済み操作セッション（選択してDevStudioへ）")
+        history.pack(fill="both", expand=True, padx=8, pady=(3, 8))
+        tree_frame = ttk.Frame(history)
+        tree_frame.pack(fill="both", expand=True, padx=4, pady=4)
+        self.operation_session_tree = ttk.Treeview(
+            tree_frame, columns=("status", "created", "duration", "inputs", "name", "folder"),
+            show="headings", selectmode="browse", height=9)
+        for column, label, width in (
+                ("status", "状態", 100), ("created", "開始", 145),
+                ("duration", "秒", 65), ("inputs", "入力", 65),
+                ("name", "記録名", 190), ("folder", "フォルダ", 300)):
+            self.operation_session_tree.heading(column, text=label)
+            self.operation_session_tree.column(
+                column, width=width, stretch=(column in ("name", "folder")))
+        scroll_y = ttk.Scrollbar(tree_frame, orient="vertical",
+                                 command=self.operation_session_tree.yview)
+        scroll_x = ttk.Scrollbar(tree_frame, orient="horizontal",
+                                 command=self.operation_session_tree.xview)
+        self.operation_session_tree.configure(
+            yscrollcommand=scroll_y.set, xscrollcommand=scroll_x.set)
+        self.operation_session_tree.grid(column=0, row=0, sticky="nsew")
+        scroll_y.grid(column=1, row=0, sticky="ns")
+        scroll_x.grid(column=0, row=1, sticky="ew")
+        tree_frame.columnconfigure(0, weight=1)
+        tree_frame.rowconfigure(0, weight=1)
+        self.operation_session_tree.bind(
+            "<Double-1>", lambda _event: self.open_selected_operation_in_dev_studio())
+        history_actions = ttk.Frame(history)
+        history_actions.pack(fill="x", padx=4, pady=(0, 4))
+        ttk.Button(history_actions, text="一覧更新",
+                   command=self.refresh_operation_sessions).pack(side="left", padx=2)
+        ttk.Button(history_actions, text="選択フォルダを開く",
+                   command=self.open_selected_operation_folder).pack(side="left", padx=2)
+        ttk.Button(history_actions, text="一時停止した記録を再読込",
+                   command=self.restore_paused_operation_capture).pack(side="left", padx=2)
+        ttk.Button(history_actions, text="選択記録を再結合",
+                   command=self.retry_selected_operation_finalize).pack(
+                       side="left", padx=2)
+        ttk.Button(history_actions, text="選択記録を削除／削除待ち再試行",
+                   command=self.discard_selected_operation_capture).pack(
+                       side="left", padx=2)
+        self.root.after(250, self._poll_operation_capture_ui)
+
+    def _poll_operation_capture_ui(self):
+        try:
+            self._update_operation_capture_ui()
+            self.root.after(250, self._poll_operation_capture_ui)
+        except tk.TclError:
+            pass
+
+    def open_operation_capture_guide(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "OPERATION_CAPTURE_GUIDE.md")
+        try:
+            with open(path, "r", encoding="utf-8") as stream:
+                content = stream.read()
+        except OSError as error:
+            tkmsg.showerror("操作記録→Commands", str(error), parent=self.root)
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("操作記録→Commands - 使い方")
+        dialog.geometry("900x700")
+        dialog.transient(self.root)
+        frame = ttk.Frame(dialog)
+        frame.pack(fill="both", expand=True, padx=7, pady=7)
+        viewer = tk.Text(frame, wrap="word", padx=10, pady=8)
+        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=viewer.yview)
+        viewer.configure(yscrollcommand=scrollbar.set)
+        viewer.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        viewer.insert("1.0", content)
+        viewer.configure(state="disabled")
+        ttk.Button(dialog, text="閉じる", command=dialog.destroy).pack(pady=(0, 7))
+
+    def _operation_output_root(self):
+        selected = self.operation_capture_output_dir.get().strip()
+        if selected:
+            return os.path.abspath(selected)
+        # This workspace is intentionally independent from Recording's output
+        # setting and cleanup rules.
+        return os.path.abspath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "OperationSessions"))
+
+    def _operation_frame(self, frame=None):
+        source = frame if frame is not None else getattr(self.camera, "image_bgr", None)
+        if source is None:
+            return None
+        if source.shape[1] == 1280 and source.shape[0] == 720:
+            # CaptureRecorder already owns a copy after add_frame().  Avoid a
+            # second 1280x720 copy in the camera callback hot path.
+            return source
+        return cv2.resize(source, (1280, 720), interpolation=cv2.INTER_AREA)
+
+    def _operation_disk_space_ok(self, show_popup=True):
+        minimum, maximum = self._recording_disk_thresholds()
+        session = getattr(self, "operation_capture_session", None)
+        output_path = session.session_dir if session is not None else self._operation_output_root()
+        violations = disk_space_violations(
+            (("ツール", os.path.dirname(os.path.abspath(__file__))),
+             ("操作記録保存先", output_path)),
+            min_free_gb=minimum, max_usage_percent=maximum)
+        if violations and show_popup:
+            text = "\n\n".join(
+                "{} ({})\n空き {:.2f} GB / 使用率 {:.1f}%".format(
+                    item.get("label", ""), item.get("drive", ""),
+                    float(item.get("free_gb", 0.0)), float(item.get("used_percent", 0.0)))
+                if not item.get("error") else
+                "{}: {}".format(item.get("label", ""), item.get("error", ""))
+                for item in violations)
+            tkmsg.showerror("操作記録: ドライブ容量不足", text, parent=self.root)
+        return not violations
+
+    def choose_operation_capture_output_dir(self):
+        from tkinter import filedialog
+        path = filedialog.askdirectory(
+            title="操作記録の保存フォルダ", initialdir=self._operation_output_root(),
+            parent=self.root)
+        if path:
+            self.operation_capture_output_dir.set(os.path.abspath(path))
+            self._sync_operation_capture_to_active_input_set()
+            self.refresh_operation_sessions()
+
+    def open_operation_capture_output_dir(self):
+        path = self._operation_output_root()
+        os.makedirs(path, exist_ok=True)
+        if platform.system() == "Windows":
+            os.startfile(path)
+        else:
+            webbrowser.open("file://" + path)
+
+    def _operation_gamepad_profile_store(self):
+        return OperationGamepadProfileStore(os.path.join(
+            os.path.dirname(os.path.abspath(PokeKeycon.SETTING_PATH)),
+            "operation_gamepad_profiles.json"))
+
+    def refresh_operation_gamepad_profiles(self, preferred=""):
+        store = self._operation_gamepad_profile_store()
+        data = store.load()
+        names = sorted(data["profiles"], key=str.casefold)
+        self.operation_gamepad_profile_cb.configure(values=names)
+        selected = str(preferred or self.operation_gamepad_profile_name.get()
+                       or data["selected"])
+        if selected not in data["profiles"]:
+            selected = data["selected"]
+        if preferred and selected != data["selected"]:
+            data = store.select(selected)
+        self.operation_gamepad_profile_name.set(selected)
+        return data
+
+    def _selected_operation_gamepad_profile(self):
+        data = self.refresh_operation_gamepad_profiles()
+        name = self.operation_gamepad_profile_name.get().strip()
+        item = data["profiles"].get(name, {})
+        mapping = dict(item.get("mapping", {}))
+        self._active_operation_gamepad_mapping = dict(mapping)
+        return name, mapping
+
+    def _operation_gamepad_profile_selected(self, _event=None):
+        name = self.operation_gamepad_profile_name.get().strip()
+        self._operation_gamepad_profile_store().select(name)
+        if self.procon is not None:
+            _profile, mapping = self._selected_operation_gamepad_profile()
+            self.procon.set_control_mapping(mapping)
+        self._sync_operation_capture_to_active_input_set()
+
+    def _operation_gamepad_settings_saved(self, name, mapping):
+        self.refresh_operation_gamepad_profiles(preferred=name)
+        if self.procon is not None:
+            self.procon.set_control_mapping(mapping)
+        self._sync_operation_capture_to_active_input_set()
+
+    def _queue_operation_gamepad_physical_input(self, token, pressed):
+        if self._operation_gamepad_dialog is None:
+            return
+        def deliver():
+            dialog = self._operation_gamepad_dialog
+            if dialog is not None:
+                try:
+                    if dialog.window.winfo_exists():
+                        dialog.handle_physical_input(token, pressed)
+                except tk.TclError:
+                    self._operation_gamepad_dialog = None
+        self._gui_action_queue.put(deliver)
+
+    def open_operation_gamepad_settings(self):
+        self.refresh_pc_gamepads()
+        if not self.pc_gamepad.get():
+            tkmsg.showwarning("ゲームパッド設定", "PCゲームパッドが見つかりません。")
+            return
+        try:
+            joystick_index = int(self.pc_gamepad.get().split(":", 1)[0])
+        except (ValueError, IndexError):
+            joystick_index = 0
+        bridge_running = (self.pro_controller_thread is not None
+                          and self.pro_controller_thread.is_alive())
+        self._operation_gamepad_dialog = OperationGamepadMapDialog(
+            self.root, self._operation_gamepad_profile_store(),
+            joystick_index=joystick_index, use_monitor=not bridge_running,
+            on_saved=self._operation_gamepad_settings_saved)
+
+    def _ensure_operation_gamepad(self, quiet=False):
+        session = getattr(self, "operation_capture_session", None)
+        configuration = session.manifest.get("input_configuration", {}) \
+            if session is not None else {}
+        saved_mapping = configuration.get("gamepad_mapping") \
+            if isinstance(configuration, dict) else None
+        if isinstance(saved_mapping, dict) and any(saved_mapping.values()):
+            mapping = dict(saved_mapping)
+            self._active_operation_gamepad_mapping = dict(mapping)
+        else:
+            _profile, mapping = self._selected_operation_gamepad_profile()
+        if self.procon is not None:
+            self.procon.set_control_mapping(mapping)
+        if not self.operation_capture_auto_controller.get():
+            running = (self.pro_controller_thread is not None
+                       and self.pro_controller_thread.is_alive()
+                       and self.pc_gamepad_input_enabled.get())
+            if not running and not quiet:
+                tkmsg.showwarning(
+                    "操作記録",
+                    "自動接続がOFFです。Manual ControlでPCゲームパッド入力を開始・許可してから再実行してください。")
+            return running
+        self.refresh_pc_gamepads()
+        if not self.pc_gamepad.get():
+            if not quiet:
+                tkmsg.showwarning("操作記録", "PCゲームパッドが見つかりません。接続後に再検索してください。")
+            return False
+        self.is_use_Pro_Controller.set(True)
+        self.mode_change_Pro_Controller()
+        return bool(self.is_use_Pro_Controller.get())
+
+    def _ensure_operation_input_devices(self):
+        gamepad_ready = self._ensure_operation_gamepad(quiet=False)
+        if not gamepad_ready:
+            raise RuntimeError("操作入力を開始できません。PCゲームパッドを接続してください。")
+        return True
+
+    def _start_operation_segment(self):
+        frame = self._operation_frame()
+        if frame is None:
+            raise RuntimeError("Camera映像を開始してから操作記録を開始してください。")
+        if not self._operation_disk_space_ok(show_popup=True):
+            raise RuntimeError("保存先ドライブの容量制限により開始できません。")
+        self._operation_disk_last_ok = True
+        self._operation_disk_last_check = time.monotonic()
+        self._operation_disk_interrupt_queued = False
+        session = self.operation_capture_session
+        self.operation_recorder.output_dir = os.path.join(session.session_dir, "segments")
+        audio = self._selected_audio_device_name() \
+            if self.operation_capture_include_audio.get() else ""
+        if audio and not self._confirm_selected_audio_for_use():
+            raise RuntimeError("使用中のAudioを反映しませんでした。Audioを変更してください。")
+        self.operation_recorder.start(
+            frame, self.fps.get(), audio, self.audio_gain.get())
+        self._sync_audio_device_usage()
+        session.begin_segment(
+            self.operation_recorder.session_dir,
+            started=getattr(self.operation_recorder, "started_at", None))
+        self._operation_input_accepting = True
+        self.is_use_Pro_Controller.set(True)
+        self.mode_change_Pro_Controller()
+        self._update_operation_capture_ui()
+
+    def _command_execution_active(self):
+        """Return True only while the selected Command is actually running."""
+        command = getattr(self, "cur_command", None)
+        if command is None:
+            return False
+        worker = getattr(command, "thread", None)
+        if worker is not None:
+            try:
+                if worker.is_alive():
+                    return True
+            except (AttributeError, RuntimeError):
+                pass
+        # MCU/Unit commands do not necessarily own a Python worker thread.
+        return bool(getattr(command, "isRunning", False))
+
+    def start_operation_capture(self):
+        if (self._operation_finalize_thread is not None
+                and self._operation_finalize_thread.is_alive()):
+            tkmsg.showinfo("操作記録", "前の録画を結合中です。完了後に新しい記録を開始してください。")
+            return
+        if self.operation_capture_session is not None:
+            tkmsg.showinfo("操作記録", "現在のセッションを再開または完了してください。")
+            return
+        if self.recorder.active or self.record_armed or self.recorder.is_finalizing:
+            tkmsg.showwarning(
+                "操作記録", "通常録画・保存処理またはCommands監視録画を停止してから開始してください。")
+            return
+        if self._command_execution_active():
+            tkmsg.showwarning(
+                "操作記録", "CommandsをStopしてからPC操作の記録を開始してください。",
+                parent=self.root)
+            return
+        if not self.ser.isOpened():
+            tkmsg.showwarning(
+                "操作記録", "Serialを接続してから操作記録を開始してください。",
+                parent=self.root)
+            return
+        frame = self._operation_frame()
+        if frame is None:
+            tkmsg.showwarning("操作記録", "Camera映像を開始してから操作記録を開始してください。")
+            return
+        if not self._operation_disk_space_ok(show_popup=True):
+            return
+        record_name = self.operation_capture_name.get().strip()
+        paused_path = find_paused_session(
+            self._operation_output_root(), record_name)
+        if paused_path:
+            choice = tkmsg.askyesnocancel(
+                "同じ記録名の続きを記録",
+                ("記録名「{}」の一時停止データがあります。\n"
+                 "前回の続きとして新しい区間を追加しますか？\n\n"
+                 "はい: 続きから記録\n"
+                 "いいえ: 同じ名前で新規記録\n"
+                 "キャンセル: 何もしない").format(record_name),
+                parent=self.root)
+            if choice is None:
+                return
+            if choice:
+                self.operation_capture_last_session.set(paused_path)
+                self.refresh_operation_sessions(select_path=paused_path)
+                self.restore_paused_operation_capture()
+                if self.operation_capture_session is not None:
+                    self.resume_operation_capture()
+                return
+        try:
+            session = OperationCaptureSession(
+                self._operation_output_root(), input_set=self.input_set_name.get().strip(),
+                name=self.operation_capture_name.get().strip(), fps=float(self.fps.get()),
+                frame_size=(1280, 720))
+            self.operation_capture_session = session
+            self.operation_capture_last_session.set(session.session_dir)
+            profile_name, profile_mapping = self._selected_operation_gamepad_profile()
+            # During an authoring session, Commands packets wait while manual
+            # PC-gamepad packets (priority=True) remain immediate.
+            self.ser.begin_manual_override()
+            self._ensure_operation_input_devices()
+            # Freeze both the selected profile and its complete mapping in the
+            # session.  Later profile edits must not alter recorded evidence.
+            session.set_input_configuration(
+                gamepad=self.pc_gamepad.get(),
+                gamepad_profile=profile_name,
+                gamepad_mapping=profile_mapping)
+            self._start_operation_segment()
+            self.operation_capture_status.set(
+                "● 記録中：PCゲームパッド入力と1280x720映像を同期保存しています。")
+            self.operation_capture_status_label.configure(fg="#c62828")
+            self._sync_operation_capture_to_active_input_set()
+            self.refresh_operation_sessions()
+        except Exception as error:
+            self._operation_input_accepting = False
+            self._operation_input_queue.join()
+            self.ser.end_manual_override()
+            if self.operation_recorder.active:
+                self.operation_recorder.stop(discard=True)
+            if self.operation_capture_session is not None:
+                self.operation_capture_session.mark_finalize_error(error)
+                self.operation_capture_session.close()
+            self.operation_capture_session = None
+            tkmsg.showerror("操作記録", str(error), parent=self.root)
+            self._update_operation_capture_ui()
+
+    def pause_operation_capture(self, quiet=False):
+        session = self.operation_capture_session
+        if session is None or not session.active:
+            if not quiet:
+                tkmsg.showinfo("操作記録", "現在は記録中ではありません。")
+            return False
+        frame = self._operation_frame()
+        media_hint = str(getattr(self.operation_recorder, "mp4_path", "") or "")
+        cutoff = time.monotonic()
+        self._operation_input_accepting = False
+        # End every captured section with an explicit neutral packet.  The
+        # live gamepad remains available after recording stops, but this
+        # neutral row closes the captured timeline deterministically.
+        self._operation_input_queue.put(
+            (session, "0x0003 8 80 80 80 80", cutoff))
+        self._operation_input_queue.join()
+        stopped = time.monotonic()
+        # Publish "paused" only after the AVI is closed, so DevStudio can
+        # seek it immediately even while MP4 conversion continues.
+        self.operation_recorder.stop()
+        self._operation_latest_pause_image = session.pause(
+            frame=frame, media_hint=media_hint, stopped=stopped)
+        self._sync_audio_device_usage()
+        self.operation_capture_status.set(
+            "Ⅱ 一時停止中：停止画像を確認してから［④ 画像確認して再開］を押してください。")
+        self.operation_capture_status_label.configure(fg="#b26a00")
+        self._update_operation_capture_ui()
+        self._sync_operation_capture_to_active_input_set()
+        self.refresh_operation_sessions()
+        return True
+
+    def _show_operation_pause_dialog(self, resume=False):
+        path = self._operation_latest_pause_image
+        if not path and self.operation_capture_session is not None:
+            images = self.operation_capture_session.manifest.get("pause_images", [])
+            path = images[-1].get("path", "") if images else ""
+        if not path or not os.path.isfile(path):
+            tkmsg.showwarning("操作記録", "停止画像がありません。", parent=self.root)
+            return False
+        dialog = tk.Toplevel(self.root)
+        dialog.title("停止時画像の確認" + ("／再開" if resume else ""))
+        dialog.transient(self.root)
+        dialog.resizable(False, False)
+        # Copy while the source is open, then release the PNG immediately.
+        # Keeping a lazy PIL file handle alive prevents deletion on Windows.
+        with Image.open(path) as source_image:
+            image = source_image.copy()
+        image.thumbnail((720, 405), Image.Resampling.LANCZOS)
+        photo = ImageTk.PhotoImage(image)
+        label = ttk.Label(dialog, image=photo)
+        label.image = photo
+        label.pack(padx=10, pady=(10, 4))
+        ttk.Label(dialog, text=os.path.basename(path)).pack(padx=10, pady=(0, 6))
+        result = {"resume": False}
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=10, pady=(0, 10))
+        if resume:
+            def accept():
+                result["resume"] = True
+                dialog.destroy()
+            ttk.Button(buttons, text="この画面位置から再開", command=accept).pack(
+                side="left", fill="x", expand=True, padx=(0, 4))
+        ttk.Button(buttons, text="閉じる", command=dialog.destroy).pack(
+            side="right", fill="x", expand=True, padx=(4, 0))
+        dialog.grab_set()
+        dialog.wait_window()
+        return result["resume"] if resume else True
+
+    def show_operation_pause_image(self):
+        self._show_operation_pause_dialog(resume=False)
+
+    def resume_operation_capture(self):
+        session = self.operation_capture_session
+        if session is None or session.status != "paused":
+            tkmsg.showinfo("操作記録", "再開できる一時停止セッションがありません。")
+            return
+        if not self._show_operation_pause_dialog(resume=True):
+            return
+        try:
+            if not self.ser.isOpened():
+                raise RuntimeError("Serialを接続してから再開してください。")
+            self.ser.begin_manual_override()
+            self._ensure_operation_input_devices()
+            self._start_operation_segment()
+            self.operation_capture_status.set("● 記録再開：前区間の続きとして保存しています。")
+            self.operation_capture_status_label.configure(fg="#c62828")
+        except Exception as error:
+            self.ser.end_manual_override()
+            tkmsg.showerror("操作記録", str(error), parent=self.root)
+            self._update_operation_capture_ui()
+
+    def complete_operation_capture(self):
+        session = self.operation_capture_session
+        if session is None:
+            tkmsg.showinfo("操作記録", "完了する操作セッションがありません。")
+            return
+        if session.active and not self.pause_operation_capture(quiet=True):
+            return
+        if not tkmsg.askyesno(
+                "操作記録を完了", "入力記録と全録画区間を順番に結合します。\n"
+                "完了後はDevStudioで編集できます。続行しますか？", parent=self.root):
+            return
+        try:
+            session.complete()
+        except Exception as error:
+            tkmsg.showerror("操作記録", str(error), parent=self.root)
+            return
+        session_dir = session.session_dir
+        self.operation_capture_last_session.set(session_dir)
+        self.operation_capture_status.set("◐ 結合中：PokeConはそのまま操作できます。")
+        self.operation_capture_status_label.configure(fg="#1565c0")
+        self.ser.end_manual_override()
+        self.operation_capture_session = None
+        self._update_operation_capture_ui()
+        self._sync_operation_capture_to_active_input_set()
+
+        def finalize():
+            try:
+                while self.operation_recorder.is_finalizing:
+                    time.sleep(0.1)
+                outputs = finalize_operation_session(session_dir)
+                self._gui_action_queue.put(
+                    lambda: self._operation_finalize_finished(session_dir, outputs, None))
+            except Exception as error:
+                self._gui_action_queue.put(
+                    lambda message=str(error): self._operation_finalize_finished(
+                        session_dir, None, message))
+        self._operation_finalize_thread = threading.Thread(
+            target=finalize, daemon=True, name="OperationCaptureFinalize")
+        self._operation_finalize_thread.start()
+
+    def discard_operation_capture(self):
+        """Forget a paused mistaken capture and remove it after encoders exit."""
+        session = self.operation_capture_session
+        if session is None or session.status != "paused":
+            tkmsg.showinfo(
+                "操作記録を削除", "一時停止中の操作セッションだけ削除できます。",
+                parent=self.root)
+            return False
+        session_dir = session.session_dir
+        if not tkmsg.askyesno(
+                "一時停止記録を削除",
+                ("この一時停止記録を削除します。\n"
+                 "入力記録・停止画像・録画区間は元に戻せません。\n\n"
+                "削除後はすぐに新しい記録を開始できます。続行しますか？"),
+                parent=self.root):
+            return False
+        self._operation_input_accepting = False
+        self._operation_input_queue.join()
+        self.ser.end_manual_override()
+        try:
+            session.discard()
+        except Exception as error:
+            tkmsg.showerror("操作記録を削除", str(error), parent=self.root)
+            return False
+        self.operation_capture_session = None
+        self.operation_capture_last_session.set("")
+        self._operation_latest_pause_image = ""
+        self._operation_last_counts = "区間 0 / 入力 0行 / 有効時間 0.0秒"
+        self.operation_capture_counts.set(self._operation_last_counts)
+        self.operation_capture_status.set(
+            "破棄しました：［② ● 開始］から新しい記録を開始できます。")
+        self.operation_capture_status_label.configure(fg="#1b5e20")
+        self._update_operation_capture_ui()
+        self._sync_operation_capture_to_active_input_set()
+        self.refresh_operation_sessions()
+
+        self._schedule_operation_session_removal(session_dir)
+        return True
+
+    def _schedule_operation_session_removal(self, session_dir):
+        target = os.path.abspath(session_dir)
+        root = os.path.abspath(self._operation_output_root())
+        try:
+            safe = target != root and os.path.commonpath((target, root)) == root
+        except (OSError, ValueError):
+            safe = False
+        if not safe:
+            self._discard_operation_files_finished(
+                target, "削除対象が操作記録の保存フォルダ外です。")
+            return False
+        if target in self._operation_discard_paths:
+            self.operation_capture_status.set("削除待ち記録のファイル解放を待っています。")
+            return True
+        self._operation_discard_paths.add(target)
+        self.operation_capture_status.set(
+            "削除処理中：使用中のファイルは解放されるまで自動再試行します。")
+
+        def remove_when_released():
+            # pause() may still be converting this segment to MP4.  Once the
+            # encoder is done, retry WinError 32 locks for up to one minute.
+            while self.operation_recorder.is_finalizing:
+                time.sleep(0.1)
+            error = remove_session_directory(target, attempts=120, delay=0.5)
+            self._gui_action_queue.put(
+                lambda message=error: self._discard_operation_files_finished(
+                    target, message))
+
+        threading.Thread(
+            target=remove_when_released, daemon=True,
+            name="OperationCaptureDiscard").start()
+        return True
+
+    def discard_selected_operation_capture(self):
+        """Discard a paused history row without requiring a separate reload."""
+        if self.operation_capture_session is not None:
+            return self.discard_operation_capture()
+        path = self._selected_operation_session_path()
+        if not path or not os.path.isfile(os.path.join(path, "session.json")):
+            tkmsg.showinfo(
+                "操作記録を削除", "一覧から一時停止記録を選択してください。",
+                parent=self.root)
+            return False
+        try:
+            session = OperationCaptureSession(
+                os.path.dirname(path), session_dir=path)
+        except Exception as error:
+            tkmsg.showerror(
+                "操作記録を削除", "操作セッションを読み込めません。\n" + str(error),
+                parent=self.root)
+            return False
+        if session.status != "paused":
+            if session.status == "discarded":
+                session.close()
+                self.operation_capture_status.set("削除待ち記録を再試行します。")
+                return self._schedule_operation_session_removal(path)
+            session.close()
+            tkmsg.showinfo(
+                "操作記録を削除", "一時停止状態の記録だけ削除できます。",
+                parent=self.root)
+            return False
+        self.operation_capture_session = session
+        self.operation_capture_last_session.set(path)
+        deleted = self.discard_operation_capture()
+        if not deleted and self.operation_capture_session is session:
+            session.close()
+            self.operation_capture_session = None
+            self._update_operation_capture_ui()
+        return deleted
+
+    def _discard_operation_files_finished(self, session_dir, error=""):
+        self._operation_discard_paths.discard(os.path.abspath(session_dir))
+        if error:
+            self.operation_capture_status.set(
+                "記録は破棄済みですが、ファイルが使用中です。"
+                "DevStudio・別PokeCon等を閉じて一覧の［削除待ち再試行］を押してください：" + error)
+            self.operation_capture_status_label.configure(fg="#c62828")
+        else:
+            self.operation_capture_status.set(
+                "✓ 一時停止記録を削除しました。新しい記録を開始できます。")
+            self.operation_capture_status_label.configure(fg="#1b5e20")
+        self.refresh_operation_sessions()
+
+    def _operation_finalize_finished(self, session_dir, outputs, error):
+        if error:
+            try:
+                manifest = OperationCaptureSession(
+                    self._operation_output_root(), session_dir=session_dir)
+                manifest.mark_finalize_error(error)
+                manifest.close()
+            except Exception:
+                pass
+            self.operation_capture_status.set("結合エラー：" + error)
+            self.operation_capture_status_label.configure(fg="#c62828")
+            tkmsg.showerror("操作記録の結合", error, parent=self.root)
+        else:
+            self.operation_capture_status.set(
+                "✓ 完了：入力・1280x720映像・操作情報付き映像を保存しました。DevStudioで開けます。")
+            self.operation_capture_status_label.configure(fg="#1b5e20")
+            self.show_output("Analysis", text="操作記録を結合しました: " + session_dir)
+        self.refresh_operation_sessions(select_path=session_dir)
+        self._sync_operation_capture_to_active_input_set()
+
+    def _record_operation_input(self, message, occurred, source="pc_gamepad"):
+        # Operation authoring and the Commands manual-input trace accept only
+        # the physical PC gamepad and the on-screen Software Controller.
+        # Keyboard shortcuts must never be mixed into either recording.
+        if not operation_input_source_is_recordable(source):
+            return
+        session = self.operation_capture_session
+        if (self._operation_input_accepting and session is not None
+                and session.active):
+            # Never perform filesystem I/O in ProController's 240 Hz worker.
+            self._operation_input_queue.put(
+                (session, str(message), float(occurred), str(source)))
+        # Commands already describe their generated controller operations in
+        # source.  Only an actual PC-gamepad override is an extra input track.
+        # Queue that exceptional input next to the source/Step timeline.
+        with self._command_monitor_lock:
+            chunk = getattr(self, "_command_monitor_current_chunk", None)
+            current_session = str(getattr(self, "_command_monitor_session_id", ""))
+            chunk_session = str(chunk.get("command_session_id", "")) if chunk else ""
+            last_step = (list(chunk.get("states", ())) or [""])[-1] if chunk else ""
+            chunk_started = float(chunk.get("started", occurred)) if chunk else float(occurred)
+            session_started = float(self._command_monitor_session_started or occurred)
+        if (chunk is not None and getattr(self, "record_armed", False)
+                and current_session == chunk_session):
+            now = float(occurred)
+            payload = {
+                "time": datetime.datetime.now().isoformat(timespec="milliseconds"),
+                "event": "manual_controller_input",
+                "states": {},
+                "step_path": last_step,
+                "chunk_time": max(0.0, now - chunk_started),
+                "command_time": max(0.0, now - session_started),
+                "location": {},
+                "controller_input": str(message),
+                "controller_source": str(source),
+            }
+            self._command_trace_queue.put((
+                os.path.join(chunk["session_dir"], "steps.jsonl"), payload))
+
+    def _operation_input_writer_loop(self):
+        while True:
+            item = self._operation_input_queue.get()
+            try:
+                if item is None:
+                    return
+                if len(item) == 4:
+                    session, message, occurred, source = item
+                else:
+                    session, message, occurred = item
+                    source = "pc_gamepad"
+                session.record_input(
+                    message, occurred=occurred, source=source)
+            except Exception as error:
+                logger = getattr(self, "_logger", None)
+                if logger is not None:
+                    logger.warning("Operation input write failed: %s", error)
+            finally:
+                self._operation_input_queue.task_done()
+
+    def _process_operation_capture_frame(self, frame):
+        if not self.operation_recorder.active:
+            return
+        now = time.monotonic()
+        if now - self._operation_disk_last_check >= 2.0:
+            self._operation_disk_last_check = now
+            self._operation_disk_last_ok = self._operation_disk_space_ok(show_popup=False)
+            if (not self._operation_disk_last_ok
+                    and not self._operation_disk_interrupt_queued):
+                self._operation_disk_interrupt_queued = True
+                self._gui_action_queue.put(self._interrupt_operation_capture_disk)
+        if not self._operation_disk_last_ok:
+            return
+        clean = self._operation_frame(frame)
+        if clean is not None:
+            self.operation_recorder.add_frame(clean)
+
+    def _interrupt_operation_capture_disk(self):
+        self._operation_disk_interrupt_queued = False
+        if (self.operation_capture_session is not None
+                and self.operation_capture_session.active):
+            self.pause_operation_capture(quiet=True)
+            self.operation_capture_status.set(
+                "容量不足で一時停止しました。保存先を整理してから再開してください。")
+            self.operation_capture_status_label.configure(fg="#c62828")
+            self._operation_disk_space_ok(show_popup=True)
+
+    def _update_operation_capture_ui(self):
+        session = self.operation_capture_session
+        summary = session.summary() if session is not None else None
+        status = summary["status"] if summary is not None else "idle"
+        recording = status == "recording"
+        paused = status == "paused"
+        self.operation_start_button.configure(state="disabled" if session else "normal")
+        self.operation_pause_button.configure(state="normal" if recording else "disabled")
+        self.operation_resume_button.configure(state="normal" if paused else "disabled")
+        self.operation_complete_button.configure(
+            state="normal" if (recording or paused) else "disabled")
+        self.operation_discard_button.configure(
+            state="normal" if paused else "disabled")
+        image_exists = bool(self._operation_latest_pause_image and
+                            os.path.isfile(self._operation_latest_pause_image))
+        self.operation_pause_image_button.configure(
+            state="normal" if image_exists else "disabled")
+        if session is not None:
+            self._operation_last_counts = \
+                "区間 {} / 入力 {}行 / 有効時間 {:.1f}秒".format(
+                    summary["segments"], summary["input_count"],
+                    summary["active_duration"])
+            self.operation_capture_counts.set(self._operation_last_counts)
+        elif not (self._operation_finalize_thread and self._operation_finalize_thread.is_alive()):
+            self.operation_capture_counts.set(self._operation_last_counts)
+
+    def refresh_operation_sessions(self, select_path=None):
+        if not hasattr(self, "operation_session_tree"):
+            return
+        tree = self.operation_session_tree
+        tree.delete(*tree.get_children())
+        self._operation_session_rows = {}
+        root = self._operation_output_root()
+        try:
+            folders = sorted(
+                (item.path for item in os.scandir(root) if item.is_dir()), reverse=True)
+        except OSError:
+            folders = []
+        selected_iid = None
+        selected_name = ""
+        for index, folder in enumerate(folders):
+            path = os.path.join(folder, "session.json")
+            try:
+                with open(path, "r", encoding="utf-8") as stream:
+                    item = json.load(stream)
+            except (OSError, ValueError):
+                continue
+            iid = "operation-{}".format(index)
+            self._operation_session_rows[iid] = folder
+            status_labels = {"recording": "記録中", "paused": "一時停止",
+                             "finalizing": "結合中", "ready_to_edit": "編集可能",
+                             "finalize_error": "結合エラー", "ready": "準備中",
+                             "discarded": "削除待ち"}
+            tree.insert("", "end", iid=iid, values=(
+                status_labels.get(item.get("status"), item.get("status", "")),
+                item.get("created_at", ""), "{:.1f}".format(float(item.get("active_duration", 0.0))),
+                item.get("input_count", 0), item.get("name", ""), os.path.basename(folder)))
+            if os.path.abspath(folder) == os.path.abspath(
+                    select_path or self.operation_capture_last_session.get() or ""):
+                selected_iid = iid
+                selected_name = str(item.get("name", "") or "")
+        if selected_iid:
+            tree.selection_set(selected_iid)
+            tree.see(selected_iid)
+            if (hasattr(self, "operation_capture_name")
+                    and not self.operation_capture_name.get().strip()):
+                self.operation_capture_name.set(selected_name)
+        self.refresh_paused_operation_names()
+
+    def refresh_paused_operation_names(self):
+        names = paused_session_names(self._operation_output_root())
+        if hasattr(self, "operation_capture_name_cb"):
+            self.operation_capture_name_cb.configure(values=names)
+        return names
+
+    def load_paused_operation_from_name(self, _event=None):
+        """Load the newest paused session chosen from the editable name list."""
+        name = self.operation_capture_name.get().strip()
+        if not name:
+            return False
+        current = self.operation_capture_session
+        if current is not None:
+            if (current.status == "paused"
+                    and str(current.manifest.get("name", "")).strip() == name):
+                return True
+            tkmsg.showinfo(
+                "途中記録を呼び出す",
+                "現在開いている操作セッションを完了または削除してから選択してください。",
+                parent=self.root)
+            return False
+        path = find_paused_session(self._operation_output_root(), name)
+        if not path:
+            tkmsg.showinfo(
+                "途中記録を呼び出す", "選択した名前の一時停止記録が見つかりません。",
+                parent=self.root)
+            self.refresh_paused_operation_names()
+            return False
+        self.operation_capture_last_session.set(path)
+        self.refresh_operation_sessions(select_path=path)
+        self.restore_paused_operation_capture()
+        return self.operation_capture_session is not None
+
+    def _selected_operation_session_path(self):
+        selected = self.operation_session_tree.selection() if hasattr(
+            self, "operation_session_tree") else ()
+        if selected:
+            return self._operation_session_rows.get(selected[0], "")
+        return self.operation_capture_last_session.get().strip()
+
+    def open_selected_operation_folder(self):
+        path = self._selected_operation_session_path()
+        if not path or not os.path.isdir(path):
+            tkmsg.showinfo("操作記録", "保存済みセッションを選択してください。")
+            return
+        if platform.system() == "Windows":
+            os.startfile(path)
+        else:
+            webbrowser.open("file://" + path)
+
+    def retry_selected_operation_finalize(self):
+        """Retry an interrupted/failed merge from its retained raw segments."""
+        running = (self._operation_finalize_thread is not None
+                   and self._operation_finalize_thread.is_alive())
+        if running or self.operation_recorder.is_finalizing:
+            tkmsg.showinfo(
+                "操作記録を再結合", "別の操作記録を結合中です。完了後に再実行してください。",
+                parent=self.root)
+            return False
+        path = self._selected_operation_session_path()
+        if not path or not os.path.isfile(os.path.join(path, "session.json")):
+            tkmsg.showinfo(
+                "操作記録を再結合", "保存済み操作セッションを一覧から選択してください。",
+                parent=self.root)
+            return False
+        try:
+            session = OperationCaptureSession(
+                os.path.dirname(path), session_dir=path)
+        except Exception as error:
+            tkmsg.showerror(
+                "操作記録を再結合", "操作セッションを読み込めません。\n" + str(error),
+                parent=self.root)
+            return False
+        status = session.status
+        if status not in ("finalizing", "finalize_error", "ready_to_edit"):
+            session.close()
+            tkmsg.showinfo(
+                "操作記録を再結合",
+                "状態が「結合中」「結合エラー」「編集可能」の記録を選択してください。",
+                parent=self.root)
+            return False
+        if not tkmsg.askyesno(
+                "操作記録を再結合",
+                "保持されている分割録画から結合映像を作り直します。\n"
+                "既存の結合映像がある場合は上書きされます。続行しますか？",
+                parent=self.root):
+            session.close()
+            return False
+        try:
+            session.prepare_finalize_retry()
+        except Exception as error:
+            session.close()
+            tkmsg.showerror("操作記録を再結合", str(error), parent=self.root)
+            return False
+        session.close()
+        self.operation_capture_last_session.set(path)
+        self.operation_capture_status.set(
+            "◐ 再結合中：保持済みの分割録画から映像を作成しています。")
+        self.operation_capture_status_label.configure(fg="#1565c0")
+        self.refresh_operation_sessions(select_path=path)
+
+        def finalize():
+            try:
+                outputs = finalize_operation_session(path)
+                self._gui_action_queue.put(
+                    lambda: self._operation_finalize_finished(path, outputs, None))
+            except Exception as error:
+                self._gui_action_queue.put(
+                    lambda message=str(error): self._operation_finalize_finished(
+                        path, None, message))
+        self._operation_finalize_thread = threading.Thread(
+            target=finalize, daemon=True, name="OperationCaptureRefinalize")
+        self._operation_finalize_thread.start()
+        return True
+
+    def restore_paused_operation_capture(self):
+        if self.operation_capture_session is not None:
+            tkmsg.showinfo("操作記録", "すでに操作セッションを開いています。")
+            return
+        path = self._selected_operation_session_path()
+        try:
+            session = OperationCaptureSession(
+                os.path.dirname(path), session_dir=path)
+        except Exception as error:
+            tkmsg.showerror("操作記録", "操作セッションを読み込めません。\n" + str(error))
+            return
+        if session.status != "paused":
+            session.close()
+            tkmsg.showinfo("操作記録", "一時停止状態のセッションだけ再読込できます。")
+            return
+        self.operation_capture_session = session
+        self.operation_capture_name.set(
+            str(session.manifest.get("name", "") or ""))
+        configuration = session.manifest.get("input_configuration", {})
+        if isinstance(configuration, dict):
+            self.refresh_operation_gamepad_profiles(
+                preferred=configuration.get("gamepad_profile", ""))
+        images = session.manifest.get("pause_images", [])
+        self._operation_latest_pause_image = images[-1].get("path", "") if images else ""
+        self.operation_capture_last_session.set(path)
+        self.operation_capture_status.set(
+            "Ⅱ 一時停止セッションを再読込しました。停止画像を確認して再開できます。")
+        self.operation_capture_status_label.configure(fg="#b26a00")
+        self._update_operation_capture_ui()
+        self._sync_operation_capture_to_active_input_set()
+
+    def open_selected_operation_in_dev_studio(self):
+        path = self._selected_operation_session_path()
+        if not path or not os.path.isfile(os.path.join(path, "session.json")):
+            tkmsg.showinfo("操作記録", "保存済み操作セッションを選択してください。")
+            return
+        self.open_dev_studio(operation_session=path)
+
+    def _sync_operation_capture_to_active_input_set(self):
+        name = str(getattr(self, "_active_input_set_name", "") or "").strip()
+        if (not name or not hasattr(self, "input_set_name")
+                or self.input_set_name.get().strip() != name):
+            return False
+        data = self._read_input_sets()
+        item = data.get("input_sets", {}).get(name)
+        if not isinstance(item, dict):
+            return False
+        if not input_set_commands_enabled(item):
+            return False
+        config = {
+            "output_dir": self.operation_capture_output_dir.get().strip(),
+            "include_audio": bool(self.operation_capture_include_audio.get()),
+            "auto_controller": bool(self.operation_capture_auto_controller.get()),
+            "gamepad_profile": self.operation_gamepad_profile_name.get().strip(),
+            "last_session": self.operation_capture_last_session.get().strip(),
+        }
+        item["operation_capture"] = dict(config)
+        if isinstance(item.get("all_tabs"), dict):
+            item["all_tabs"]["operation_capture"] = dict(config)
+            values = item["all_tabs"].setdefault("values", {})
+            values.update({
+                "operation_capture_output_dir": config["output_dir"],
+                "operation_capture_include_audio": config["include_audio"],
+                "operation_capture_auto_controller": config["auto_controller"],
+                "operation_gamepad_profile_name": config["gamepad_profile"],
+                "operation_capture_last_session": config["last_session"],
+            })
+        self._write_input_sets(data)
+        return True
+
     def _build_command_monitor_recording_tab(self, parent):
         self.record_monitor_chunk_seconds = tk.DoubleVar(value=30.0)
         self.record_monitor_keep_steps = tk.IntVar(value=5)
         self.record_monitor_loop_cycles = tk.IntVar(value=3)
         self.record_monitor_long_seconds = tk.DoubleVar(value=180.0)
+        self.record_monitor_failure_tail_seconds = tk.DoubleVar(value=60.0)
         self.record_monitor_auto_arm = tk.BooleanVar(value=True)
         self.record_monitor_confirm_delete_on_stop = tk.BooleanVar(value=True)
         self.record_monitor_status = tk.StringVar(
@@ -11255,13 +14545,22 @@ class PokeControllerApp:
         self.record_monitor_counts = tk.StringVar(value="一時 0本 / 保護 0本 / 削除待ち 0本")
         self._recording_normal_mode = "Manual"
         self._command_monitor_timeline = CommandStateTimeline(loop_cycles=3)
+        self._command_monitor_visual_detector = DarkStillFrameDetector()
+        self._command_monitor_input_tracker = CommandInputActivityTracker(60.0)
         self._command_monitor_chunks = []
         self._command_monitor_current_chunk = None
         self._command_monitor_last_check = 0.0
+        self._command_monitor_last_trace_check = 0.0
+        self._command_monitor_session_started = 0.0
+        self._command_monitor_source = {}
+        self._command_monitor_last_location_key = ()
+        self._command_monitor_last_snapshot = {}
         self._command_monitor_session_id = ""
         self._command_monitor_command = None
         self._command_monitor_stop_cleanup_command = None
         self._command_monitor_stop_cleanup_session_id = ""
+        self._command_monitor_failure_capture_until = None
+        self._command_monitor_failure_capture_mode = ""
         self._command_monitor_merge_active = 0
         self._command_monitor_merge_lock = threading.Lock()
         self._command_monitor_delete_queue = queue.Queue()
@@ -11299,14 +14598,27 @@ class PokeControllerApp:
             settings,
             text="A→B→A→Bは2Stepとして数え、最初と直近の指定周を保持します。",
             foreground="#555555").grid(column=3, columnspan=6, row=1, sticky="w")
+        ttk.Label(settings, text="停止後の原因確認映像").grid(
+            column=0, row=2, padx=(6, 2), pady=5)
+        ttk.Spinbox(
+            settings, from_=10, to=300, increment=10,
+            textvariable=self.record_monitor_failure_tail_seconds,
+            width=7).grid(column=1, row=2)
+        ttk.Label(settings, text="秒").grid(
+            column=2, row=2, padx=(2, 10))
+        ttk.Label(
+            settings,
+            text="キー無操作・暗転停止の開始から、この時間まで原因確認用として残します。",
+            foreground="#555555").grid(
+                column=3, columnspan=6, row=2, sticky="w")
         ttk.Checkbutton(
             settings, text="Commands Start時に自動で監視開始",
             variable=self.record_monitor_auto_arm).grid(
-                column=0, columnspan=4, row=2, padx=6, pady=(1, 5), sticky="w")
+                column=0, columnspan=4, row=3, padx=6, pady=(1, 5), sticky="w")
         ttk.Checkbutton(
             settings, text="Commands Stop時に今回の仮録画を削除確認",
             variable=self.record_monitor_confirm_delete_on_stop).grid(
-                column=4, columnspan=5, row=2, padx=6, pady=(1, 5), sticky="w")
+                column=4, columnspan=5, row=3, padx=6, pady=(1, 5), sticky="w")
 
         actions = ttk.Frame(parent)
         actions.pack(fill="x", padx=8, pady=5)
@@ -11321,6 +14633,9 @@ class PokeControllerApp:
                    command=self.toggle_selected_command_monitor_chunks).pack(side="left", padx=2)
         ttk.Button(actions, text="一時分を破棄",
                    command=self.discard_command_monitor_temporary).pack(side="left", padx=2)
+        ttk.Button(actions, text="動画・ソース比較",
+                   command=self.open_selected_command_recording_in_dev_studio).pack(
+                       side="left", padx=2)
         ttk.Button(actions, text="保存先を開く",
                    command=self.open_record_output_dir).pack(side="right", padx=2)
         ttk.Button(actions, text="使い方",
@@ -11353,6 +14668,8 @@ class PokeControllerApp:
         scroll_x.grid(column=0, row=1, sticky="ew")
         tree_frame.columnconfigure(0, weight=1)
         tree_frame.rowconfigure(0, weight=1)
+        self.record_monitor_tree.bind(
+            "<Double-1>", lambda _event: self.open_selected_command_recording_in_dev_studio())
 
     def _on_recording_mode_tab_changed(self, _event=None):
         if not hasattr(self, "recording_mode_tabs"):
@@ -11376,6 +14693,14 @@ class PokeControllerApp:
             self.record_mode.set(self._recording_normal_mode or "Manual")
 
     def _arm_command_monitor_recording(self, show_popup=True):
+        if getattr(self, "operation_capture_session", None) is not None:
+            if show_popup:
+                tkmsg.showinfo(
+                    "Commands監視録画",
+                    "［操作記録→Commands］のセッションを完了してから開始してください。",
+                    parent=self.root)
+            self.record_monitor_status.set("開始できません：操作記録セッションを使用中です。")
+            return False
         frame = getattr(self.camera, "image_bgr", None)
         if frame is None:
             if show_popup:
@@ -11385,10 +14710,15 @@ class PokeControllerApp:
             return False
         if not self._recording_disk_space_ok(show_popup=show_popup, force=True):
             return False
+        if not self._confirm_selected_audio_for_use():
+            self.record_monitor_status.set("使用中のAudioを反映しなかったため監視を開始していません。")
+            return False
         self.record_armed = True
         self._command_monitor_command = None
         self._command_monitor_current_chunk = None
         self._command_monitor_last_check = 0.0
+        self._command_monitor_visual_detector.reset()
+        self._command_monitor_input_tracker.reset(time.monotonic())
         self.record_monitor_status.set(
             "監視開始：Commands開始を待っています。開始後は自動録画します。")
         self._refresh_command_monitor_tree()
@@ -11431,6 +14761,32 @@ class PokeControllerApp:
         viewer.configure(state="disabled")
         ttk.Button(dialog, text="閉じる", command=dialog.destroy).pack(pady=(0, 7))
 
+    def open_selected_command_recording_in_dev_studio(self):
+        selected = list(self.record_monitor_tree.selection()) \
+            if hasattr(self, "record_monitor_tree") else []
+        chunks = [chunk for chunk in self._command_monitor_chunks
+                  if str(chunk.get("id", "")) in selected]
+        if not chunks and self._command_monitor_chunks:
+            chunks = [self._command_monitor_chunks[-1]]
+        if not chunks:
+            tkmsg.showinfo(
+                "Commands録画とソース比較",
+                "比較する録画を一覧から選んでください。", parent=self.root)
+            return
+        chunk = chunks[0]
+        if chunk is self._command_monitor_current_chunk or chunk.get("merge_pending"):
+            tkmsg.showinfo(
+                "Commands録画とソース比較",
+                "録画または結合の完了後に開いてください。", parent=self.root)
+            return
+        path = os.path.abspath(str(chunk.get("session_dir", "") or ""))
+        if not os.path.isfile(os.path.join(path, "command_monitor.json")):
+            tkmsg.showwarning(
+                "Commands録画とソース比較",
+                "録画情報が見つかりません。\n" + path, parent=self.root)
+            return
+        self.open_dev_studio(command_recording=path)
+
     def _select_recording_mode_page(self):
         if not hasattr(self, "recording_mode_tabs"):
             return
@@ -11450,9 +14806,13 @@ class PokeControllerApp:
         now = time.monotonic() if now is None else float(now)
         if self.recorder.active:
             return
+        if not self._confirm_selected_audio_for_use():
+            self.record_monitor_status.set("使用中のAudioを反映しなかったため録画を開始していません。")
+            return
         self.recorder.start(
-            frame, self.fps.get(), self.audio_input.get(), self.audio_gain.get(),
+            frame, self.fps.get(), self._selected_audio_device_name(), self.audio_gain.get(),
             cleanup_rules=[], minimum_duration=0)
+        self._sync_audio_device_usage()
         chunk = {
             "id": str(time.time_ns()),
             "session_dir": os.path.abspath(self.recorder.session_dir),
@@ -11465,29 +14825,103 @@ class PokeControllerApp:
             "delete_pending": False,
             "command": str(getattr(command, "NAME", "")),
             "command_session_id": self._command_monitor_session_id,
+            "source": dict(self._command_monitor_source),
+            "source_snapshots": {},
         }
-        self._command_monitor_current_chunk = chunk
+        chunk["source"] = self._ensure_command_monitor_source_snapshot(
+            chunk, chunk["source"])
+        with self._command_monitor_lock:
+            self._command_monitor_current_chunk = chunk
         self._command_monitor_chunks.append(chunk)
         self._write_command_monitor_metadata(chunk)
         self._refresh_command_monitor_tree()
 
-    def _write_command_monitor_event(self, chunk, snapshot, event_name="state"):
+    def _ensure_command_monitor_source_snapshot(self, chunk, location):
+        """Copy each linked source file once so later edits do not erase evidence."""
+        location = dict(location or {})
+        source_file = os.path.abspath(str(location.get("file", "") or ""))
+        if not source_file or not os.path.isfile(source_file) or not chunk:
+            return location
+        snapshots = chunk.setdefault("source_snapshots", {})
+        relative = snapshots.get(source_file)
+        if not relative:
+            digest = hashlib.sha1(source_file.lower().encode("utf-8")).hexdigest()[:12]
+            safe_name = re.sub(r"[^0-9A-Za-z_.-]+", "_", os.path.basename(source_file))
+            relative = os.path.join(
+                "source_snapshots", "{}_{}".format(digest, safe_name))
+            target = os.path.join(chunk["session_dir"], relative)
+            try:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                shutil.copy2(source_file, target)
+                snapshots[source_file] = relative
+            except OSError as error:
+                self._logger.warning("Command source snapshot failed: %s", error)
+                return location
+        location["snapshot"] = relative
+        return location
+
+    def _command_trace_writer_loop(self):
+        while True:
+            batch = [self._command_trace_queue.get()]
+            # A busy command may change source locations many times per
+            # second. Drain a bounded burst and append each file once instead
+            # of repeatedly opening it; every evidence event is still kept.
+            for _ in range(255):
+                try:
+                    batch.append(self._command_trace_queue.get_nowait())
+                except queue.Empty:
+                    break
+            try:
+                by_path = {}
+                for item in batch:
+                    if item is not None:
+                        path, payload = item
+                        by_path.setdefault(path, []).append(payload)
+                for path, payloads in by_path.items():
+                    try:
+                        with open(path, "a", encoding="utf-8", newline="\n") as stream:
+                            for payload in payloads:
+                                json.dump(payload, stream, ensure_ascii=False)
+                                stream.write("\n")
+                    except OSError as error:
+                        logger = getattr(self, "_logger", None)
+                        if logger is not None:
+                            logger.warning(
+                                "Command recording trace write failed: %s", error)
+            finally:
+                for _ in batch:
+                    self._command_trace_queue.task_done()
+            if any(item is None for item in batch):
+                return
+
+    def _write_command_monitor_event(self, chunk, snapshot, event_name="state",
+                                     location=None, now=None, extra=None):
         if not chunk:
             return
+        now = time.monotonic() if now is None else float(now)
         step_text = self._command_monitor_step_text(snapshot)
-        if step_text not in chunk["states"]:
-            chunk["states"].append(step_text)
+        with self._command_monitor_lock:
+            if step_text not in chunk["states"]:
+                chunk["states"].append(step_text)
+        if location is None:
+            location = runtime_execution_location(
+                self._command_monitor_command,
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        location = self._ensure_command_monitor_source_snapshot(chunk, location)
         path = os.path.join(chunk["session_dir"], "steps.jsonl")
-        try:
-            with open(path, "a", encoding="utf-8", newline="\n") as stream:
-                json.dump({
-                    "time": datetime.datetime.now().isoformat(timespec="milliseconds"),
-                    "event": event_name,
-                    "states": dict(snapshot),
-                }, stream, ensure_ascii=False)
-                stream.write("\n")
-        except OSError as error:
-            self._logger.warning("Command monitor Step log failed: %s", error)
+        payload = {
+            "time": datetime.datetime.now().isoformat(timespec="milliseconds"),
+            "event": event_name,
+            "states": dict(snapshot or {}),
+            "step_path": step_text,
+            "chunk_time": max(0.0, now - float(chunk.get("started", now))),
+            "command_time": max(
+                0.0, now - float(self._command_monitor_session_started or now)),
+            "location": location,
+        }
+        if isinstance(extra, dict):
+            payload.update(extra)
+        self._command_trace_queue.put((path, payload))
 
     def _write_command_monitor_metadata(self, chunk):
         if not chunk:
@@ -11519,7 +14953,8 @@ class PokeControllerApp:
             self._logger.warning("Command monitor output log failed: %s", error)
 
     def _finish_command_monitor_chunk(self, reason="chunk_end", frame=None, restart=False):
-        chunk = self._command_monitor_current_chunk
+        with self._command_monitor_lock:
+            chunk = self._command_monitor_current_chunk
         if chunk is None:
             return
         chunk["ended"] = time.monotonic()
@@ -11528,7 +14963,10 @@ class PokeControllerApp:
         self._write_command_monitor_output_log(chunk)
         self._write_command_monitor_metadata(chunk)
         self.recorder.stop()
-        self._command_monitor_current_chunk = None
+        self._sync_audio_device_usage()
+        with self._command_monitor_lock:
+            if self._command_monitor_current_chunk is chunk:
+                self._command_monitor_current_chunk = None
         self._refresh_command_monitor_tree()
         if restart and frame is not None and self.record_armed:
             self._start_command_monitor_chunk(
@@ -11538,26 +14976,61 @@ class PokeControllerApp:
         self._command_monitor_command = command
         self._command_monitor_session_id = datetime.datetime.now().strftime(
             "%Y%m%d_%H%M%S_%f")
+        self._command_monitor_session_started = time.monotonic()
+        self._command_monitor_source = command_source_descriptor(command)
+        self._command_monitor_last_location_key = ()
+        self._command_monitor_last_snapshot = {}
         try:
             loop_cycles = max(2, int(self.record_monitor_loop_cycles.get()))
         except (tk.TclError, TypeError, ValueError):
             loop_cycles = 3
             self.record_monitor_loop_cycles.set(loop_cycles)
         self._command_monitor_timeline.reset(loop_cycles=loop_cycles)
+        self._command_monitor_visual_detector.reset()
+        self._command_monitor_input_tracker.reset(time.monotonic())
+        self._command_monitor_failure_capture_until = None
+        self._command_monitor_failure_capture_mode = ""
         self._command_monitor_last_check = 0.0
+        self._command_monitor_last_trace_check = 0.0
         self.record_monitor_status.set(
             "監視中: {} / Stepを自動検出しています".format(
                 getattr(command, "NAME", "Commands")))
 
     def _update_command_monitor_state(self, command, now):
-        if now - self._command_monitor_last_check < 0.25:
-            return
-        self._command_monitor_last_check = now
-        snapshot = runtime_state_snapshot(command)
-        result = self._command_monitor_timeline.add(snapshot, now)
-        if result.get("changed"):
+        state_due = now - self._command_monitor_last_check >= 0.25
+        trace_due = now - self._command_monitor_last_trace_check >= 0.10
+        if not state_due and not trace_due:
+            return {"changed": False, "loop_started": False,
+                    "loop_ended": False}
+        if state_due:
+            self._command_monitor_last_check = now
+        if trace_due:
+            self._command_monitor_last_trace_check = now
+        if state_due or not self._command_monitor_last_snapshot:
+            snapshot = runtime_state_snapshot(command)
+            self._command_monitor_last_snapshot = dict(snapshot)
+        else:
+            snapshot = dict(self._command_monitor_last_snapshot)
+        result = self._command_monitor_timeline.add(snapshot, now) if state_due else {
+            "changed": False, "loop_started": False, "loop_ended": False,
+        }
+        location = runtime_execution_location(
+            command, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) \
+            if trace_due else {}
+        if result.get("changed") and not location:
+            location = runtime_execution_location(
+                command, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        location_key = execution_location_key(location)
+        location_changed = bool(location_key and
+                                location_key != self._command_monitor_last_location_key)
+        if result.get("changed") or location_changed:
             self._write_command_monitor_event(
-                self._command_monitor_current_chunk, snapshot, "state_changed")
+                self._command_monitor_current_chunk, snapshot,
+                "state_changed" if result.get("changed") else "execution",
+                location=location, now=now)
+            if location_key:
+                self._command_monitor_last_location_key = location_key
+        if result.get("changed"):
             if result.get("loop_started"):
                 loop = result.get("loop") or {}
                 for chunk in self._command_monitor_chunks:
@@ -11566,7 +15039,7 @@ class PokeControllerApp:
                         chunk["loop_anchor"] = True
                         self._write_command_monitor_metadata(chunk)
                 self.record_monitor_status.set(
-                    "ループ検出: {}Step × {}周 / 開始側と直近側を保持".format(
+                    "ループ検出: {}Step × {}周 / ループ前と最初の周回だけを保持".format(
                         loop.get("period", 0), self.record_monitor_loop_cycles.get()))
             elif result.get("loop_ended"):
                 for chunk in self._command_monitor_chunks:
@@ -11578,20 +15051,98 @@ class PokeControllerApp:
             else:
                 self.record_monitor_status.set(
                     "監視中: " + self._command_monitor_step_text(snapshot))
-        self._mark_command_monitor_prune_candidates(now)
+        if state_due:
+            self._mark_command_monitor_prune_candidates(now)
+        return result
+
+    def _update_command_monitor_visual_state(self, frame, now):
+        """Detect only a sustained black/still failure, never a normal static menu."""
+        result = self._command_monitor_visual_detector.add(frame, now)
+        if result.get("stall_started"):
+            active = result.get("active") or {}
+            self._write_command_monitor_event(
+                self._command_monitor_current_chunk,
+                self._command_monitor_last_snapshot,
+                "dark_still_detected", now=now,
+                extra={
+                    "brightness": active.get("brightness"),
+                    "frame_difference": active.get("difference"),
+                    "failure_started_at": active.get("started_at"),
+                })
+            self.record_monitor_status.set(
+                "暗転・画面停止を検出しました。停止開始から約{}秒まで原因確認映像を記録します。".format(
+                    int(self._command_monitor_failure_tail_seconds())))
+        elif result.get("recovered"):
+            self._write_command_monitor_event(
+                self._command_monitor_current_chunk,
+                self._command_monitor_last_snapshot,
+                "dark_still_recovered", now=now)
+            self.record_monitor_status.set("画面変化が戻ったため、暗転停止の保持制限を解除しました。")
+        return result
+
+    def _record_command_key_activity(self, _payload, priority=False):
+        """Sender callback: update a timestamp only; never touch Tk here."""
+        if priority:
+            return
+        tracker = getattr(self, "_command_monitor_input_tracker", None)
+        command = getattr(self, "cur_command", None)
+        if (tracker is not None and command is not None
+                and command is getattr(self, "_command_monitor_command", None)
+                and getattr(command, "alive", False)):
+            tracker.mark_activity(time.monotonic())
+
+    def _update_command_monitor_input_state(self, now):
+        result = self._command_monitor_input_tracker.check(now)
+        if result.get("stall_started"):
+            active = result.get("active") or {}
+            self._write_command_monitor_event(
+                self._command_monitor_current_chunk,
+                self._command_monitor_last_snapshot,
+                "key_inactivity_detected", now=now,
+                extra={
+                    "last_key_activity_at": active.get("started_at"),
+                    "idle_seconds": active.get("idle_seconds"),
+                })
+            self.record_monitor_status.set(
+                "キー操作が60秒間ありません。停止開始から約{}秒分を原因確認映像として保持します。".format(
+                    int(self._command_monitor_failure_tail_seconds())))
+        elif result.get("recovered"):
+            self._write_command_monitor_event(
+                self._command_monitor_current_chunk,
+                self._command_monitor_last_snapshot,
+                "key_activity_recovered", now=now)
+            self.record_monitor_status.set("60秒以内にキー操作が再開したため、無操作判定を解除しました。")
+        return result
 
     def _mark_command_monitor_prune_candidates(self, now=None):
         now = time.monotonic() if now is None else float(now)
+        visual = getattr(self._command_monitor_visual_detector, "active", None)
+        inactivity = getattr(self._command_monitor_input_tracker, "active", None)
+        terminals = []
+        tail_seconds = self._command_monitor_failure_tail_seconds()
+        if isinstance(visual, dict):
+            started = float(visual.get("started_at", now))
+            terminals.append((failure_evidence_end(
+                started, now, tail_seconds), "dark_still"))
+        if isinstance(inactivity, dict):
+            started = float(inactivity.get("started_at", now))
+            terminals.append((failure_evidence_end(
+                started, now, tail_seconds),
+                              "key_inactivity"))
+        terminal_time, terminal_mode = min(terminals) if terminals else (None, "")
         try:
             retention = self._command_monitor_timeline.retention(
                 now,
                 keep_unique_steps=max(1, int(self.record_monitor_keep_steps.get())),
                 long_step_seconds=max(30.0, float(self.record_monitor_long_seconds.get())),
                 loop_cycles=max(2, int(self.record_monitor_loop_cycles.get())),
+                terminal_time=terminal_time,
+                terminal_mode=terminal_mode,
             )
         except (tk.TclError, TypeError, ValueError):
-            return
+            return None
         keep_after = retention["keep_after"]
+        keep_before = retention.get("keep_before")
         anchors = retention["loop_anchors"]
         for chunk in self._command_monitor_chunks:
             if (chunk is self._command_monitor_current_chunk or chunk.get("pinned")
@@ -11602,11 +15153,22 @@ class PokeControllerApp:
             overlaps_anchor = any(
                 end >= start and chunk.get("started", end) <= finish
                 for start, finish in anchors)
-            keep = end >= keep_after or overlaps_anchor or (
-                chunk.get("loop_anchor") and self._command_monitor_timeline.active_loop)
+            if keep_before is not None:
+                keep = end >= keep_after and chunk.get("started", end) <= keep_before
+            else:
+                keep = end >= keep_after or overlaps_anchor or (
+                    chunk.get("loop_anchor") and self._command_monitor_timeline.active_loop)
             chunk["delete_pending"] = not keep
         self._flush_command_monitor_deletes()
         self._refresh_command_monitor_tree()
+        return retention
+
+    def _command_monitor_failure_tail_seconds(self):
+        try:
+            return max(10.0, min(
+                300.0, float(self.record_monitor_failure_tail_seconds.get())))
+        except (tk.TclError, TypeError, ValueError):
+            return 60.0
 
     def _queue_command_monitor_folder_delete(self, path, output_root=None):
         root = os.path.abspath(
@@ -11693,6 +15255,11 @@ class PokeControllerApp:
                     "merged": bool(value.get("merged", False)),
                     "source_chunk_ids": [str(item) for item in
                                          value.get("source_chunk_ids", [])],
+                    "source": dict(value.get("source", {}) or {}),
+                    "sources": [dict(item) for item in value.get("sources", [])
+                                if isinstance(item, dict)],
+                    "source_snapshots": dict(
+                        value.get("source_snapshots", {}) or {}),
                     "historical": True,
                     "duration_saved": duration,
                 })
@@ -11834,6 +15401,35 @@ class PokeControllerApp:
         self._command_monitor_stop_cleanup_session_id = str(
             getattr(self, "_command_monitor_session_id", "") or "")
 
+    def _stop_command_monitor_capture_on_request(self, command, reason):
+        """Bound and stop recording immediately, even if Commands cannot exit."""
+        if (getattr(self, "record_mode", None) is None
+                or self.record_mode.get() != "CommandMonitor"
+                or command is None
+                or command is not getattr(self, "_command_monitor_command", None)):
+            return False
+        self.record_armed = False
+        if self._command_monitor_current_chunk is not None:
+            self._finish_command_monitor_chunk(reason)
+        retention = self._mark_command_monitor_prune_candidates(time.monotonic()) or {}
+        mode = retention.get("mode")
+        if mode == "loop":
+            message = "Stop時に録画を確定しました。ループ前{} Stepと最初の{}周だけを保持します。".format(
+                self.record_monitor_keep_steps.get(), self.record_monitor_loop_cycles.get())
+        elif mode == "dark_still":
+            message = (
+                "Stop時に録画を確定しました。暗転・画面停止の開始から最大{}秒の原因確認映像を保持します。"
+            ).format(int(self._command_monitor_failure_tail_seconds()))
+        elif mode == "key_inactivity":
+            message = (
+                "Stop時に録画を確定しました。最後のキー操作から最大{}秒の原因確認映像を保持します。"
+            ).format(int(self._command_monitor_failure_tail_seconds()))
+        else:
+            message = "Stop時にCommands監視録画を停止し、直近の有効なStep範囲だけを保持します。"
+        self.record_monitor_status.set(message)
+        self._refresh_command_monitor_tree()
+        return True
+
     def _consume_command_monitor_stop_cleanup(self, command):
         if (command is None
                 or command is not getattr(
@@ -11914,6 +15510,9 @@ class PokeControllerApp:
                     time.sleep(0.2)
                 if self.recorder.is_finalizing:
                     raise TimeoutError("分割録画の保存完了を10分以内に確認できませんでした。")
+                # Source/Step events use a dedicated writer so they never
+                # delay controller input.  Flush it before reading the chunks.
+                self._command_trace_queue.join()
                 merged = merge_command_recording_chunks(
                     targets, output_root, session_id)
             except Exception as caught:
@@ -11941,6 +15540,7 @@ class PokeControllerApp:
             for chunk in self._command_monitor_chunks
             if (str(chunk.get("command_session_id", "")) == str(session_id)
                 and not chunk.get("historical")
+                and not chunk.get("delete_pending")
                 and chunk.get("id") not in (None, ""))
         }
         if not target_ids:
@@ -11970,6 +15570,12 @@ class PokeControllerApp:
             "今回のCommands仮録画{}本を削除待ちにしました。".format(len(targets)))
         self._refresh_command_monitor_tree()
 
+    def _command_monitor_failure_active(self):
+        return bool(
+            self._command_monitor_timeline.active_loop
+            or getattr(self._command_monitor_visual_detector, "active", None)
+            or getattr(self._command_monitor_input_tracker, "active", None))
+
     def _process_command_monitor_frame(self, frame):
         if not self.record_armed:
             return
@@ -11987,21 +15593,79 @@ class PokeControllerApp:
                 self._finish_command_monitor_chunk("command_changed")
             self._command_monitor_begin_session(command)
         now = time.monotonic()
-        if not self.recorder.active:
+        if not self.recorder.active and not self._command_monitor_failure_active():
             if not self._recording_disk_space_ok(show_popup=True, force=True):
                 self._interrupt_recording_for_disk_space()
                 return
             self._start_command_monitor_chunk(frame, command, now)
             snapshot = runtime_state_snapshot(command)
+            self._command_monitor_last_snapshot = dict(snapshot)
             self._command_monitor_timeline.add(snapshot, now)
+            location = runtime_execution_location(
+                command, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+            self._command_monitor_last_location_key = execution_location_key(location)
             self._write_command_monitor_event(
-                self._command_monitor_current_chunk, snapshot, "recording_started")
-        self._update_command_monitor_state(command, now)
+                self._command_monitor_current_chunk, snapshot, "recording_started",
+                location=location, now=now)
+        state_result = self._update_command_monitor_state(command, now)
+        visual_result = self._update_command_monitor_visual_state(frame, now)
+        input_result = self._update_command_monitor_input_state(now)
+        evidence_started = bool(
+            state_result.get("loop_started") or visual_result.get("stall_started")
+            or input_result.get("stall_started"))
+        bounded_for_evidence = False
+        if evidence_started and self._command_monitor_current_chunk is not None:
+            if state_result.get("loop_started"):
+                reason = "loop_evidence_bounded"
+                self._finish_command_monitor_chunk(reason)
+                self._mark_command_monitor_prune_candidates(now)
+                bounded_for_evidence = True
+            else:
+                active = ((input_result.get("active")
+                           if input_result.get("stall_started") else None)
+                          or visual_result.get("active") or {})
+                started_at = float(active.get("started_at", now))
+                self._command_monitor_failure_capture_until = (
+                    started_at + self._command_monitor_failure_tail_seconds())
+                self._command_monitor_failure_capture_mode = (
+                    "key_inactivity" if input_result.get("stall_started")
+                    else "dark_still")
+
+        failure_until = self._command_monitor_failure_capture_until
+        if (failure_until is not None
+                and self._command_monitor_current_chunk is not None
+                and now >= float(failure_until)):
+            reason = "{}_evidence_60s_bounded".format(
+                self._command_monitor_failure_capture_mode or "failure")
+            self._finish_command_monitor_chunk(reason)
+            self._mark_command_monitor_prune_candidates(now)
+            self.record_monitor_status.set(
+                "停止開始から約{}秒の原因確認映像を保持しました。復帰するまで後続の無変化映像は破棄します。".format(
+                    int(self._command_monitor_failure_tail_seconds())))
+            self._command_monitor_failure_capture_until = None
+            self._command_monitor_failure_capture_mode = ""
+            bounded_for_evidence = True
+        recovered = bool(
+            state_result.get("loop_ended") or visual_result.get("recovered")
+            or input_result.get("recovered"))
+        if recovered:
+            self._command_monitor_failure_capture_until = None
+            self._command_monitor_failure_capture_mode = ""
+            self._mark_command_monitor_prune_candidates(now)
+            if (not self._command_monitor_failure_active()
+                    and not self.recorder.active):
+                self._start_command_monitor_chunk(frame, command, now)
+                snapshot = runtime_state_snapshot(command)
+                self._command_monitor_last_snapshot = dict(snapshot)
+                self._write_command_monitor_event(
+                    self._command_monitor_current_chunk, snapshot,
+                    "recording_resumed", now=now)
         try:
             chunk_seconds = max(10.0, float(self.record_monitor_chunk_seconds.get()))
         except (tk.TclError, TypeError, ValueError):
             chunk_seconds = 30.0
-        if (self._command_monitor_current_chunk is not None
+        if (not bounded_for_evidence
+                and self._command_monitor_current_chunk is not None
                 and now - self._command_monitor_current_chunk["started"] >= chunk_seconds):
             self._finish_command_monitor_chunk(
                 "chunk_rotated", frame=frame, restart=True)
@@ -12103,6 +15767,7 @@ class PokeControllerApp:
             "monitor_keep_steps": self.record_monitor_keep_steps.get(),
             "monitor_loop_cycles": self.record_monitor_loop_cycles.get(),
             "monitor_long_seconds": self.record_monitor_long_seconds.get(),
+            "monitor_failure_tail_seconds": self.record_monitor_failure_tail_seconds.get(),
             "monitor_auto_arm": self.record_monitor_auto_arm.get(),
             "monitor_confirm_delete_on_stop": self.record_monitor_confirm_delete_on_stop.get(),
         }
@@ -12155,6 +15820,8 @@ class PokeControllerApp:
         self.record_monitor_keep_steps.set(data.get("monitor_keep_steps", 5))
         self.record_monitor_loop_cycles.set(data.get("monitor_loop_cycles", 3))
         self.record_monitor_long_seconds.set(data.get("monitor_long_seconds", 180.0))
+        self.record_monitor_failure_tail_seconds.set(
+            data.get("monitor_failure_tail_seconds", 60.0))
         self.record_monitor_auto_arm.set(data.get("monitor_auto_arm", True))
         self.record_monitor_confirm_delete_on_stop.set(
             data.get("monitor_confirm_delete_on_stop", True))
@@ -12332,6 +15999,19 @@ class PokeControllerApp:
             pass
 
     def toggle_recording(self):
+        operation = getattr(self, "operation_capture_session", None)
+        operation_finalizing = (self._operation_finalize_thread is not None
+                                and self._operation_finalize_thread.is_alive())
+        if (operation is not None
+                or (getattr(self, "operation_recorder", None) is not None
+                    and self.operation_recorder.active)
+                or operation_finalizing):
+            tkmsg.showinfo(
+                "Recording",
+                "［操作記録→Commands］は通常Recordingと別管理です。\n"
+                "操作セッションを完了してから通常録画を開始してください。",
+                parent=self.root)
+            return
         self.configure_recording_rules()
         if self.record_mode.get() == "CommandMonitor":
             if self.record_armed:
@@ -12366,6 +16046,8 @@ class PokeControllerApp:
                 }]
             if not self._recording_disk_space_ok(show_popup=True, force=True):
                 return
+            if not self._confirm_selected_audio_for_use():
+                return
             self.record_armed = True
             self._record_variable_evaluator.reset()
             self._record_variable_active_rule_id = None
@@ -12392,6 +16074,8 @@ class PokeControllerApp:
                 return
             if not self._recording_disk_space_ok(show_popup=True, force=True):
                 return
+            if not self._confirm_selected_audio_for_use():
+                return
             self.record_armed = True
             self.recorder.last_check = 0.0
             self.record_button.configure(text="Stop monitoring")
@@ -12399,6 +16083,7 @@ class PokeControllerApp:
             return
         if self.recorder.active:
             self.recorder.stop()
+            self._sync_audio_device_usage()
             self.record_button.configure(text="Start recording")
             self.show_output("Analysis", text="録画を停止しました。MP4はバックグラウンドで結合中です。")
             return
@@ -12408,7 +16093,11 @@ class PokeControllerApp:
             return
         if not self._recording_disk_space_ok(show_popup=True, force=True):
             return
-        self.recorder.start(frame, self.fps.get(), self.audio_input.get(), self.audio_gain.get())
+        if not self._confirm_selected_audio_for_use():
+            return
+        self.recorder.start(
+            frame, self.fps.get(), self._selected_audio_device_name(), self.audio_gain.get())
+        self._sync_audio_device_usage()
         self.record_button.configure(text="Stop recording")
 
     def open_recording_output_layout(self):
@@ -12516,6 +16205,9 @@ class PokeControllerApp:
             "matched": bool(detail.get("matched")),
             "show_value": bool(detail.get("show_value", False)),
             "source": "Commands",
+            "position": detail.get("position"),
+            "template_size": detail.get("template_size"),
+            "variant": detail.get("variant"),
             "rect": rect,
             "timestamp": float(detail.get("timestamp", time.time())),
         }
@@ -12529,44 +16221,97 @@ class PokeControllerApp:
                 del self._record_detection_events[oldest]
         if event["show_value"] or Command.isSimilarity:
             with self._pending_image_detection_value_lock:
-                self._pending_image_detection_value = dict(event)
+                key = (event["name"], str(event.get("variant") or ""))
+                self._pending_image_detection_values[key] = dict(event)
+                # Commands may call many detections per cycle.  Coalesce each
+                # name independently but keep the worker-to-Tk queue bounded.
+                while len(self._pending_image_detection_values) > 32:
+                    del self._pending_image_detection_values[
+                        next(iter(self._pending_image_detection_values))]
                 if not self._pending_image_detection_value_queued:
                     self._pending_image_detection_value_queued = True
                     self._gui_action_queue.put(self._drain_image_detection_value)
 
     def _drain_image_detection_value(self):
         with self._pending_image_detection_value_lock:
-            detail = self._pending_image_detection_value
-            self._pending_image_detection_value = None
+            details = list(self._pending_image_detection_values.values())
+            self._pending_image_detection_values = {}
             self._pending_image_detection_value_queued = False
-        if detail is not None:
-            self._show_image_detection_value(detail)
+        accepted = False
+        for detail in details:
+            accepted = self._show_image_detection_value(detail, refresh=False) or accepted
+        if accepted:
+            self._refresh_image_detection_value_output(force=True)
 
-    def _show_image_detection_value(self, detail):
-        """Show the newest requested Show Value result in the configured log."""
+    def _show_image_detection_value(self, detail, refresh=True):
+        """Keep the newest value for each image and render active values together."""
         if not isinstance(detail, dict):
-            return
+            return False
         if not bool(detail.get("show_value")) and not self.is_show_value.get():
+            return False
+        update_show_value_entries(self._image_detection_value_entries, detail)
+        if refresh:
+            self._refresh_image_detection_value_output(force=True)
+        return True
+
+    def _image_detection_value_timeout_seconds(self):
+        try:
+            return max(0.5, min(60.0, float(
+                self.image_detection_monitor_value_timeout.get())))
+        except (TypeError, ValueError, tk.TclError):
+            return 5.0
+
+    def _output_panel_current_text(self, panel):
+        """Read the assigned output text so stale cleanup never erases newer tools."""
+        logical = "Log: " + str(panel).replace("Log: ", "", 1)
+        slot = next((name for name, value in self.panel_slots.items()
+                     if value.get() == logical), None)
+        if slot is None:
+            slot = {"Output#1": "right_top", "Output#2": "right_bottom",
+                    "Output#3": "left_top", "Output#4": "left_bottom"}.get(
+                        str(panel).replace("Log: ", "", 1), "right_bottom")
+        try:
+            return self.panel_widgets[slot][2].get("1.0", "end-1c")
+        except (KeyError, tk.TclError):
+            return ""
+
+    def _refresh_image_detection_value_output(self, force=False):
+        now = time.time()
+        if not force and now < self._image_detection_value_next_prune:
+            return
+        self._image_detection_value_next_prune = now + 0.25
+        removed = prune_show_value_entries(
+            self._image_detection_value_entries,
+            self._image_detection_value_timeout_seconds(), now=now)
+        if not force and not removed:
             return
         output = self.image_detection_monitor_output.get()
+        text = format_show_value_entries(
+            self._image_detection_value_entries,
+            self.image_detection_monitor_output_tag.get().strip() or "ShowValue")
+        previous_output = self._image_detection_value_rendered_output
+        previous_text = self._image_detection_value_rendered_text
         if output == "Disabled":
+            # Clear only text still owned by this ShowValue renderer.
+            if previous_output and previous_text and \
+                    self._output_panel_current_text(previous_output) == previous_text:
+                self.show_output(previous_output, text="")
+            self._image_detection_value_rendered_output = None
+            self._image_detection_value_rendered_text = ""
             return
-        tag = self.image_detection_monitor_output_tag.get().strip() or "ShowValue"
-        try:
-            score = float(detail.get("score"))
-            threshold = float(detail.get("threshold", 0.0))
-        except (TypeError, ValueError):
-            return
-        position = detail.get("position") or ("-", "-")
-        variant = detail.get("variant")
-        variant_text = " / パターン{}".format(variant) if variant else ""
-        text = ("[{}] {}{}\n"
-                "一致度: {:.6f} / 閾値: {:.6f} / {}\n"
-                "検出位置: {},{} / 取得元: {}").format(
-                    tag, detail.get("name", "image detection"), variant_text,
-                    score, threshold, "一致" if detail.get("matched") else "不一致",
-                    position[0], position[1], detail.get("source", "Commands"))
-        self.show_output(output, text=text)
+        if previous_output and previous_output != output and previous_text and \
+                self._output_panel_current_text(previous_output) == previous_text:
+            self.show_output(previous_output, text="")
+        if text:
+            self.show_output(output, text=text)
+            self._image_detection_value_rendered_output = output
+            self._image_detection_value_rendered_text = text
+        else:
+            if previous_output == output and previous_text and \
+                    self._output_panel_current_text(output) == previous_text:
+                self.show_output(output, text="")
+            self._image_detection_value_rendered_output = None
+            self._image_detection_value_rendered_text = ""
 
     def _recent_image_detection_events(self, seconds=3.0):
         cutoff = time.time() - float(seconds)
@@ -12801,6 +16546,10 @@ class PokeControllerApp:
                 self._logger.warning("Recording compositor failed: %s", error)
 
     def process_recording_frame(self, frame):
+        self._sync_audio_device_usage()
+        # Operation authoring is an independent clean-video pipeline.  Feed it
+        # before the normal recording mode returns from this callback.
+        self._process_operation_capture_frame(frame)
         if (self.recorder.active or self.record_armed) and not self._recording_disk_space_ok(show_popup=True):
             self._interrupt_recording_for_disk_space()
             return
@@ -12815,7 +16564,7 @@ class PokeControllerApp:
             if not self.record_trigger_rules and self.recorder.template_path != self.record_template_path.get():
                 self.recorder.configure_template(self.record_template_path.get())
             self.recorder.process_detection(
-                frame, self.fps.get(), self.audio_input.get(), self.audio_gain.get(),
+                frame, self.fps.get(), self._selected_audio_device_name(), self.audio_gain.get(),
                 self.record_threshold.get(), self._recording_roi(), self.record_interval.get(),
                 self.record_release.get(), allow_start=False,
             )
@@ -12832,7 +16581,7 @@ class PokeControllerApp:
             if not self.record_trigger_rules and self.recorder.template_path != self.record_template_path.get():
                 self.recorder.configure_template(self.record_template_path.get())
             self.recorder.process_detection(
-                frame, self.fps.get(), self.audio_input.get(), self.audio_gain.get(),
+                frame, self.fps.get(), self._selected_audio_device_name(), self.audio_gain.get(),
                 self.record_threshold.get(), self._recording_roi(), self.record_interval.get(),
                 self.record_release.get(), allow_start=False,
             )
@@ -12856,7 +16605,9 @@ class PokeControllerApp:
                         if not self._recording_disk_space_ok(show_popup=True, force=True):
                             self._interrupt_recording_for_disk_space()
                             return
-                        self.recorder.start(frame, self.fps.get(), self.audio_input.get(), self.audio_gain.get())
+                        self.recorder.start(
+                            frame, self.fps.get(), self._selected_audio_device_name(),
+                            self.audio_gain.get())
                         self._record_variable_active_rule_id = str(rule.get("id"))
                         self.record_variable_status.set("Recording: {} == {}".format(
                             rule.get("variable", ""), result.get("value")))
@@ -12906,7 +16657,8 @@ class PokeControllerApp:
         if not self.record_trigger_rules and self.recorder.template_path != self.record_template_path.get():
             self.recorder.configure_template(self.record_template_path.get())
         result = self.recorder.process_detection(
-            frame, self.fps.get(), self.audio_input.get(), self.audio_gain.get(), self.record_threshold.get(), self._recording_roi(),
+            frame, self.fps.get(), self._selected_audio_device_name(), self.audio_gain.get(),
+            self.record_threshold.get(), self._recording_roi(),
             self.record_interval.get(), self.record_release.get(), allow_start=self.record_armed,
         )
         self.update_recording_debug(frame)
@@ -12946,6 +16698,11 @@ class PokeControllerApp:
         self.settings.show_size.set(self.show_size.get())
         self.settings.last_active_preview_full_fps = \
             self.last_active_preview_full_fps.get()
+        self.settings.resource_control_enabled = \
+            self.resource_control_enabled.get()
+        self.settings.resource_cpu_target = clamp_cpu_target(
+            self.resource_cpu_target.get())
+        self.settings.resource_main_tool = self.resource_main_tool.get()
         self.settings.is_show_realtime.set(self.is_show_realtime.get())
         self.settings.is_show_value.set(self.is_show_value.get())
         self.settings.is_show_guide.set(self.is_show_guide.get())
@@ -12972,7 +16729,7 @@ class PokeControllerApp:
         self.settings.video_source = self.video_source.get()
         self.settings.window_capture_mode = self._window_capture_mode_key()
         self.settings.window_title, self.settings.window_process = self._selected_window_identity()
-        self.settings.audio_input = self.audio_input.get()
+        self.settings.audio_input = self._selected_audio_device_name()
         self.settings.audio_gain = self.audio_gain.get()
         self.settings.audio_filter_camera = self.audio_filter_camera.get()
         self.settings.audio_auto_start = self.audio_auto_start.get()
@@ -13297,8 +17054,9 @@ class PokeControllerApp:
         self.softcon_home_button.configure(bg="#343434", fg="#FFFFFF")
 
     def _queue_software_controller(self, action, buttons):
-        """Keep serial I/O out of Tk button press/release callbacks."""
+        """Keep serial I/O out of Tk callbacks and supersede stale input."""
         try:
+            self._note_resource_interaction()
             # Manual input temporarily owns the controller.  Pausing at the
             # command's next 10-20 ms checkpoint prevents its next packet from
             # immediately overwriting what the user just pressed.
@@ -13311,46 +17069,84 @@ class PokeControllerApp:
                     else:
                         command.pause_requested = True
                     self._software_controller_paused_command = command
-            self._software_controller_queue.put_nowait((action, buttons))
+            version = self._software_controller_state.update(action, buttons)
+            self._enqueue_latest_software_controller_version(version)
         except Exception as error:
             self._logger.warning("Software Controller queue failed: %s", error)
 
+    def _enqueue_latest_software_controller_version(self, version):
+        """Replace an unsent state version without losing task accounting."""
+        while True:
+            try:
+                self._software_controller_queue.put_nowait(version)
+                return
+            except queue.Full:
+                try:
+                    self._software_controller_queue.get_nowait()
+                    self._software_controller_queue.task_done()
+                except queue.Empty:
+                    # The sender consumed it between Full and get_nowait.
+                    continue
+
     def _software_controller_loop(self):
         while True:
-            action, buttons = self._software_controller_queue.get()
+            version = self._software_controller_queue.get()
+            pending_count = 1
             try:
-                if action == "hold":
-                    if not self._software_controller_override_active:
-                        self.keys_software_controller.begin_manual_override()
-                        self._software_controller_override_active = True
-                    self.keys_software_controller.hold(buttons)
-                elif action == "holdEnd":
-                    self.keys_software_controller.holdEnd(buttons)
-                elif action == "neutral":
-                    self.keys_software_controller.neutral()
-                if (self._software_controller_override_active
-                        and action in ("holdEnd", "neutral")
-                        and not self.keys_software_controller.holdButton):
+                # Collapse queued mouse events before touching the serial port.
+                # Only the newest complete state is useful after any backlog.
+                while True:
+                    try:
+                        version = self._software_controller_queue.get_nowait()
+                        pending_count += 1
+                    except queue.Empty:
+                        break
+                controls = self._software_controller_state.snapshot_if_current(version)
+                if controls is None:
+                    continue
+                if controls and not self._software_controller_override_active:
+                    self.keys_software_controller.begin_manual_override()
+                    self._software_controller_override_active = True
+                self.keys_software_controller.replace_hold(controls)
+                self._record_software_controller_state()
+                _, latest_controls = self._software_controller_state.latest_snapshot()
+                if (self._software_controller_override_active and not latest_controls):
                     # Send the final neutral packet before allowing Commands
                     # to write again.
                     self.keys_software_controller.end_manual_override()
                     self._software_controller_override_active = False
                 command = self._software_controller_paused_command
-                if (command is not None and action in ("holdEnd", "neutral")
-                        and not self.keys_software_controller.holdButton):
+                if command is not None and not latest_controls:
                     if hasattr(command, "resume"):
                         command.resume()
                     else:
                         command.pause_requested = False
                     self._software_controller_paused_command = None
             except Exception as error:
+                _, latest_controls = self._software_controller_state.latest_snapshot()
                 if (self._software_controller_override_active
-                        and not self.keys_software_controller.holdButton):
+                        and not latest_controls):
                     self.keys_software_controller.end_manual_override()
                     self._software_controller_override_active = False
                 self._logger.warning("Software Controller send failed: %s", error)
             finally:
-                self._software_controller_queue.task_done()
+                for _ in range(pending_count):
+                    self._software_controller_queue.task_done()
+
+    def _record_software_controller_state(self):
+        """Record the exact coalesced on-screen state, including HOME."""
+        try:
+            formatter = self.keys_software_controller.format
+            if self.keys_software_controller.serial_data_format_name == "3DS Controller":
+                message = " ".join(map(str, formatter.convert2list2()))
+            elif self.keys_software_controller.serial_data_format_name == "Qingpi":
+                message = " ".join(map(str, formatter.convert2list()))
+            else:
+                message = formatter.convert2str()
+            self._record_operation_input(
+                message, time.monotonic(), source="software_controller")
+        except Exception as error:
+            self._logger.warning("Software Controller input recording failed: %s", error)
 
 
 # ToolTipのクラスは以下のサイトを参考に作成
@@ -13412,7 +17208,10 @@ class StdoutRedirector(object):
 
     def __init__(self, text_widget):
         self.text_space = text_widget
-        self._buffer = []
+        self._buffer = deque()
+        self._buffer_chars = 0
+        self._buffer_dropped = False
+        self._max_pending_chars = 250000
         self._buffer_lock = threading.Lock()
         self._closed = False
         self._display_chars = 0
@@ -13424,12 +17223,34 @@ class StdoutRedirector(object):
         # Commands run on worker threads. Never enter Tcl/Tk from those
         # threads; collect output and let the Tk timer insert one batch.
         with self._buffer_lock:
-            self._buffer.append(str(string))
+            value = str(string)
+            if len(value) > self._max_pending_chars:
+                value = value[-self._max_pending_chars:]
+                self._buffer.clear()
+                self._buffer_chars = 0
+                self._buffer_dropped = True
+            self._buffer.append(value)
+            self._buffer_chars += len(value)
+            while (self._buffer_chars > self._max_pending_chars
+                   and len(self._buffer) > 1):
+                self._buffer_chars -= len(self._buffer.popleft())
+                self._buffer_dropped = True
+            if self._buffer_chars > self._max_pending_chars and self._buffer:
+                tail = self._buffer.pop()[-self._max_pending_chars:]
+                self._buffer.clear()
+                self._buffer.append(tail)
+                self._buffer_chars = len(tail)
+                self._buffer_dropped = True
 
     def _drain(self):
         with self._buffer_lock:
             text = "".join(self._buffer)
-            self._buffer = []
+            dropped = self._buffer_dropped
+            self._buffer.clear()
+            self._buffer_chars = 0
+            self._buffer_dropped = False
+        if dropped:
+            text = "[表示待ちログが上限を超えたため、古い表示分を省略しました]\n" + text
         if text:
             try:
                 self.text_space.configure(state="normal")

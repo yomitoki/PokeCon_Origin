@@ -9,35 +9,35 @@ def etc_sendCommand(self, command_name, wait: float = 0.04):
     Lbutton_right2 = "0x0000 8"
     plusbutton1 = "0x0800 8"
     plusbutton2 = "0x0000 8"
+    Bbutton1  = "0x0008 8"
+    Bbutton2  = "0x0000 8"
+    Lbutton_rab1  = "0x0018 6"
+    Lbutton_rb1  = "0x0008 6"
 
     if command_name == "Lbutton_down":
-        self._etc_sendCommand_raw(Lbutton_down1, wait)
-        self._etc_sendCommand_raw(Lbutton_down2, wait)
+        self.sendCommand(Lbutton_down1, wait)
+        self.sendCommand(Lbutton_down2, wait)
     elif command_name == "Lbutton_up":
-        self._etc_sendCommand_raw(Lbutton_up1, wait)
-        self._etc_sendCommand_raw(Lbutton_up2, wait)
+        self.sendCommand(Lbutton_up1, wait)
+        self.sendCommand(Lbutton_up2, wait)
     elif command_name == "Lbutton_up_push":
-        self._etc_sendCommand_raw(Lbutton_up1, wait)
+        self.sendCommand(Lbutton_up1, wait)
     elif command_name == "Lbutton_up_pull":
-        self._etc_sendCommand_raw(Lbutton_up2, wait)
+        self.sendCommand(Lbutton_up2, wait)
     elif command_name == "Lbutton_left":
-        self._etc_sendCommand_raw(Lbutton_left1, wait)
-        self._etc_sendCommand_raw(Lbutton_left2, wait)
+        self.sendCommand(Lbutton_left1, wait)
+        self.sendCommand(Lbutton_left2, wait)
     elif command_name == "Lbutton_right":
-        self._etc_sendCommand_raw(Lbutton_right1, wait)
-        self._etc_sendCommand_raw(Lbutton_right2, wait)
+        self.sendCommand(Lbutton_right1, wait)
+        self.sendCommand(Lbutton_right2, wait)
     elif command_name == "plusbutton":
-        self._etc_sendCommand_raw(plusbutton1, wait)
-        self._etc_sendCommand_raw(plusbutton2, wait)
+        self.sendCommand(plusbutton1, wait)
+        self.sendCommand(plusbutton2, wait)
     elif command_name == "plusbutton_push":
-        self._etc_sendCommand_raw(plusbutton1, wait)
+        self.sendCommand(plusbutton1, wait)
     elif command_name == "plusbutton_release":
-        self._etc_sendCommand_raw(plusbutton2, wait)
+        self.sendCommand(plusbutton2, wait)
     else:
         raise ValueError("Unknown Switch command: " + str(command_name))
 
 
-def _etc_sendCommand_raw(self, row: str, wait: float = 0.04):
-    self.keys.ser.ser.write((row + "\r\n").encode("utf-8"))
-    self.wait(wait)
-    self.checkIfAlive()
