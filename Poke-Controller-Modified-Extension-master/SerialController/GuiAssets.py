@@ -748,7 +748,7 @@ class CaptureArea(tk.Canvas):
             top = self.winfo_toplevel()
             viewable = bool(top.winfo_viewable()) and top.state() != "iconic"
             focused = top.focus_displayof() is not None
-        except tk.TclError:
+        except (tk.TclError, KeyError):
             viewable, focused = True, True
         last_active, allow_full_rate = False, False
         if callable(self.render_priority_provider):

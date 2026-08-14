@@ -1,0 +1,53 @@
+import contextlib
+import importlib.util
+import io
+from pathlib import Path
+import tempfile
+import unittest
+
+
+REPOSITORY = Path(__file__).resolve().parents[1]
+TOOL_PATH = REPOSITORY / "PortablePackageTool" / "portable_package.py"
+SPEC = importlib.util.spec_from_file_location("portable_package_progress", TOOL_PATH)
+portable_package = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(portable_package)
+
+
+class PortableProgressTests(unittest.TestCase):
+    def test_packages_include_python314_compatibility_repair(self):
+        self.assertIn(
+            "Apply-PokeConCompatibilityFixes.ps1",
+            portable_package.PACKAGE_TOOL_FILES,
+        )
+
+    def test_progress_reports_percentage(self):
+        output = io.StringIO()
+        reporter = portable_package.ProgressReporter(100, interval=0)
+        with contextlib.redirect_stdout(output):
+            reporter.advance(25, "sample.bin")
+        self.assertIn("25.0%", output.getvalue())
+        self.assertIn("sample.bin", output.getvalue())
+
+    def test_required_space_includes_reserve(self):
+        source_bytes = 10 * 1024 * 1024
+        self.assertGreater(portable_package._required_free_bytes(source_bytes), source_bytes)
+
+    def test_large_file_is_streamed_and_split(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = root / "source"
+            package = root / "package"
+            source.mkdir()
+            package.mkdir()
+            sample = source / "sample.bin"
+            sample.write_bytes((b"PokeCon-progress-test" * 300_000)[:5 * 1024 * 1024])
+            progress = portable_package.ProgressReporter(sample.stat().st_size, interval=0)
+            record, volumes = portable_package._write_chunked_file(
+                package, 1, sample, source, 4 * 1024 * 1024, progress)
+            self.assertEqual(record["size"], sample.stat().st_size)
+            self.assertGreaterEqual(len(volumes), 2)
+            self.assertTrue(all(volume["size"] <= 4 * 1024 * 1024 for volume in volumes))
+
+
+if __name__ == "__main__":
+    unittest.main()

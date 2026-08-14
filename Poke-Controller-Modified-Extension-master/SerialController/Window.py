@@ -8320,7 +8320,7 @@ class PokeControllerApp:
         try:
             if self.root.focus_displayof() is None:
                 return
-        except tk.TclError:
+        except (tk.TclError, KeyError):
             return
         now = time.monotonic()
         if now - self._last_focus_mark_monotonic < 0.15:
@@ -8353,7 +8353,7 @@ class PokeControllerApp:
         try:
             if self.root.focus_displayof() is not None:
                 return
-        except tk.TclError:
+        except (tk.TclError, KeyError):
             return
         self._refresh_preview_priority_status()
         keys = getattr(self, "keys_software_controller", None)
@@ -8772,7 +8772,7 @@ class PokeControllerApp:
             requested = 30
         try:
             foreground = self.root.focus_displayof() is not None
-        except tk.TclError:
+        except (tk.TclError, KeyError):
             foreground = False
         if self._resource_main_effective:
             label = "メイン表示"
