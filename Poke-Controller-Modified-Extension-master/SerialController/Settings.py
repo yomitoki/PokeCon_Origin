@@ -7,6 +7,8 @@ import os
 import tkinter as tk
 from logging import getLogger  # , DEBUG, NullHandler
 
+from AudioLevelControl import sanitize_audio_level_settings
+
 
 class GuiSettings:
     SETTING_PATH = os.path.join(os.path.dirname(__file__), "profiles", "default", "settings.ini")
@@ -157,6 +159,22 @@ class GuiSettings:
         self.audio_gain = self.setting.get("Audio", "gain", fallback="100")
         self.audio_filter_camera = self.setting.getboolean("Audio", "filter_camera", fallback=False)
         self.audio_auto_start = self.setting.getboolean("Audio", "auto_start", fallback=False)
+        self.audio_auto_level = self.setting.getboolean(
+            "Audio", "auto_level", fallback=False)
+        self.audio_target_dbfs = self.setting.getfloat(
+            "Audio", "target_dbfs", fallback=-6.0)
+        self.audio_max_auto_gain = self.setting.getint(
+            "Audio", "max_auto_gain", fallback=800)
+        self.audio_limiter_ceiling_dbfs = self.setting.getfloat(
+            "Audio", "limiter_ceiling_dbfs", fallback=-1.0)
+        safe_audio = sanitize_audio_level_settings(
+            self.audio_gain, self.audio_target_dbfs,
+            self.audio_max_auto_gain, self.audio_limiter_ceiling_dbfs)
+        self.audio_gain = str(safe_audio["gain_percent"])
+        self.audio_target_dbfs = safe_audio["target_dbfs"]
+        self.audio_max_auto_gain = safe_audio["max_auto_gain_percent"]
+        self.audio_limiter_ceiling_dbfs = safe_audio[
+            "limiter_ceiling_dbfs"]
         self.vision_mode = self.setting.get("Analysis", "vision_mode", fallback="default")
         self.image_assist_enabled = self.setting.getboolean("Analysis", "image_assist_enabled", fallback=False)
         self.image_assist_output = self.setting.get("Analysis", "image_assist_output", fallback="Output#2")
@@ -347,7 +365,12 @@ class GuiSettings:
             "side_width_balance": "50",
             "show_software_controller": True,
         }
-        self.setting["Audio"] = {"input_device": "", "gain": "100", "filter_camera": False, "auto_start": False}
+        self.setting["Audio"] = {
+            "input_device": "", "gain": "100", "filter_camera": False,
+            "auto_start": False, "auto_level": False,
+            "target_dbfs": "-6.0", "max_auto_gain": "800",
+            "limiter_ceiling_dbfs": "-1.0",
+        }
         self.setting["Resource Control"] = {
             "enabled": True, "cpu_target": 90, "main_tool": False,
         }
@@ -477,6 +500,10 @@ class GuiSettings:
             "gain": self.audio_gain,
             "filter_camera": self.audio_filter_camera,
             "auto_start": self.audio_auto_start,
+            "auto_level": self.audio_auto_level,
+            "target_dbfs": self.audio_target_dbfs,
+            "max_auto_gain": self.audio_max_auto_gain,
+            "limiter_ceiling_dbfs": self.audio_limiter_ceiling_dbfs,
         }
         self.setting["Resource Control"] = {
             "enabled": self.resource_control_enabled,

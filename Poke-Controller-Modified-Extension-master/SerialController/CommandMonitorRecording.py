@@ -235,7 +235,7 @@ def execution_location_key(location):
             int(location.get("line", 0) or 0))
 
 
-def historical_retention_ids(chunks, keep_unique_steps=5,
+def historical_retention_ids(chunks, keep_unique_steps=15,
                              long_step_seconds=180.0, loop_cycles=3):
     """Choose a bounded useful tail of unprotected previous recordings."""
     temporary = [chunk for chunk in chunks if not chunk.get("pinned")]
@@ -276,6 +276,21 @@ def temporary_chunk_ids_for_session(chunks, session_id):
             and not chunk.get("delete_pending")
             and chunk.get("id") not in (None, ""))
     }
+
+
+def apply_stopped_session_recording_choice(chunks, session_id, save):
+    """Apply the explicit Stop dialog choice to this Commands run only.
+
+    Saving also protects the retained chunks so the next historical cleanup
+    cannot remove footage which the user explicitly chose to keep.
+    """
+    target_ids = temporary_chunk_ids_for_session(chunks, session_id)
+    for chunk in chunks:
+        if str(chunk.get("id", "")) not in target_ids:
+            continue
+        chunk["pinned"] = bool(save)
+        chunk["delete_pending"] = not bool(save)
+    return target_ids
 
 
 class DarkStillFrameDetector:
@@ -529,15 +544,16 @@ class CommandStateTimeline:
                 break
         return cutoff
 
-    def failure_window(self, keep_unique_steps=5, terminal_time=None,
-                       terminal_mode="dark_still"):
+    def failure_window(self, keep_unique_steps=15, terminal_time=None,
+                       terminal_mode="dark_still", terminal_started_at=None):
         """Return the useful evidence window ending at a detected failure.
 
         For an unescaped loop, only the distinct Steps immediately before the
         loop and the first detected loop cycles are useful.  A/B/A/B is two
-        distinct Steps, not four.  For dark/still or input inactivity, callers
-        pass the configured post-stall evidence cutoff (normally 60 seconds),
-        so only the later meaningless inactive tail is excluded.
+        distinct Steps, not four.  For explicit Stop, dark/still, or input
+        inactivity, callers pass both the problem start and the configured
+        evidence cutoff (normally 60 seconds).  The configured number of
+        distinct Steps before the problem is retained with that failure tail.
         """
         if self.active_loop:
             anchor_index = max(0, int(self.active_loop.get("anchor_index", 0)))
@@ -552,11 +568,31 @@ class CommandStateTimeline:
             }
         if terminal_time is not None:
             terminal_time = float(terminal_time)
-            preceding = [event for event in self.events
-                         if float(event["time"]) <= terminal_time]
+            if terminal_started_at is None:
+                preceding = [event for event in self.events
+                             if float(event["time"]) <= terminal_time]
+                problem_event = None
+            else:
+                terminal_started_at = float(terminal_started_at)
+                problem_index = None
+                for index, event in enumerate(self.events):
+                    if float(event["time"]) <= terminal_started_at:
+                        problem_index = index
+                    else:
+                        break
+                problem_event = self.events[problem_index] \
+                    if problem_index is not None else None
+                # The configured count means Steps *before* the problem Step.
+                # Repeated paths are deduplicated, so A/B/A/B still counts as
+                # two prior Steps rather than four transitions.
+                preceding = self.events[:problem_index] \
+                    if problem_index is not None else []
             keep_after = self._unique_cutoff(preceding, keep_unique_steps)
             if keep_after is None:
-                keep_after = terminal_time
+                keep_after = float(problem_event["time"]) \
+                    if problem_event is not None else float(
+                        terminal_started_at if terminal_started_at is not None
+                        else terminal_time)
             return {"keep_after": float(keep_after),
                     "keep_before": terminal_time,
                     "mode": str(terminal_mode or "terminal")}
@@ -569,12 +605,13 @@ class CommandStateTimeline:
         count = self.active_loop["period"] * cycles
         return self.events[max(0, len(self.events) - count)]["time"]
 
-    def retention(self, now, keep_unique_steps=5, long_step_seconds=180.0,
-                  loop_cycles=None, terminal_time=None,
-                  terminal_mode="dark_still"):
+    def retention(self, now, keep_unique_steps=15, long_step_seconds=180.0,
+                   loop_cycles=None, terminal_time=None,
+                   terminal_mode="dark_still", terminal_started_at=None):
         failure = self.failure_window(
             keep_unique_steps=keep_unique_steps, terminal_time=terminal_time,
-            terminal_mode=terminal_mode)
+            terminal_mode=terminal_mode,
+            terminal_started_at=terminal_started_at)
         if failure is not None:
             return {
                 "keep_after": failure["keep_after"],

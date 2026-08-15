@@ -2,13 +2,19 @@ import datetime
 import ast
 import inspect
 import os
+import queue
 import sys
 import json
 import tempfile
 import threading
 import time
+import types
 import unittest
 import struct
+import wave
+import cv2
+import numpy
+from PIL import Image
 from collections import namedtuple
 from unittest import mock
 
@@ -43,7 +49,9 @@ from SampleFunctionSync import (compare_folder as compare_sample_function_folder
                                 replace_fragment_function_text,
                                 replace_class_functions,
                                 restore_sample_sync_backup,
+                                resolve_fragment_folder,
                                 side_by_side_diff_rows,
+                                source_paths_equivalent,
                                 source_paths_for_folder,
                                 update_fragments as update_sample_fragments,
                                 update_source as update_source_from_samples)
@@ -71,6 +79,7 @@ from SourceDependencyTools import (analyze_source_dependencies,
                                    state_dictionary_names,
                                    suggest_state_dictionary)
 from SampleLibrary import compose_preview, save_library
+from PokeConDevStudio import pack_scrollable_widget
 from SampleOriginSync import (apply_sample_list_to_origins,
                               compare_sample_list_origins,
                               restore_origin_sync_backup)
@@ -92,6 +101,9 @@ from InputSetRuntimeRegistry import (ActiveInputSetRegistry,
                                      device_usage_conflicts,
                                      main_resource_conflicts,
                                      process_identity, read_active_input_sets)
+from PokeConRecovery import (PokeConRecoveryError, discover_running_pokecon,
+                             force_terminate, request_normal_close,
+                             validate_recovery_target)
 from ResourceControl import (clamp_cpu_target, resource_throttle_level,
                              throttle_multiplier)
 from ImageDetectionMonitor import (filter_target_names, format_show_value_entries,
@@ -105,11 +117,46 @@ from ImageCheckReferenceAudit import (audit_image_check_references,
                                       preserve_library_import_block)
 from ImageDetectionLibrary import generate_image_check
 from CompletionEngine import CompletionEngine
+from Camera import (Camera, camera_fourcc_name,
+                    camera_frame_freshness_timeout, camera_reader_backoff)
+from Commands.PythonCommandBase import (ImageProcPythonCommand,
+                                        PythonCommand)
+from LocalFunction.ImageDetection import _command_frame
+from AudioMonitor import (AudioMonitor, StreamingAudioRateConverter,
+                          fit_audio_block, plan_audio_buffer_consume)
+from AudioLevelControl import (AdaptivePeakNormalizer,
+                               sanitize_audio_level_settings,
+                               suggest_audio_level_settings)
+from WindowsAudioIdentity import (enrich_saved_audio_identity,
+                                  identity_for_audio_label,
+                                  normalized_audio_name,
+                                  physical_usb_key,
+                                  resolve_saved_audio,
+                                  upgrade_input_set_audio_identities,
+                                  usb_connection_token)
+from GuiAssets import (CaptureArea, hold_last_preview_on_missing_frame,
+                       prepare_disabled_preview_image,
+                       prepare_preview_image)
 from PokeConShowInfo import (installed_distribution_version,
                              requirement_distribution_name)
-from UiResponsiveness import preview_capture_interval, preview_render_interval
+from Recording import CaptureRecorder, audio_callback_presentation_time
+from RecordingSyncRepair import (audio_advance_filter, wav_info,
+                                 write_without_exact_zeros)
+from UiResponsiveness import (compensated_after_delay,
+                              confirmation_audio_action,
+                              foreground_process_id,
+                              foreground_process_matches,
+                              keyboard_listener_should_run,
+                              preview_capture_interval, preview_priority,
+                              preview_rate_permissions,
+                              preview_render_due, preview_render_interval,
+                              resize_safe_preview_intervals)
+from VideoInputPolicy import (consume_combobox_mousewheel,
+                              guard_combobox_mousewheel,
+                              is_pokecon_window_title)
 from CommandMonitorRecording import (CommandInputActivityTracker,
                                      CommandStateTimeline, DarkStillFrameDetector,
+                                     apply_stopped_session_recording_choice,
                                      command_source_descriptor,
                                      failure_evidence_end,
                                      runtime_execution_location,
@@ -781,6 +828,28 @@ class InputSetRuntimeRegistryTests(unittest.TestCase):
             self.assertEqual(device_usage_conflicts(
                 second.entries(include_self=False), "camera", camera_key), [])
 
+    def test_confirmation_audio_output_claim_is_machine_wide(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = os.path.join(temporary, "active_windows.json")
+            provider = lambda pid: "{}:start".format(pid)
+            first = ActiveInputSetRegistry(
+                path, identity_provider=provider, token="first", pid=611)
+            second = ActiveInputSetRegistry(
+                path, identity_provider=provider, token="second", pid=612)
+            output_key = canonical_device_key(
+                "audio_output", "confirmation")
+            first.set_device(
+                "audio_output", output_key,
+                "PokeCon confirmation playback")
+            conflicts = device_usage_conflicts(
+                second.entries(include_self=False),
+                "audio_output", output_key)
+            self.assertEqual([entry["pid"] for entry in conflicts], [611])
+            first.set_device("audio_output", "", "")
+            self.assertEqual(device_usage_conflicts(
+                second.entries(include_self=False),
+                "audio_output", output_key), [])
+
     def test_main_resource_role_is_unique_across_processes(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = os.path.join(temporary, "active_windows.json")
@@ -795,6 +864,101 @@ class InputSetRuntimeRegistryTests(unittest.TestCase):
             self.assertEqual([item["pid"] for item in conflicts], [701])
             first.close()
             self.assertTrue(second.set_resource_state(main_requested=True))
+
+
+class PokeConRecoveryTests(unittest.TestCase):
+    def test_discovery_merges_profile_input_set_with_machine_activity(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            profiles = os.path.join(temporary, "profiles")
+            profile_dir = os.path.join(profiles, "default")
+            os.makedirs(profile_dir)
+            input_path = os.path.join(profile_dir, "active_input_sets.json")
+            activity_path = os.path.join(temporary, "active_windows.json")
+            identities = {101: "101:start-a", 202: "202:start-b"}
+            provider = lambda pid: identities.get(pid)
+
+            input_registry = ActiveInputSetRegistry(
+                input_path, profile="default", identity_provider=provider,
+                token="input", pid=101)
+            input_registry.set_active("Switch_No1", "Switch 1")
+            activity_registry = ActiveInputSetRegistry(
+                activity_path, profile="default", identity_provider=provider,
+                token="activity", pid=101)
+            activity_registry.mark_focused(marker=10)
+            activity_registry.set_resource_state(main_requested=True)
+            unselected_registry = ActiveInputSetRegistry(
+                activity_path, profile="spare", identity_provider=provider,
+                token="unselected", pid=202)
+            unselected_registry.mark_focused(marker=20)
+
+            entries = discover_running_pokecon(
+                profiles, identity_provider=provider, activity_path=activity_path)
+            self.assertEqual([entry["pid"] for entry in entries], [202, 101])
+            selected = next(entry for entry in entries if entry["pid"] == 101)
+            self.assertEqual(selected["input_set"], "Switch_No1")
+            self.assertEqual(selected["combined_set"], "Switch 1")
+            self.assertTrue(selected["resource"]["main_effective"])
+
+    def test_discovery_keeps_duplicate_input_set_processes_separate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            profiles = os.path.join(temporary, "profiles")
+            profile_dir = os.path.join(profiles, "default")
+            os.makedirs(profile_dir)
+            input_path = os.path.join(profile_dir, "active_input_sets.json")
+            activity_path = os.path.join(temporary, "missing_activity.json")
+            identities = {301: "301:start-a", 302: "302:start-b"}
+            provider = lambda pid: identities.get(pid)
+            first = ActiveInputSetRegistry(
+                input_path, identity_provider=provider, token="first", pid=301)
+            second = ActiveInputSetRegistry(
+                input_path, identity_provider=provider, token="second", pid=302)
+            first.set_active("SameInputSet")
+            second.set_active("SameInputSet")
+
+            entries = discover_running_pokecon(
+                profiles, identity_provider=provider, activity_path=activity_path)
+            self.assertEqual([entry["pid"] for entry in entries], [301, 302])
+
+    def test_pid_reuse_is_rejected_before_recovery_action(self):
+        entry = {"pid": 401, "process_identity": "401:old"}
+        with self.assertRaises(PokeConRecoveryError):
+            validate_recovery_target(
+                entry, identity_provider=lambda _pid: "401:new", self_pid=999)
+
+    def test_force_terminate_targets_one_verified_pokecon_only(self):
+        identities = {501: "501:start"}
+        terminated = []
+        entry = {"pid": 501, "process_identity": "501:start"}
+        result = force_terminate(
+            entry, identity_provider=lambda pid: identities.get(pid),
+            window_provider=lambda _pid: [
+                (11, "Poke-Controller Modified Extension ver.0.1.7")],
+            terminator=terminated.append, self_pid=999)
+        self.assertEqual(result, 501)
+        self.assertEqual(terminated, [501])
+
+    def test_force_terminate_refuses_non_pokecon_window(self):
+        terminated = []
+        entry = {"pid": 601, "process_identity": "601:start"}
+        with self.assertRaises(PokeConRecoveryError):
+            force_terminate(
+                entry, identity_provider=lambda _pid: "601:start",
+                window_provider=lambda _pid: [(12, "Google Chrome")],
+                terminator=terminated.append, self_pid=999)
+        self.assertEqual(terminated, [])
+
+    def test_normal_close_posts_only_to_pokecon_main_window(self):
+        posted = []
+        entry = {"pid": 701, "process_identity": "701:start"}
+        result = request_normal_close(
+            entry, identity_provider=lambda _pid: "701:start",
+            window_provider=lambda _pid: [
+                (21, "PokeCon 固まり復旧"),
+                (22, "Poke-Controller Modified Extension ver.0.1.7")],
+            post_close=lambda hwnd: posted.append(hwnd) or True,
+            self_pid=999)
+        self.assertEqual(result, 701)
+        self.assertEqual(posted, [22])
 
 
 class InputSetDataTests(unittest.TestCase):
@@ -1116,6 +1280,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
         generated = generate_image_check(library, "POKEMON_ZA_ALL", "list")
         self.assertIn("POKEMON_ZA_KOHUKI_ICON_GET5", generated)
+        self.assertIn("image_check_confirmation", generated)
 
         source_path = os.path.join(
             SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
@@ -1128,6 +1293,33 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             source,
             r'image_check\("POKEMON_ZA_KOHUKI_ICON_GET4"\)\s*'
             r'and self\.image_check\("POKEMON_ZA_KOHUKI_ICON_GET5"\)')
+
+    def test_za_white_comment_accepts_both_arrow_animation_states(self):
+        profile_path = os.path.join(
+            SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
+        with open(profile_path, "r", encoding="utf-8") as stream:
+            library = json.load(stream)
+
+        variants = library["targets"][
+            "POKEMON_ZA_TEXT_WHITE_COMMENT"]["variants"]
+        template_paths = {variant["template_path"] for variant in variants}
+        self.assertEqual(template_paths, {
+            "Template/ZA_Story/Common/white_comment.png",
+            "Template/ZA_Story/Common/white_comment2.png",
+        })
+        self.assertEqual({tuple(variant["crop"]) for variant in variants}, {
+            (300, 555, 1000, 700),
+        })
+
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+        self.assertIn(
+            'IMAGE_DETECTION_TARGETS["POKEMON_ZA_TEXT_WHITE_COMMENT"].extend(',
+            source)
+        self.assertNotIn("def image_check_confirmation", source)
 
 
 class ImageHealthCheckTests(unittest.TestCase):
@@ -1635,16 +1827,33 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         self.assertEqual(retention["keep_before"], 10.0)
         self.assertEqual(timeline.active_loop["period"], 2)
 
-    def test_dark_still_failure_keeps_only_the_last_five_steps_to_detection(self):
+    def test_dark_still_failure_keeps_five_steps_before_the_problem_step(self):
         timeline = CommandStateTimeline(loop_cycles=3)
         for now, value in enumerate(("A", "B", "C", "D", "E", "F")):
             timeline.add({"STATE": value}, now)
         retention = timeline.retention(
             60, keep_unique_steps=5, long_step_seconds=180,
-            loop_cycles=3, terminal_time=5.0)
+            loop_cycles=3, terminal_time=60.0,
+            terminal_started_at=5.0)
         self.assertEqual(retention["mode"], "dark_still")
+        self.assertEqual(retention["keep_after"], 0.0)
+        self.assertEqual(retention["keep_before"], 60.0)
+
+    def test_problem_window_keeps_fifteen_distinct_prior_steps(self):
+        timeline = CommandStateTimeline(loop_cycles=3)
+        values = (["OLD"] + ["P{}".format(index) for index in range(1, 14)]
+                  + ["A", "B", "A", "B", "STUCK"])
+        for now, value in enumerate(values):
+            timeline.add({"STATE": value}, now)
+        retention = timeline.retention(
+            100.0, keep_unique_steps=15, long_step_seconds=180,
+            terminal_time=78.0, terminal_mode="manual_stop",
+            terminal_started_at=18.0)
+        # A/B/A/B contributes two distinct prior Steps, so OLD is the only
+        # sixteenth prior Step excluded from the saved window.
         self.assertEqual(retention["keep_after"], 1.0)
-        self.assertEqual(retention["keep_before"], 5.0)
+        self.assertEqual(retention["keep_before"], 78.0)
+        self.assertEqual(retention["mode"], "manual_stop")
 
     def test_key_inactivity_waits_sixty_seconds_and_clears_on_recovery(self):
         tracker = CommandInputActivityTracker(timeout_seconds=60.0)
@@ -1759,6 +1968,38 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             temporary_chunk_ids_for_session(chunks, "run-2"), {"current"})
         self.assertEqual(temporary_chunk_ids_for_session(chunks, ""), set())
 
+    def test_stop_save_choice_protects_only_the_current_run(self):
+        chunks = [
+            {"id": "current", "command_session_id": "run-2",
+             "pinned": False, "delete_pending": False},
+            {"id": "protected", "command_session_id": "run-2",
+             "pinned": True, "delete_pending": False},
+            {"id": "previous", "command_session_id": "run-1",
+             "pinned": False, "delete_pending": False},
+        ]
+        selected = apply_stopped_session_recording_choice(
+            chunks, "run-2", save=True)
+        self.assertEqual(selected, {"current"})
+        self.assertTrue(chunks[0]["pinned"])
+        self.assertFalse(chunks[0]["delete_pending"])
+        self.assertFalse(chunks[2]["pinned"])
+
+    def test_stop_do_not_save_choice_deletes_only_the_current_run(self):
+        chunks = [
+            {"id": "current", "command_session_id": "run-2",
+             "pinned": False, "delete_pending": False},
+            {"id": "protected", "command_session_id": "run-2",
+             "pinned": True, "delete_pending": False},
+            {"id": "previous", "command_session_id": "run-1",
+             "pinned": False, "delete_pending": False},
+        ]
+        selected = apply_stopped_session_recording_choice(
+            chunks, "run-2", save=False)
+        self.assertEqual(selected, {"current"})
+        self.assertFalse(chunks[0]["pinned"])
+        self.assertTrue(chunks[0]["delete_pending"])
+        self.assertFalse(chunks[2]["delete_pending"])
+
 
 class PackageVersionCompatibilityTests(unittest.TestCase):
     def test_requirement_name_supports_versions_and_environment_markers(self):
@@ -1773,6 +2014,1267 @@ class PackageVersionCompatibilityTests(unittest.TestCase):
 
 
 class MultiInstanceResponsivenessTests(unittest.TestCase):
+    def test_confirmation_audio_belongs_to_one_runtime_main(self):
+        self.assertEqual(confirmation_audio_action(
+            requested=True, runtime_owner=True), "start")
+        self.assertEqual(confirmation_audio_action(
+            requested=True, runtime_owner=False), "wait")
+        self.assertEqual(confirmation_audio_action(
+            requested=True, runtime_owner=True,
+            other_output_active=True), "wait")
+        self.assertEqual(confirmation_audio_action(
+            requested=True, runtime_owner=False,
+            stream_active=True), "stop")
+        self.assertEqual(confirmation_audio_action(
+            requested=True, runtime_owner=True, other_output_active=True,
+            stream_active=True), "stop")
+        self.assertEqual(confirmation_audio_action(
+            requested=True, runtime_owner=False, stream_active=True,
+            recording_uses_output=True), "keep")
+
+    def test_preview_frame_preparation_is_tk_free_and_converts_bgr(self):
+        frame = numpy.zeros((2, 3, 3), dtype=numpy.uint8)
+        frame[0, 0] = (11, 22, 33)
+        image = prepare_preview_image(frame, (3, 2))
+        self.assertEqual(image.size, (3, 2))
+        self.assertEqual(image.getpixel((0, 0)), (33, 22, 11))
+        self.assertEqual(prepare_preview_image(frame, (6, 4)).size, (6, 4))
+
+    def test_disabled_preview_always_covers_the_selected_show_size(self):
+        placeholder = Image.new("RGB", (640, 360), "black")
+        resized = prepare_disabled_preview_image(placeholder, (1280, 720))
+        self.assertEqual(resized.size, (1280, 720))
+        self.assertEqual(
+            prepare_disabled_preview_image(None, (320, 180)).size,
+            (320, 180))
+
+    def test_leaving_native_preview_erases_direct_gdi_pixels(self):
+        cleared = []
+        configured = []
+        wake_calls = []
+        native = types.SimpleNamespace(
+            clear=lambda size: cleared.append(tuple(size)))
+        preview = types.SimpleNamespace(
+            _native_preview_active=True, _native_preview=native,
+            _native_render_mode_lock=threading.Lock(),
+            _native_render_enabled=True,
+            _native_render_wake=threading.Event(),
+            camera=types.SimpleNamespace(
+                wakeFrameWait=lambda: wake_calls.append(True)),
+            show_size=(640, 360), im_=7,
+            itemconfig=lambda item, **kwargs: configured.append(
+                (item, kwargs)))
+        preview._disable_threaded_native_preview = types.MethodType(
+            CaptureArea._disable_threaded_native_preview, preview)
+        CaptureArea._leave_native_preview(preview)
+        self.assertEqual(cleared, [(640, 360)])
+        self.assertEqual(wake_calls, [True])
+        self.assertFalse(preview._native_preview_active)
+        self.assertEqual(configured, [(7, {"state": "normal"})])
+
+    def test_compatibility_preview_rejects_a_frame_left_from_previous_mode(self):
+        configured = []
+        preview = types.SimpleNamespace(
+            show_size=(640, 360), camera=types.SimpleNamespace(
+                frameSequence=lambda: 240),
+            _requested_fps=60, _last_rendered_frame_sequence=239,
+            _live_preview_tk=None, _live_preview_size=None, im_=7,
+            itemconfig=lambda *args, **kwargs: configured.append(
+                (args, kwargs)))
+        prepared = (
+            120, (640, 360), Image.new("RGB", (640, 360)),
+            numpy.zeros((360, 640, 3), dtype=numpy.uint8),
+            time.monotonic() - 1.0)
+        self.assertFalse(
+            CaptureArea._install_prepared_preview(preview, prepared))
+        self.assertEqual(configured, [])
+
+    def test_leaving_native_preview_seeds_current_tk_frame_before_clear(self):
+        events = []
+
+        class ExistingPhoto:
+            def paste(self, image):
+                events.append(("paste", image.getpixel((0, 0))))
+
+        frame = numpy.zeros((2, 3, 3), dtype=numpy.uint8)
+        frame[0, 0] = (11, 22, 33)
+        preview = types.SimpleNamespace(
+            _native_preview_active=True,
+            _discard_prepared_preview=lambda: events.append(("discard",)),
+            _disable_threaded_native_preview=lambda clear=False:
+                events.append(("clear", clear)),
+            _live_preview_tk=ExistingPhoto(), _live_preview_size=(3, 2),
+            show_size=(3, 2), im_=7, im=None,
+            itemconfig=lambda item, **kwargs:
+                events.append(("itemconfig", item, kwargs)),
+            _displaying_live_preview=False,
+            _last_rendered_frame_sequence=-1,
+            _last_submitted_frame_sequence=-1,
+            _last_preview_render_time=0.0,
+            _note_preview_frame=lambda now: events.append(("note", now)),
+            presentation_listener=lambda image, sequence, now:
+                events.append(("present", sequence)))
+        self.assertTrue(CaptureArea._leave_native_preview(
+            preview, frame, frame_sequence=42))
+        self.assertLess(
+            next(i for i, event in enumerate(events) if event[0] == "paste"),
+            next(i for i, event in enumerate(events) if event[0] == "clear"))
+        self.assertIn(("paste", (33, 22, 11)), events)
+        self.assertEqual(preview._last_rendered_frame_sequence, 42)
+
+    def test_image_command_first_check_requires_a_post_start_frame(self):
+        old_frame = object()
+        new_frame = object()
+
+        class CameraStub:
+            sequence = 10
+
+            def frameSequence(self):
+                return self.sequence
+
+            def waitForFrame(self, last_sequence, timeout):
+                if self.sequence == last_sequence:
+                    return self.sequence, old_frame
+                return self.sequence, new_frame
+
+            def readFreshFrame(self, timeout):
+                return new_frame
+
+        command = ImageProcPythonCommand.__new__(ImageProcPythonCommand)
+        command.camera = CameraStub()
+        command._camera_frame_unavailable_logged = False
+        command._logger = mock.Mock()
+        command._command_start_frame_sequence = None
+        command._require_new_frame_after_start = False
+        with mock.patch.object(PythonCommand, "start", return_value="started"):
+            self.assertEqual(command.start(None, None), "started")
+        self.assertIsNone(command._read_camera_frame())
+        command.camera.sequence = 11
+        self.assertIs(command._read_camera_frame(), new_frame)
+        self.assertFalse(command._require_new_frame_after_start)
+
+    def test_feature_limited_native_worker_draws_new_frame_without_tk(self):
+        draws = []
+        notes = []
+        presented = []
+        stop = threading.Event()
+        frame = numpy.zeros((2, 4, 3), dtype=numpy.uint8)
+
+        def draw(image, size):
+            draws.append((image, tuple(size)))
+            stop.set()
+            return True
+
+        preview = types.SimpleNamespace(
+            _native_render_stop=stop,
+            _native_render_enabled=True,
+            _native_render_wake=threading.Event(),
+            _native_render_mode_lock=threading.Lock(),
+            _native_preview=types.SimpleNamespace(draw=draw),
+            camera=types.SimpleNamespace(
+                waitForFrame=lambda _sequence, timeout: (4, frame)),
+            show_size=(640, 360),
+            _last_rendered_frame_sequence=-1,
+            _last_preview_render_time=0.0,
+            _note_preview_frame=notes.append,
+            presentation_listener=lambda image, sequence, timestamp:
+                presented.append((image, sequence, timestamp)),
+            _logger=types.SimpleNamespace(warning=lambda *args: None))
+        CaptureArea._native_render_loop(preview)
+        self.assertEqual(draws, [(frame, (640, 360))])
+        self.assertEqual(preview._last_rendered_frame_sequence, 4)
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(len(presented), 1)
+        self.assertIs(presented[0][0], frame)
+        self.assertEqual(presented[0][1], 4)
+        self.assertGreater(presented[0][2], 0.0)
+
+    def test_dev_studio_scroll_helper_adds_both_bars_and_local_wheel(self):
+        scrollbars = []
+
+        class FakeScrollbar:
+            def __init__(self, parent, orient, command):
+                self.parent = parent
+                self.orient = orient
+                self.command = command
+                self.packed = None
+                scrollbars.append(self)
+
+            def pack(self, **kwargs):
+                self.packed = kwargs
+
+            def set(self, *_args):
+                pass
+
+        class FakeWidget:
+            def __init__(self):
+                self.master = object()
+                self.configured = {}
+                self.packed = None
+                self.bindings = []
+                self.y_calls = []
+                self.x_calls = []
+
+            def yview(self, *_args):
+                pass
+
+            def xview(self, *_args):
+                pass
+
+            def yview_scroll(self, *args):
+                self.y_calls.append(args)
+
+            def xview_scroll(self, *args):
+                self.x_calls.append(args)
+
+            def configure(self, **kwargs):
+                self.configured.update(kwargs)
+
+            def pack(self, **kwargs):
+                self.packed = kwargs
+
+            def bind(self, event, callback, add=None):
+                self.bindings.append((event, callback, add))
+
+        widget = FakeWidget()
+        with mock.patch("PokeConDevStudio.ttk.Scrollbar", FakeScrollbar):
+            vertical, horizontal = pack_scrollable_widget(
+                widget, horizontal=True)
+        self.assertEqual(
+            [item.orient for item in scrollbars], ["vertical", "horizontal"])
+        self.assertIs(vertical, scrollbars[0])
+        self.assertIs(horizontal, scrollbars[1])
+        self.assertIn("yscrollcommand", widget.configured)
+        self.assertIn("xscrollcommand", widget.configured)
+        self.assertEqual(widget.bindings[0][0], "<MouseWheel>")
+        self.assertEqual(widget.bindings[0][2], "+")
+        wheel = widget.bindings[0][1]
+        self.assertEqual(
+            wheel(types.SimpleNamespace(delta=120, state=0)), "break")
+        self.assertEqual(widget.y_calls, [(-1, "units")])
+        self.assertEqual(
+            wheel(types.SimpleNamespace(delta=-120, state=1)), "break")
+        self.assertEqual(widget.x_calls, [(1, "units")])
+
+    def test_native_worker_consumes_camera_clear_without_spinning(self):
+        waits = []
+        stop = threading.Event()
+
+        def wait_for_frame(last_sequence, timeout):
+            waits.append(last_sequence)
+            if len(waits) > 1:
+                stop.set()
+            return 5, None
+
+        preview = types.SimpleNamespace(
+            _native_render_stop=stop,
+            _native_render_enabled=True,
+            _native_render_wake=threading.Event(),
+            _native_render_mode_lock=threading.Lock(),
+            _native_preview=types.SimpleNamespace(
+                draw=lambda _image, _size: self.fail("None frame was drawn")),
+            camera=types.SimpleNamespace(waitForFrame=wait_for_frame),
+            show_size=(640, 360),
+            _last_rendered_frame_sequence=-1,
+            _last_preview_render_time=0.0,
+            _note_preview_frame=lambda _now: None,
+            _logger=types.SimpleNamespace(warning=lambda *args: None))
+        CaptureArea._native_render_loop(preview)
+        self.assertEqual(waits, [-1, 5])
+
+    def test_tab_interaction_temporarily_yields_preview_rendering(self):
+        preview = types.SimpleNamespace(_ui_interaction_busy_until=0.0)
+        with mock.patch("GuiAssets.time.monotonic", return_value=10.0):
+            CaptureArea.prioritizeUiInteraction(preview, seconds=0.45)
+        self.assertEqual(preview._ui_interaction_busy_until, 10.45)
+
+    def test_feature_limited_preview_removes_overlays_and_range_bindings(self):
+        unbound = []
+        deleted = []
+        preview = types.SimpleNamespace(
+            _feature_limited=False, im_=1,
+            unbind=unbound.append, find_all=lambda: (1, 2, 3),
+            delete=deleted.append,
+            _bind_range_selection=lambda: None)
+        CaptureArea.setFeatureLimited(preview, True)
+        self.assertTrue(preview._feature_limited)
+        self.assertIn("<Shift-ButtonPress-1>", unbound)
+        self.assertEqual(deleted, [2, 3])
+
+    def test_windows_foreground_pid_owns_keyboard_and_preview_focus(self):
+        self.assertEqual(foreground_process_id(lambda: 123), 123)
+        self.assertTrue(foreground_process_matches(
+            pid=123, foreground_pid_provider=lambda: 123))
+        self.assertFalse(foreground_process_matches(
+            pid=123, foreground_pid_provider=lambda: 456))
+
+    def test_camera_reader_does_not_spin_faster_than_requested_fps(self):
+        class ImmediateCapture:
+            def __init__(self):
+                self.read_count = 0
+                self.opened = True
+
+            def read(self):
+                self.read_count += 1
+                return True, object()
+
+            def isOpened(self):
+                return self.opened
+
+            def release(self):
+                self.opened = False
+
+        camera = Camera(60)
+        capture = ImmediateCapture()
+        camera.camera = capture
+        camera._start_camera_reader()
+        time.sleep(0.12)
+        camera.destroy()
+        self.assertGreaterEqual(capture.read_count, 4)
+        self.assertLessEqual(capture.read_count, 12)
+
+    def test_blocking_60fps_camera_does_not_get_an_extra_short_wait(self):
+        interval = 1.0 / 60.0
+        self.assertEqual(camera_reader_backoff(interval, 0.015), 0.0)
+        self.assertAlmostEqual(
+            camera_reader_backoff(interval, 0.001), interval - 0.001)
+
+    def test_camera_reports_measured_input_fps_and_detects_a_stall(self):
+        camera = Camera(60)
+        for timestamp in (10.0, 10.25, 10.50, 10.75):
+            camera._note_frame_received(timestamp)
+        self.assertAlmostEqual(camera.measuredFps(10.80), 4.0)
+        self.assertEqual(camera.measuredFps(12.30), 0.0)
+
+    def test_camera_does_not_publish_the_last_frame_after_input_stalls(self):
+        camera = Camera(60)
+        frame = object()
+        camera.image_bgr = frame
+        camera._last_frame_received_at = time.monotonic()
+        self.assertIs(camera.readFrame(), frame)
+        camera._last_frame_received_at = time.monotonic() - 1.0
+        self.assertIsNone(camera.readFrame())
+        self.assertIs(camera.readFrame(allow_stale=True), frame)
+
+    def test_camera_fresh_read_waits_for_a_transient_gap_but_rejects_stall(self):
+        camera = Camera(60)
+        frame = object()
+
+        def publish():
+            time.sleep(0.03)
+            camera.image_bgr = frame
+            camera._frame_sequence += 1
+            camera._note_frame_received()
+
+        publisher = threading.Thread(target=publish)
+        publisher.start()
+        self.assertIs(camera.readFreshFrame(timeout=0.25), frame)
+        publisher.join()
+        camera._last_frame_received_at = time.monotonic() - 1.0
+        self.assertIsNone(camera.readFreshFrame(timeout=0.02))
+
+    def test_camera_frame_freshness_allows_driver_scheduling_headroom(self):
+        self.assertEqual(camera_frame_freshness_timeout(60), 0.25)
+        self.assertEqual(camera_frame_freshness_timeout(5), 0.8)
+        self.assertEqual(camera_frame_freshness_timeout("invalid"), 0.25)
+
+    def test_local_image_detection_does_not_fallback_to_stale_cache(self):
+        stale_frame = object()
+        camera = types.SimpleNamespace(
+            image_bgr=stale_frame, readFrame=lambda: None)
+        command = types.SimpleNamespace(camera=camera)
+        with self.assertRaisesRegex(RuntimeError, "新しい映像"):
+            _command_frame(command)
+
+    def test_local_image_detection_uses_transient_gap_recovery(self):
+        frame = object()
+        camera = types.SimpleNamespace(
+            readFreshFrame=lambda timeout: frame,
+            readFrame=lambda: None)
+        command = types.SimpleNamespace(camera=camera)
+        self.assertIs(_command_frame(command), frame)
+
+    def test_preview_reports_only_successful_draw_fps(self):
+        preview = types.SimpleNamespace(
+            _measured_preview_fps=0.0,
+            _preview_fps_measure_started=0.0,
+            _preview_fps_measure_frames=0,
+            _last_preview_frame_at=0.0)
+        for timestamp in (20.0, 20.25, 20.50, 20.75):
+            CaptureArea._note_preview_frame(preview, timestamp)
+        self.assertAlmostEqual(
+            CaptureArea.measuredPreviewFps(preview, 20.80), 4.0)
+        self.assertEqual(
+            CaptureArea.measuredPreviewFps(preview, 22.30), 0.0)
+
+    def test_resize_temporarily_yields_time_to_tk(self):
+        capture, render = resize_safe_preview_intervals(
+            1.0 / 60.0, 1.0 / 60.0, resizing=True)
+        self.assertEqual(capture, 1.0 / 30.0)
+        self.assertEqual(render, 1.0 / 15.0)
+        recording_capture, _ = resize_safe_preview_intervals(
+            1.0 / 60.0, 1.0 / 60.0,
+            resizing=True, background_work=True)
+        self.assertEqual(recording_capture, 1.0 / 60.0)
+
+    def test_keyboard_listener_runs_only_for_focused_pokecon(self):
+        self.assertTrue(keyboard_listener_should_run(True, True))
+        self.assertFalse(keyboard_listener_should_run(True, False))
+        self.assertFalse(keyboard_listener_should_run(False, True))
+
+    def test_requested_fps_is_applied_to_an_open_capture_device(self):
+        calls = []
+
+        class FakeCapture:
+            def isOpened(self):
+                return True
+
+            def set(self, prop, value):
+                calls.append((prop, value))
+                return True
+
+            def get(self, prop):
+                return 60.0
+
+        camera = Camera(30)
+        camera.camera = FakeCapture()
+        self.assertTrue(camera.setFps(60))
+        self.assertEqual(camera.fps, 60)
+        self.assertEqual(
+            [prop for prop, _value in calls],
+            [cv2.CAP_PROP_FRAME_WIDTH, cv2.CAP_PROP_FRAME_HEIGHT,
+             cv2.CAP_PROP_FPS, cv2.CAP_PROP_FOURCC])
+        self.assertEqual(
+            calls[-1][1], cv2.VideoWriter_fourcc(*"MJPG"))
+        self.assertEqual(calls[-2][1], 60)
+
+    def test_camera_fourcc_diagnostic_decodes_mjpg(self):
+        self.assertEqual(camera_fourcc_name(
+            cv2.VideoWriter_fourcc(*"MJPG")), "MJPG")
+        self.assertEqual(camera_fourcc_name(-1), "")
+
+    def test_camera_native_lifecycle_is_serialized(self):
+        camera = Camera(60)
+        active = 0
+        peak = 0
+        lock = threading.Lock()
+
+        def fake_open(_camera_id):
+            nonlocal active, peak
+            with lock:
+                active += 1
+                peak = max(peak, active)
+            time.sleep(0.03)
+            with lock:
+                active -= 1
+
+        camera._open_camera_locked = fake_open
+        first = threading.Thread(target=camera.openCamera, args=(0,))
+        second = threading.Thread(target=camera.openCamera, args=(1,))
+        first.start()
+        second.start()
+        first.join()
+        second.join()
+        self.assertEqual(peak, 1)
+
+    def test_camera_open_returns_atomic_native_result(self):
+        camera = Camera(60)
+        camera._open_camera_locked = lambda camera_id: camera_id == 4
+        self.assertTrue(camera.openCamera(4))
+        self.assertFalse(camera.openCamera(3))
+
+    def test_main_tool_keeps_full_rate_while_another_app_has_focus(self):
+        self.assertEqual(
+            preview_priority(False, True, False), (True, True))
+        self.assertEqual(
+            preview_priority(False, False, True), (False, False))
+        self.assertEqual(
+            preview_priority(True, False, True), (True, True))
+        self.assertEqual(
+            preview_priority(False, False, False, keep_warm=True),
+            (True, False))
+        self.assertAlmostEqual(
+            preview_render_interval(
+                60, focused=False, viewable=True, full_rate=True),
+            1.0 / 60.0)
+        self.assertAlmostEqual(
+            preview_capture_interval(
+                60, focused=False, viewable=True, full_rate=True),
+            1.0 / 60.0)
+        self.assertAlmostEqual(
+            preview_render_interval(
+                60, focused=False, viewable=False, full_rate=True),
+            1.0 / 60.0)
+        self.assertAlmostEqual(
+            preview_render_interval(
+                60, focused=False, viewable=True, full_rate=False),
+            0.2)
+
+    def test_main_preview_permission_follows_pokecon_owner_and_wait_state(self):
+        # The checked owner is unique, so neither a browser nor another
+        # PokeCon in front revokes its rate. A finalization wait still does.
+        self.assertEqual(
+            preview_rate_permissions(True, False, False, False), (True, False))
+        self.assertEqual(
+            preview_rate_permissions(True, True, False, False), (True, False))
+        self.assertEqual(
+            preview_rate_permissions(True, False, True, True), (False, False))
+
+    def test_preview_timer_subtracts_frame_conversion_work(self):
+        self.assertEqual(compensated_after_delay(
+            1.0 / 60.0, started_at=10.0, now=10.006), 11)
+        self.assertEqual(compensated_after_delay(
+            1.0 / 60.0, started_at=10.0, now=10.020), 1)
+
+    def test_recording_can_request_high_precision_capture_while_preview_is_capped(self):
+        delays = []
+        preview = types.SimpleNamespace(
+            _capture_high_precision_requested=True,
+            after=lambda delay, _callback: delays.append(delay),
+            capture=lambda: None)
+        with mock.patch(
+                "GuiAssets.compensated_after_delay", return_value=14):
+            CaptureArea._schedule_next_capture(
+                preview, 1.0 / 60.0, time.monotonic(),
+                high_precision=False)
+        self.assertEqual(delays, [4])
+
+    def test_audio_packet_gap_becomes_silence_without_shifting_later_audio(self):
+        class FakeWave:
+            def __init__(self):
+                self.data = bytearray()
+
+            def writeframesraw(self, payload):
+                self.data.extend(payload)
+
+        recorder = CaptureRecorder()
+        recorder.audio = FakeWave()
+        recorder.audio_channels = 1
+        recorder.audio_sample_rate = 10
+        recorder.audio_gain = 1.0
+        recorder.audio_frames_written = 0
+        first = struct.pack("<hh", 100, 200)
+        second = struct.pack("<hh", 300, 400)
+        recorder._write_audio_packet(0, 2, first)
+        recorder._write_audio_packet(2, 2, second)
+        self.assertEqual(
+            struct.unpack("<hhhhhh", bytes(recorder.audio.data)),
+            (100, 200, 0, 0, 300, 400))
+        self.assertEqual(recorder.audio_frames_written, 6)
+
+    def test_peak_normalizer_brings_measured_usb_level_to_target(self):
+        normalizer = AdaptivePeakNormalizer(
+            48000, enabled=True, target_dbfs=-6.0,
+            max_gain_percent=200, ceiling_dbfs=-1.0)
+        # The measured -23.8 dBFS input is first raised by the configured
+        # manual 400% gain, then the automatic stage supplies the remainder.
+        signal = numpy.full((480, 1), 0.064453 * 4.0, dtype=numpy.float32)
+        output = normalizer.process(signal)
+        self.assertAlmostEqual(float(numpy.max(numpy.abs(output))),
+                               10 ** (-6.0 / 20.0), places=4)
+        self.assertGreater(normalizer.last_info["adaptive_gain"], 1.9)
+
+    def test_audio_auto_preset_keeps_loud_target_without_manual_pre_gain(self):
+        settings = suggest_audio_level_settings(-23.8)
+        self.assertEqual(settings["gain_percent"], 100)
+        self.assertEqual(settings["target_dbfs"], -6.0)
+        self.assertEqual(settings["max_auto_gain_percent"], 800)
+        self.assertEqual(settings["limiter_ceiling_dbfs"], -1.0)
+        self.assertIsNone(suggest_audio_level_settings(-80.0))
+        self.assertIsNone(suggest_audio_level_settings("invalid"))
+
+    def test_audio_auto_preset_adjusts_target_and_limiter_from_rms(self):
+        settings = suggest_audio_level_settings(
+            -23.8, raw_rms_dbfs=-39.4)
+        self.assertEqual(settings["target_dbfs"], -4.0)
+        self.assertEqual(settings["limiter_ceiling_dbfs"], -1.0)
+        self.assertEqual(settings["max_auto_gain_percent"], 800)
+        clipped = suggest_audio_level_settings(
+            -0.01, raw_rms_dbfs=-12.0, raw_clip_blocks=3)
+        self.assertEqual(clipped["target_dbfs"], -9.0)
+        self.assertEqual(clipped["limiter_ceiling_dbfs"], -3.0)
+
+    def test_audio_auto_preset_reserves_repeatable_loud_effect_headroom(self):
+        settings = suggest_audio_level_settings(
+            -24.5, raw_rms_dbfs=-35.5,
+            raw_loud_peak_dbfs=-9.0)
+        self.assertEqual(settings["target_dbfs"], -7.0)
+        self.assertEqual(settings["max_auto_gain_percent"], 750)
+        self.assertEqual(settings["limiter_ceiling_dbfs"], -4.0)
+        self.assertEqual(settings["transient_reserve_db"], 2.0)
+
+    def test_invalid_saved_audio_levels_are_repaired_before_use(self):
+        repaired = sanitize_audio_level_settings(100, 40, 800, -20)
+        self.assertEqual(repaired["gain_percent"], 100)
+        self.assertEqual(repaired["target_dbfs"], -6.0)
+        self.assertEqual(repaired["max_auto_gain_percent"], 800)
+        self.assertEqual(repaired["limiter_ceiling_dbfs"], -1.0)
+        no_headroom = sanitize_audio_level_settings(100, -1, 800, -6)
+        self.assertEqual(no_headroom["target_dbfs"], -9.0)
+
+    def test_limiter_recovers_gradually_after_a_loud_effect(self):
+        normalizer = AdaptivePeakNormalizer(
+            48000, enabled=True, target_dbfs=-6.0,
+            max_gain_percent=800, ceiling_dbfs=-1.0)
+        normalizer.process(numpy.full(
+            (480, 1), 0.01, dtype=numpy.float32))
+        normalizer.process(numpy.ones(
+            (480, 1), dtype=numpy.float32))
+        limited_gain = normalizer.last_info["limiter_gain"]
+        normalizer.process(numpy.full(
+            (480, 1), 0.01, dtype=numpy.float32))
+        recovered_gain = normalizer.last_info["limiter_gain"]
+        self.assertLess(limited_gain, recovered_gain)
+        self.assertLess(recovered_gain, 1.0)
+
+    def test_peak_normalizer_limits_a_sudden_loud_effect(self):
+        normalizer = AdaptivePeakNormalizer(
+            48000, enabled=True, target_dbfs=-6.0,
+            max_gain_percent=800, ceiling_dbfs=-1.0)
+        normalizer.process(numpy.full(
+            (480, 1), 0.01, dtype=numpy.float32))
+        output = normalizer.process(numpy.ones(
+            (480, 1), dtype=numpy.float32))
+        self.assertLessEqual(float(numpy.max(numpy.abs(output))),
+                             10 ** (-1.0 / 20.0) + 1.0e-6)
+        self.assertTrue(normalizer.last_info["limited"])
+
+    def test_peak_limiter_preserves_waveform_and_holds_maximums(self):
+        normalizer = AdaptivePeakNormalizer(
+            48000, enabled=True, target_dbfs=-6.0,
+            max_gain_percent=800, ceiling_dbfs=-1.0)
+        normalizer.process(numpy.full(
+            (480, 1), 0.01, dtype=numpy.float32))
+        signal = numpy.array([[1.0], [0.5], [-0.25]], dtype=numpy.float32)
+        output = normalizer.process(signal)
+        self.assertAlmostEqual(
+            abs(float(output[0, 0] / output[1, 0])), 2.0, places=5)
+        self.assertAlmostEqual(
+            normalizer.last_info["input_peak_max_dbfs"], 0.0, places=5)
+        self.assertEqual(normalizer.last_info["limited_blocks"], 1)
+        normalizer.reset_statistics()
+        self.assertEqual(
+            normalizer.last_info["input_peak_max_dbfs"], -180.0)
+        self.assertEqual(normalizer.last_info["limited_blocks"], 0)
+
+    def test_audio_monitor_reports_raw_peak_hold_and_clip_count(self):
+        monitor = AudioMonitor()
+        monitor._last_raw_peak = 0.5
+        monitor._raw_peak_max = 1.0
+        monitor._raw_clip_blocks = 2
+        monitor.software_buffer_underflow_frames = 3
+        monitor.software_buffer_drift_drop_frames = 4
+        info = monitor.level_info()
+        self.assertAlmostEqual(info["raw_peak_dbfs"], -6.0206, places=3)
+        self.assertAlmostEqual(info["raw_peak_max_dbfs"], 0.0, places=5)
+        self.assertEqual(info["raw_clip_blocks"], 2)
+        self.assertEqual(info["software_buffer_underflow_frames"], 3)
+        self.assertEqual(info["software_buffer_drift_drop_frames"], 4)
+        monitor.reset_level_statistics()
+        reset = monitor.level_info()
+        self.assertEqual(reset["raw_peak_max_dbfs"], -180.0)
+        self.assertEqual(reset["raw_clip_blocks"], 0)
+
+    def test_audio_calibration_uses_robust_active_signal_references(self):
+        monitor = AudioMonitor()
+        monitor._raw_active_block_peaks_dbfs.extend(
+            [-20.0] * 100 + [0.0])
+        monitor._raw_active_block_rms_dbfs.extend(
+            [-35.0] * 101)
+        info = monitor.level_info()
+        self.assertAlmostEqual(
+            info["raw_reference_peak_dbfs"], -20.0, places=3)
+        self.assertAlmostEqual(
+            info["raw_loud_peak_dbfs"], -20.0, places=3)
+        self.assertAlmostEqual(
+            info["raw_reference_rms_dbfs"], -35.0, places=3)
+        first = suggest_audio_level_settings(-20.0, -35.0)
+        repeated = suggest_audio_level_settings(-20.2, -35.1)
+        self.assertEqual(first, repeated)
+
+    def test_audio_callback_packets_stay_contiguous_without_clock_correction(self):
+        recorder = CaptureRecorder()
+        recorder.audio_queue = queue.Queue(maxsize=2)
+        recorder.audio_pending_gap_frames = 0
+        recorder.audio_callback_warning_count = 0
+        recorder.audio_queue_drop_count = 0
+        recorder.audio_queue_dropped_frames = 0
+        recorder.audio_accepting_packets = True
+        packet = numpy.array([[10], [20]], dtype=numpy.int16)
+        self.assertTrue(recorder._queue_audio_packet(packet, 2))
+        gap, frames, payload = recorder.audio_queue.get_nowait()
+        self.assertEqual((gap, frames), (0, 2))
+        self.assertEqual(payload, packet.tobytes())
+
+    def test_audio_queue_drop_is_replaced_once_by_confirmed_silence(self):
+        recorder = CaptureRecorder()
+        recorder.audio_queue = queue.Queue(maxsize=1)
+        recorder.audio_queue.put_nowait((0, 1, b"old"))
+        recorder.audio_pending_gap_frames = 0
+        recorder.audio_callback_warning_count = 0
+        recorder.audio_queue_drop_count = 0
+        recorder.audio_queue_dropped_frames = 0
+        recorder.audio_accepting_packets = True
+        packet = numpy.array([[10], [20]], dtype=numpy.int16)
+        self.assertFalse(recorder._queue_audio_packet(packet, 2))
+        self.assertEqual(recorder.audio_pending_gap_frames, 2)
+        recorder.audio_queue.get_nowait()
+        self.assertTrue(recorder._queue_audio_packet(packet, 2))
+        self.assertEqual(recorder.audio_queue.get_nowait()[:2], (2, 2))
+
+    def test_truncated_mme_name_prefers_equivalent_wasapi_input(self):
+        devices = [
+            {"name": "デジタル オーディオ インターフェイス (3- USB2 Di",
+             "max_input_channels": 2, "hostapi": 0},
+            {"name": "デジタル オーディオ インターフェイス (3- USB2 Digital Audio)",
+             "max_input_channels": 2, "hostapi": 1},
+            {"name": "デジタル オーディオ インターフェイス (3- USB2 Digital Audio)",
+             "max_input_channels": 2, "hostapi": 2},
+        ]
+        host_apis = [
+            {"name": "MME"}, {"name": "Windows WASAPI"},
+            {"name": "Windows DirectSound"},
+        ]
+        fake_sd = types.SimpleNamespace(
+            query_devices=lambda: devices,
+            query_hostapis=lambda: host_apis)
+        self.assertEqual(
+            AudioMonitor._candidate_input_indices(fake_sd, 0), [1, 2, 0])
+
+    def test_default_mme_speaker_prefers_equivalent_wasapi_output(self):
+        devices = [
+            {"name": "スピーカー (Realtek Audio)",
+             "max_output_channels": 2, "hostapi": 0},
+            {"name": "スピーカー (Realtek Audio)",
+             "max_output_channels": 2, "hostapi": 1},
+            {"name": "スピーカー (Realtek Audio)",
+             "max_output_channels": 2, "hostapi": 2},
+        ]
+        host_apis = [
+            {"name": "MME"}, {"name": "Windows WASAPI"},
+            {"name": "Windows DirectSound"},
+        ]
+        fake_sd = types.SimpleNamespace(
+            query_devices=lambda: devices,
+            query_hostapis=lambda: host_apis)
+        self.assertEqual(
+            AudioMonitor._candidate_output_indices(fake_sd, 0), [1, 0, 2])
+
+    def test_streaming_audio_rate_converter_keeps_callback_continuity(self):
+        converter = StreamingAudioRateConverter(96000, 48000, 1)
+        first = converter.process(numpy.ones((960, 1), dtype=numpy.float32))
+        second = converter.process(numpy.ones((960, 1), dtype=numpy.float32))
+        self.assertEqual((len(first), len(second)), (480, 480))
+        self.assertGreater(float(numpy.min(second)), 0.99)
+
+    def test_96khz_converter_rejects_inaudible_alias_source(self):
+        def converted_rms(frequency):
+            frames = 9600
+            time_axis = numpy.arange(frames, dtype=numpy.float64) / 96000.0
+            source = numpy.sin(
+                2.0 * numpy.pi * frequency * time_axis).astype(
+                    numpy.float32).reshape((-1, 1))
+            converter = StreamingAudioRateConverter(96000, 48000, 1)
+            output = []
+            offset = 0
+            for size in (997, 1021, 883, 1103, 959, 1201, 743, 1307):
+                if offset >= len(source):
+                    break
+                output.append(converter.process(source[offset:offset + size]))
+                offset += size
+            if offset < len(source):
+                output.append(converter.process(source[offset:]))
+            combined = numpy.concatenate(output, axis=0)[200:]
+            return float(numpy.sqrt(numpy.mean(combined * combined)))
+
+        self.assertGreater(converted_rms(19000.0), 0.45)
+        self.assertLess(converted_rms(25000.0), 0.02)
+
+    def test_elastic_audio_clock_correction_has_continuous_endpoints(self):
+        source = numpy.sin(numpy.linspace(
+            0.0, 8.0 * numpy.pi, 1025,
+            dtype=numpy.float32)).reshape((-1, 1))
+        corrected = fit_audio_block(source, 1024)
+
+        self.assertEqual(corrected.shape, (1024, 1))
+        self.assertAlmostEqual(float(corrected[0, 0]), float(source[0, 0]))
+        self.assertAlmostEqual(float(corrected[-1, 0]), float(source[-1, 0]))
+        self.assertLess(float(numpy.max(numpy.abs(numpy.diff(
+            corrected[:, 0])))), 0.03)
+
+    def test_audio_startup_waits_for_one_complete_output_block(self):
+        self.assertEqual(
+            plan_audio_buffer_consume(480, 960, False, 1920), (0, 0))
+        self.assertEqual(
+            plan_audio_buffer_consume(960, 960, False, 1920), (0, 0))
+        self.assertEqual(
+            plan_audio_buffer_consume(1440, 480, False, 1920), (0, 0))
+        self.assertEqual(
+            plan_audio_buffer_consume(1920, 960, False, 1920), (960, 0))
+        self.assertEqual(
+            plan_audio_buffer_consume(959, 960, True, 1920), (959, -1))
+        self.assertEqual(
+            plan_audio_buffer_consume(1440, 480, True, 1920), (480, 0))
+        self.assertEqual(
+            plan_audio_buffer_consume(2400, 480, True, 1920), (480, 0))
+        self.assertEqual(
+            plan_audio_buffer_consume(1439, 480, True, 1920), (479, -1))
+        self.assertEqual(
+            plan_audio_buffer_consume(2401, 480, True, 1920), (481, 1))
+
+    def test_audio_identity_ignores_portaudio_and_windows_numbers(self):
+        self.assertEqual(
+            normalized_audio_name(
+                "8: デジタル オーディオ (3- USB2 Digital Audio)"),
+            normalized_audio_name(
+                "2: デジタル オーディオ (USB2 Digital Audio)"))
+        self.assertEqual(
+            physical_usb_key(
+                r"@device:pnp:\\?\usb#vid_345f&pid_2131&mi_00#b&2838c96c&0&0000#global"),
+            "b&2838c96c&0")
+        self.assertEqual(
+            usb_connection_token(
+                r"@device:pnp:\\?\usb#vid_345f&pid_2131&mi_00#a&2838c96c&0&0000#global"),
+            "2838c96c")
+
+    def test_short_input_handoff_keeps_last_valid_preview(self):
+        self.assertTrue(hold_last_preview_on_missing_frame(
+            True, 10.0, 12.9, grace_seconds=3.0))
+        self.assertFalse(hold_last_preview_on_missing_frame(
+            True, 10.0, 13.0, grace_seconds=3.0))
+        self.assertFalse(hold_last_preview_on_missing_frame(
+            False, None, 10.0, grace_seconds=3.0))
+
+    def test_legacy_input_set_audio_identity_is_enriched(self):
+        endpoints = [{
+            "endpoint_id": "{stable-guid}",
+            "friendly_name": "Audio (4- USB2 Digital Audio)",
+            "device_instance_id": "stable-instance",
+            "device_interface_path": "stable-interface",
+            "physical_usb_key": "9&225d3b8d&0",
+            "active": False,
+        }]
+        data = {"input_sets": {"Switch2": {
+            "camera": {"device_path": (
+                r"@device:pnp:\\?\usb#vid_345f&pid_2131&mi_00#9&225d3b8d&0&0000#global")},
+            "audio": {"enabled": True,
+                      "device_name": "5: Audio (4- USB2 Digital Audio)"},
+        }}}
+        self.assertTrue(upgrade_input_set_audio_identities(
+            data, endpoints=endpoints))
+        self.assertEqual(data["input_sets"]["Switch2"]["audio"]["endpoint_id"],
+                         "{stable-guid}")
+        self.assertFalse(upgrade_input_set_audio_identities(
+            data, endpoints=endpoints))
+
+    def test_stable_audio_identity_is_not_overwritten_during_enrichment(self):
+        saved = {"enabled": True, "device_name": "Audio (USB2)",
+                 "endpoint_id": "{missing-guid}"}
+        endpoints = [{"endpoint_id": "{other-guid}",
+                      "friendly_name": "Audio (USB2)",
+                      "physical_usb_key": "a&111&0", "active": True}]
+        self.assertFalse(enrich_saved_audio_identity(saved, endpoints=endpoints))
+        self.assertEqual(saved["endpoint_id"], "{missing-guid}")
+
+    def test_audio_endpoint_guid_tracks_shifted_display_numbers(self):
+        endpoints = [{
+            "endpoint_id": "{stable-guid}",
+            "friendly_name": "デジタル オーディオ (5- USB2 Digital Audio)",
+            "device_instance_id": r"USB\VID_345F&PID_2131\B&2838C96C&0&0002",
+            "device_interface_path": "stable-path",
+            "physical_usb_key": "b&2838c96c&0",
+            "active": True,
+        }]
+        label = resolve_saved_audio(
+            {"device_name": "8: デジタル オーディオ (3- USB2 Digital Audio)",
+             "endpoint_id": "{STABLE-GUID}"},
+            ["17: デジタル オーディオ (5- USB2 Digital Audio)"],
+            endpoints=endpoints)
+        self.assertEqual(
+            label, "17: デジタル オーディオ (5- USB2 Digital Audio)")
+
+    def test_missing_stable_audio_is_not_replaced_by_identical_device(self):
+        endpoints = [{
+            "endpoint_id": "{other-guid}",
+            "friendly_name": "デジタル オーディオ (USB2 Digital Audio)",
+            "device_instance_id": "other-instance",
+            "device_interface_path": "other-path",
+            "physical_usb_key": "a&111&0",
+            "active": True,
+        }]
+        self.assertIsNone(resolve_saved_audio(
+            {"device_name": "2: デジタル オーディオ (USB2 Digital Audio)",
+             "endpoint_id": "{missing-guid}",
+             "device_instance_id": "missing-instance"},
+            ["5: デジタル オーディオ (USB2 Digital Audio)"],
+            endpoints=endpoints))
+
+    def test_legacy_audio_can_follow_its_camera_usb_location(self):
+        endpoints = [
+            {"endpoint_id": "{one}", "friendly_name": "Audio (USB2)",
+             "physical_usb_key": "a&111&0", "active": True},
+            {"endpoint_id": "{two}", "friendly_name": "Audio (2- USB2)",
+             "physical_usb_key": "b&222&0", "active": True},
+        ]
+        label = resolve_saved_audio(
+            {"device_name": "4: Audio (USB2)",
+             "normalized_name": normalized_audio_name("Audio (USB2)")},
+            ["10: Audio (USB2)", "11: Audio (2- USB2)"],
+            camera_device_path=(
+                r"@device:pnp:\\?\usb#vid_345f&pid_2131&mi_00#b&222&0&0000#global"),
+            endpoints=endpoints)
+        self.assertEqual(label, "11: Audio (2- USB2)")
+
+    def test_selected_audio_saves_windows_endpoint_identity(self):
+        endpoints = [{
+            "endpoint_id": "{guid}", "friendly_name": "Audio (USB2)",
+            "device_instance_id": "instance", "device_interface_path": "path",
+            "physical_usb_key": "b&222&0", "active": True,
+        }]
+        identity = identity_for_audio_label(
+            "4: Audio (USB2)", endpoints=endpoints)
+        self.assertEqual(identity["endpoint_id"], "{guid}")
+        self.assertEqual(identity["device_instance_id"], "instance")
+
+    def test_audio_monitor_publishes_exact_confirmation_output(self):
+        monitor = AudioMonitor()
+        monitor.output_stream = types.SimpleNamespace(active=True)
+        monitor.selected_input_device_index = 8
+        monitor.actual_input_device_index = 36
+        monitor.recording_input_device_name = "USB capture"
+        monitor.recording_input_host_api = "Windows WASAPI"
+        monitor.recording_output_host_api = "Windows WASAPI"
+        monitor.recording_output_rate = 48000
+        monitor.recording_output_channels = 2
+        monitor.recording_output_latency = 0.003
+        received = []
+        token = monitor.add_recording_output_listener(
+            lambda data, frames, timing, status: received.append(
+                (data.copy(), frames, timing, status)),
+            48000, 2)
+        block = numpy.array([[0.25, -0.5], [0.75, 0.0]],
+                            dtype=numpy.float32)
+        monitor._publish_recording_output(block, 2, "clock", "status")
+        self.assertIsNotNone(token)
+        self.assertEqual(received[0][1:], (2, "clock", "status"))
+        numpy.testing.assert_array_equal(received[0][0], block)
+        self.assertTrue(monitor.remove_recording_output_listener(token))
+        monitor._publish_recording_output(block, 2, None, None)
+        self.assertEqual(len(received), 1)
+
+    def test_recorder_uses_pokecon_confirmation_pcm_and_unsubscribes(self):
+        class FakeMonitor:
+            def __init__(self):
+                self.listener = None
+                self.removed = []
+
+            @staticmethod
+            def recording_output_info():
+                return {
+                    "selected_input_device_index": 8,
+                    "actual_input_device_index": 36,
+                    "input_device_name": "USB capture",
+                    "input_host_api": "Windows WASAPI",
+                    "output_host_api": "Windows WASAPI",
+                    "sample_rate": 48000,
+                    "channels": 2,
+                    "latency": 0.003,
+                    "capture_latency": 0.002,
+                    "playback_latency": 0.004,
+                    "tap_point": "speaker_output_callback",
+                }
+
+            def add_recording_output_listener(self, callback, rate, channels):
+                self.listener = callback
+                self.asserted_format = (rate, channels)
+                return 17
+
+            def remove_recording_output_listener(self, token):
+                self.removed.append(token)
+                self.listener = None
+                return True
+
+        with tempfile.TemporaryDirectory() as folder:
+            monitor = FakeMonitor()
+            recorder = CaptureRecorder(folder)
+            recorder.wav_path = os.path.join(folder, "shared.wav")
+            recorder.audio_monitor = monitor
+            self.assertTrue(recorder._start_monitored_audio(
+                "8: USB capture"))
+            self.assertEqual(monitor.asserted_format, (48000, 2))
+            self.assertEqual(
+                recorder.audio_source_mode,
+                "pokecon_presented_output")
+            monitor.listener(
+                numpy.array([[0.5, -0.5]], dtype=numpy.float32),
+                1, None, None)
+            recorder._stop_monitored_audio_listener()
+            recorder._stop_audio_writer()
+            recorder.audio.close()
+            recorder.audio = None
+            self.assertEqual(monitor.removed, [17])
+            with wave.open(recorder.wav_path, "rb") as audio:
+                samples = struct.unpack("<hh", audio.readframes(1))
+            self.assertEqual(samples, (16384, -16384))
+
+    def test_audio_callback_uses_scheduled_speaker_presentation_time(self):
+        timing = {"currentTime": 20.0, "outputBufferDacTime": 20.125}
+        self.assertEqual(
+            audio_callback_presentation_time(timing, now=100.0), 100.125)
+        self.assertEqual(
+            audio_callback_presentation_time(None, now=100.0), 100.0)
+
+    def test_recorder_tracks_presented_video_frames(self):
+        recorder = CaptureRecorder()
+        recorder.active = True
+        recorder.latest_frame = None
+        frame = numpy.zeros((2, 3, 3), dtype=numpy.uint8)
+        recorder.add_frame(
+            frame, presented_at=10.25,
+            presentation_mode="preview_presented")
+        self.assertEqual(recorder.video_first_presentation_at, 10.25)
+        self.assertEqual(recorder.video_presentation_frames, 1)
+        self.assertEqual(
+            recorder.video_presentation_mode, "preview_presented")
+
+    def test_video_timeline_uses_preview_timestamp_not_delivery_time(self):
+        class FakeVideo:
+            def __init__(self):
+                self.values = []
+
+            def write(self, frame):
+                self.values.append(int(frame[0, 0, 0]))
+
+        recorder = CaptureRecorder()
+        recorder.started_at = 100.0
+        recorder.requested_fps = 10.0
+        recorder.frames_written = 0
+        recorder.video = FakeVideo()
+        recorder.video_current_frame = numpy.full(
+            (1, 1, 3), 1, dtype=numpy.uint8)
+        recorder._advance_video_timeline(
+            100.2, numpy.full((1, 1, 3), 2, dtype=numpy.uint8))
+        recorder._advance_video_timeline(
+            100.5, numpy.full((1, 1, 3), 3, dtype=numpy.uint8))
+        recorder._advance_video_timeline(100.6)
+        self.assertEqual(recorder.video.values, [1, 1, 2, 2, 2, 3])
+
+    def test_late_compositor_delivery_keeps_original_presentation_time(self):
+        recorder = CaptureRecorder()
+        recorder.active = True
+        recorder.started_at = time.monotonic() - 5.0
+        recorder.latest_frame = None
+        frame = numpy.zeros((2, 3, 3), dtype=numpy.uint8)
+        recorder.add_frame(
+            frame, presented_at=recorder.started_at + 1.25,
+            presentation_mode="preview_presented")
+        queued_at, queued_frame = recorder.video_frame_queue[0]
+        self.assertAlmostEqual(
+            queued_at,
+            recorder.started_at + 1.25)
+        self.assertIs(queued_frame, frame)
+        self.assertGreater(recorder.video_delivery_delay_max, 3.0)
+
+    def test_video_writer_preserves_every_presented_frame_in_order(self):
+        class FakeVideo:
+            def __init__(self):
+                self.values = []
+
+            def write(self, frame):
+                self.values.append(int(frame[0, 0, 0]))
+
+        recorder = CaptureRecorder()
+        recorder.active = True
+        recorder.started_at = 100.0
+        recorder.requested_fps = 10.0
+        recorder.frames_written = 0
+        recorder.video = FakeVideo()
+        recorder.video_current_frame = numpy.full(
+            (1, 1, 3), 1, dtype=numpy.uint8)
+        recorder.add_frame(
+            numpy.full((1, 1, 3), 2, dtype=numpy.uint8),
+            presented_at=100.2)
+        recorder.add_frame(
+            numpy.full((1, 1, 3), 3, dtype=numpy.uint8),
+            presented_at=100.5)
+        recorder.video_stop_at = 100.6
+
+        recorder._video_writer_loop()
+
+        self.assertEqual(recorder.video.values, [1, 1, 2, 2, 2, 3])
+        self.assertEqual(recorder.video_presentation_frames, 2)
+        self.assertEqual(recorder.video_coalesced_presentation_frames, 0)
+        self.assertEqual(recorder.video_frame_queue_max_depth, 2)
+
+    def test_ordered_presentations_create_a_real_60_fps_avi(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "ordered_60fps.avi")
+            recorder = CaptureRecorder()
+            writer, codec = recorder._open_video_writer(
+                path, 60.0, (160, 90))
+            self.assertIsNotNone(writer)
+            self.assertIn(codec, ("mp4v", "XVID"))
+            recorder.active = True
+            recorder.started_at = 100.0
+            recorder.requested_fps = 60.0
+            recorder.frames_written = 0
+            recorder.video = writer
+            recorder.video_current_frame = numpy.zeros(
+                (90, 160, 3), dtype=numpy.uint8)
+            for index in range(120):
+                recorder.add_frame(
+                    numpy.full(
+                        (90, 160, 3), (index + 1) * 2,
+                        dtype=numpy.uint8),
+                    presented_at=100.0 + index / 60.0)
+            recorder.video_stop_at = 102.0
+            recorder._video_writer_loop()
+            writer.release()
+
+            capture = cv2.VideoCapture(path)
+            self.assertAlmostEqual(capture.get(cv2.CAP_PROP_FPS), 60.0, places=3)
+            means = []
+            while True:
+                ok, frame = capture.read()
+                if not ok:
+                    break
+                means.append(int(round(float(frame.mean()))))
+            capture.release()
+            self.assertEqual(len(means), 120)
+            self.assertEqual(len(set(means)), 120)
+            self.assertLessEqual(max(
+                abs(actual - expected)
+                for actual, expected in zip(means, range(2, 241, 2))), 5)
+
+    def test_recorder_prefers_fast_mpeg4_avi_over_mjpeg(self):
+        opened = mock.Mock()
+        opened.isOpened.return_value = True
+        with mock.patch("Recording.cv2.VideoWriter", return_value=opened) as create:
+            writer, codec = CaptureRecorder._open_video_writer(
+                "recording.avi", 60.0, (1280, 720))
+
+        self.assertIs(writer, opened)
+        self.assertEqual(codec, "mp4v")
+        self.assertEqual(
+            create.call_args.args[1], cv2.VideoWriter_fourcc(*"mp4v"))
+        self.assertEqual(create.call_args.args[2:], (60.0, (1280, 720)))
+
+    def test_mp4_mux_keeps_the_configured_60_fps_cfr(self):
+        recorder = CaptureRecorder()
+        completed = types.SimpleNamespace(returncode=0, stderr="")
+        with mock.patch("Recording.shutil.which", return_value="ffmpeg.exe"), \
+                mock.patch("Recording.os.path.isfile", return_value=True), \
+                mock.patch("Recording.subprocess.run",
+                           return_value=completed) as run:
+            result = recorder._mux(
+                "recording.avi", "recording.wav", "recording.mp4", 60.0)
+
+        command = run.call_args.args[0]
+        rate_index = command.index("-r")
+        self.assertEqual(command[rate_index + 1], "60.000000")
+        self.assertEqual(command[command.index("-crf") + 1], "18")
+        self.assertEqual(command[command.index("-preset") + 1], "veryfast")
+        self.assertEqual(result, "recording.mp4")
+
+    def test_timing_report_separates_container_and_wall_clock_fps(self):
+        recorder = CaptureRecorder()
+        with tempfile.TemporaryDirectory() as folder:
+            recorder.session_dir = folder
+            recorder.started_at = 100.0
+            recorder.requested_fps = 60.0
+            recorder.video_codec = "mp4v"
+            recorder.frames_written = 600
+            recorder._write_timing_report(9.9992, 60.0, 60.0048)
+            with open(os.path.join(folder, "recording_timing.json"),
+                      "r", encoding="utf-8") as stream:
+                report = json.load(stream)
+
+        video = report["video"]
+        self.assertEqual(video["intermediate_codec"], "mp4v")
+        self.assertEqual(video["container_fps"], 60.0)
+        self.assertEqual(video["corrected_fps"], 60.0)
+        self.assertEqual(video["wall_clock_frame_rate"], 60.0048)
+
+    def test_recording_repair_removes_only_all_channel_exact_zeros(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = os.path.join(folder, "source.wav")
+            repaired = os.path.join(folder, "repaired.wav")
+            samples = numpy.array([
+                [10, 0], [0, 0], [0, 20], [0, 0], [30, 40],
+            ], dtype=numpy.int16)
+            with wave.open(source, "wb") as audio:
+                audio.setnchannels(2)
+                audio.setsampwidth(2)
+                audio.setframerate(10)
+                audio.writeframes(samples.tobytes())
+            details = wav_info(source)
+            self.assertEqual(details["exact_zero_frames"], 2)
+            kept, removed = write_without_exact_zeros(source, repaired)
+            self.assertEqual((kept, removed), (3, 2))
+            with wave.open(repaired, "rb") as audio:
+                result = numpy.frombuffer(
+                    audio.readframes(audio.getnframes()),
+                    dtype=numpy.int16).reshape(-1, 2)
+            numpy.testing.assert_array_equal(
+                result, samples[[0, 2, 4]])
+
+    def test_recording_repair_audio_advance_keeps_total_duration(self):
+        expression = audio_advance_filter(500)
+        self.assertIn("atrim=start=0.500000", expression)
+        self.assertIn("asetpts=PTS-STARTPTS", expression)
+        self.assertIn("apad=pad_dur=0.500000", expression)
+
+    def test_main_full_rate_does_not_skip_on_early_timer_jitter(self):
+        self.assertTrue(preview_render_due(
+            0.016, 1.0 / 60.0, full_rate=True,
+            prioritized=True, viewable=True))
+        self.assertFalse(preview_render_due(
+            0.005, 1.0 / 60.0, full_rate=True,
+            prioritized=True, viewable=True))
+        self.assertFalse(preview_render_due(
+            0.016, 1.0 / 60.0, full_rate=False,
+            prioritized=True, viewable=True))
+
+    def test_video_input_combobox_does_not_change_with_mousewheel(self):
+        calls = []
+
+        class FakeCombobox:
+            def bind(self, event, callback, add=None):
+                calls.append((event, callback, add))
+                return "binding-id"
+
+        result = guard_combobox_mousewheel(FakeCombobox())
+        self.assertEqual(result, "binding-id")
+        self.assertEqual(calls[0][0], "<MouseWheel>")
+        self.assertIs(calls[0][1], consume_combobox_mousewheel)
+        self.assertEqual(calls[0][2], "+")
+        self.assertEqual(calls[0][1](object()), "break")
+
+    def test_input_set_combobox_forwards_wheel_only_to_tab_scroll(self):
+        bindings = []
+        scrolled = []
+
+        class FakeCombobox:
+            def bind(self, event, callback, add=None):
+                bindings.append((event, callback, add))
+                return "input-set-wheel-binding"
+
+        wheel_event = object()
+        result = guard_combobox_mousewheel(
+            FakeCombobox(), lambda event: scrolled.append(event))
+        self.assertEqual(result, "input-set-wheel-binding")
+        self.assertEqual(bindings[0][0], "<MouseWheel>")
+        self.assertEqual(bindings[0][1](wheel_event), "break")
+        self.assertEqual(scrolled, [wheel_event])
+
+    def test_pokecon_windows_are_rejected_as_capture_targets(self):
+        name = "Poke-Controller Modified Extension"
+        self.assertTrue(is_pokecon_window_title(
+            name + " ver.0.1.7 (profile: default)", name))
+        self.assertTrue(is_pokecon_window_title(name, name))
+        self.assertFalse(is_pokecon_window_title("Google Chrome", name))
+        self.assertFalse(is_pokecon_window_title("Pokemon Game", name))
+
     def test_full_rate_choice_belongs_to_each_input_set(self):
         self.assertIn("last_active_preview_full_fps", INPUT_SET_VARIABLES)
 
@@ -1786,6 +3288,7 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
         self.assertFalse(restored["resource_main_tool"])
         self.assertTrue(restored["resource_control_enabled"])
         self.assertEqual(restored["resource_cpu_target"], 90)
+        self.assertFalse(restored["camera_feature_limited"])
 
         saved_snapshot = {"values": {
             "resource_control_enabled": True,
@@ -1829,10 +3332,11 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
         self.assertAlmostEqual(
             preview_render_interval(60, True, True, full_rate=True), 1.0 / 60)
         self.assertEqual(preview_render_interval(60, False, True), 0.2)
-        # Minimized windows stay inexpensive even when full-rate display was
-        # requested; recording explicitly restores the capture cadence.
-        self.assertEqual(
-            preview_render_interval(60, True, False, full_rate=True), 0.5)
+        # The single checked owner keeps its cadence while minimized too;
+        # ordinary minimized windows remain inexpensive.
+        self.assertAlmostEqual(
+            preview_render_interval(60, True, False, full_rate=True),
+            1.0 / 60.0)
         self.assertEqual(preview_render_interval(60, False, False), 0.5)
 
     def test_inactive_frame_consumption_is_throttled_unless_recording(self):
@@ -2071,6 +3575,66 @@ class Demo:
                 path, path, "class Old:\n    pass\n", editor_dirty=False)
             self.assertEqual(mode, "disk")
             self.assertIn("class Demo", source)
+
+    def test_sample_check_project_root_resolves_to_fragment_library(self):
+        with tempfile.TemporaryDirectory() as project:
+            fragment_root = os.path.join(
+                project, "SerialController", "DevTemplates", "Fragments")
+            os.makedirs(fragment_root)
+            self.assertEqual(
+                resolve_fragment_folder(fragment_root, project),
+                os.path.abspath(fragment_root))
+            child = os.path.join(fragment_root, "Pokemon_ZA")
+            os.makedirs(child)
+            self.assertEqual(
+                resolve_fragment_folder(fragment_root, child),
+                os.path.abspath(child))
+            unrelated = os.path.join(os.path.dirname(project), "unrelated")
+            with self.assertRaises(ValueError):
+                resolve_fragment_folder(fragment_root, unrelated)
+
+    def test_sample_origin_path_survives_drive_and_workspace_move(self):
+        old = ("D:/tools/PokeCon/Poke-Controller/SerialController/"
+               "Commands/PythonCommands/ZA/ZA_story/ZA_story.py")
+        current = ("C:/PokeCon/Poke-Controller/SerialController/"
+                   "Commands/PythonCommands/ZA/ZA_story/ZA_story.py")
+        relative = ("SerialController/Commands/PythonCommands/ZA/"
+                    "ZA_story/ZA_story.py")
+        self.assertTrue(source_paths_equivalent(old, current))
+        self.assertTrue(source_paths_equivalent(relative, current))
+        self.assertFalse(source_paths_equivalent(
+            "SerialController/Commands/Other.py", current))
+
+    def test_recheck_keeps_sample_registered_before_workspace_move(self):
+        source = (
+            "class Demo:\n"
+            "    def updated(self):\n"
+            "        return 'new'\n")
+        with tempfile.TemporaryDirectory() as root:
+            sample_dir = os.path.join(root, "Pokemon_ZA", "updated")
+            os.makedirs(sample_dir)
+            with open(os.path.join(sample_dir, "updated.pyfrag"), "w",
+                      encoding="utf-8") as stream:
+                stream.write(
+                    "def updated(self):\n"
+                    "    return 'old'\n")
+            with open(os.path.join(
+                    sample_dir, "updated.pokesample.json"), "w",
+                    encoding="utf-8") as stream:
+                json.dump({
+                    "name": "updated", "fragment": "updated.pyfrag",
+                    "source": {
+                        "path": ("D:/old/PokeCon/SerialController/Commands/"
+                                 "PythonCommands/ZA/ZA_story/ZA_story.py"),
+                        "function": "updated",
+                    },
+                }, stream)
+            comparisons = compare_sample_function_folder(
+                source, root, root,
+                "C:/new/PokeCon/SerialController/Commands/PythonCommands/"
+                "ZA/ZA_story/ZA_story.py")
+            self.assertEqual(len(comparisons), 1)
+            self.assertEqual(comparisons[0]["status"], "different")
 
     def test_dirty_editor_recheck_keeps_unsaved_reflection(self):
         with tempfile.TemporaryDirectory() as root:

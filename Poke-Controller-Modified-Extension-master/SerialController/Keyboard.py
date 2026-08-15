@@ -90,6 +90,8 @@ class SwitchKeyboardController(Keyboard):
         try:
             _k = key.char
             key_type = (type(self.key_map[_k]))
+        except KeyError:
+            return
         except AttributeError:
             try:
                 _k = key
@@ -160,6 +162,8 @@ class SwitchKeyboardController(Keyboard):
         try:
             _k = key.char
             key_type = (type(self.key_map[_k]))
+        except KeyError:
+            return
         except AttributeError:
             try:
                 _k = key

@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 
 COMMAND_INPUT_SET_VARIABLES = frozenset((
@@ -67,12 +67,13 @@ INPUT_SET_VARIABLES = (
     # Camera / display
     "is_show_realtime", "is_show_value", "is_show_guide", "is_show_serial",
     "fps", "show_size", "video_source", "window_capture_mode",
-    "last_active_preview_full_fps",
+    "last_active_preview_full_fps", "camera_feature_limited",
     # Multi-instance resource control
     "resource_control_enabled", "resource_cpu_target", "resource_main_tool",
     # Audio
     "audio_input", "audio_gain", "audio_filter_camera", "audio_auto_start",
-    "audio_monitor_mode",
+    "audio_monitor_mode", "audio_auto_level", "audio_target_dbfs",
+    "audio_max_auto_gain", "audio_limiter_ceiling_dbfs",
     # Serial / Manual Control
     "serial_data_format_name", "is_use_keyboard",
     "is_use_left_stick_mouse", "is_use_right_stick_mouse",
@@ -147,6 +148,9 @@ def snapshot_values_with_defaults(snapshot):
     result = copy.deepcopy(values) if isinstance(values, dict) else {}
     for name, value in RESOURCE_INPUT_SET_DEFAULTS.items():
         result.setdefault(name, value)
+    # A legacy InputSet must not inherit the previously loaded InputSet's
+    # feature-limited Camera mode.
+    result.setdefault("camera_feature_limited", False)
     return result
 
 

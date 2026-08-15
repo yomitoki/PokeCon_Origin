@@ -57,11 +57,20 @@ def _command_frame(command):
     camera = getattr(command, "camera", None)
     if camera is None:
         raise RuntimeError("画像検知にはPokeConのCameraが必要です。")
-    frame = getattr(camera, "image_bgr", None)
-    if frame is None and hasattr(camera, "readFrame"):
+    if hasattr(camera, "readFreshFrame"):
+        # A momentary DirectShow/Windows scheduling gap is not an input loss.
+        # Wait outside Tk for capture to resume, while still refusing the
+        # cached final image if the device has genuinely stopped.
+        frame = camera.readFreshFrame(timeout=0.75)
+    elif hasattr(camera, "readFrame"):
         frame = camera.readFrame()
+    else:
+        # Compatibility for copied LocalFunction modules used with an older
+        # Camera implementation.  Current PokeCon always uses readFrame(),
+        # which rejects the cached final frame after input has stalled.
+        frame = getattr(camera, "image_bgr", None)
     if frame is None:
-        raise RuntimeError("Cameraから画像を取得できません。")
+        raise RuntimeError("Cameraの新しい映像を取得できません（入力停止または切替中）。")
     return frame
 
 

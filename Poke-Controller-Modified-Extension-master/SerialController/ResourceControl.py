@@ -11,6 +11,44 @@ THROTTLE_MULTIPLIERS = {
     "strong": 8.0,
 }
 
+_MAIN_RUNTIME_PRIORITY_ACTIVE = False
+_MAIN_RUNTIME_TIMER_ACTIVE = False
+
+
+def set_main_runtime_priority(enabled):
+    """Give the unique 60-FPS owner stable Windows scheduling precision."""
+    global _MAIN_RUNTIME_PRIORITY_ACTIVE, _MAIN_RUNTIME_TIMER_ACTIVE
+    enabled = bool(enabled)
+    if os.name != "nt":
+        _MAIN_RUNTIME_PRIORITY_ACTIVE = enabled
+        return True
+    try:
+        import ctypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        kernel32.SetPriorityClass.restype = ctypes.c_int
+        priority_class = 0x00008000 if enabled else 0x00000020
+        changed = bool(kernel32.SetPriorityClass(
+            kernel32.GetCurrentProcess(), priority_class))
+
+        winmm = ctypes.WinDLL("winmm", use_last_error=True)
+        winmm.timeBeginPeriod.argtypes = [ctypes.c_uint]
+        winmm.timeBeginPeriod.restype = ctypes.c_uint
+        winmm.timeEndPeriod.argtypes = [ctypes.c_uint]
+        winmm.timeEndPeriod.restype = ctypes.c_uint
+        if enabled and not _MAIN_RUNTIME_TIMER_ACTIVE:
+            _MAIN_RUNTIME_TIMER_ACTIVE = winmm.timeBeginPeriod(1) == 0
+        elif not enabled and _MAIN_RUNTIME_TIMER_ACTIVE:
+            winmm.timeEndPeriod(1)
+            _MAIN_RUNTIME_TIMER_ACTIVE = False
+        _MAIN_RUNTIME_PRIORITY_ACTIVE = bool(enabled and changed)
+        return changed
+    except (AttributeError, ImportError, OSError, ValueError):
+        return False
+
 
 def clamp_cpu_target(value, minimum=50, maximum=95):
     """Normalize the user-facing target without accepting unsafe extremes."""

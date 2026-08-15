@@ -11,10 +11,13 @@
 *.exe
 *.json
 !SerialController/Commands/PythonCommands/Samples/vision_rules.json
+!PokeConRuntimeLauncher.ja.json
 *.bat
 !ExecutePokeConModified-Extension.bat
 !SetupPokeConPythonEnvironments.bat
 !UpdatePokeConModified-Extension.bat
+!PokeCon_固まり復旧.bat
+!PokeCon_録画同期修復.bat
 .idea/
 SerialController/Captures/
 SerialController/Template/*
@@ -135,6 +138,7 @@ celerybeat-schedule
 .venv
 .venv*/
 .pokecon-python-version
+.pokecon-start-maximized
 env/
 venv/
 ENV/

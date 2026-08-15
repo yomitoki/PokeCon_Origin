@@ -1,0 +1,18 @@
+{
+  "window_title": "PokeCon Python実行環境の選択",
+  "heading": "PokeConを起動するPythonを選択してください",
+  "help": "PokeCon本体は3.14互換モードを推奨します。3.14tはGILなし対応状況を表示します。",
+  "button_314": "Python 3.14（Commands互換／GILあり） - {0}",
+  "button_314t": "Python 3.14t（GILなし対応状況） - {0}",
+  "button_312": "Python 3.12（推奨） - {0}",
+  "button_37": "Python 3.7（互換モード） - {0}",
+  "button_last": "前回の選択で起動：{0}",
+  "cancel": "キャンセル",
+  "start_maximized": "PokeConを最大化して起動（映像・音声の開始前に最大化）",
+  "recovery": "固まったPokeConを終了（復旧）...",
+  "recovery_failed": "PokeCon復旧画面を起動できませんでした。\r\n\r\n{0}",
+  "note": "選択内容は保存されます。次回起動時にも変更できます。",
+  "error_title": "PokeCon 起動エラー",
+  "missing_runtime": "{0} が見つかりません。別の環境を選ぶか、必要な環境を準備してください。",
+  "startup_failed": "PokeConを起動できませんでした。\r\n\r\n{0}"
+}

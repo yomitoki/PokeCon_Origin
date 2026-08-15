@@ -11,7 +11,7 @@ import uuid
 
 
 REGISTRY_VERSION = 1
-DEVICE_KINDS = ("camera", "serial", "audio")
+DEVICE_KINDS = ("camera", "serial", "audio", "audio_output")
 
 
 def default_window_activity_registry_path():

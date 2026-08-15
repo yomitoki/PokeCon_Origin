@@ -7,10 +7,12 @@ param(
 $ErrorActionPreference = "Stop"
 $rootDir = $PSScriptRoot
 $statePath = Join-Path $rootDir ".pokecon-python-version"
+$maximizeStatePath = Join-Path $rootDir ".pokecon-start-maximized"
 $python314 = Join-Path $rootDir ".venv314\Scripts\python.exe"
 $python314t = Join-Path $rootDir ".venv314t\Scripts\python.exe"
 $python312 = Join-Path $rootDir ".venv312\Scripts\python.exe"
 $uiPath = Join-Path $rootDir "PokeConRuntimeLauncher.ja.json"
+$recoveryScript = Join-Path $rootDir "SerialController\PokeConRecovery.py"
 $ui = [pscustomobject]@{
     window_title = "PokeCon Python runtime selection"
     heading = "Select Python before starting PokeCon"
@@ -21,6 +23,9 @@ $ui = [pscustomobject]@{
     button_37 = "Python 3.7 (Compatibility) - {0}"
     button_last = "Use previous selection: {0}"
     cancel = "Cancel"
+    start_maximized = "Start PokeCon maximized (before video and audio start)"
+    recovery = "Close a frozen PokeCon..."
+    recovery_failed = "The PokeCon recovery window could not be started.`r`n`r`n{0}"
     note = "The selection is saved and can be changed at every startup."
     error_title = "PokeCon startup error"
     missing_runtime = "{0} was not found. Select another runtime or prepare the missing environment."
@@ -75,6 +80,13 @@ function Get-SavedRuntime {
     return "314"
 }
 
+function Get-SavedStartMaximized {
+    if (-not (Test-Path -LiteralPath $maximizeStatePath)) {
+        return $false
+    }
+    return ((Get-Content -LiteralPath $maximizeStatePath -TotalCount 1).Trim() -eq "1")
+}
+
 function Get-PythonDescription([string]$PythonPath) {
     if (-not $PythonPath -or -not (Test-Path -LiteralPath $PythonPath)) {
         return "Not installed"
@@ -114,7 +126,7 @@ function Show-RuntimeMenu([string]$Python37Path, [string]$SavedRuntime) {
     $form.MaximizeBox = $false
     $form.MinimizeBox = $false
     $form.TopMost = $false
-    $form.ClientSize = New-Object System.Drawing.Size(560, 420)
+    $form.ClientSize = New-Object System.Drawing.Size(560, 520)
     $form.Font = New-Object System.Drawing.Font("Meiryo UI", 10)
 
     $title = New-Object System.Windows.Forms.Label
@@ -193,13 +205,46 @@ function Show-RuntimeMenu([string]$Python37Path, [string]$SavedRuntime) {
     $form.CancelButton = $cancel
     $form.Controls.Add($cancel)
 
+    $maximize = New-Object System.Windows.Forms.CheckBox
+    $maximize.Location = New-Object System.Drawing.Point(22, 371)
+    $maximize.Size = New-Object System.Drawing.Size(516, 30)
+    $maximize.Text = $ui.start_maximized
+    $maximize.Checked = [bool]$script:startMaximized
+    $form.Controls.Add($maximize)
+
+    $recoveryPython = @(
+        (Join-Path $rootDir ".venv314\Scripts\pythonw.exe"),
+        (Join-Path $rootDir ".venv312\Scripts\pythonw.exe"),
+        $Python37Path
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+    $recovery = New-Object System.Windows.Forms.Button
+    $recovery.Location = New-Object System.Drawing.Point(22, 409)
+    $recovery.Size = New-Object System.Drawing.Size(516, 38)
+    $recovery.Text = $ui.recovery
+    $recovery.Enabled = [bool]$recoveryPython -and (Test-Path -LiteralPath $recoveryScript)
+    $recovery.Add_Click({
+        try {
+            Start-Process -FilePath $recoveryPython -ArgumentList @(('"{0}"' -f $recoveryScript)) | Out-Null
+        }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show(
+                ($ui.recovery_failed -f $_.Exception.Message),
+                $ui.error_title,
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Error
+            ) | Out-Null
+        }
+    })
+    $form.Controls.Add($recovery)
+
     $note = New-Object System.Windows.Forms.Label
-    $note.Location = New-Object System.Drawing.Point(22, 375)
+    $note.Location = New-Object System.Drawing.Point(22, 459)
     $note.Size = New-Object System.Drawing.Size(515, 35)
     $note.Text = $ui.note
     $form.Controls.Add($note)
 
     $result = $form.ShowDialog()
+    $script:startMaximized = [bool]$maximize.Checked
     if ($result -ne [System.Windows.Forms.DialogResult]::OK) {
         return $null
     }
@@ -208,6 +253,7 @@ function Show-RuntimeMenu([string]$Python37Path, [string]$SavedRuntime) {
 
 $python37 = Find-Python37
 $savedRuntime = Get-SavedRuntime
+$script:startMaximized = Get-SavedStartMaximized
 $selectedRuntime = $Runtime
 
 if ($selectedRuntime -eq "menu") {
@@ -250,6 +296,7 @@ if (-not $pythonPath -or -not (Test-Path -LiteralPath $pythonPath)) {
 }
 
 Set-Content -LiteralPath $statePath -Value $selectedRuntime -Encoding Ascii
+Set-Content -LiteralPath $maximizeStatePath -Value $(if ($script:startMaximized) { "1" } else { "0" }) -Encoding Ascii
 $description = Get-PythonDescription $pythonPath
 Write-Host "PokeCon runtime: $description"
 Write-Host "Python executable: $pythonPath"
@@ -295,7 +342,11 @@ try {
 
     Push-Location $controllerDir
     try {
-        & $pythonPath $windowScript
+        $windowArguments = @($windowScript)
+        if ($script:startMaximized) {
+            $windowArguments += "--start-maximized"
+        }
+        & $pythonPath @windowArguments
         $windowExitCode = $LASTEXITCODE
     }
     finally {

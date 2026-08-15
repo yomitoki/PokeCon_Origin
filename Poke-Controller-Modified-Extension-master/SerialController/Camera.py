@@ -189,6 +189,51 @@ _WINDOW_CAPTURE_HEADER = struct.Struct("<16siiiiii")
 _WINDOW_CAPTURE_MAGIC = "PKWGC01".encode("utf-16-le")
 
 
+def camera_reader_backoff(frame_interval, read_elapsed):
+    """Pace only camera drivers which return buffers suspiciously quickly.
+
+    A real 60-FPS DirectShow ``read`` normally blocks for most of its 16.7-ms
+    frame period. Adding a sub-millisecond ``Event.wait`` afterwards can wake
+    one Windows timer tick late and intermittently skip the following frame.
+    Immediate-buffer drivers still need pacing to avoid a CPU spin.
+    """
+    try:
+        interval = max(0.0, float(frame_interval))
+        elapsed = max(0.0, float(read_elapsed))
+    except (TypeError, ValueError):
+        return 0.0
+    if interval <= 0.0 or elapsed >= interval * 0.5:
+        return 0.0
+    return max(0.0, interval - elapsed)
+
+
+def camera_frame_freshness_timeout(fps):
+    """Return how long the latest captured frame may be used by consumers.
+
+    A preview may retain its own last rendered bitmap briefly to hide a USB
+    reconnect, but Commands and recording must not mistake a stopped capture
+    device's final frame for live input.  Allow at least four expected frame
+    periods and a little Windows scheduling headroom.
+    """
+    try:
+        rate = float(fps)
+    except (TypeError, ValueError):
+        rate = 0.0
+    if rate <= 0.0:
+        return 0.25
+    return max(0.25, min(1.0, 4.0 / rate))
+
+
+def camera_fourcc_name(value):
+    """Return a readable OpenCV FOURCC value for diagnostics."""
+    try:
+        code = int(round(float(value)))
+    except (TypeError, ValueError, OverflowError):
+        return ""
+    name = "".join(chr((code >> (8 * index)) & 0xff) for index in range(4))
+    return name if all(32 <= ord(char) < 127 for char in name) else ""
+
+
 def _get_save_filespec(filename: str) -> str:
     """
     画像ファイルの保存パスを取得する。
@@ -211,13 +256,24 @@ class Camera:
         self._window_reader_thread = None
         self._camera_reader_stop = None
         self._camera_reader_thread = None
+        # DirectShow graph creation/reconfiguration/release is not thread
+        # safe. Camera Name and Apply input can be clicked close together, so
+        # serialize the complete native lifecycle rather than only read().
+        self._camera_lifecycle_lock = threading.RLock()
+        self._camera_io_lock = threading.Lock()
         self._window_raw_bgr = None
         self.window_capture_mode = "client"
         self.image_bgr = None
+        self._frame_sequence = 0
         self.capture_size = (1280, 720)
         self.capture_dir = "Captures"
         self.fps = int(fps)
         self.window_capture_backend = "WindowCapture"
+        self._measured_fps = 0.0
+        self._fps_measure_started = 0.0
+        self._fps_measure_frames = 0
+        self._last_frame_received_at = 0.0
+        self._frame_ready_event = threading.Event()
 
         self._logger = getLogger(__name__)
         self._logger.addHandler(NullHandler())
@@ -272,6 +328,10 @@ class Camera:
         return windows
 
     def openWindow(self, hwnd: int):
+        with self._camera_lifecycle_lock:
+            return self._open_window_locked(hwnd)
+
+    def _open_window_locked(self, hwnd: int):
         """
         指定したウィンドウハンドル(hwnd)を開く/キャプチャ準備を行う。
         """
@@ -324,6 +384,8 @@ class Camera:
                 if frame is not None:
                     self._window_raw_bgr = frame
                     self.image_bgr = self._resize_window_frame(frame)
+                    self._frame_sequence += 1
+                    self._note_frame_received()
                     self._start_window_reader()
                     return True
                 if self._window_capture_error:
@@ -404,6 +466,7 @@ class Camera:
         raw = self._window_raw_bgr
         if raw is not None:
             self.image_bgr = self._resize_window_frame(raw)
+            self._frame_sequence += 1
 
     def _crop_window_frame(self, frame):
         """Remove title/border pixels when game-client-only mode is selected."""
@@ -493,6 +556,8 @@ class Camera:
                         # path therefore always sees a complete frame object.
                         self._window_raw_bgr = frame
                         self.image_bgr = self._resize_window_frame(frame)
+                        self._frame_sequence += 1
+                        self._note_frame_received()
                 except Exception as error:
                     self._logger.warning("Game capture reader failed: %s", error)
                 stop_event.wait(max(0.005, 1.0 / max(1, int(self.fps))))
@@ -502,6 +567,10 @@ class Camera:
         self._window_reader_thread.start()
 
     def openCamera(self, cameraId: int):
+        with self._camera_lifecycle_lock:
+            return self._open_camera_locked(cameraId)
+
+    def _open_camera_locked(self, cameraId: int):
         self.destroy()
 
         if os.name == "nt":
@@ -514,12 +583,64 @@ class Camera:
         if not self.camera.isOpened():
             print("Camera ID " + str(cameraId) + " can't open.")
             self._logger.error(f"Camera ID {cameraId} cannot open.")
-            return
+            return False
         print("Camera ID " + str(cameraId) + " opened successfully")
         self._logger.debug(f"Camera ID {cameraId} opened successfully.")
-        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, self.capture_size[0])
-        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, self.capture_size[1])
+        self._apply_camera_mode(self.camera)
         self._start_camera_reader()
+        # Return the result while the lifecycle lock is still held. Callers
+        # must not perform a separate isOpened() check after openCamera()
+        # returns: another queued Camera selection may legitimately begin its
+        # hand-off in that gap and create a false failure popup.
+        return True
+
+    def _apply_camera_mode(self, capture):
+        """Negotiate the 720p high-frame-rate DirectShow media type.
+
+        The connected capture devices expose 1280x720 YUY2 at only 10-20 FPS
+        while their MJPEG pin supports 60 FPS.  DirectShow can still report a
+        requested 60 FPS property while delivering YUY2 at 20 FPS, so choose
+        the compressed media type before applying size and rate.
+        """
+        capture.set(cv2.CAP_PROP_FRAME_WIDTH, self.capture_size[0])
+        capture.set(cv2.CAP_PROP_FRAME_HEIGHT, self.capture_size[1])
+        applied = bool(capture.set(cv2.CAP_PROP_FPS, self.fps))
+        if os.name == "nt":
+            # These USB capture drivers rebuild their DirectShow media type
+            # after FPS is set. MJPG must therefore be the final property:
+            # size -> FPS -> MJPG measured 59.1 FPS on the connected device,
+            # while putting MJPG first reverted to YUY2 at 9-20 FPS.
+            capture.set(
+                cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        actual_fps = capture.get(cv2.CAP_PROP_FPS)
+        actual_width = capture.get(cv2.CAP_PROP_FRAME_WIDTH)
+        actual_height = capture.get(cv2.CAP_PROP_FRAME_HEIGHT)
+        actual_fourcc = camera_fourcc_name(capture.get(cv2.CAP_PROP_FOURCC))
+        self._logger.info(
+            "Camera mode requested=%sx%s@%s MJPG negotiated=%sx%s@%s %s",
+            self.capture_size[0], self.capture_size[1], self.fps,
+            actual_width, actual_height, actual_fps,
+            actual_fourcc or "unknown-format")
+        return applied
+
+    def setFps(self, fps):
+        with self._camera_lifecycle_lock:
+            return self._set_fps_locked(fps)
+
+    def _set_fps_locked(self, fps):
+        """Apply the requested rate to both window and capture-device input."""
+        self.fps = max(1, int(fps))
+        capture = self.camera
+        if capture is None:
+            return False
+        try:
+            with self._camera_io_lock:
+                if self.camera is not capture or not capture.isOpened():
+                    return False
+                return self._apply_camera_mode(capture)
+        except Exception as error:
+            self._logger.warning("Could not apply Camera FPS: %s", error)
+            return False
 
     def _start_camera_reader(self):
         """Drain a capture device outside Tk and retain only its latest frame."""
@@ -531,8 +652,10 @@ class Camera:
 
         def read_latest_frames():
             while not stop_event.is_set() and self.camera is capture:
+                cycle_started = time.monotonic()
                 try:
-                    ok, frame = capture.read()
+                    with self._camera_io_lock:
+                        ok, frame = capture.read()
                 except Exception as error:
                     self._logger.warning("Camera reader failed: %s", error)
                     break
@@ -541,26 +664,127 @@ class Camera:
                     # Consumers may safely retain this immutable-by-convention
                     # snapshot while the reader publishes the next ndarray.
                     self.image_bgr = frame
+                    self._frame_sequence += 1
+                    self._note_frame_received()
                 else:
                     stop_event.wait(0.02)
+                    continue
+                # Some DirectShow drivers return the latest buffer immediately
+                # instead of blocking for the next frame.  Do not let one
+                # PokeCon spin faster than its configured camera FPS.
+                interval = 1.0 / max(1, int(self.fps))
+                remaining = camera_reader_backoff(
+                    interval, time.monotonic() - cycle_started)
+                if remaining > 0:
+                    stop_event.wait(remaining)
 
         self._camera_reader_thread = threading.Thread(
             target=read_latest_frames, daemon=True, name="CameraCaptureReader")
         self._camera_reader_thread.start()
 
     def isOpened(self):
-        self._logger.debug("Camera is opened")
-        if self.window_hwnd is not None and platform.system() == "Windows":
-            process_alive = self._window_capture_process is not None and \
-                self._window_capture_process.poll() is None
-            return process_alive and bool(ctypes.windll.user32.IsWindow(
-                wintypes.HWND(int(self.window_hwnd))))
-        return self.camera is not None and self.camera.isOpened()
+        with self._camera_lifecycle_lock:
+            self._logger.debug("Camera is opened")
+            if self.window_hwnd is not None and platform.system() == "Windows":
+                process_alive = self._window_capture_process is not None and \
+                    self._window_capture_process.poll() is None
+                return process_alive and bool(ctypes.windll.user32.IsWindow(
+                    wintypes.HWND(int(self.window_hwnd))))
+            return self.camera is not None and self.camera.isOpened()
 
-    def readFrame(self):
+    def frameAge(self, now=None):
+        """Return seconds since a frame actually arrived, or infinity."""
+        received_at = float(self._last_frame_received_at)
+        if received_at <= 0.0:
+            return float("inf")
+        now = time.monotonic() if now is None else float(now)
+        return max(0.0, now - received_at)
+
+    def hasFreshFrame(self, max_age=None, now=None):
+        """Whether ``image_bgr`` came from a recently received input frame."""
+        if self.image_bgr is None:
+            return False
+        if max_age is None:
+            max_age = camera_frame_freshness_timeout(self.fps)
+        try:
+            allowed_age = max(0.0, float(max_age))
+        except (TypeError, ValueError):
+            allowed_age = camera_frame_freshness_timeout(self.fps)
+        return self.frameAge(now) <= allowed_age
+
+    def readFrame(self, max_age=None, allow_stale=False):
         # Both physical capture and Windows Graphics Capture are drained by a
         # reader thread.  Never wait for a driver from Tk/Commands callers.
+        # The ndarray remains cached for diagnostics, but normal consumers
+        # must never run Commands against the final frame of a stalled input.
+        if not allow_stale and not self.hasFreshFrame(max_age=max_age):
+            return None
         return self.image_bgr
+
+    def readFreshFrame(self, timeout=0.75, max_age=None):
+        """Return live input, briefly waiting through a transient reader gap.
+
+        A busy Windows scheduler or a short DirectShow hiccup can occasionally
+        exceed the strict freshness window even though capture resumes on the
+        next frame.  Commands may wait here, outside Tk, but the final cached
+        frame of a genuinely stopped input is never returned.
+        """
+        frame = self.readFrame(max_age=max_age)
+        if frame is not None:
+            return frame
+        try:
+            deadline = time.monotonic() + max(0.0, float(timeout))
+        except (TypeError, ValueError):
+            deadline = time.monotonic()
+        sequence = self._frame_sequence
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0.0:
+                return None
+            # Use short waits so an already-set event from an older frame is
+            # harmless and shutdown/input switching remains responsive.
+            sequence, frame = self.waitForFrame(
+                sequence, timeout=min(0.10, remaining))
+            if frame is not None:
+                return frame
+
+    def frameSequence(self):
+        """Return a counter which advances only when a new frame is published."""
+        return self._frame_sequence
+
+    def _note_frame_received(self, now=None):
+        now = time.monotonic() if now is None else float(now)
+        self._last_frame_received_at = now
+        self._frame_ready_event.set()
+        if self._fps_measure_started <= 0.0:
+            self._fps_measure_started = now
+            self._fps_measure_frames = 0
+            return
+        self._fps_measure_frames += 1
+        elapsed = now - self._fps_measure_started
+        if elapsed >= 0.75:
+            self._measured_fps = self._fps_measure_frames / elapsed
+            self._fps_measure_started = now
+            self._fps_measure_frames = 0
+
+    def measuredFps(self, now=None):
+        """Return recently measured source FPS, or zero after a stall."""
+        now = time.monotonic() if now is None else float(now)
+        if self._last_frame_received_at <= 0.0 \
+                or now - self._last_frame_received_at > 1.5:
+            return 0.0
+        return max(0.0, float(self._measured_fps))
+
+    def waitForFrame(self, last_sequence=-1, timeout=0.1):
+        """Wait for a frame newer than ``last_sequence`` without polling Tk."""
+        if self._frame_sequence == last_sequence:
+            self._frame_ready_event.wait(max(0.001, float(timeout)))
+        self._frame_ready_event.clear()
+        return self._frame_sequence, self.readFrame()
+
+    def wakeFrameWait(self):
+        """Wake a preview waiter during a mode switch or shutdown."""
+        self._frame_ready_event.set()
 
     def saveCapture(self, filename: str = None, crop: int = None, crop_ax: List[int] = None, img: numpy.ndarray = None):
         if crop_ax is None:
@@ -598,20 +822,30 @@ class Camera:
             self._logger.error(f"Capture Failed :{e}")
 
     def destroy(self):
+        with self._camera_lifecycle_lock:
+            return self._destroy_locked()
+
+    def _destroy_locked(self):
+        self._frame_ready_event.set()
         if self._camera_reader_stop is not None:
             self._camera_reader_stop.set()
         capture, self.camera = self.camera, None
+        reader = self._camera_reader_thread
+        # Most DirectShow reads return within one frame. Give that native call
+        # time to finish before release(); releasing the graph under read() is
+        # a common source of 0xC0000409 native termination. A stalled driver is
+        # still released after the bounded wait so source switching can recover.
+        if reader is not None and reader is not threading.current_thread():
+            reader.join(timeout=0.5)
         if capture is not None:
             try:
                 if capture.isOpened():
-                    # Release first: some DirectShow drivers otherwise leave
-                    # read() blocked and delay input-source switching.
                     capture.release()
             except Exception:
                 pass
-        if self._camera_reader_thread is not None and \
-                self._camera_reader_thread is not threading.current_thread():
-            self._camera_reader_thread.join(timeout=0.5)
+        if reader is not None and reader is not threading.current_thread() \
+                and reader.is_alive():
+            reader.join(timeout=0.5)
         self._camera_reader_stop = None
         self._camera_reader_thread = None
         if self._window_reader_stop is not None:
@@ -643,4 +877,9 @@ class Camera:
         self._window_capture_error = ""
         self._window_raw_bgr = None
         self.image_bgr = None
+        self._measured_fps = 0.0
+        self._fps_measure_started = 0.0
+        self._fps_measure_frames = 0
+        self._last_frame_received_at = 0.0
+        self._frame_sequence += 1
         self._logger.debug("Video input destroyed")

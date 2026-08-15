@@ -44,7 +44,12 @@ def ZA_load_sleeps(self):
     try:
         data = self.ZA_load_json_with_comments(self.config_path2)
         # JSONではキーが文字列になるのでintキーに変換
-        self.SLEEPLIST = {int(k): v for k, v in data.items()}
+        loaded_sleeps = {int(k): v for k, v in data.items()}
+        # 途中開始用の既定値は残し、ファイルにある項目だけを上書きする。
+        # これにより古い設定ファイルに新しいキーがなくても停止しない。
+        merged_sleeps = dict(self.SLEEPLIST)
+        merged_sleeps.update(loaded_sleeps)
+        self.SLEEPLIST = merged_sleeps
         print("SLEEPLISTを更新しました。")
         if not added and not changed:
             print("（変更はありません）")
@@ -919,7 +924,7 @@ def ZA_battle_move(self):
     if self.battle_step_return == 0:
         self.battle_step=0
     else:
-    	self.battle_step=self.battle_step_return  
+        self.battle_step=self.battle_step_return  
     
     count=0
     if self.battle_step_return == 0:

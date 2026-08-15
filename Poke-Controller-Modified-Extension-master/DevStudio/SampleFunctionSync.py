@@ -213,10 +213,50 @@ def fragment_function_stats(fragment_source, function_name):
     }
 
 
+def resolve_fragment_folder(fragment_root, folder):
+    """Resolve a requested comparison folder without scanning outside samples.
+
+    Selecting the project root is a common way to ask for every registered
+    sample.  Treat any ancestor of the fragment library as the library root,
+    while still rejecting an unrelated directory.
+    """
+    root = os.path.abspath(fragment_root)
+    requested = os.path.abspath(folder or root)
+    try:
+        common = os.path.commonpath([root, requested])
+    except ValueError:
+        common = ""
+    if common == root:
+        return requested
+    if common == requested:
+        return root
+    raise ValueError("サンプル関数ライブラリ配下のフォルダーを選択してください。")
+
+
+def source_paths_equivalent(saved_path, current_path):
+    """Match a recorded origin after a workspace/drive relocation."""
+    saved = str(saved_path or "").strip()
+    current = str(current_path or "").strip()
+    if not saved or not current:
+        return False
+    if os.path.normcase(os.path.abspath(saved)) == \
+            os.path.normcase(os.path.abspath(current)):
+        return True
+
+    def portable_suffix(value):
+        normalized = value.replace("\\", "/").strip().casefold()
+        marker = "serialcontroller/"
+        index = normalized.rfind(marker)
+        return normalized[index:] if index >= 0 else ""
+
+    saved_suffix = portable_suffix(saved)
+    current_suffix = portable_suffix(current)
+    return bool(saved_suffix) and saved_suffix == current_suffix
+
+
 def scan_folder(fragment_root, folder):
-    root, folder = os.path.abspath(fragment_root), os.path.abspath(folder)
-    if os.path.commonpath([root, folder]) != root:
-        raise ValueError("サンプル関数ライブラリ配下のフォルダーを選択してください。")
+    root = os.path.abspath(fragment_root)
+    folder = resolve_fragment_folder(root, folder)
     metadata_by_fragment = {}
     for directory, _, names in os.walk(folder):
         for filename in names:
@@ -314,11 +354,11 @@ def compare_folder(source, fragment_root, folder, source_path=""):
     for recorded_name in sorted(fragment_functions, key=str.lower):
         variants = fragment_functions[recorded_name]
         if source_path:
-            wanted = os.path.normcase(os.path.abspath(source_path))
             variants = [
                 item for item in variants
                 if not item.get("source_path") or
-                os.path.normcase(os.path.abspath(item["source_path"])) == wanted]
+                source_paths_equivalent(
+                    item.get("source_path"), source_path)]
             if not variants:
                 continue
         name = recorded_name

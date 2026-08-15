@@ -505,6 +505,52 @@ class ImageProcPythonCommand(PythonCommand):
 
         self.camera = cam
         self.gui = gui
+        self._camera_frame_unavailable_logged = False
+        self._command_start_frame_sequence = None
+        self._require_new_frame_after_start = False
+
+    def start(self, ser, postProcess):
+        """Start after marking the current camera frame as pre-command data."""
+        frame_sequence = getattr(self.camera, "frameSequence", None)
+        wait_for_frame = getattr(self.camera, "waitForFrame", None)
+        if callable(frame_sequence) and callable(wait_for_frame):
+            self._command_start_frame_sequence = frame_sequence()
+            self._require_new_frame_after_start = True
+        else:
+            self._command_start_frame_sequence = None
+            self._require_new_frame_after_start = False
+        return super().start(ser, postProcess)
+
+    def _read_camera_frame(self):
+        """Return only live input; never reuse a stalled camera's last frame."""
+        if self._require_new_frame_after_start:
+            baseline = self._command_start_frame_sequence
+            try:
+                sequence, frame = self.camera.waitForFrame(
+                    baseline, timeout=0.75)
+            except (AttributeError, TypeError, ValueError):
+                sequence, frame = baseline, None
+            if sequence != baseline:
+                self._command_start_frame_sequence = sequence
+            if frame is not None and sequence != baseline:
+                self._require_new_frame_after_start = False
+            else:
+                frame = None
+        elif hasattr(self.camera, "readFreshFrame"):
+            frame = self.camera.readFreshFrame(timeout=0.75)
+        else:
+            frame = self.camera.readFrame()
+        if frame is None:
+            if not self._camera_frame_unavailable_logged:
+                message = "Cameraの新しい映像がないため画像処理を待機します。"
+                print(message)
+                self._logger.warning(message)
+                self._camera_frame_unavailable_logged = True
+            return None
+        if self._camera_frame_unavailable_logged:
+            self._logger.info("Cameraの映像入力が復帰しました。")
+            self._camera_frame_unavailable_logged = False
+        return frame
 
     def pausedecorator2(func):
         """
@@ -573,7 +619,9 @@ class ImageProcPythonCommand(PythonCommand):
         crop_cv2, _ = convertCv2Format(crop_fmt=crop_fmt, crop=crop)
 
         # カメラの画像を取得
-        src = self.camera.readFrame()
+        src = self._read_camera_frame()
+        if src is None:
+            return None
 
         # トリミング
         cropped_image = crop_image(src, crop=crop_cv2)
@@ -617,7 +665,9 @@ class ImageProcPythonCommand(PythonCommand):
         crop_template_cv2, _ = convertCv2Format(crop_fmt=crop_fmt, crop=crop_template)
 
         # カメラの画像を取得
-        src = self.camera.readFrame()
+        src = self._read_camera_frame()
+        if src is None:
+            return False
 
         # テンプレート画像を取得
         if isinstance(template_path, ImageProcessing.image_type):
@@ -698,7 +748,10 @@ class ImageProcPythonCommand(PythonCommand):
         crop_template_cv2, _ = convertCv2Format(crop_fmt=crop_fmt, crop=crop_template)
 
         # カメラの画像を取得
-        src = self.camera.readFrame()
+        src = self._read_camera_frame()
+        if src is None:
+            count = len(template_path_list)
+            return (0 if count else -1), [0.0] * count, [False] * count
 
         # テンプレート画像を取得
         template_image_list = []
@@ -847,7 +900,9 @@ class ImageProcPythonCommand(PythonCommand):
         crop_template_cv2, crop_template_pillow = convertCv2Format(crop_fmt=crop_fmt, crop=crop_template)
 
         # カメラの画像を取得
-        template_image = self.camera.readFrame()
+        template_image = self._read_camera_frame()
+        if template_image is None:
+            return False
 
         # テンプレートマッチング対象画像を取得
         if isinstance(image_path, ImageProcessing.image_type):
@@ -968,7 +1023,9 @@ class ImageProcPythonCommand(PythonCommand):
         crop_cv2, _ = convertCv2Format(crop_fmt=crop_fmt, crop=crop)
 
         # カメラの画像を取得
-        src = self.camera.readFrame()
+        src = self._read_camera_frame()
+        if src is None:
+            return False
 
         # ファイル名を設定する
         if filename is None or filename == "":
@@ -992,7 +1049,9 @@ class ImageProcPythonCommand(PythonCommand):
         crop_cv2, _ = convertCv2Format(crop_fmt=crop_fmt, crop=crop)
 
         # カメラの画像を取得
-        src = self.camera.readFrame()
+        src = self._read_camera_frame()
+        if src is None:
+            return False
 
         opneImage(src, crop=crop_cv2, title=title)
 
@@ -1004,7 +1063,9 @@ class ImageProcPythonCommand(PythonCommand):
         crop_cv2, _ = convertCv2Format(crop_fmt=crop_fmt, crop=crop)
 
         # カメラの画像を取得
-        src = self.camera.readFrame()
+        src = self._read_camera_frame()
+        if src is None:
+            return False
 
         # トリミング
         cropped_image = crop_image(src, crop=crop_cv2)
@@ -1030,7 +1091,9 @@ class ImageProcPythonCommand(PythonCommand):
         crop_cv2, _ = convertCv2Format(crop_fmt=crop_fmt, crop=crop)
 
         # カメラの画像を取得
-        src = self.camera.readFrame()
+        src = self._read_camera_frame()
+        if src is None:
+            return False
 
         # トリミング
         cropped_image = crop_image(src, crop=crop_cv2)

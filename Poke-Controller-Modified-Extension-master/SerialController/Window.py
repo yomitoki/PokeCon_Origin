@@ -48,6 +48,13 @@ from CommandLoader import CommandLoader, FileCommandLoader
 from GuiAssets import CaptureArea, ControllerGUI
 from VisionAutomation import VisionAutomation
 from AudioMonitor import AudioMonitor
+from AudioLevelControl import (sanitize_audio_level_settings,
+                               suggest_audio_level_settings)
+from WindowsAudioIdentity import (identity_for_audio_label,
+                                  normalized_audio_name, physical_usb_key,
+                                  resolve_saved_audio,
+                                  upgrade_input_set_audio_identities,
+                                  usb_connection_token)
 from ImageAnalysisAssist import ImageAnalysisAssist
 from ImageDetectionMonitor import (crop_search_region, filter_target_names,
                                    format_show_value_entries,
@@ -62,6 +69,7 @@ from DiskSpaceGuard import disk_space_violations
 from Recording import CaptureRecorder
 from CommandMonitorRecording import (CommandInputActivityTracker,
                                      CommandStateTimeline, DarkStillFrameDetector,
+                                     apply_stopped_session_recording_choice,
                                      command_source_descriptor,
                                      execution_location_key,
                                      failure_evidence_end,
@@ -112,8 +120,17 @@ from InputSetRuntimeRegistry import (ActiveInputSetRegistry,
                                      device_usage_conflicts,
                                      main_resource_conflicts,
                                      read_active_input_sets)
+from PokeConRecovery import show_recovery_dialog
 from ResourceControl import (SystemCpuSampler, clamp_cpu_target,
-                             resource_throttle_level, throttle_multiplier)
+                             resource_throttle_level,
+                             set_main_runtime_priority, throttle_multiplier)
+from UiResponsiveness import (foreground_process_id,
+                              foreground_process_matches,
+                              confirmation_audio_action,
+                              keyboard_listener_should_run,
+                              preview_rate_permissions)
+from VideoInputPolicy import (guard_combobox_mousewheel,
+                              is_pokecon_window_title)
 from SharedDebugLibrary import (SharedDebugConflictError, default_library_path,
                                 read_shared_debug, write_shared_debug)
 from SoftwareControllerState import SoftwareControllerState
@@ -131,6 +148,14 @@ from Commands.Keys import KeyPress, Button, Hat, Stick, Direction
 from Commands.ProController import ProController
 from Commands.CommandBase import Command
 
+# OpenCV defaults to all logical CPUs.  Several PokeCon processes then each
+# create a full machine-sized worker pool and starve Tk.  Two workers retain
+# ample 720p throughput while allowing multiple GUIs to remain interactive.
+try:
+    cv2.setNumThreads(2)
+except Exception:
+    pass
+
 addpath = dirname(dirname(dirname(abspath(__file__))))  # SerialControllerフォルダのパス
 sys.path.append(addpath)
 
@@ -139,7 +164,7 @@ WINDOW_CAPTURE_WINDOW_LABEL = "ウィンドウ全体（タイトルバーあり�
 
 
 class PokeControllerApp:
-    def __init__(self, master=None, profile="default"):
+    def __init__(self, master=None, profile="default", start_maximized=False):
         self._logger = getLogger(__name__)
         self._logger.addHandler(NullHandler())
 
@@ -174,6 +199,12 @@ class PokeControllerApp:
         self._resource_status_refresh_lock = threading.Lock()
         self._preview_status_refresh_queued = False
         self._preview_status_refresh_lock = threading.Lock()
+        self._audio_owner_reconcile_queued = False
+        self._audio_owner_reconcile_lock = threading.Lock()
+        self._audio_monitor_lifecycle_lock = threading.RLock()
+        self._audio_monitor_requested = False
+        self._other_confirmation_audio_output = False
+        self._audio_auto_retry_at = 0.0
         runtime_label = os.environ.get("POKECON_RUNTIME_LABEL", "").strip()
         runtime_suffix = f" [{runtime_label}]" if runtime_label else ""
         self.root.title(f"{Constant.NAME} ver.{Constant.VERSION} (profile: {args.profile}){runtime_suffix}")
@@ -196,9 +227,11 @@ class PokeControllerApp:
         self.vision = VisionAutomation(os.path.join("Commands", "PythonCommands", "Samples", "vision_rules.json"))
         self.audio_monitor = AudioMonitor()
         self.recorder = CaptureRecorder()
+        self.recorder.audio_monitor = self.audio_monitor
         # Long-form operation authoring uses its own clean 1280x720 recorder.
         # It must not change the normal/Commands-monitor recording modes.
         self.operation_recorder = CaptureRecorder()
+        self.operation_recorder.audio_monitor = self.audio_monitor
         self.operation_capture_session = None
         self._operation_gamepad_dialog = None
         self._active_operation_gamepad_mapping = {}
@@ -245,6 +278,7 @@ class PokeControllerApp:
         self._pc_gamepad_restore_after_command = False
         self.object_detection_assist_window = None
         self._initial_video_open_thread = None
+        self._camera_name_open_thread = None
         self._initial_serial_open_thread = None
         self._defer_serial_open = True
         self._commands_loaded = False
@@ -262,6 +296,8 @@ class PokeControllerApp:
         self.pokeconversion = Constant.VERSION
 
         self.profile = profile
+        self._force_start_maximized = bool(start_maximized)
+        self._startup_maximize_requested = bool(start_maximized)
         self._active_input_set_registry = None
         self._startup_selected_combined_name = ""
         self._startup_skip_hardware = False
@@ -272,18 +308,26 @@ class PokeControllerApp:
         self._window_activity_stop = threading.Event()
         self._window_activity_thread = None
         self._window_activity_update_lock = threading.Lock()
-        self._last_active_preview_owner = True
+        self._other_pokecon_foreground = False
+        self._newest_pokecon_instance = True
+        self._other_main_preview_owner = False
         self._last_active_preview_status_value = None
+        self._preview_shutdown_mode = False
         self._last_focus_mark_monotonic = 0.0
+        self._keyboard_focus_after_id = None
         self._resource_cpu_sampler = SystemCpuSampler()
         self._resource_cpu_percent = None
         self._resource_throttle_level = "normal"
         self._resource_main_effective = False
+        self._runtime_full_rate_effective = False
         self._resource_main_open_downgraded = False
         self._resource_protected_until = 0.0
         self._resource_control_config = {
             "enabled": True, "target_percent": 90, "main_requested": False,
         }
+        self.last_active_preview_full_fps = tk.BooleanVar(value=False)
+        self.last_active_preview_status = tk.StringVar(
+            value="メインツールは設定FPS、通常ツールは最大30fpsで表示")
         Command.app_name = f"{Constant.NAME} ver.{Constant.VERSION}"
         Command.profilename = profile
 
@@ -326,6 +370,20 @@ class PokeControllerApp:
         self.html_button = ttk.Button(self.top_command_f, text="Open HTML")
         self.html_button.grid(column="6", padx="5", pady="5", row="0", sticky="ew")
         self.html_button.configure(command=self.open_html_output)
+        # Keep the FPS control beside the preview so it remains visible even
+        # when the scrollable Camera settings are below the fold at 720p.
+        self.keep_preview_fps_checkbox = ttk.Checkbutton(
+            self.top_command_f, text="表示60FPS維持（1つだけ）",
+            variable=self.last_active_preview_full_fps,
+            command=self._resource_main_changed)
+        self.keep_preview_fps_checkbox.grid(
+            column="7", padx="8", pady="5", row="0", sticky="ew")
+        self.preview_fps_live_label = ttk.Label(
+            self.top_command_f, textvariable=self.last_active_preview_status,
+            foreground="#174a7e", anchor="w")
+        self.preview_fps_live_label.grid(
+            column="0", columnspan="8", padx="5", pady=(0, 3),
+            row="1", sticky="ew")
         self.top_command_f.grid(column="0", row="0", sticky="w")
         self.top_command_f.grid_anchor("center")
         self.canvas_frame = ttk.Frame(self.camera_lf)
@@ -414,19 +472,21 @@ class PokeControllerApp:
             column=1, columnspan=4, row=3, padx=5, pady=(0, 5), sticky="w")
         self.window_capture_mode_cb.bind(
             "<<ComboboxSelected>>", self.apply_window_capture_mode, add="+")
+        # ttk.Combobox changes its selection when the pointer is over it and
+        # the mouse wheel moves.  Video input applies that change immediately,
+        # so this one field requires a click/keyboard choice. Notebook tabs and
+        # every other setting keep their normal mouse behaviour.
+        guard_combobox_mousewheel(self.video_source_cb)
         ttk.Label(
             self.camera_settings_lf,
             text="表示・画像解析・録画へ共通反映",
             foreground="#174a7e").grid(
                 column=5, columnspan=5, row=3, padx=5, pady=(0, 5), sticky="w")
-        self.last_active_preview_full_fps = tk.BooleanVar(value=False)
-        self.last_active_preview_status = tk.StringVar(
-            value="前面表示またはメインツールは最大30fps表示を維持")
         ttk.Checkbutton(
             self.camera_settings_lf,
-            text="前面表示またはメインツールは設定FPS（最大60）で表示",
+            text="表示60FPS維持（このPCで同時に1つだけ設定可能）",
             variable=self.last_active_preview_full_fps,
-            command=self._refresh_preview_priority_status).grid(
+            command=self._resource_main_changed).grid(
                 column=0, columnspan=6, row=4, padx=5, pady=(0, 5), sticky="w")
         ttk.Label(
             self.camera_settings_lf, textvariable=self.last_active_preview_status,
@@ -471,6 +531,23 @@ class PokeControllerApp:
         ttk.Button(self.display_settings_lf, text="検知記録を再読込",
                    command=self.reload_image_analysis_assist).grid(
                        column="3", padx="5", pady=(0, 3), row="2", sticky="w")
+        self.camera_feature_limited = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            self.display_settings_lf,
+            text="機能制限版（Commands・解析・映像範囲指定・Tk重ね描画を無効）",
+            variable=self.camera_feature_limited,
+            command=lambda: self._apply_camera_feature_limited(
+                notify=True)).grid(
+                    column=0, columnspan=4, padx=5, pady=(4, 2),
+                    row=3, sticky="w")
+        self.camera_feature_limited_status = tk.StringVar(
+            value="通常版：映像上の範囲指定とTk重ね描画を使用できます。")
+        ttk.Label(
+            self.display_settings_lf,
+            textvariable=self.camera_feature_limited_status,
+            foreground="#174a7e", wraplength=620, justify="left").grid(
+                column=0, columnspan=4, padx=5, pady=(0, 5),
+                row=4, sticky="w")
         # Audio is intentionally separate from camera/display settings.
         self.audio_tab, self.audio_f = self._create_scrollable_tab()
         self.audio_lf = ttk.Labelframe(self.audio_f, text="Capture Audio")
@@ -499,18 +576,75 @@ class PokeControllerApp:
         )
         self.audio_input.trace_add("write", self._show_full_audio_device_name)
         self.audio_gain = tk.IntVar(value=100)
-        ttk.Label(self.audio_lf, text="Gain:").grid(column=0, row=3, padx=(5, 2), pady=(0, 5), sticky="e")
+        ttk.Label(self.audio_lf, text="Gain (100%=原音):").grid(column=0, row=3, padx=(5, 2), pady=(0, 5), sticky="e")
         ttk.Spinbox(self.audio_lf, from_=0, to=400, increment=10, textvariable=self.audio_gain, width=5).grid(column=1, row=3, padx=(2, 2), pady=(0, 5), sticky="w")
         ttk.Label(self.audio_lf, text="%").grid(column=1, row=3, padx=(58, 0), pady=(0, 5), sticky="w")
         self.audio_start_button = ttk.Button(self.audio_lf, text="Start audio", command=self.start_audio_monitor)
         self.audio_start_button.grid(column=1, row=3, padx=(86, 2), pady=(0, 5), sticky="w")
         ttk.Button(self.audio_lf, text="Stop", command=self.stop_audio_monitor).grid(column=1, row=3, padx=(180, 0), pady=(0, 5), sticky="w")
         self.audio_monitor_mode = tk.StringVar(value="No monitoring")
-        ttk.Radiobutton(self.audio_lf, text="確認再生する", value="Monitor", variable=self.audio_monitor_mode,
+        ttk.Radiobutton(self.audio_lf, text="確認再生する（メインPokeConのみ）", value="Monitor", variable=self.audio_monitor_mode,
                         command=self.apply_audio_monitor_mode).grid(column=2, row=3, padx=5, pady=(0, 5), sticky="w")
         ttk.Radiobutton(self.audio_lf, text="出力なし（録画には収録）", value="No monitoring",
                         variable=self.audio_monitor_mode, command=self.apply_audio_monitor_mode).grid(
                             column=3, columnspan=2, row=3, padx=5, pady=(0, 5), sticky="w")
+        self.audio_auto_level = tk.BooleanVar(value=False)
+        self.audio_target_dbfs = tk.DoubleVar(value=-6.0)
+        self.audio_max_auto_gain = tk.IntVar(value=200)
+        self.audio_limiter_ceiling_dbfs = tk.DoubleVar(value=-1.0)
+        ttk.Checkbutton(
+            self.audio_lf, text="入力ピーク自動補正",
+            variable=self.audio_auto_level).grid(
+                column=0, row=4, padx=5, pady=(0, 5), sticky="w")
+        ttk.Label(self.audio_lf, text="目標:").grid(
+            column=1, row=4, padx=(2, 0), pady=(0, 5), sticky="w")
+        ttk.Spinbox(
+            self.audio_lf, from_=-18.0, to=-1.0, increment=1.0,
+            textvariable=self.audio_target_dbfs, width=5).grid(
+                column=1, row=4, padx=(42, 0), pady=(0, 5), sticky="w")
+        ttk.Label(self.audio_lf, text="dBFS / 自動追加最大:").grid(
+            column=1, row=4, padx=(96, 0), pady=(0, 5), sticky="w")
+        ttk.Spinbox(
+            self.audio_lf, from_=100, to=800, increment=50,
+            textvariable=self.audio_max_auto_gain, width=5).grid(
+                column=1, row=4, padx=(230, 0), pady=(0, 5), sticky="w")
+        ttk.Label(self.audio_lf, text="% / Limiter:").grid(
+            column=2, row=4, padx=(0, 0), pady=(0, 5), sticky="e")
+        ttk.Spinbox(
+            self.audio_lf, from_=-6.0, to=-0.1, increment=0.5,
+            textvariable=self.audio_limiter_ceiling_dbfs, width=5).grid(
+                column=3, row=4, padx=(2, 0), pady=(0, 5), sticky="w")
+        ttk.Label(self.audio_lf, text="dBFS").grid(
+            column=3, row=4, padx=(58, 0), pady=(0, 5), sticky="w")
+        self.audio_level_status = tk.StringVar(
+            value="自動補正はAudio再開始後に反映されます。")
+        self._audio_level_poll_generation = 0
+        self._audio_auto_calibration_generation = 0
+        self._audio_auto_calibration_active = False
+        self._audio_auto_calibration_deadline = 0.0
+        ttk.Label(
+            self.audio_lf, textvariable=self.audio_level_status,
+            foreground="#174a7e").grid(
+                column=0, columnspan=3, row=5, padx=5, pady=(0, 5), sticky="w")
+        self.audio_auto_calibrate_button = ttk.Button(
+            self.audio_lf, text="5秒おまかせ",
+            command=lambda: self.auto_calibrate_audio_level(5))
+        self.audio_auto_calibrate_button.grid(
+            column=3, row=5, padx=5, pady=(0, 5), sticky="e")
+        self.audio_precise_calibrate_button = ttk.Button(
+            self.audio_lf, text="30秒精密調整",
+            command=lambda: self.auto_calibrate_audio_level(30))
+        self.audio_precise_calibrate_button.grid(
+            column=4, row=5, padx=5, pady=(0, 5), sticky="e")
+        ttk.Label(
+            self.audio_lf,
+            text="不定期な大音量・音割れの調整には30秒版を使用してください。",
+            foreground="#555555").grid(
+                column=0, columnspan=4, row=6, padx=5, pady=(0, 5), sticky="w")
+        ttk.Button(
+            self.audio_lf, text="最大値リセット",
+            command=self.reset_audio_level_statistics).grid(
+                column=4, row=6, padx=5, pady=(0, 5), sticky="e")
         self.refresh_audio_devices()
         self.display_settings_lf.configure(height="200", text="Display Settings", width="200")
         self.display_settings_lf.grid(column="1", padx="5", pady="0", row="0", sticky="nw")
@@ -540,7 +674,10 @@ class PokeControllerApp:
         resource_box.pack(fill="x", padx=5, pady=5)
         self.resource_control_enabled = tk.BooleanVar(value=True)
         self.resource_cpu_target = tk.IntVar(value=90)
-        self.resource_main_tool = tk.BooleanVar(value=False)
+        # The visible 60-FPS checkbox and the unique resource-main role are
+        # one machine-wide ownership request. Keeping separate variables used
+        # to allow several windows to look checked while only one was honored.
+        self.resource_main_tool = self.last_active_preview_full_fps
         self.resource_control_status = tk.StringVar(
             value="CPU使用率を測定しています…")
         ttk.Checkbutton(
@@ -734,8 +871,14 @@ class PokeControllerApp:
         self._record_detection_events = {}
         self._record_detection_events_lock = threading.Lock()
         self._record_compose_lock = threading.Lock()
-        self._record_compose_event = threading.Event()
-        self._record_compose_pending = None
+        self._record_compose_condition = threading.Condition(
+            self._record_compose_lock)
+        self._record_compose_queue = deque()
+        self._record_compose_active_session = None
+        self._record_compose_closing_sessions = set()
+        self._record_compose_queue_max_depth = 0
+        self._recording_latest_snapshot = None
+        self._recording_last_presentation_at = 0.0
         self._record_compose_thread = threading.Thread(
             target=self._recording_compose_loop, daemon=True, name="RecordingCompositor")
         self._record_compose_thread.start()
@@ -1446,8 +1589,24 @@ class PokeControllerApp:
         self.root.bind_all("<MouseWheel>", self._scroll_tabs_with_wheel, add="+")
         self.controller_nb.bind(
             "<<NotebookTabChanged>>", self._note_resource_interaction, add="+")
+        self.controller_nb.bind(
+            "<<NotebookTabChanged>>", self._prioritize_tab_interaction, add="+")
+        # A widget binding runs before ttk.Notebook's class binding.  Pause
+        # expensive preview installation first, then let the normal class
+        # binding select and draw the requested tab without returning "break".
+        self.controller_nb.bind(
+            "<ButtonPress-1>", self._prioritize_tab_interaction, add="+")
         self.root.bind_all("<ButtonPress>", self._note_resource_interaction, add="+")
         self.root.bind_all("<KeyPress>", self._note_resource_interaction, add="+")
+        # Pointer motion reaches Tk before the following click. Yield the
+        # expensive video-image paste while the pointer is over a control so
+        # Combobox popdowns and buttons never wait behind the 60-FPS preview.
+        self.root.bind_all(
+            "<Motion>", self._prioritize_control_interaction, add="+")
+        self.root.bind_all(
+            "<ButtonPress>", self._prioritize_control_interaction, add="+")
+        self.root.bind_all(
+            "<KeyPress>", self._prioritize_control_interaction, add="+")
         if platform.system() == "Windows" or platform.system() == "Darwin":
             self.controller_nb.configure(height="150")
         else:
@@ -1800,14 +1959,15 @@ class PokeControllerApp:
         self.is_use_keyboard.set(self.settings.is_use_keyboard.get())
         self.fps.set(self.settings.fps.get())
         self.show_size.set(self.settings.show_size.get())
-        self.last_active_preview_full_fps.set(
-            bool(getattr(self.settings, "last_active_preview_full_fps", False)))
+        preview_owner_requested = bool(
+            getattr(self.settings, "last_active_preview_full_fps", False)
+            or getattr(self.settings, "resource_main_tool", False))
+        self.last_active_preview_full_fps.set(preview_owner_requested)
         self.resource_control_enabled.set(
             bool(getattr(self.settings, "resource_control_enabled", True)))
         self.resource_cpu_target.set(clamp_cpu_target(
             getattr(self.settings, "resource_cpu_target", 90)))
-        self.resource_main_tool.set(
-            bool(getattr(self.settings, "resource_main_tool", False)))
+        self.resource_main_tool.set(preview_owner_requested)
         self._cache_resource_control_config()
         self.com_port.set(self.settings.com_port.get())
         self.com_port_name.set(self.settings.com_port_name.get())
@@ -1883,6 +2043,11 @@ class PokeControllerApp:
         self.audio_gain.set(self.settings.audio_gain)
         self.audio_filter_camera.set(self.settings.audio_filter_camera)
         self.audio_auto_start.set(self.settings.audio_auto_start)
+        self.audio_auto_level.set(self.settings.audio_auto_level)
+        self.audio_target_dbfs.set(self.settings.audio_target_dbfs)
+        self.audio_max_auto_gain.set(self.settings.audio_max_auto_gain)
+        self.audio_limiter_ceiling_dbfs.set(
+            self.settings.audio_limiter_ceiling_dbfs)
         self.vision_mode.set(self.settings.vision_mode)
         self.image_assist_enabled.set(self.settings.image_assist_enabled)
         self.image_assist_output.set(self.settings.image_assist_output)
@@ -2158,10 +2323,13 @@ class PokeControllerApp:
         self.preview.set_frame_listener(self.analyse_live_frame)
         self.preview.set_frame_work_provider(self._live_frame_analysis_active)
         self.preview.set_record_listener(self.process_recording_frame)
+        self.preview.set_presentation_listener(
+            self.process_presented_recording_frame)
         self.preview.set_render_priority_provider(self._preview_render_priority)
         self.preview.set_capture_work_provider(self._preview_capture_work_active)
         self.preview.set_resource_multiplier_provider(
             self._resource_preview_multiplier)
+        self.preview.setFeatureLimited(self.camera_feature_limited.get())
         self.image_analysis_assist = ImageAnalysisAssist(
             os.path.dirname(os.path.abspath(__file__)), self._queue_image_assist_results,
             max_candidates=self.image_assist_max_candidates.get())
@@ -2337,8 +2505,8 @@ class PokeControllerApp:
                     self.camera.setWindowCaptureMode(window_capture_mode)
                     self.camera.openWindow(window_handle)
                 else:
-                    self.camera.openCamera(camera_id)
-                    if not self.camera.isOpened():
+                    opened = bool(self.camera.openCamera(camera_id))
+                    if not opened:
                         raise RuntimeError("Camera ID {} を開けませんでした。".format(camera_id))
             except Exception as caught:
                 error = str(caught)
@@ -2429,8 +2597,8 @@ class PokeControllerApp:
                     str(self.camera_id.get()), "Camera ID {}".format(self.camera_id.get()))))
             if not self._confirm_shared_device("camera", key, label):
                 return
-            self.camera.openCamera(self.camera_id.get())
-            if self.camera.isOpened():
+            opened = bool(self.camera.openCamera(self.camera_id.get()))
+            if opened:
                 self._publish_device_usage("camera", key, label)
 
     def refresh_window_sources(self):
@@ -2438,6 +2606,11 @@ class PokeControllerApp:
         self.window_source_details = {}
         usage_entries = self._other_device_usage_entries()
         for item in Camera.listWindows():
+            # Capturing PokeCon produces an infinite mirror of its own preview.
+            # Exclude every PokeCon instance, not only this process, because
+            # multiple profiles commonly have the same window title prefix.
+            if is_pokecon_window_title(item.get("title"), Constant.NAME):
+                continue
             state = " / minimized" if item.get("minimized") else ""
             process = item.get("process_name") or "unknown process"
             base = "{}  [{}{} / HWND:{}]".format(
@@ -2452,6 +2625,13 @@ class PokeControllerApp:
         if self.window_source.get() not in self.window_sources:
             saved = getattr(self, "saved_window_title", "")
             saved_process = getattr(self, "saved_window_process", "").casefold()
+            if is_pokecon_window_title(saved, Constant.NAME):
+                # Do not replace a rejected self-capture with an arbitrary
+                # browser/desktop window during automatic startup.
+                self.saved_window_title = ""
+                self.saved_window_process = ""
+                self.window_source.set("")
+                return
             restored = next((value for value in values if
                              self.window_source_details[value].get("title") == saved and
                              (not saved_process or saved_process in {
@@ -2507,9 +2687,14 @@ class PokeControllerApp:
                     str(self.camera_id.get()), "Camera ID {}".format(self.camera_id.get()))))
             if not self._confirm_shared_device("camera", key, label):
                 return False
-            self.camera.openCamera(self.camera_id.get())
-            if not self.camera.isOpened():
+            opened = bool(self.camera.openCamera(self.camera_id.get()))
+            if not opened:
                 self._publish_device_usage("camera", "", "")
+                if show_errors:
+                    tkmsg.showerror(
+                        "Video input",
+                        "選択したCamera Nameの映像を開けませんでした。\n\n"
+                        "別のPokeConで使用中でないか、USB接続を確認してください。")
                 return False
             self._publish_device_usage("camera", key, label)
             if hasattr(self, "audio_input_cb"):
@@ -2526,6 +2711,13 @@ class PokeControllerApp:
             self._publish_device_usage("camera", "", "")
             if show_errors:
                 tkmsg.showwarning("Video input", "入力するゲームウィンドウを選択してください。")
+            return False
+        detail = getattr(self, "window_source_details", {}).get(label, {})
+        if is_pokecon_window_title(detail.get("title"), Constant.NAME):
+            if show_errors:
+                tkmsg.showwarning(
+                    "Video input",
+                    "PokeCon自身は映像入力にできません。ゲーム画面を選択してください。")
             return False
         key = self._camera_usage_key(
             source_type="Window (Steam/game)", window_handle=hwnd)
@@ -3897,8 +4089,119 @@ class PokeControllerApp:
         # Presets are superseded by the all-tab snapshot stored in InputSet.
         if str(self.presets_tab) in self.controller_nb.tabs():
             self.controller_nb.forget(self.presets_tab)
+        limited_tabs = set(self._feature_limited_hidden_tabs()) \
+            if hasattr(self, "camera_feature_limited") \
+            and self.camera_feature_limited.get() else set()
         for index, (widget, label) in enumerate(ordered):
+            if widget in limited_tabs:
+                try:
+                    self.controller_nb.hide(widget)
+                except tk.TclError:
+                    pass
+                continue
+            try:
+                # add() makes a previously hidden tab visible again.
+                self.controller_nb.add(widget)
+            except tk.TclError:
+                pass
             self.controller_nb.insert(index, widget, text=label, padding="5", sticky="nsew")
+
+    def _feature_limited_hidden_tabs(self):
+        return tuple(
+            tab for tab in (
+                getattr(self, "area_capture_tab", None),
+                getattr(self, "commands_tab", None),
+                getattr(self, "commands_assist_tab", None),
+                getattr(self, "operation_capture_tab", None),
+                getattr(self, "image_detection_monitor_tab", None),
+                getattr(self, "analysis_tab", None),
+                getattr(self, "object_detection_tab", None),
+                getattr(self, "command_watch_tab", None),
+            ) if tab is not None)
+
+    def _apply_camera_feature_limited(self, notify=False):
+        limited = bool(self.camera_feature_limited.get())
+        limited_tabs = self._feature_limited_hidden_tabs()
+        if limited:
+            selected = self.controller_nb.select()
+            if selected and any(str(tab) == selected for tab in limited_tabs):
+                self.controller_nb.select(self.camera_tab)
+            for tab in limited_tabs:
+                try:
+                    self.controller_nb.hide(tab)
+                except tk.TclError:
+                    pass
+            if hasattr(self, "recording_mode_tabs"):
+                try:
+                    if self.recording_mode_tabs.select() == str(
+                            self.recording_monitor_page):
+                        self.recording_mode_tabs.select(
+                            self.recording_normal_page)
+                    self.recording_mode_tabs.hide(
+                        self.recording_monitor_page)
+                except tk.TclError:
+                    pass
+            if hasattr(self, "top_command_f"):
+                self.top_command_f.grid_remove()
+            if hasattr(self, "input_set_include_commands"):
+                self.input_set_include_commands.set(False)
+                self._toggle_input_set_commands()
+            if hasattr(self, "record_debug"):
+                self.record_debug.set(False)
+            for variable_name in (
+                    "is_show_value", "is_show_guide", "image_assist_enabled",
+                    "analysis_rules_enabled", "image_detection_monitor_enabled",
+                    "area_capture_active"):
+                variable = getattr(self, variable_name, None)
+                if hasattr(variable, "set"):
+                    variable.set(False)
+            if hasattr(self, "record_mode") \
+                    and self.record_mode.get() == "CommandMonitor":
+                self.record_mode.set("Manual")
+            self.camera_feature_limited_status.set(
+                "機能制限版：Windowsネイティブ映像を優先。Commands・解析・範囲指定・Tk重ね描画は停止中です。")
+        else:
+            for tab in limited_tabs:
+                try:
+                    self.controller_nb.add(tab)
+                except tk.TclError:
+                    pass
+            self._reorder_controller_tabs()
+            if hasattr(self, "recording_mode_tabs"):
+                try:
+                    self.recording_mode_tabs.add(
+                        self.recording_monitor_page, text="Commands監視録画")
+                    self.recording_mode_tabs.insert(
+                        1, self.recording_monitor_page,
+                        text="Commands監視録画")
+                except tk.TclError:
+                    pass
+            if hasattr(self, "top_command_f"):
+                self.top_command_f.grid()
+            self.camera_feature_limited_status.set(
+                "通常版：映像上の範囲指定とTk重ね描画を使用できます。")
+        preview = getattr(self, "preview", None)
+        if preview is not None:
+            preview.setFeatureLimited(limited)
+        if notify:
+            message = ("機能制限版を有効にしました。InputSetへ残すには「変更保存」を押してください。"
+                       if limited else
+                       "通常版へ戻しました。Tk重ね描画と映像範囲指定を使用できます。")
+            self.camera_feature_limited_status.set(
+                self.camera_feature_limited_status.get() + " " + message)
+
+    def _require_tk_video_overlay(self, feature_name, show_popup=True):
+        limited_var = getattr(self, "camera_feature_limited", None)
+        if limited_var is None or not limited_var.get():
+            return True
+        if show_popup:
+            tkmsg.showwarning(
+                "機能制限版では使用できません",
+                "「{}」にはTkの映像重ね描画または範囲指定が必要です。\n\n"
+                "Cameraタブで「機能制限版」をOFFにしてから実行してください。".format(
+                    feature_name),
+                parent=self.root)
+        return False
 
     def _build_commands_assist_tab(self):
         self.commands_assist_tab, self.commands_assist_f = self._create_scrollable_tab()
@@ -8182,9 +8485,95 @@ class PokeControllerApp:
             keys = [k for k, v in self.camera_dic.items()
                     if "No." + str(k) + ": " + v == selected]
             ret = keys[0] if keys else None
+        if ret is None:
+            self.show_output(
+                "Analysis", text="Camera Nameの選択をCamera IDへ変換できませんでした。")
+            return
         self.camera_id.set(ret)
         if hasattr(self, "audio_filter_camera") and self.audio_filter_camera.get():
             self.update_audio_input_list()
+        # A Camera Name choice is an input choice, not merely an edit to the
+        # hidden ID field.  In particular, selecting a camera while Window
+        # capture is active must switch the source back to the capture device.
+        # Defer until the combobox event has returned so its popup can close
+        # before DirectShow performs the device hand-off.
+        if event is not None and hasattr(self, "camera"):
+            selected_id = int(ret)
+            self.video_source.set("Capture device")
+            self.root.after_idle(
+                lambda camera_id=selected_id:
+                self._apply_camera_name_selection(camera_id))
+
+    def _apply_camera_name_selection(self, selected_id):
+        """Open the Camera Name selection without blocking Tk controls."""
+        if int(self.camera_id.get()) != int(selected_id):
+            return False
+        initial_open = getattr(self, "_initial_video_open_thread", None)
+        name_open = getattr(self, "_camera_name_open_thread", None)
+        if ((initial_open is not None and initial_open.is_alive()) or
+                (name_open is not None and name_open.is_alive())):
+            self.root.after(
+                100, lambda camera_id=selected_id:
+                self._apply_camera_name_selection(camera_id))
+            return False
+        preview = getattr(self, "preview", None)
+        if preview is not None and hasattr(preview, "prioritizeUiInteraction"):
+            preview.prioritizeUiInteraction(1.0)
+        key = self._camera_usage_key(
+            camera_id=selected_id, source_type="Capture device")
+        label = str((self.camera_dic or {}).get(
+            selected_id, (self.camera_dic or {}).get(
+                str(selected_id), "Camera ID {}".format(selected_id))))
+        if not self._confirm_shared_device("camera", key, label):
+            return False
+        self.show_output(
+            "Analysis",
+            text="Camera Nameの映像へ切り替え中です: Camera ID {}".format(
+                selected_id))
+
+        def worker():
+            error = ""
+            opened = False
+            try:
+                opened = bool(self.camera.openCamera(selected_id))
+                if not opened:
+                    error = "選択したカメラを開けませんでした。"
+            except Exception as caught:
+                error = str(caught)
+            self._gui_action_queue.put(
+                lambda: self._finish_camera_name_selection(
+                    selected_id, key, label, opened, error))
+
+        self._camera_name_open_thread = threading.Thread(
+            target=worker, daemon=True, name="CameraNameOpen")
+        self._camera_name_open_thread.start()
+        return True
+
+    def _finish_camera_name_selection(
+            self, selected_id, usage_key, label, opened, error):
+        # A newer combobox choice may have been made while DirectShow was
+        # opening. Its queued switch owns the final status and device usage.
+        if int(self.camera_id.get()) != int(selected_id):
+            return
+        if not opened:
+            self._publish_device_usage("camera", "", "")
+            tkmsg.showerror(
+                "Video input",
+                "選択したCamera Nameの映像を開けませんでした。\n\n"
+                "別のPokeConで使用中でないか、USB接続を確認してください。"
+                + (("\n\n" + error) if error else ""))
+            self.show_output(
+                "Analysis",
+                text="Camera Nameの映像切替に失敗しました: Camera ID {}".format(
+                    selected_id))
+            return
+        self._publish_device_usage("camera", usage_key, label)
+        if hasattr(self, "audio_input_cb"):
+            self.refresh_audio_devices()
+        self.show_output(
+            "Analysis",
+            text="Camera Nameの選択を映像へ反映しました: Camera ID {}".format(
+                selected_id))
 
     def set_device(self, event=None):
         selected = self.serial_device_name.get().strip()
@@ -8220,6 +8609,7 @@ class PokeControllerApp:
 
     def applyFps(self, event=None):
         print("changed FPS to: " + self.fps.get() + " [fps]")
+        self.camera.setFps(self.fps.get())
         self.preview.setFps(self.fps.get())
         self._refresh_preview_priority_status()
 
@@ -8283,17 +8673,20 @@ class PokeControllerApp:
 
     def activateKeyboard(self):
         if self.is_use_keyboard.get():
-            # enable Keyboard as controller
-            if self.keyboard is None:
-                self.keyboard = SwitchKeyboardController(self.keyPress)
-                self.keyboard.listen()
-
             # bind focus
             if platform.system() != "Linux":
                 self.root.bind("<FocusIn>", self.onFocusInController)
                 self.root.bind("<FocusOut>", self.onFocusOutController)
+            self.root.after_idle(self._sync_keyboard_listener_for_focus)
+            self._schedule_keyboard_focus_poll()
 
         else:
+            if self._keyboard_focus_after_id is not None:
+                try:
+                    self.root.after_cancel(self._keyboard_focus_after_id)
+                except tk.TclError:
+                    pass
+                self._keyboard_focus_after_id = None
             # stop listening to keyboard events
             if self.keyboard is not None:
                 self.keyboard.stop()
@@ -8305,10 +8698,10 @@ class PokeControllerApp:
 
     def onFocusInController(self, event):
         self.onFocusInPokeCon(event)
-        # enable Keyboard as controller
-        if event.widget == self.root and self.keyboard is None:
-            self.keyboard = SwitchKeyboardController(self.keyPress)
-            self.keyboard.listen()
+        try:
+            self.root.after_idle(self._sync_keyboard_listener_for_focus)
+        except tk.TclError:
+            pass
 
     def onFocusInPokeCon(self, event=None):
         try:
@@ -8326,7 +8719,6 @@ class PokeControllerApp:
         if now - self._last_focus_mark_monotonic < 0.15:
             return
         self._last_focus_mark_monotonic = now
-        self._last_active_preview_owner = True
         self._refresh_preview_priority_status()
         threading.Thread(
             target=self._publish_window_focus, daemon=True,
@@ -8334,10 +8726,38 @@ class PokeControllerApp:
 
     def onFocusOutController(self, event):
         self.onFocusOutSoftwareController(event)
-        # stop listening to keyboard events
-        if event.widget == self.root and self.keyboard is not None:
+        try:
+            self.root.after_idle(self._sync_keyboard_listener_for_focus)
+        except tk.TclError:
+            pass
+
+    def _sync_keyboard_listener_for_focus(self):
+        try:
+            foreground = foreground_process_matches()
+            focused = (self.root.focus_displayof() is not None) \
+                if foreground is None else foreground
+            enabled = self.is_use_keyboard.get()
+        except (tk.TclError, KeyError):
+            focused, enabled = False, False
+        should_run = keyboard_listener_should_run(enabled, focused)
+        if should_run and self.keyboard is None:
+            self.keyboard = SwitchKeyboardController(self.keyPress)
+            self.keyboard.listen()
+        elif not should_run and self.keyboard is not None:
             self.keyboard.stop()
             self.keyboard = None
+
+    def _schedule_keyboard_focus_poll(self):
+        if self._keyboard_focus_after_id is not None:
+            return
+
+        def poll():
+            self._keyboard_focus_after_id = None
+            self._sync_keyboard_listener_for_focus()
+            if self.is_use_keyboard.get():
+                self._keyboard_focus_after_id = self.root.after(200, poll)
+
+        self._keyboard_focus_after_id = self.root.after(200, poll)
 
     def onFocusOutSoftwareController(self, event):
         """Release a mouse hold that cannot receive ButtonRelease after Alt-Tab."""
@@ -8389,6 +8809,7 @@ class PokeControllerApp:
         with self._resource_status_refresh_lock:
             self._resource_status_refresh_queued = False
         self._refresh_resource_control_status()
+        self._refresh_preview_priority_status()
 
     def _queue_preview_status_refresh(self):
         with self._preview_status_refresh_lock:
@@ -8402,6 +8823,42 @@ class PokeControllerApp:
             self._preview_status_refresh_queued = False
         self._refresh_preview_priority_status()
 
+    def _queue_confirmation_audio_reconcile(self):
+        """Coalesce main-owner changes before touching Tk audio controls."""
+        with self._audio_owner_reconcile_lock:
+            if self._audio_owner_reconcile_queued:
+                return
+            self._audio_owner_reconcile_queued = True
+        self._gui_action_queue.put(
+            self._drain_confirmation_audio_reconcile)
+
+    def _drain_confirmation_audio_reconcile(self):
+        with self._audio_owner_reconcile_lock:
+            self._audio_owner_reconcile_queued = False
+        action = confirmation_audio_action(
+            requested=self._audio_monitor_requested,
+            runtime_owner=self._runtime_full_rate_effective,
+            other_output_active=self._other_confirmation_audio_output,
+            stream_active=self._audio_output_stream_active(),
+            recording_uses_output=self._confirmation_audio_recording_active())
+        if action == "start":
+            if time.monotonic() >= self._audio_auto_retry_at:
+                self._start_audio_monitor_internal(automatic=True)
+            return
+        if action == "keep" and not self._runtime_full_rate_effective:
+            self.audio_start_button.configure(text="Audio running (recording)")
+            self.audio_level_status.set(
+                "録画音声を切らないため、録画終了まで現在の確認再生を維持します。")
+            return
+        if self._audio_monitor_requested:
+            self.audio_monitor_mode.set("Monitor")
+            self.audio_start_button.configure(text="Audio waiting (main only)")
+            if self._other_confirmation_audio_output:
+                message = "別のPokeConの確認再生終了を待っています。"
+            else:
+                message = "確認再生はメインPokeConだけで有効になります。"
+            self.audio_level_status.set(message)
+
     def _window_activity_monitor_loop(self):
         while not self._window_activity_stop.wait(0.5):
             try:
@@ -8409,7 +8866,40 @@ class PokeControllerApp:
                     if self._window_activity_stop.is_set():
                         return
                     registry = self._ensure_window_activity_registry()
-                    owner = registry.is_last_focused()
+                    live_entries = registry.entries(include_self=True)
+                    if not any(int(entry.get("pid", 0)) == os.getpid()
+                               for entry in live_entries):
+                        live_entries.append({
+                            "pid": os.getpid(),
+                            "started_at": getattr(registry, "started_at", ""),
+                        })
+                    other_entries = [
+                        entry for entry in live_entries
+                        if int(entry.get("pid", 0)) != os.getpid()]
+                    foreground_pid = foreground_process_id()
+                    other_pokecon_foreground = bool(
+                        foreground_pid is not None
+                        and foreground_pid != os.getpid()
+                        and any(
+                            int(entry.get("pid", 0)) == foreground_pid
+                            for entry in other_entries))
+                    other_confirmation_audio_output = any(
+                        self._entry_has_confirmation_audio_output(entry)
+                        for entry in other_entries)
+                    latest_entry = max(
+                        live_entries,
+                        key=lambda entry: (
+                            str(entry.get("started_at", "")),
+                            int(entry.get("pid", 0))),
+                        default=None)
+                    newest_pokecon_instance = bool(
+                        latest_entry is None
+                        or int(latest_entry.get("pid", 0)) == os.getpid())
+                    other_main_preview_owner = any(
+                        isinstance(entry.get("resource"), dict)
+                        and bool(entry["resource"].get(
+                            "main_effective", False))
+                        for entry in other_entries)
                     cpu_percent = self._resource_cpu_sampler.sample()
                     if cpu_percent is not None:
                         self._resource_cpu_percent = cpu_percent
@@ -8428,6 +8918,14 @@ class PokeControllerApp:
                         protected=protected,
                         throttle=self._resource_throttle_level,
                         cpu_percent=self._resource_cpu_percent)
+                    if requested_main and not effective_main \
+                            and not self._resource_main_open_downgraded:
+                        # The registry is the final guard when two checkboxes
+                        # are clicked nearly simultaneously. Reflect the lost
+                        # claim in Tk so only the real owner remains checked.
+                        self._resource_main_open_downgraded = True
+                        self._gui_action_queue.put(
+                            self._revoke_duplicate_main_request)
                     level = resource_throttle_level(
                         config.get("enabled", True), self._resource_cpu_percent,
                         config.get("target_percent", 90),
@@ -8442,8 +8940,40 @@ class PokeControllerApp:
                 self._queue_preview_status_refresh()
             self._resource_main_effective = effective_main
             self._resource_throttle_level = level
-            if owner != self._last_active_preview_owner:
-                self._last_active_preview_owner = owner
+            if other_pokecon_foreground != self._other_pokecon_foreground:
+                self._other_pokecon_foreground = other_pokecon_foreground
+                self._queue_preview_status_refresh()
+            if newest_pokecon_instance != self._newest_pokecon_instance \
+                    or other_main_preview_owner != self._other_main_preview_owner:
+                self._newest_pokecon_instance = newest_pokecon_instance
+                self._other_main_preview_owner = other_main_preview_owner
+                self._queue_preview_status_refresh()
+            runtime_full_rate = bool(
+                effective_main
+                or (newest_pokecon_instance
+                    and not other_main_preview_owner))
+            if runtime_full_rate != self._runtime_full_rate_effective:
+                if not set_main_runtime_priority(runtime_full_rate):
+                    self._logger.warning(
+                        "Could not change full-rate PokeCon scheduling priority")
+                self._runtime_full_rate_effective = runtime_full_rate
+            audio_owner_changed = (
+                other_confirmation_audio_output
+                != self._other_confirmation_audio_output)
+            self._other_confirmation_audio_output = \
+                other_confirmation_audio_output
+            audio_action = confirmation_audio_action(
+                requested=self._audio_monitor_requested,
+                runtime_owner=runtime_full_rate,
+                other_output_active=other_confirmation_audio_output,
+                stream_active=self._audio_output_stream_active(),
+                recording_uses_output=
+                    self._confirmation_audio_recording_active())
+            if audio_action == "stop":
+                if self._suspend_confirmation_audio_for_owner_loss(registry):
+                    audio_action = "wait"
+            if audio_owner_changed or audio_action in ("start", "stop", "wait"):
+                self._queue_confirmation_audio_reconcile()
             if status_changed or cpu_percent is not None:
                 self._queue_resource_status_refresh()
 
@@ -8451,7 +8981,7 @@ class PokeControllerApp:
         if self._window_activity_thread is not None:
             return
         self._window_activity_stop.clear()
-        self._last_active_preview_owner = True
+        self._other_pokecon_foreground = False
         self._refresh_preview_priority_status()
         self._window_activity_thread = threading.Thread(
             target=self._window_activity_monitor_loop, daemon=True,
@@ -8463,6 +8993,7 @@ class PokeControllerApp:
 
     def _stop_window_activity_tracking(self):
         self._window_activity_stop.set()
+        set_main_runtime_priority(False)
         with self._window_activity_update_lock:
             registry = self._window_activity_registry
             if registry is not None:
@@ -8472,10 +9003,34 @@ class PokeControllerApp:
                     self._logger.warning("Could not unregister PokeCon focus: %s", error)
 
     def _preview_render_priority(self):
-        # CaptureArea separately detects actual foreground focus.  Only the
-        # explicit main-tool role may keep background preview priority.
-        return (bool(self._resource_main_effective),
-                bool(self.last_active_preview_full_fps.get()))
+        # Chrome and other non-PokeCon applications do not reduce the main
+        # preview. The checked 60-FPS owner is unique across all PokeCons, so
+        # another PokeCon in front does not revoke it either.
+        # Exit/finalization waits always release 60-FPS display.
+        main_permission, _ = preview_rate_permissions(
+            main_tool=self._resource_main_effective,
+            other_pokecon_foreground=self._other_pokecon_foreground,
+            # The checkbox is now the unique main-owner request. It must not
+            # independently grant 60 FPS to a second, downgraded foreground
+            # PokeCon after the startup confirmation popup.
+            allow_foreground_full_rate=False,
+            suspended=self._preview_full_rate_suspended())
+        suspended = self._preview_full_rate_suspended()
+        newest = bool(self._newest_pokecon_instance)
+        # With no checked owner, the last-opened PokeCon keeps the configured
+        # FPS. If another PokeCon owns 60 FPS, the newest ordinary instance is
+        # still kept warm at 30 FPS rather than dropping to 5 because Chrome
+        # or another non-PokeCon application is in front.
+        automatic_latest_full_rate = bool(
+            newest and not self._other_main_preview_owner and not suspended)
+        return (bool(main_permission or automatic_latest_full_rate),
+                False, newest)
+
+    def _preview_full_rate_suspended(self):
+        # Saving/merging while PokeCon remains open must not reduce preview
+        # FPS. Suspension is reserved for the X-button close flow while the
+        # final video is being created and the process is waiting to exit.
+        return bool(getattr(self, "_preview_shutdown_mode", False))
 
     def _resource_runtime_protected(self):
         if time.monotonic() < self._resource_protected_until:
@@ -8499,6 +9054,28 @@ class PokeControllerApp:
     def _note_resource_interaction(self, event=None):
         self._resource_protected_until = max(
             self._resource_protected_until, time.monotonic() + 3.0)
+
+    def _prioritize_tab_interaction(self, event=None):
+        preview = getattr(self, "preview", None)
+        if preview is not None:
+            preview.prioritizeUiInteraction()
+
+    def _prioritize_control_interaction(self, event=None):
+        preview = getattr(self, "preview", None)
+        if preview is None:
+            return
+        widget = getattr(event, "widget", None)
+        # Pointer motion over the video is used for manual stick/touchscreen
+        # control and should not suppress its own preview. Other controls get
+        # a short render-free window before their click or key event.
+        if getattr(event, "type", None) == tk.EventType.Motion and widget is not None:
+            try:
+                if widget is preview or str(widget).startswith(str(preview) + "."):
+                    return
+            except (AttributeError, tk.TclError):
+                pass
+        seconds = 0.30 if getattr(event, "type", None) == tk.EventType.Motion else 0.55
+        preview.prioritizeUiInteraction(seconds)
 
     def _cache_resource_control_config(self):
         try:
@@ -8533,6 +9110,20 @@ class PokeControllerApp:
                     parent=self.root)
         self._resource_main_open_downgraded = False
         self._resource_config_changed()
+
+    def _revoke_duplicate_main_request(self):
+        """Uncheck a 60-FPS claim which lost cross-process arbitration."""
+        if self._resource_main_effective or not self.resource_main_tool.get():
+            return
+        self.resource_main_tool.set(False)
+        self.last_active_preview_full_fps.set(False)
+        self._cache_resource_control_config()
+        self._refresh_resource_control_status()
+        self._refresh_preview_priority_status()
+        self._sync_resource_control_to_active_input_set()
+        self.show_output(
+            "Analysis",
+            text="表示60FPS維持は別のPokeConで使用中のため、この画面では解除しました。")
 
     def _refresh_resource_control_status(self):
         if not hasattr(self, "resource_control_status"):
@@ -8608,6 +9199,13 @@ class PokeControllerApp:
         except (OSError, TimeoutError, ValueError) as error:
             self._logger.warning("Could not read shared device usage: %s", error)
             return []
+
+    @staticmethod
+    def _entry_has_confirmation_audio_output(entry):
+        devices = entry.get("devices", {}) if isinstance(entry, dict) else {}
+        output = devices.get("audio_output", {}) \
+            if isinstance(devices, dict) else {}
+        return bool(isinstance(output, dict) and output.get("key"))
 
     def _device_conflicts(self, kind, key):
         return device_usage_conflicts(self._other_device_usage_entries(), kind, key)
@@ -8771,21 +9369,51 @@ class PokeControllerApp:
         except (tk.TclError, TypeError, ValueError):
             requested = 30
         try:
-            foreground = self.root.focus_displayof() is not None
+            actual_foreground = foreground_process_matches()
+            foreground = (self.root.focus_displayof() is not None) \
+                if actual_foreground is None else actual_foreground
         except (tk.TclError, KeyError):
             foreground = False
-        if self._resource_main_effective:
+        suspended = self._preview_full_rate_suspended()
+        newest = bool(self._newest_pokecon_instance)
+        automatic_latest_full_rate = bool(
+            newest and not self._other_main_preview_owner and not suspended)
+        main_full_rate = bool(
+            (self._resource_main_effective and not suspended)
+            or automatic_latest_full_rate)
+        if suspended:
+            label = "終了・録画保存待ち"
+        elif self._resource_main_effective and main_full_rate:
             label = "メイン表示"
+        elif automatic_latest_full_rate:
+            label = "最終起動PokeCon"
+        elif newest:
+            label = "最終起動PokeCon（別メインあり）"
         elif foreground:
             label = "前面表示"
         else:
             label = ""
         if label:
-            limit = min(60, requested) if self.last_active_preview_full_fps.get() \
-                else min(30, requested)
+            full_rate = bool(main_full_rate)
+            if full_rate:
+                limit = min(60, requested)
+            elif foreground or newest:
+                limit = min(30, requested)
+            else:
+                limit = min(5, requested)
             status = "{}：{}fps（録画fpsには影響なし）".format(label, limit)
         else:
             status = "省負荷表示：5fps（録画fpsには影響なし）"
+        camera = getattr(self, "camera", None)
+        preview = getattr(self, "preview", None)
+        input_fps = camera.measuredFps() \
+            if camera is not None and hasattr(camera, "measuredFps") else 0.0
+        display_fps = preview.measuredPreviewFps() \
+            if preview is not None and hasattr(preview, "measuredPreviewFps") else 0.0
+        measured = "入力{} / 表示{}fps".format(
+            "{:.1f}".format(input_fps) if input_fps > 0.0 else "測定中",
+            "{:.1f}".format(display_fps) if display_fps > 0.0 else "測定中")
+        status = status + " / " + measured
         if status != self._last_active_preview_status_value:
             self._last_active_preview_status_value = status
             self.last_active_preview_status.set(status)
@@ -9953,7 +10581,7 @@ class PokeControllerApp:
             self.record_monitor_status.set(
                 "Commands終了を検出しました。録画とログは確認待ちで保持しています。")
         if cleanup_session_id:
-            self._confirm_delete_stopped_command_monitor_recordings(cleanup_session_id)
+            self._confirm_save_stopped_command_monitor_recordings(cleanup_session_id)
         self.start_button["text"] = "Start"
         self.force_stop_button.configure(state="disabled", text="Force stop")
         self.start_top_button["text"] = "Start"
@@ -10019,6 +10647,8 @@ class PokeControllerApp:
         """Avoid destroying the window while the background MP4 encoder runs."""
         if getattr(self, "_exit_waiting", False):
             return
+        self._preview_shutdown_mode = True
+        self._refresh_preview_priority_status()
 
         # In Template mode the Start button arms monitoring.  Disarm it before
         # closing so that a camera callback cannot begin another segment.
@@ -10031,7 +10661,7 @@ class PokeControllerApp:
         # This starts final encoding in a background thread when there is an
         # active clip; it intentionally does not wait for ffmpeg here.
         if getattr(self.recorder, "active", False):
-            self.recorder.stop()
+            self._stop_capture_recorder()
             if hasattr(self, "record_button"):
                 self.record_button.configure(text="Start recording")
 
@@ -10053,6 +10683,9 @@ class PokeControllerApp:
                 self.show_output(
                     "Analysis", text="録画保存処理の終了後にツールを閉じます。")
                 self._wait_for_recording_finalization()
+            else:
+                self._preview_shutdown_mode = False
+                self._refresh_preview_priority_status()
             return
         self._exit_now()
 
@@ -10068,6 +10701,10 @@ class PokeControllerApp:
     def _exit_now(self, confirm=True):
         # 一度proconのスレッドを落とす
         ret = not confirm or tkmsg.askyesno("確認", "Poke Controllerを終了しますか？")
+        if not ret:
+            self._preview_shutdown_mode = False
+            self._refresh_preview_priority_status()
+            return
         if ret:
             # Revoke permission and stop the actual class-level controller
             # loop only after exit is confirmed.
@@ -10163,6 +10800,11 @@ class PokeControllerApp:
             self.settings.audio_gain = self.audio_gain.get()
             self.settings.audio_filter_camera = self.audio_filter_camera.get()
             self.settings.audio_auto_start = self.audio_auto_start.get()
+            self.settings.audio_auto_level = self.audio_auto_level.get()
+            self.settings.audio_target_dbfs = self.audio_target_dbfs.get()
+            self.settings.audio_max_auto_gain = self.audio_max_auto_gain.get()
+            self.settings.audio_limiter_ceiling_dbfs = \
+                self.audio_limiter_ceiling_dbfs.get()
             self.settings.vision_mode = self.vision_mode.get()
             self.settings.image_assist_enabled = self.image_assist_enabled.get()
             self.settings.image_assist_output = self.image_assist_output.get()
@@ -10224,7 +10866,7 @@ class PokeControllerApp:
             self.settings.save()
 
             self.stop_audio_monitor()
-            self.recorder.stop()
+            self._stop_capture_recorder()
             self.camera.destroy()
             cv2.destroyAllWindows()
             self._stop_window_activity_tracking()
@@ -11250,6 +11892,8 @@ class PokeControllerApp:
             self._show_analysis_rule_results([])
 
     def select_analysis_rule_roi(self):
+        if not self._require_tk_video_overlay("解析ROIのマウス範囲指定"):
+            return
         index = self._selected_analysis_rule_index()
         if index is None:
             tkmsg.showwarning("解析ROI", "解析ルールを選択してください。")
@@ -11640,6 +12284,15 @@ class PokeControllerApp:
         self.input_recording_record_cb = ttk.Combobox(
             combined_box, textvariable=self.input_recording_record_name, state="readonly", width=34)
         self.input_recording_record_cb.grid(column=1, row=2, padx=5, pady=5, sticky="ew")
+        # The InputSet tab itself is vertically scrollable. Forward wheel
+        # movement to that canvas while preventing any of its Combobox values
+        # from changing merely because the pointer happens to be over one.
+        for combobox in (
+                self.input_set_cb, self.input_recording_set_cb,
+                self.input_recording_input_cb,
+                self.input_recording_record_cb):
+            guard_combobox_mousewheel(
+                combobox, self._scroll_input_set_with_wheel)
         actions = ttk.Frame(combined_box)
         actions.grid(column=2, columnspan=4, row=0, rowspan=4, padx=4, pady=4, sticky="ns")
         ttk.Button(actions, text="呼び出し", command=self.load_input_recording_set).pack(fill="x", pady=1)
@@ -11648,15 +12301,24 @@ class PokeControllerApp:
         ttk.Button(actions, text="新規登録", command=lambda: self.save_input_recording_set(False)).pack(fill="x", pady=1)
         ttk.Button(actions, text="変更保存", command=lambda: self.save_input_recording_set(True)).pack(fill="x", pady=1)
         ttk.Button(actions, text="削除", command=self.delete_input_recording_set).pack(fill="x", pady=1)
+        ttk.Button(actions, text="起動中PokeConを終了...",
+                   command=self.open_pokecon_recovery).pack(fill="x", pady=(7, 1))
         self.input_set_startup_prompt = tk.BooleanVar(value=False)
         ttk.Checkbutton(combined_box, text="起動時、Camera・Serialを開く前にこのセットを選択",
                         variable=self.input_set_startup_prompt,
                         command=self._save_input_set_startup_preference).grid(
                             column=0, columnspan=2, row=3, padx=5, pady=3, sticky="w")
+        self.input_set_startup_maximized = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            combined_box,
+            text="PokeConを最大化して起動（映像・音声を開始する前に最大化）",
+            variable=self.input_set_startup_maximized,
+            command=self._save_input_set_startup_preference).grid(
+                column=0, columnspan=2, row=4, padx=5, pady=3, sticky="w")
         self.input_recording_summary = tk.StringVar(
             value="新形式では全タブ設定とRecording設定をInputSet本体から読み込みます。")
         ttk.Label(combined_box, textvariable=self.input_recording_summary, anchor="w").grid(
-            column=0, columnspan=6, row=4, padx=5, pady=(0, 5), sticky="ew")
+            column=0, columnspan=6, row=5, padx=5, pady=(0, 5), sticky="ew")
         combined_box.columnconfigure(1, weight=1)
         self.input_set_cb.bind("<<ComboboxSelected>>", self._show_input_set_summary)
         self.input_recording_set_cb.bind("<<ComboboxSelected>>", self._select_input_recording_set)
@@ -11784,6 +12446,14 @@ class PokeControllerApp:
         except (OSError, TimeoutError, ValueError) as error:
             self._logger.warning("Could not read active InputSets: %s", error)
             return []
+
+    def open_pokecon_recovery(self, parent=None):
+        """Open the one-process recovery window from a responsive PokeCon."""
+        show_recovery_dialog(
+            parent or self.root,
+            profiles_root=os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "profiles"),
+            exclude_pid=os.getpid())
 
     def _set_active_input_set(self, name, combined_set=""):
         """Set the local active name and publish it to other PokeCon windows."""
@@ -12007,6 +12677,17 @@ class PokeControllerApp:
             data.setdefault("input_sets", {})
             data.setdefault("combined_sets", {})
             data.setdefault("startup", {})
+            if not getattr(self, "_audio_identity_migration_checked", False):
+                self._audio_identity_migration_checked = True
+                try:
+                    if upgrade_input_set_audio_identities(data):
+                        self._write_input_sets(data)
+                except OSError as error:
+                    # A migration write failure must not make every InputSet
+                    # appear missing for the rest of this startup.
+                    self._logger.warning(
+                        "Could not persist InputSet Audio identities: %s",
+                        error)
             return data
         except (OSError, ValueError):
             return {"schema_version": SCHEMA_VERSION, "input_sets": {}, "combined_sets": {}, "startup": {}}
@@ -12071,6 +12752,8 @@ class PokeControllerApp:
             "display_name": display_name,
             "device_value": str(value or ""),
             "device_path": device_path,
+            "physical_usb_key": physical_usb_key(device_path or value),
+            "usb_connection_token": usb_connection_token(device_path or value),
             "vid": vid,
             "pid": pid,
             "fps": self.fps.get(),
@@ -12082,19 +12765,28 @@ class PokeControllerApp:
         include_commands = self.input_set_include_commands.get()
         selection = self._current_command_selection()
         snapshot = self._all_tabs_snapshot(include_commands=include_commands)
+        selected_audio = self._selected_audio_device_name() \
+            if include_audio else ""
+        audio_data = {
+            "enabled": include_audio,
+            "device_name": selected_audio,
+            "normalized_name": self._normalize_audio_device_name(
+                selected_audio) if include_audio else "",
+            "gain": self.audio_gain.get(),
+            "auto_level": self.audio_auto_level.get(),
+            "target_dbfs": self.audio_target_dbfs.get(),
+            "max_auto_gain_percent": self.audio_max_auto_gain.get(),
+            "limiter_ceiling_dbfs": self.audio_limiter_ceiling_dbfs.get(),
+            "filter_camera": self.audio_filter_camera.get(),
+            "auto_start": self.audio_auto_start.get(),
+            "running": bool(getattr(self.audio_monitor, "input_stream", None) is not None or
+                            getattr(self.audio_monitor, "process_loopback", None)),
+        }
+        if include_audio:
+            audio_data.update(identity_for_audio_label(selected_audio))
         result = {
             "camera": self._current_camera_data(),
-            "audio": {
-                "enabled": include_audio,
-                "device_name": self._selected_audio_device_name() if include_audio else "",
-                "normalized_name": self._normalize_audio_device_name(
-                    self._selected_audio_device_name()) if include_audio else "",
-                "gain": self.audio_gain.get(),
-                "filter_camera": self.audio_filter_camera.get(),
-                "auto_start": self.audio_auto_start.get(),
-                "running": bool(getattr(self.audio_monitor, "input_stream", None) is not None or
-                                getattr(self.audio_monitor, "process_loopback", None)),
-            },
+            "audio": audio_data,
             "serial": self._current_serial_data(),
             "recording": self._recording_preset_data(),
             "commands": {
@@ -12217,6 +12909,24 @@ class PokeControllerApp:
                 return int(key)
             if saved_path and saved_path.casefold() in value.casefold():
                 return int(key)
+        # DirectShow's numeric Camera ID and the leading USB enumerator nibble
+        # can both change.  Match the stable connection token before falling
+        # back to the much less specific VID/PID or display name.
+        saved_token = saved.get("usb_connection_token", "") \
+            or usb_connection_token(saved_path or saved_value)
+        if saved_token:
+            saved_vid_pid = (str(saved.get("vid", "") or "").upper(),
+                             str(saved.get("pid", "") or "").upper())
+            matches = [key for key, value in devices
+                       if usb_connection_token(value) == saved_token
+                       and (not all(saved_vid_pid)
+                            or self._usb_identity(value) == saved_vid_pid)]
+            if len(matches) == 1:
+                return int(matches[0])
+            if len(matches) > 1:
+                return self._choose_camera_candidate(
+                    saved, matches,
+                    "同じUSB接続位置のカメラ候補が複数見つかりました。")
         vid, pid = saved.get("vid", ""), saved.get("pid", "")
         if vid and pid:
             matches = [key for key, value in devices if self._usb_identity(value) == (vid, pid)]
@@ -12314,27 +13024,16 @@ class PokeControllerApp:
     @staticmethod
     def _normalize_audio_device_name(value):
         """Remove PortAudio/Windows enumeration numbers from a device name."""
-        value = re.sub(r"^\s*\d+\s*:\s*", "", str(value or ""))
-        # Windows may rename a reconnected device from "(USB...)" to
-        # "(2- USB...)".  That instance counter is not part of its identity.
-        value = re.sub(r"\(\s*\d+\s*-\s*", "(", value)
-        value = re.sub(r"\s+", " ", value).strip()
-        return value.casefold()
+        return normalized_audio_name(value)
 
-    def _resolve_audio_name(self, saved_name, saved_normalized=""):
-        inputs = list(getattr(self, "all_audio_inputs", []))
-        for value in inputs:
-            if value.casefold() == str(saved_name).casefold():
-                return value
-        normalized = saved_normalized or self._normalize_audio_device_name(saved_name)
-        matches = [value for value in inputs if normalized and
-                   self._normalize_audio_device_name(value) == normalized]
-        if matches:
-            return matches[0]
-        matches = [value for value in inputs if normalized and
-                   (normalized in self._normalize_audio_device_name(value) or
-                    self._normalize_audio_device_name(value) in normalized)]
-        return matches[0] if matches else None
+    def _resolve_audio_name(self, saved_name, saved_normalized="",
+                            saved_identity=None, camera_device_path=""):
+        saved = dict(saved_identity or {})
+        saved.setdefault("device_name", saved_name)
+        saved.setdefault("normalized_name", saved_normalized)
+        return resolve_saved_audio(
+            saved, getattr(self, "all_audio_inputs", []),
+            camera_device_path=camera_device_path)
 
     def _apply_serial_input_set(self, saved):
         if not saved.get("enabled", bool(saved.get("device_name"))):
@@ -12440,6 +13139,7 @@ class PokeControllerApp:
         self._write_step_debug_rules()
         camera = item.get("camera", {})
         audio = item.get("audio", {})
+        resolved_camera_device_path = camera.get("device_path", "")
         camera_allowed = not self._startup_skip_hardware
         audio_allowed = not self._startup_skip_hardware
         use_window_input = camera.get("source_type") == "Window (Steam/game)"
@@ -12488,13 +13188,25 @@ class PokeControllerApp:
         else:
             self.camera_id.set(camera_id)
             self.camera_name_cb.current(camera_id)
-            self.camera_name_fromDLL.set((self.camera_dic or {}).get(camera_id, (self.camera_dic or {}).get(str(camera_id), "")))
+            resolved_camera_value = str((self.camera_dic or {}).get(
+                camera_id, (self.camera_dic or {}).get(str(camera_id), "")))
+            self.camera_name_fromDLL.set(resolved_camera_value)
+            # Audio and video interfaces of a capture card share this USB
+            # connection. Use the path resolved now, rather than a stale saved
+            # path, when upgrading an old Audio entry.
+            resolved_camera_device_path = resolved_camera_value
         audio_enabled = audio.get("enabled", bool(audio.get("device_name")))
         self.input_set_include_audio.set(audio_enabled)
         if audio_enabled and audio_allowed:
             self.audio_filter_camera.set(audio.get("filter_camera", False))
             self.audio_auto_start.set(audio.get("running", audio.get("auto_start", False)))
             self.audio_gain.set(audio.get("gain", 100))
+            self.audio_auto_level.set(audio.get("auto_level", False))
+            self.audio_target_dbfs.set(audio.get("target_dbfs", -6.0))
+            self.audio_max_auto_gain.set(
+                audio.get("max_auto_gain_percent", 200))
+            self.audio_limiter_ceiling_dbfs.set(
+                audio.get("limiter_ceiling_dbfs", -1.0))
             self.refresh_audio_devices()
             if camera.get("source_type") == "Window (Steam/game)":
                 # refresh_audio_devices has rebuilt the process source using
@@ -12502,7 +13214,9 @@ class PokeControllerApp:
                 audio_name = self._selected_audio_device_name()
             else:
                 audio_name = self._resolve_audio_name(
-                    audio.get("device_name", ""), audio.get("normalized_name", ""))
+                    audio.get("device_name", ""), audio.get("normalized_name", ""),
+                    saved_identity=audio,
+                    camera_device_path=resolved_camera_device_path)
             if audio_name:
                 audio_key = canonical_device_key("audio", audio_name)
                 if self._confirm_shared_device("audio", audio_key, audio_name):
@@ -12590,8 +13304,8 @@ class PokeControllerApp:
                 self.video_source.set("Capture device")
                 if hasattr(self, "camera"):
                     self.camera.fps = int(self.fps.get())
-                    self.camera.openCamera(camera_id)
-                    if self.camera.isOpened():
+                    opened = bool(self.camera.openCamera(camera_id))
+                    if opened:
                         self._publish_device_usage(
                             "camera", self._camera_usage_key(
                                 camera_id=camera_id, source_type="Capture device"),
@@ -12751,6 +13465,14 @@ class PokeControllerApp:
         if commands_enabled is None:
             commands_enabled = bool(snapshot.get("commands_enabled", True))
         values = snapshot_values_with_defaults(snapshot)
+        # The former foreground-only FPS option and the resource-main option
+        # now represent the same unique 60-FPS ownership request. Preserve an
+        # older InputSet which stored either one of the two flags.
+        preview_owner_requested = bool(
+            values.get("last_active_preview_full_fps", False)
+            or values.get("resource_main_tool", False))
+        values["last_active_preview_full_fps"] = preview_owner_requested
+        values["resource_main_tool"] = preview_owner_requested
         for name, value in values.items():
             if not commands_enabled and name in COMMAND_INPUT_SET_VARIABLES:
                 continue
@@ -12760,6 +13482,15 @@ class PokeControllerApp:
                     variable.set(value)
                 except (tk.TclError, ValueError, TypeError):
                     self._logger.warning("InputSet value could not be restored: %s", name)
+        if self._resource_main_open_downgraded:
+            # The existing startup popup's "open as a normal tool" choice is
+            # preserved. Only this runtime view is unchecked; the saved
+            # InputSet keeps its request and will ask again next launch.
+            self.resource_main_tool.set(False)
+            self.last_active_preview_full_fps.set(False)
+        if self.camera_feature_limited.get():
+            commands_enabled = False
+        self._apply_camera_feature_limited(notify=False)
         self._cache_resource_control_config()
         self._refresh_resource_control_status()
         if hasattr(self, "image_detection_monitor_target_cb"):
@@ -12951,22 +13682,33 @@ class PokeControllerApp:
 
     def _save_input_set_startup_preference(self):
         data = self._read_input_sets()
-        data["startup"] = {"prompt": bool(self.input_set_startup_prompt.get()),
-                           "default": self.input_recording_set_name.get().strip()}
+        startup = dict(data.get("startup", {}))
+        startup.update({
+            "prompt": bool(self.input_set_startup_prompt.get()),
+            "default": self.input_recording_set_name.get().strip(),
+            "maximized": bool(self.input_set_startup_maximized.get()),
+        })
+        data["startup"] = startup
         self._write_input_sets(data)
 
     def _choose_combined_set_dialog(self, title, default_name="", full_only=False,
-                                    allow_skip=True, allow_without_devices=False):
+                                    allow_skip=True, allow_without_devices=False,
+                                    allow_start_maximized=False):
         """Select a combined set while visibly distinguishing new/legacy data."""
         self._last_combined_set_without_devices = False
         input_data = self._read_input_sets()
         combined = input_data.get("combined_sets", {})
         input_sets = input_data.get("input_sets", {})
         active_by_input = {}
-        for active in self._active_input_set_entries():
-            input_name = str(active.get("input_set", "")).strip()
-            if input_name:
-                active_by_input.setdefault(input_name, []).append(active)
+
+        def update_active_entries():
+            active_by_input.clear()
+            for active in self._active_input_set_entries():
+                input_name = str(active.get("input_set", "")).strip()
+                if input_name:
+                    active_by_input.setdefault(input_name, []).append(active)
+
+        update_active_entries()
 
         def active_status(input_name):
             entries = active_by_input.get(str(input_name or ""), [])
@@ -12990,22 +13732,24 @@ class PokeControllerApp:
         dialog.title(title)
         dialog.transient(self.root)
         dialog.resizable(True, True)
-        dialog.geometry("1040x380")
+        dialog.geometry("1040x420")
         ttk.Label(dialog, text="読み込むセットを選択してください。全タブ保存済みか旧形式かを確認できます。").pack(
             fill="x", padx=10, pady=(10, 5))
-        if active_by_input:
+
+        def active_summary_text():
+            if not active_by_input:
+                return "現在起動中のほかのInputSetはありません。"
             active_summary = " / ".join(
                 "{}（{}）".format(name, active_status(name))
                 for name in sorted(active_by_input, key=str.casefold))
-            ttk.Label(
-                dialog, text="現在起動中のInputSet: " + active_summary,
-                foreground="#b05a00", wraplength=1000, anchor="w",
-                justify="left").pack(fill="x", padx=10, pady=(0, 5))
-        else:
-            ttk.Label(
-                dialog, text="現在起動中のほかのInputSetはありません。",
-                foreground="#666666", anchor="w").pack(
-                    fill="x", padx=10, pady=(0, 5))
+            return "現在起動中のInputSet: " + active_summary
+
+        active_summary_var = tk.StringVar(value=active_summary_text())
+        active_summary_label = ttk.Label(
+            dialog, textvariable=active_summary_var,
+            foreground="#b05a00" if active_by_input else "#666666",
+            wraplength=1000, anchor="w", justify="left")
+        active_summary_label.pack(fill="x", padx=10, pady=(0, 5))
         tree_frame = ttk.Frame(dialog)
         tree_frame.pack(fill="both", expand=True, padx=10, pady=5)
         tree = ttk.Treeview(
@@ -13026,12 +13770,14 @@ class PokeControllerApp:
         tree.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
         name_by_item = {}
+        input_by_item = {}
         default_item = None
         for index, name in enumerate(names):
             item = combined[name]
             item_id = "set_{}".format(index)
             name_by_item[item_id] = name
             input_name = str(item.get("input_set", ""))
+            input_by_item[item_id] = input_name
             input_label = input_name + ("（起動中）" if input_name in active_by_input else "")
             tree.insert("", "end", iid=item_id, text=name,
                         values=(input_label, active_status(input_name),
@@ -13060,6 +13806,39 @@ class PokeControllerApp:
             result["without_devices"] = True
             dialog.destroy()
 
+        def refresh_active_display():
+            update_active_entries()
+            active_summary_var.set(active_summary_text())
+            active_summary_label.configure(
+                foreground="#b05a00" if active_by_input else "#666666")
+            for item_id, input_name in input_by_item.items():
+                values = list(tree.item(item_id, "values"))
+                if len(values) < 4:
+                    continue
+                values[0] = input_name + (
+                    "（起動中）" if input_name in active_by_input else "")
+                values[1] = active_status(input_name)
+                tree.item(item_id, values=values)
+
+        def open_recovery():
+            try:
+                dialog.grab_release()
+            except tk.TclError:
+                pass
+            try:
+                self.open_pokecon_recovery(dialog)
+            finally:
+                if dialog.winfo_exists():
+                    refresh_active_display()
+                    dialog.grab_set()
+                    dialog.lift()
+
+        if allow_start_maximized:
+            ttk.Checkbutton(
+                dialog,
+                text="最大化して起動（映像・音声の開始前に最大化）",
+                variable=self.input_set_startup_maximized).pack(
+                    fill="x", padx=10, pady=(2, 5))
         buttons = ttk.Frame(dialog)
         buttons.pack(fill="x", padx=10, pady=(2, 10))
         ttk.Button(buttons, text="選択して読み込む", command=use_selected).pack(side="left", padx=(0, 5))
@@ -13067,6 +13846,9 @@ class PokeControllerApp:
             ttk.Button(
                 buttons, text="Camera・Serial・Audioを未設定で反映",
                 command=use_selected_without_devices).pack(side="left", padx=(0, 5))
+        ttk.Button(
+            buttons, text="固まったPokeConを終了...", command=open_recovery).pack(
+                side="left", padx=(0, 5))
         ttk.Button(buttons, text="スキップ" if allow_skip else "キャンセル",
                    command=dialog.destroy).pack(side="left")
         tree.bind("<Double-1>", use_selected)
@@ -13094,9 +13876,13 @@ class PokeControllerApp:
         data = self._read_input_sets()
         startup = data.get("startup", {})
         enabled = bool(startup.get("prompt", False))
+        maximized = bool(startup.get("maximized", False) or
+                         self._force_start_maximized)
         self.input_set_startup_prompt.set(enabled)
+        self.input_set_startup_maximized.set(maximized)
         names = sorted(data.get("combined_sets", {}))
         if not names:
+            self._apply_startup_window_state(maximized)
             return None
         default_name = startup.get("default") if startup.get("default") in names else names[0]
         # Restore all three selection fields even when startup application is
@@ -13104,10 +13890,22 @@ class PokeControllerApp:
         self.input_recording_set_name.set(default_name)
         self._select_input_recording_set()
         if not enabled:
+            self._apply_startup_window_state(maximized)
             return None
         name = self._choose_combined_set_dialog(
             "起動時 InputSet（機器を開く前）", default_name, full_only=False,
-            allow_skip=True, allow_without_devices=True)
+            allow_skip=True, allow_without_devices=True,
+            allow_start_maximized=True)
+        maximized = bool(self.input_set_startup_maximized.get())
+        self._apply_startup_window_state(maximized)
+        updated_startup = dict(startup)
+        updated_startup.update({
+            "prompt": True,
+            "default": name or default_name,
+            "maximized": maximized,
+        })
+        data["startup"] = updated_startup
+        self._write_input_sets(data)
         if not name:
             return None
         combined_item = data["combined_sets"].get(name)
@@ -13121,9 +13919,24 @@ class PokeControllerApp:
         self._startup_selected_combined_name = name
         self._startup_skip_hardware = bool(
             getattr(self, "_last_combined_set_without_devices", False))
-        data["startup"] = {"prompt": True, "default": name}
-        self._write_input_sets(data)
         return data["combined_sets"].get(name)
+
+    def _apply_startup_window_state(self, maximized):
+        """Finish the requested window-size change before devices start."""
+        self._startup_maximize_requested = bool(maximized)
+        try:
+            target = "zoomed" if maximized else "normal"
+            if str(self.root.state()) != target:
+                self.root.state(target)
+            # Drain geometry work before Camera/Audio callbacks begin
+            # competing with Tk's layout and tab event handling.
+            self.root.update_idletasks()
+        except (AttributeError, tk.TclError):
+            try:
+                self.root.attributes("-zoomed", bool(maximized))
+                self.root.update_idletasks()
+            except (AttributeError, tk.TclError):
+                pass
 
     def save_input_recording_set(self, update=False):
         name = self.input_recording_set_name.get().strip()
@@ -13150,7 +13963,13 @@ class PokeControllerApp:
             "recording_set": recording_name,
         }
         if self.input_set_startup_prompt.get():
-            data["startup"] = {"prompt": True, "default": name}
+            startup = dict(data.get("startup", {}))
+            startup.update({
+                "prompt": True,
+                "default": name,
+                "maximized": bool(self.input_set_startup_maximized.get()),
+            })
+            data["startup"] = startup
         self._write_input_sets(data)
         self.refresh_input_sets()
         self._select_input_recording_set()
@@ -13262,6 +14081,37 @@ class PokeControllerApp:
         return (not selected or self._confirm_shared_device(
             "audio", canonical_device_key("audio", selected), selected))
 
+    def _audio_output_stream_active(self):
+        stream = getattr(self.audio_monitor, "output_stream", None)
+        return bool(stream is not None
+                    and bool(getattr(stream, "active", False)))
+
+    def _confirmation_audio_recording_active(self):
+        return bool(getattr(self.recorder, "active", False)
+                    or getattr(self.operation_recorder, "active", False))
+
+    def _confirmation_audio_owner_ready(self):
+        return bool(self._runtime_full_rate_effective
+                    and not self._other_confirmation_audio_output)
+
+    def _suspend_confirmation_audio_for_owner_loss(self, registry=None):
+        """Stop a non-main speaker stream even if Tk is temporarily blocked."""
+        with self._audio_monitor_lifecycle_lock:
+            if self._confirmation_audio_recording_active() \
+                    or not self._audio_output_stream_active():
+                return False
+            self.audio_monitor.stop()
+        registry = registry or self._ensure_window_activity_registry()
+        try:
+            registry.set_device("audio_output", "", "")
+            registry.set_device("audio", "", "")
+            self._published_device_usage["audio_output"] = ("", "")
+            self._published_device_usage["audio"] = ("", "")
+        except (OSError, TimeoutError, ValueError) as error:
+            self._logger.warning(
+                "Could not release non-main audio output: %s", error)
+        return True
+
     def _sync_audio_device_usage(self):
         selected = self._selected_audio_device_name()
         monitor_active = bool(
@@ -13275,6 +14125,13 @@ class PokeControllerApp:
                 "audio", canonical_device_key("audio", selected), selected)
         else:
             self._publish_device_usage("audio", "", "")
+        if self._audio_output_stream_active():
+            self._publish_device_usage(
+                "audio_output",
+                canonical_device_key("audio_output", "confirmation"),
+                "PokeCon confirmation playback")
+        else:
+            self._publish_device_usage("audio_output", "", "")
 
     def _show_full_audio_device_name(self, *_):
         self.audio_device_full_name.set(self._selected_audio_device_name())
@@ -13306,66 +14163,266 @@ class PokeControllerApp:
         else:
             tkmsg.showinfo("Capture audio", "カメラ名に一致する音声デバイスを見つけられませんでした。Audio Inから選択してください。")
 
-    def start_audio_monitor(self):
+    def _audio_level_options(self):
+        safe = sanitize_audio_level_settings(
+            self.audio_gain.get(), self.audio_target_dbfs.get(),
+            self.audio_max_auto_gain.get(),
+            self.audio_limiter_ceiling_dbfs.get())
+        self.audio_gain.set(safe["gain_percent"])
+        self.audio_target_dbfs.set(safe["target_dbfs"])
+        self.audio_max_auto_gain.set(safe["max_auto_gain_percent"])
+        self.audio_limiter_ceiling_dbfs.set(
+            safe["limiter_ceiling_dbfs"])
+        return {
+            "auto_level": bool(self.audio_auto_level.get()),
+            "target_dbfs": safe["target_dbfs"],
+            "max_auto_gain_percent": safe["max_auto_gain_percent"],
+            "limiter_ceiling_dbfs": safe["limiter_ceiling_dbfs"],
+        }
+
+    def _begin_audio_level_poll(self):
+        self._audio_level_poll_generation += 1
+        self._poll_audio_level_status(self._audio_level_poll_generation)
+
+    def _poll_audio_level_status(self, generation):
+        if generation != self._audio_level_poll_generation:
+            return
+        monitor = getattr(self, "audio_monitor", None)
+        info = monitor.level_info() \
+            if monitor is not None and hasattr(monitor, "level_info") else {}
+        stream = getattr(monitor, "output_stream", None)
+        if stream is None or not bool(getattr(stream, "active", False)):
+            self.audio_level_status.set(
+                "自動補正はAudio再開始後に反映されます。")
+            return
+        raw = float(info.get("raw_peak_dbfs", -180.0))
+        raw_rms = float(info.get("raw_rms_dbfs", -180.0))
+        raw_max = float(info.get("raw_peak_max_dbfs", -180.0))
+        output = float(info.get("output_peak_dbfs", -180.0))
+        adaptive = float(info.get("adaptive_gain", 1.0))
+        raw_clip_blocks = int(info.get("raw_clip_blocks", 0))
+        limited_blocks = int(info.get("limited_blocks", 0))
+        input_status = int(info.get("audio_input_status_count", 0))
+        output_status = int(info.get("audio_output_status_count", 0))
+        software_underflow = int(info.get(
+            "software_buffer_underflow_frames", 0))
+        software_trimmed = int(info.get(
+            "software_buffer_overflow_trimmed_frames", 0))
+        if self._audio_auto_calibration_active:
+            remaining = max(
+                0.0, self._audio_auto_calibration_deadline - time.monotonic())
+            self.audio_level_status.set(
+                "おまかせ調整中：ゲーム音を鳴らしてください（残り {:.1f}秒）"
+                " / 基準peak {:.1f} / 大音量peak {:.1f} / RMS {:.1f} dBFS".format(
+                    remaining,
+                    float(info.get("raw_reference_peak_dbfs", -180.0)),
+                    float(info.get("raw_loud_peak_dbfs", -180.0)),
+                    float(info.get("raw_reference_rms_dbfs", -180.0))))
+            self.root.after(
+                250, lambda: self._poll_audio_level_status(generation))
+            return
+        warnings = []
+        if raw_clip_blocks:
+            warnings.append("原音CLIP {}回".format(raw_clip_blocks))
+        if limited_blocks:
+            warnings.append(
+                "Limiter保護 {}ブロック".format(limited_blocks))
+        if input_status or output_status:
+            warnings.append(
+                "Audio driver警告 入{}／出{}".format(
+                    input_status, output_status))
+        if software_underflow or software_trimmed:
+            warnings.append(
+                "Audio buffer補修 不足{}／超過{}frames".format(
+                    software_underflow, software_trimmed))
+        warning_text = " / " + " / ".join(warnings) if warnings else ""
+        self.audio_level_status.set(
+            "原音peak {:.1f} / RMS {:.1f} dBFS（最大 {:.1f}）"
+            "→ 出力peak {:.1f} dBFS "
+            "/ 自動×{:.2f}{}".format(
+                raw, raw_rms, raw_max, output, adaptive, warning_text))
+        self.root.after(
+            500, lambda: self._poll_audio_level_status(generation))
+
+    def reset_audio_level_statistics(self):
+        monitor = getattr(self, "audio_monitor", None)
+        if monitor is not None and hasattr(monitor, "reset_level_statistics"):
+            monitor.reset_level_statistics()
+        self.audio_level_status.set("音声ピーク最大値をリセットしました。")
+
+    def auto_calibrate_audio_level(self, duration_seconds=5):
+        """Measure raw input and apply a safe, continuously adaptive preset."""
+        duration_seconds = 30 if int(duration_seconds) >= 30 else 5
+        monitor = getattr(self, "audio_monitor", None)
+        stream = getattr(monitor, "output_stream", None)
+        if stream is None or not bool(getattr(stream, "active", False)):
+            if not self.start_audio_monitor():
+                return
+        self._audio_auto_calibration_generation += 1
+        generation = self._audio_auto_calibration_generation
+        self._audio_auto_calibration_active = True
+        self._audio_auto_calibration_deadline = (
+            time.monotonic() + duration_seconds)
+        self.audio_auto_calibrate_button.configure(state="disabled")
+        self.audio_precise_calibrate_button.configure(state="disabled")
+        monitor.reset_level_statistics()
+        self.audio_level_status.set(
+            "おまかせ調整中：{}秒間、普段のゲーム音を鳴らしてください。".format(
+                duration_seconds))
+        self.root.after(
+            duration_seconds * 1000,
+            lambda: self._finish_audio_level_calibration(generation))
+
+    def _finish_audio_level_calibration(self, generation):
+        if generation != self._audio_auto_calibration_generation:
+            return
+        self._audio_auto_calibration_active = False
+        self.audio_auto_calibrate_button.configure(state="normal")
+        self.audio_precise_calibrate_button.configure(state="normal")
+        info = self.audio_monitor.level_info()
+        raw_max = float(info.get("raw_peak_max_dbfs", -180.0))
+        raw_reference_peak = float(info.get(
+            "raw_reference_peak_dbfs", -180.0))
+        raw_loud_peak = float(info.get(
+            "raw_loud_peak_dbfs", raw_reference_peak))
+        raw_rms = float(info.get("raw_reference_rms_dbfs", -180.0))
+        raw_clips = int(info.get("raw_clip_blocks", 0))
+        settings = suggest_audio_level_settings(
+            raw_reference_peak, raw_rms_dbfs=raw_rms,
+            raw_clip_blocks=raw_clips,
+            raw_loud_peak_dbfs=raw_loud_peak)
+        if settings is None:
+            self.audio_level_status.set(
+                "おまかせ調整失敗：音声を検出できませんでした。音を鳴らして再実行してください。")
+            return
+        self.audio_gain.set(settings["gain_percent"])
+        self.audio_auto_level.set(settings["auto_level"])
+        self.audio_target_dbfs.set(settings["target_dbfs"])
+        self.audio_max_auto_gain.set(settings["max_auto_gain_percent"])
+        self.audio_limiter_ceiling_dbfs.set(
+            settings["limiter_ceiling_dbfs"])
+        if not self.start_audio_monitor():
+            return
+        message = (
+            "おまかせ調整完了：基準peak {:.1f} / 大音量peak {:.1f} "
+            "/ RMS {:.1f} dBFS "
+            "（絶対最大 {:.1f}）/ "
+            "Gain 100% / 自動最大 {}% / 目標 {:.1f} dBFS / "
+            "Limiter {:.1f} dBFS / 大音量保護 {:.1f} dB"
+            "（通常音量維持）".format(
+                raw_reference_peak, raw_loud_peak, raw_rms, raw_max,
+                settings["max_auto_gain_percent"],
+                settings["target_dbfs"],
+                settings["limiter_ceiling_dbfs"],
+                settings.get("transient_reserve_db", 0.0)))
+        self.show_output("Analysis", text=message)
+        if raw_clips:
+            tkmsg.showwarning(
+                "Audio: 原音側の音割れを検出",
+                "USBから届いたGain適用前の原音が0 dBFSへ達しました。\n"
+                "PokeCon側は安全設定へ変更しましたが、入力前に発生した音割れは修復できません。\n"
+                "Switch本体、キャプチャ機器、Windows録音レベルを下げてください。",
+                parent=self.root)
+
+    def _set_confirmation_audio_waiting(self):
+        self.audio_monitor_mode.set("Monitor")
+        self.audio_start_button.configure(text="Audio waiting (main only)")
+        if self._other_confirmation_audio_output:
+            message = "別のPokeConの確認再生終了を待っています。"
+        else:
+            message = "確認再生はメインPokeConだけで有効になります。"
+        self.audio_level_status.set(message)
+
+    def _start_audio_monitor_internal(self, automatic=False):
         selected = self._selected_audio_device_name()
         if not selected:
-            return
+            return False
         key = canonical_device_key("audio", selected)
-        if not self._confirm_shared_device("audio", key, selected):
-            return
+        conflicts = self._device_conflicts("audio", key)
+        if conflicts:
+            if automatic:
+                self._audio_auto_retry_at = time.monotonic() + 1.0
+                self._set_confirmation_audio_waiting()
+                return False
+            if not self._confirm_shared_device("audio", key, selected):
+                return False
         try:
-            self.audio_monitor.start(selected, gain_percent=self.audio_gain.get())
+            level_options = self._audio_level_options()
+            with self._audio_monitor_lifecycle_lock:
+                self.audio_monitor.start(
+                    selected, gain_percent=self.audio_gain.get(),
+                    **level_options)
             self.audio_start_button.configure(text="Audio running")
             self.audio_monitor_mode.set("Monitor")
-            self._publish_device_usage("audio", key, selected)
+            self._sync_audio_device_usage()
+            self._audio_auto_retry_at = 0.0
             notice = str(getattr(
                 self.audio_monitor, "last_start_notice", "") or "")
             if notice:
                 self.show_output("Analysis", text=notice)
+            self._begin_audio_level_poll()
+            return True
         except Exception as error:
             self.audio_start_button.configure(text="Start audio")
             self.audio_monitor_mode.set("No monitoring")
             self._sync_audio_device_usage()
-            tkmsg.showerror(
-                "Capture audio", self.audio_monitor.failure_message(error),
-                parent=self.root)
+            self._audio_auto_retry_at = time.monotonic() + 5.0
+            if automatic:
+                print("[AUDIO] Automatic start failed: " + str(error))
+            else:
+                tkmsg.showerror(
+                    "Capture audio", self.audio_monitor.failure_message(error),
+                    parent=self.root)
+            return False
+
+    def start_audio_monitor(self):
+        self._audio_monitor_requested = True
+        self.audio_monitor_mode.set("Monitor")
+        if not self._confirmation_audio_owner_ready():
+            self._set_confirmation_audio_waiting()
+            return False
+        return self._start_audio_monitor_internal(automatic=False)
 
     def start_audio_on_launch(self):
         """Automatic start should never show a modal error during launch."""
         if self._startup_skip_hardware:
+            self._audio_monitor_requested = False
             self._set_audio_unconfigured()
             return
         selected = self._selected_audio_device_name()
         if not self.audio_auto_start.get() or not selected:
+            self._audio_monitor_requested = False
             return
-        key = canonical_device_key("audio", selected)
-        if not self._confirm_shared_device("audio", key, selected):
-            self.audio_input.set("")
-            self.audio_auto_start.set(False)
+        self._audio_monitor_requested = True
+        self.audio_monitor_mode.set("Monitor")
+        if not self._confirmation_audio_owner_ready():
+            self._set_confirmation_audio_waiting()
             return
-        try:
-            self.audio_monitor.start(selected, gain_percent=self.audio_gain.get())
-            self.audio_start_button.configure(text="Audio running")
-            self.audio_monitor_mode.set("Monitor")
-            self._publish_device_usage("audio", key, selected)
-            notice = str(getattr(
-                self.audio_monitor, "last_start_notice", "") or "")
-            if notice:
-                self.show_output("Analysis", text=notice)
-        except Exception as error:
+        self._start_audio_monitor_internal(automatic=True)
+
+    def stop_audio_monitor(self, preserve_request=False):
+        if not preserve_request:
+            self._audio_monitor_requested = False
+        self._audio_auto_calibration_generation += 1
+        self._audio_auto_calibration_active = False
+        if hasattr(self, "audio_auto_calibrate_button"):
+            self.audio_auto_calibrate_button.configure(state="normal")
+        if hasattr(self, "audio_precise_calibrate_button"):
+            self.audio_precise_calibrate_button.configure(state="normal")
+        self._audio_level_poll_generation += 1
+        with self._audio_monitor_lifecycle_lock:
+            self.audio_monitor.stop()
+        self._sync_audio_device_usage()
+        if preserve_request and self._audio_monitor_requested:
+            self._set_confirmation_audio_waiting()
+        else:
             self.audio_start_button.configure(text="Start audio")
             self.audio_monitor_mode.set("No monitoring")
-            self._sync_audio_device_usage()
-            print("[AUDIO] Automatic start failed: " + str(error))
-
-    def stop_audio_monitor(self):
-        self.audio_monitor.stop()
-        self._sync_audio_device_usage()
-        self.audio_start_button.configure(text="Start audio")
-        self.audio_monitor_mode.set("No monitoring")
+            self.audio_level_status.set(
+                "自動補正はAudio再開始後に反映されます。")
 
     def apply_audio_monitor_mode(self):
-        """Monitoring affects speakers only; recording always uses Audio In."""
+        """Control confirmation playback; recording can share its exact PCM."""
         if self.audio_monitor_mode.get() == "Monitor":
             self.start_audio_monitor()
         else:
@@ -13436,7 +14493,7 @@ class PokeControllerApp:
         """Finalize a partial recording and disarm automatic recording modes."""
         was_active = self.recorder.active
         if was_active:
-            self.recorder.stop()
+            self._stop_capture_recorder()
         self.record_armed = False
         self._record_variable_active_rule_id = None
         self._record_variable_evaluator.reset()
@@ -13808,7 +14865,8 @@ class PokeControllerApp:
         if audio and not self._confirm_selected_audio_for_use():
             raise RuntimeError("使用中のAudioを反映しませんでした。Audioを変更してください。")
         self.operation_recorder.start(
-            frame, self.fps.get(), audio, self.audio_gain.get())
+            frame, self.fps.get(), audio, self.audio_gain.get(),
+            audio_level_options=self._audio_level_options())
         self._sync_audio_device_usage()
         session.begin_segment(
             self.operation_recorder.session_dir,
@@ -14534,11 +15592,13 @@ class PokeControllerApp:
 
     def _build_command_monitor_recording_tab(self, parent):
         self.record_monitor_chunk_seconds = tk.DoubleVar(value=30.0)
-        self.record_monitor_keep_steps = tk.IntVar(value=5)
+        self.record_monitor_keep_steps = tk.IntVar(value=15)
         self.record_monitor_loop_cycles = tk.IntVar(value=3)
         self.record_monitor_long_seconds = tk.DoubleVar(value=180.0)
         self.record_monitor_failure_tail_seconds = tk.DoubleVar(value=60.0)
         self.record_monitor_auto_arm = tk.BooleanVar(value=True)
+        # Keep the legacy storage/attribute name for existing InputSets.  The
+        # checked option now means that Stop asks whether to save this run.
         self.record_monitor_confirm_delete_on_stop = tk.BooleanVar(value=True)
         self.record_monitor_status = tk.StringVar(
             value="停止中：このタブを選び［監視開始］を押してください。")
@@ -14582,7 +15642,8 @@ class PokeControllerApp:
         ttk.Spinbox(settings, from_=10, to=600, increment=10,
                     textvariable=self.record_monitor_chunk_seconds, width=7).grid(column=1, row=0)
         ttk.Label(settings, text="秒").grid(column=2, row=0, padx=(2, 10))
-        ttk.Label(settings, text="直近の異なるStep").grid(column=3, row=0, padx=(4, 2))
+        ttk.Label(settings, text="問題Stepより前の異なるStep").grid(
+            column=3, row=0, padx=(4, 2))
         ttk.Spinbox(settings, from_=1, to=30, increment=1,
                     textvariable=self.record_monitor_keep_steps, width=5).grid(column=4, row=0)
         ttk.Label(settings, text="個").grid(column=5, row=0, padx=(2, 10))
@@ -14596,7 +15657,7 @@ class PokeControllerApp:
         ttk.Label(settings, text="秒").grid(column=2, row=1, padx=(2, 10))
         ttk.Label(
             settings,
-            text="A→B→A→Bは2Stepとして数え、最初と直近の指定周を保持します。",
+            text="A→B→A→Bは2Stepとして数え、問題Stepの前から指定数を保持します。",
             foreground="#555555").grid(column=3, columnspan=6, row=1, sticky="w")
         ttk.Label(settings, text="停止後の原因確認映像").grid(
             column=0, row=2, padx=(6, 2), pady=5)
@@ -14616,7 +15677,7 @@ class PokeControllerApp:
             variable=self.record_monitor_auto_arm).grid(
                 column=0, columnspan=4, row=3, padx=6, pady=(1, 5), sticky="w")
         ttk.Checkbutton(
-            settings, text="Commands Stop時に今回の仮録画を削除確認",
+            settings, text="Commands Stop時に今回の録画を保存確認",
             variable=self.record_monitor_confirm_delete_on_stop).grid(
                 column=4, columnspan=5, row=3, padx=6, pady=(1, 5), sticky="w")
 
@@ -14809,9 +15870,10 @@ class PokeControllerApp:
         if not self._confirm_selected_audio_for_use():
             self.record_monitor_status.set("使用中のAudioを反映しなかったため録画を開始していません。")
             return
-        self.recorder.start(
+        self._start_capture_recorder(
             frame, self.fps.get(), self._selected_audio_device_name(), self.audio_gain.get(),
-            cleanup_rules=[], minimum_duration=0)
+            cleanup_rules=[], minimum_duration=0,
+            audio_level_options=self._audio_level_options())
         self._sync_audio_device_usage()
         chunk = {
             "id": str(time.time_ns()),
@@ -14962,7 +16024,7 @@ class PokeControllerApp:
             chunk, runtime_state_snapshot(self._command_monitor_command), reason)
         self._write_command_monitor_output_log(chunk)
         self._write_command_monitor_metadata(chunk)
-        self.recorder.stop()
+        self._stop_capture_recorder()
         self._sync_audio_device_usage()
         with self._command_monitor_lock:
             if self._command_monitor_current_chunk is chunk:
@@ -15114,7 +16176,8 @@ class PokeControllerApp:
             self.record_monitor_status.set("60秒以内にキー操作が再開したため、無操作判定を解除しました。")
         return result
 
-    def _mark_command_monitor_prune_candidates(self, now=None):
+    def _mark_command_monitor_prune_candidates(self, now=None,
+                                               explicit_stop=False):
         now = time.monotonic() if now is None else float(now)
         visual = getattr(self._command_monitor_visual_detector, "active", None)
         inactivity = getattr(self._command_monitor_input_tracker, "active", None)
@@ -15123,13 +16186,23 @@ class PokeControllerApp:
         if isinstance(visual, dict):
             started = float(visual.get("started_at", now))
             terminals.append((failure_evidence_end(
-                started, now, tail_seconds), "dark_still"))
+                started, now, tail_seconds), "dark_still", started))
         if isinstance(inactivity, dict):
             started = float(inactivity.get("started_at", now))
             terminals.append((failure_evidence_end(
                 started, now, tail_seconds),
-                              "key_inactivity"))
-        terminal_time, terminal_mode = min(terminals) if terminals else (None, "")
+                              "key_inactivity", started))
+        if explicit_stop and not terminals and self._command_monitor_timeline.events:
+            # An explicit Stop means the current Step is the suspected problem
+            # even when loop/dark/input detectors have not fired yet.
+            started = float(self._command_monitor_timeline.events[-1]["time"])
+            terminals.append((failure_evidence_end(
+                started, now, tail_seconds), "manual_stop", started))
+        if terminals:
+            terminal_time, terminal_mode, terminal_started_at = min(
+                terminals, key=lambda value: value[0])
+        else:
+            terminal_time, terminal_mode, terminal_started_at = None, "", None
         try:
             retention = self._command_monitor_timeline.retention(
                 now,
@@ -15138,6 +16211,7 @@ class PokeControllerApp:
                 loop_cycles=max(2, int(self.record_monitor_loop_cycles.get())),
                 terminal_time=terminal_time,
                 terminal_mode=terminal_mode,
+                terminal_started_at=terminal_started_at,
             )
         except (tk.TclError, TypeError, ValueError):
             return None
@@ -15411,7 +16485,8 @@ class PokeControllerApp:
         self.record_armed = False
         if self._command_monitor_current_chunk is not None:
             self._finish_command_monitor_chunk(reason)
-        retention = self._mark_command_monitor_prune_candidates(time.monotonic()) or {}
+        retention = self._mark_command_monitor_prune_candidates(
+            time.monotonic(), explicit_stop=True) or {}
         mode = retention.get("mode")
         if mode == "loop":
             message = "Stop時に録画を確定しました。ループ前{} Stepと最初の{}周だけを保持します。".format(
@@ -15424,6 +16499,13 @@ class PokeControllerApp:
             message = (
                 "Stop時に録画を確定しました。最後のキー操作から最大{}秒の原因確認映像を保持します。"
             ).format(int(self._command_monitor_failure_tail_seconds()))
+        elif mode == "manual_stop":
+            message = (
+                "Stop時に録画を確定しました。問題Stepの前{} Stepから、"
+                "問題Step開始後最大{}秒までを保存候補にします。"
+            ).format(
+                self.record_monitor_keep_steps.get(),
+                int(self._command_monitor_failure_tail_seconds()))
         else:
             message = "Stop時にCommands監視録画を停止し、直近の有効なStep範囲だけを保持します。"
         self.record_monitor_status.set(message)
@@ -15532,7 +16614,7 @@ class PokeControllerApp:
             target=worker, daemon=True,
             name="CommandMonitorRecordingMerge").start()
 
-    def _confirm_delete_stopped_command_monitor_recordings(self, session_id):
+    def _confirm_save_stopped_command_monitor_recordings(self, session_id):
         target_ids = temporary_chunk_ids_for_session(
             self._command_monitor_chunks, session_id)
         session_ids = {
@@ -15545,7 +16627,7 @@ class PokeControllerApp:
         }
         if not target_ids:
             # "調整停止＋保護" already expresses a keep decision, so there is
-            # nothing to ask about deletion.  Still collapse that run to one
+            # nothing to ask about saving.  Still collapse that run to one
             # protected recording when it produced several chunks.
             if len(session_ids) > 1:
                 self._merge_stopped_command_monitor_recordings(
@@ -15553,21 +16635,28 @@ class PokeControllerApp:
             return
         targets = [chunk for chunk in self._command_monitor_chunks
                    if str(chunk.get("id", "")) in target_ids]
-        if not tkmsg.askyesno(
-                "Commands録画の整理",
-                "今回のCommands実行で作成した仮録画が{}本残っています。\n"
-                "削除しますか？\n\n"
-                "［はい］今回分だけ削除　［いいえ］1本へ結合して保持\n"
+        if tkmsg.askyesno(
+                "Commands録画の保存",
+                "今回のCommands実行で作成した録画が{}本あります。\n"
+                "問題確認用として保存しますか？\n\n"
+                "［はい］1本へ結合して保護保存　［いいえ］今回分だけ削除\n"
                 "保護した録画と過去の実行分は削除されません。".format(len(targets))):
+            saved_ids = apply_stopped_session_recording_choice(
+                self._command_monitor_chunks, session_id, save=True)
+            for chunk in self._command_monitor_chunks:
+                if str(chunk.get("id", "")) in saved_ids:
+                    self._write_command_monitor_metadata(chunk)
             self._merge_stopped_command_monitor_recordings(
                 session_id, session_ids)
             return
-        for chunk in targets:
-            chunk["delete_pending"] = True
-            self._write_command_monitor_metadata(chunk)
+        deleted_ids = apply_stopped_session_recording_choice(
+            self._command_monitor_chunks, session_id, save=False)
+        for chunk in self._command_monitor_chunks:
+            if str(chunk.get("id", "")) in deleted_ids:
+                self._write_command_monitor_metadata(chunk)
         self._flush_command_monitor_deletes()
         self.record_monitor_status.set(
-            "今回のCommands仮録画{}本を削除待ちにしました。".format(len(targets)))
+            "今回のCommands録画{}本を削除待ちにしました。".format(len(targets)))
         self._refresh_command_monitor_tree()
 
     def _command_monitor_failure_active(self):
@@ -15788,9 +16877,11 @@ class PokeControllerApp:
         if not data:
             tkmsg.showwarning("Recording set", "Select a saved recording set.")
             return
-        self._apply_recording_preset_data(data)
+        self._apply_recording_preset_data(
+            data, show_limited_warning=True)
 
-    def _apply_recording_preset_data(self, data):
+    def _apply_recording_preset_data(
+            self, data, show_limited_warning=False):
         """Apply recording data from a preset or an all-tab InputSet snapshot."""
         self.record_mode.set(data.get("mode", "Manual"))
         self.record_output_dir.set(data.get("output_dir", ""))
@@ -15817,7 +16908,7 @@ class PokeControllerApp:
         self.record_output_value.set(data.get("output_value", False))
         self.record_output_detection.set(data.get("output_detection", True))
         self.record_monitor_chunk_seconds.set(data.get("monitor_chunk_seconds", 30.0))
-        self.record_monitor_keep_steps.set(data.get("monitor_keep_steps", 5))
+        self.record_monitor_keep_steps.set(data.get("monitor_keep_steps", 15))
         self.record_monitor_loop_cycles.set(data.get("monitor_loop_cycles", 3))
         self.record_monitor_long_seconds.set(data.get("monitor_long_seconds", 180.0))
         self.record_monitor_failure_tail_seconds.set(
@@ -15829,7 +16920,8 @@ class PokeControllerApp:
         self.configure_recording_rules()
         if not self.record_trigger_rules:
             self.recorder.configure_template(self.record_template_path.get())
-        self.toggle_record_debug()
+        self.toggle_record_debug(
+            show_limited_warning=show_limited_warning)
 
     def delete_recording_preset(self):
         name = self.recording_preset_name.get().strip()
@@ -15917,8 +17009,15 @@ class PokeControllerApp:
         except ValueError:
             return 0, 0, 0, 0
 
-    def toggle_record_debug(self):
+    def toggle_record_debug(self, show_limited_warning=True):
         if self.record_debug.get():
+            if not self._require_tk_video_overlay(
+                    "録画条件のROIデバッグ表示",
+                    show_popup=show_limited_warning):
+                self.record_debug.set(False)
+                self.record_debug_status.set(
+                    "Debug: 機能制限版では停止（Cameraタブで通常版へ変更）")
+                return
             self.record_debug_status.set("Debug: checking template in the ROI...")
             return
         self.record_debug_status.set("Debug: disabled")
@@ -16012,6 +17111,11 @@ class PokeControllerApp:
                 "操作セッションを完了してから通常録画を開始してください。",
                 parent=self.root)
             return
+        if (not getattr(self.recorder, "active", False)
+                and not self.record_armed and self.record_debug.get()
+                and not self._require_tk_video_overlay(
+                    "録画条件のROIデバッグ表示")):
+            return
         self.configure_recording_rules()
         if self.record_mode.get() == "CommandMonitor":
             if self.record_armed:
@@ -16028,7 +17132,7 @@ class PokeControllerApp:
             if self.record_armed:
                 self.record_armed = False
                 if self.recorder.active:
-                    self.recorder.stop()
+                    self._stop_capture_recorder()
                 self.record_button.configure(text="Start recording")
                 self.record_variable_status.set("Variable segments: stopped")
                 return
@@ -16059,7 +17163,7 @@ class PokeControllerApp:
             if self.record_armed:
                 self.record_armed = False
                 if self.recorder.active:
-                    self.recorder.stop()
+                    self._stop_capture_recorder()
                 self.record_button.configure(text="Start recording")
                 return
             if not self.record_trigger_rules and not self.record_template_path.get():
@@ -16082,7 +17186,7 @@ class PokeControllerApp:
             self.show_output("Analysis", text="Template recording armed: waiting for score >= threshold.")
             return
         if self.recorder.active:
-            self.recorder.stop()
+            self._stop_capture_recorder()
             self._sync_audio_device_usage()
             self.record_button.configure(text="Start recording")
             self.show_output("Analysis", text="録画を停止しました。MP4はバックグラウンドで結合中です。")
@@ -16095,8 +17199,10 @@ class PokeControllerApp:
             return
         if not self._confirm_selected_audio_for_use():
             return
-        self.recorder.start(
-            frame, self.fps.get(), self._selected_audio_device_name(), self.audio_gain.get())
+        self._start_capture_recorder(
+            frame, self.fps.get(), self._selected_audio_device_name(),
+            self.audio_gain.get(),
+            audio_level_options=self._audio_level_options())
         self._sync_audio_device_usage()
         self.record_button.configure(text="Stop recording")
 
@@ -16517,33 +17623,115 @@ class PokeControllerApp:
         """Synchronous compatibility helper; live recording uses the worker."""
         return self._compose_recording_frame(frame, self._recording_output_snapshot(frame.shape[0]))
 
-    def _queue_recording_frame(self, frame):
+    def _queue_recording_frame(self, frame, presented_at=None,
+                               presentation_mode=None):
         if frame is None or not self.recorder.active:
             return
-        snapshot = self._recording_output_snapshot(frame.shape[0])
+        if presented_at is None:
+            # Capture callbacks continue to drive triggers and cache the Tk
+            # overlay state. The recorded picture itself follows the frame
+            # that PokeCon actually presented, so audio/video share the same
+            # user-observed timeline.
+            snapshot = self._recording_output_snapshot(frame.shape[0])
+            with self._record_compose_lock:
+                self._recording_latest_snapshot = snapshot
+            now = time.monotonic()
+            if self._recording_last_presentation_at > 0.0 \
+                    and now - self._recording_last_presentation_at < 0.5:
+                return
+            presented_at = now
+            presentation_mode = "capture_fallback"
+        else:
+            with self._record_compose_lock:
+                snapshot = self._recording_latest_snapshot
+            if snapshot is None:
+                snapshot = {"mode": "Video only"}
         session = getattr(self.recorder, "session_dir", None)
-        with self._record_compose_lock:
-            # Latest-only handoff: never build a backlog that can starve Tk.
-            self._record_compose_pending = (frame, snapshot, session)
-        self._record_compose_event.set()
+        mode = str(snapshot.get("mode", "Video only"))
+        if mode == "Video only":
+            # The camera publishes immutable frame objects.  Video-only output
+            # needs no compositor, so hand the displayed frame straight to the
+            # recorder's ordered queue without blocking the 60-Hz draw thread.
+            with self._record_compose_condition:
+                stopping = session in self._record_compose_closing_sessions
+            if not stopping:
+                self.recorder.add_frame(
+                    frame, presented_at=presented_at,
+                    presentation_mode=presentation_mode)
+            return
+        with self._record_compose_condition:
+            if session in self._record_compose_closing_sessions:
+                return
+            self._record_compose_queue.append((
+                frame, snapshot, session, float(presented_at),
+                str(presentation_mode or "preview_presented")))
+            self._record_compose_queue_max_depth = max(
+                self._record_compose_queue_max_depth,
+                len(self._record_compose_queue))
+            self.recorder.video_compositor_queue_max_depth = max(
+                getattr(self.recorder,
+                        "video_compositor_queue_max_depth", 0),
+                self._record_compose_queue_max_depth)
+            self._record_compose_condition.notify()
+
+    def process_presented_recording_frame(
+            self, frame, _frame_sequence, presented_at):
+        """Feed recording from the image the user actually saw."""
+        if frame is None or not self.recorder.active:
+            return
+        self._recording_last_presentation_at = float(presented_at)
+        self._queue_recording_frame(
+            frame, presented_at=presented_at,
+            presentation_mode="preview_presented")
 
     def _recording_compose_loop(self):
         while True:
-            self._record_compose_event.wait()
-            with self._record_compose_lock:
-                pending = self._record_compose_pending
-                self._record_compose_pending = None
-                self._record_compose_event.clear()
-            if pending is None:
-                continue
-            frame, snapshot, session = pending
+            with self._record_compose_condition:
+                while not self._record_compose_queue:
+                    self._record_compose_condition.wait()
+                pending = self._record_compose_queue.popleft()
+                self._record_compose_active_session = pending[2]
+            frame, snapshot, session, presented_at, presentation_mode = pending
             try:
                 composed = self._compose_recording_frame(frame, snapshot)
                 if (self.recorder.active
                         and getattr(self.recorder, "session_dir", None) == session):
-                    self.recorder.add_frame(composed)
+                    self.recorder.add_frame(
+                        composed, presented_at=presented_at,
+                        presentation_mode=presentation_mode)
             except Exception as error:
                 self._logger.warning("Recording compositor failed: %s", error)
+            finally:
+                with self._record_compose_condition:
+                    self._record_compose_active_session = None
+                    self._record_compose_condition.notify_all()
+
+    def _stop_capture_recorder(self, discard=False):
+        """Stop after every already-presented frame reaches the AVI queue."""
+        session = getattr(self.recorder, "session_dir", None)
+        if session is None or not getattr(self.recorder, "active", False):
+            return self.recorder.stop(discard=discard)
+        with self._record_compose_condition:
+            self._record_compose_closing_sessions.add(session)
+            while (self._record_compose_active_session == session
+                   or any(item[2] == session
+                          for item in self._record_compose_queue)):
+                # Do not close the AVI on a partial queue.  Stopping may wait
+                # briefly for overlay composition, but displayed frames are
+                # never discarded merely because a deadline elapsed.
+                self._record_compose_condition.wait()
+        try:
+            return self.recorder.stop(discard=discard)
+        finally:
+            with self._record_compose_condition:
+                self._record_compose_closing_sessions.discard(session)
+
+    def _start_capture_recorder(self, *args, **kwargs):
+        with self._record_compose_condition:
+            self._record_compose_queue_max_depth = 0
+            self._recording_latest_snapshot = None
+            self._recording_last_presentation_at = 0.0
+        return self.recorder.start(*args, **kwargs)
 
     def process_recording_frame(self, frame):
         self._sync_audio_device_usage()
@@ -16567,6 +17755,7 @@ class PokeControllerApp:
                 frame, self.fps.get(), self._selected_audio_device_name(), self.audio_gain.get(),
                 self.record_threshold.get(), self._recording_roi(), self.record_interval.get(),
                 self.record_release.get(), allow_start=False,
+                audio_level_options=self._audio_level_options(),
             )
             self._queue_recording_frame(frame)
             return
@@ -16584,6 +17773,7 @@ class PokeControllerApp:
                 frame, self.fps.get(), self._selected_audio_device_name(), self.audio_gain.get(),
                 self.record_threshold.get(), self._recording_roi(), self.record_interval.get(),
                 self.record_release.get(), allow_start=False,
+                audio_level_options=self._audio_level_options(),
             )
             now = time.monotonic()
             # Camera callbacks may run at 60 FPS; scalar condition checks need
@@ -16605,9 +17795,10 @@ class PokeControllerApp:
                         if not self._recording_disk_space_ok(show_popup=True, force=True):
                             self._interrupt_recording_for_disk_space()
                             return
-                        self.recorder.start(
+                        self._start_capture_recorder(
                             frame, self.fps.get(), self._selected_audio_device_name(),
-                            self.audio_gain.get())
+                            self.audio_gain.get(),
+                            audio_level_options=self._audio_level_options())
                         self._record_variable_active_rule_id = str(rule.get("id"))
                         self.record_variable_status.set("Recording: {} == {}".format(
                             rule.get("variable", ""), result.get("value")))
@@ -16627,7 +17818,7 @@ class PokeControllerApp:
                         discard_result = self._record_variable_evaluator.evaluate(
                             discard_rule, command, command_name, now)
                         if discard_result["triggered"]:
-                            self.recorder.stop(discard=True)
+                            self._stop_capture_recorder(discard=True)
                             self.record_variable_status.set(
                                 "Segment discarded: {} == {}. Waiting for next start.".format(
                                     active.get("variable", ""), discard_result.get("value")))
@@ -16641,7 +17832,7 @@ class PokeControllerApp:
                                  "seconds": active.get("stop_seconds", 0.0)}
                     result = self._record_variable_evaluator.evaluate(stop_rule, command, command_name, now)
                     if result["triggered"]:
-                        self.recorder.stop()
+                        self._stop_capture_recorder()
                         self.record_variable_status.set("Segment completed: {} == {}. Waiting for next start.".format(
                             active.get("variable", ""), result.get("value")))
                         self._record_variable_active_rule_id = None
@@ -16660,6 +17851,7 @@ class PokeControllerApp:
             frame, self.fps.get(), self._selected_audio_device_name(), self.audio_gain.get(),
             self.record_threshold.get(), self._recording_roi(),
             self.record_interval.get(), self.record_release.get(), allow_start=self.record_armed,
+            audio_level_options=self._audio_level_options(),
         )
         self.update_recording_debug(frame)
         # A detected segment must receive every camera frame, not merely the
@@ -16733,6 +17925,11 @@ class PokeControllerApp:
         self.settings.audio_gain = self.audio_gain.get()
         self.settings.audio_filter_camera = self.audio_filter_camera.get()
         self.settings.audio_auto_start = self.audio_auto_start.get()
+        self.settings.audio_auto_level = self.audio_auto_level.get()
+        self.settings.audio_target_dbfs = self.audio_target_dbfs.get()
+        self.settings.audio_max_auto_gain = self.audio_max_auto_gain.get()
+        self.settings.audio_limiter_ceiling_dbfs = \
+            self.audio_limiter_ceiling_dbfs.get()
         self.settings.vision_mode = self.vision_mode.get()
         self.settings.image_assist_enabled = self.image_assist_enabled.get()
         self.settings.image_assist_output = self.image_assist_output.get()
@@ -17280,6 +18477,9 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Switch/GC automation support software using Python")
     parser.add_argument("--profile", "-p", help="profile", type=str, default="default")
+    parser.add_argument(
+        "--start-maximized", action="store_true",
+        help="maximize the main window before Camera, Audio, and Serial start")
     args = parser.parse_args()
 
     logger = PokeConLogger.root_logger()
@@ -17291,7 +18491,30 @@ if __name__ == "__main__":
             '"plyer" is not installed. Some notification functions are not available. We recommend installing with "pip install plyer".',
         )
 
+    profile_input_sets_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "profiles", args.profile, "input_sets.json")
+    saved_start_maximized = False
+    try:
+        with open(profile_input_sets_path, "r", encoding="utf-8") as stream:
+            startup_data = json.load(stream).get("startup", {})
+        saved_start_maximized = bool(startup_data.get("maximized", False))
+    except (AttributeError, OSError, ValueError):
+        pass
+
     root = tk.Tk()
+    if args.start_maximized or saved_start_maximized:
+        try:
+            # Do this before PokeControllerApp builds widgets or starts any
+            # capture thread. Maximizing a live 60 FPS preview is much heavier.
+            root.state("zoomed")
+            root.update_idletasks()
+        except tk.TclError:
+            try:
+                root.attributes("-zoomed", True)
+                root.update_idletasks()
+            except tk.TclError:
+                pass
 
     def report_tk_callback_exception(exception_type, exception, traceback_object):
         """Log Tk callback failures without writing to an invalid console handle."""
@@ -17307,7 +18530,8 @@ if __name__ == "__main__":
 
     root.report_callback_exception = report_tk_callback_exception
     try:
-        app = PokeControllerApp(root, args.profile)
+        app = PokeControllerApp(
+            root, args.profile, start_maximized=args.start_maximized)
         app.run()
     except Exception as error:
         # Do not make startup failures look like an unexplained normal exit.

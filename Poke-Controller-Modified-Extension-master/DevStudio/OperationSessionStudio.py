@@ -381,7 +381,11 @@ class OperationSessionWorkspace(ttk.Frame):
             self.mapping_tree.heading(column, text=label)
             self.mapping_tree.column(column, width=width, stretch=column in ("name", "notes"))
         sy = ttk.Scrollbar(mapping_frame, orient="vertical", command=self.mapping_tree.yview)
-        self.mapping_tree.configure(yscrollcommand=sy.set)
+        sx = ttk.Scrollbar(
+            mapping_frame, orient="horizontal", command=self.mapping_tree.xview)
+        self.mapping_tree.configure(
+            yscrollcommand=sy.set, xscrollcommand=sx.set)
+        sx.pack(side="bottom", fill="x")
         self.mapping_tree.pack(side="left", fill="both", expand=True)
         sy.pack(side="right", fill="y")
         self.mapping_tree.bind("<<TreeviewSelect>>", self.edit_selected_mapping)

@@ -48,6 +48,7 @@ from SampleFunctionSync import replace_fragment_function_text
 from SampleFunctionSync import reflect_fragment_function_text
 from SampleFunctionSync import remove_fragment_function_text
 from SampleFunctionSync import fragment_function_stats
+from SampleFunctionSync import resolve_fragment_folder
 from SampleFunctionSync import (create_sample_sync_backup,
                                 latest_sample_sync_backup,
                                 restore_sample_sync_backup)
@@ -101,6 +102,36 @@ TODO_HELP_TEXT = (
 )
 
 
+def pack_scrollable_widget(widget, horizontal=False):
+    """Pack a list/text/tree with visible scrollbars and local wheel input."""
+    parent = widget.master
+    vertical = ttk.Scrollbar(parent, orient="vertical", command=widget.yview)
+    vertical.pack(side="right", fill="y")
+    horizontal_bar = None
+    options = {"yscrollcommand": vertical.set}
+    if horizontal:
+        horizontal_bar = ttk.Scrollbar(
+            parent, orient="horizontal", command=widget.xview)
+        horizontal_bar.pack(side="bottom", fill="x")
+        options["xscrollcommand"] = horizontal_bar.set
+    widget.configure(**options)
+    widget.pack(side="left", fill="both", expand=True)
+
+    def wheel(event):
+        delta = int(getattr(event, "delta", 0) or 0)
+        if not delta:
+            return None
+        units = -1 if delta > 0 else 1
+        if horizontal and (int(getattr(event, "state", 0) or 0) & 0x0001):
+            widget.xview_scroll(units, "units")
+        else:
+            widget.yview_scroll(units, "units")
+        return "break"
+
+    widget.bind("<MouseWheel>", wheel, add="+")
+    return vertical, horizontal_bar
+
+
 def _literal_string(node):
     """Return a string AST literal across Python 3.7 through 3.14."""
     constant_type = getattr(ast, "Constant", ())
@@ -141,10 +172,7 @@ class TagPicker(ttk.Frame):
         list_frame = ttk.Frame(self)
         list_frame.grid(column=0, columnspan=3, row=1, pady=(4, 0), sticky="nsew")
         self.listbox = tk.Listbox(list_frame, height=4, exportselection=False)
-        self.listbox.pack(side="left", fill="both", expand=True)
-        scrollbar = ttk.Scrollbar(list_frame, orient="vertical", command=self.listbox.yview)
-        scrollbar.pack(side="right", fill="y")
-        self.listbox.configure(yscrollcommand=scrollbar.set)
+        pack_scrollable_widget(self.listbox, horizontal=True)
         self.columnconfigure(1, weight=1); self.columnconfigure(2, weight=1)
         self.rowconfigure(1, weight=1)
         self.set_tags(initial or [], refresh_choices=not defer_choices)
@@ -245,6 +273,10 @@ class DevStudio(tk.Tk):
         self._build()
         self._build_menu()
         self.apply_language()
+        # Dev Studio is normally launched from a maximized PokeCon window.
+        # Present it explicitly after construction so the detached GUI does
+        # not appear to have failed while it is actually hidden behind PokeCon.
+        self.after_idle(self.present_window)
         self.after_idle(self.set_default_pane_sizes)
         self.after(100, self.restore_ui_state)
         self.after(50, self._drain_background_tasks)
@@ -402,6 +434,19 @@ class DevStudio(tk.Tk):
         except tk.TclError:
             pass
 
+    def present_window(self):
+        """Make an explicitly launched Dev Studio visible above its caller."""
+        try:
+            self.deiconify()
+            self.lift()
+            # A short topmost pulse is reliable even when the detached child
+            # finishes building after Windows' foreground grace period.
+            self.attributes("-topmost", True)
+            self.focus_force()
+            self.after(150, lambda: self.attributes("-topmost", False))
+        except tk.TclError:
+            pass
+
     def state_path(self):
         return os.path.join(os.path.dirname(os.path.abspath(__file__)), "devstudio_state.json")
 
@@ -442,7 +487,17 @@ class DevStudio(tk.Tk):
                 self.body.sashpos(1, int(state["sash1"]))
             for document in state.get("documents", []):
                 if document.get("path") and os.path.isfile(document["path"]):
-                    self.add_editor_document(document.get("content", ""), document["path"])
+                    content = document.get("content", "")
+                    # A clean tab is only a restorable view, not an unsaved
+                    # edit.  Reload it from disk so external fixes made while
+                    # Dev Studio was closed are not replaced by a stale copy.
+                    if not document.get("dirty", False):
+                        try:
+                            with open(document["path"], "r", encoding="utf-8") as handle:
+                                content = handle.read()
+                        except (OSError, UnicodeDecodeError):
+                            pass
+                    self.add_editor_document(content, document["path"])
             if state.get("left_tab") is not None:
                 self.left_tabs.select(int(state["left_tab"]))
             else:
@@ -585,19 +640,17 @@ class DevStudio(tk.Tk):
         self.search_tab = search_tab
 
         ttk.Label(explorer_tab, text="Python files").pack(anchor="w")
-        self.tree = ttk.Treeview(explorer_tab, show="tree")
-        self.tree.pack(fill="both", expand=True, side="left")
-        tree_scroll = ttk.Scrollbar(explorer_tab, orient="vertical", command=self.tree.yview)
-        tree_scroll.pack(fill="y", side="right")
-        self.tree.configure(yscrollcommand=tree_scroll.set)
+        explorer_tree_frame = ttk.Frame(explorer_tab)
+        explorer_tree_frame.pack(fill="both", expand=True)
+        self.tree = ttk.Treeview(explorer_tree_frame, show="tree")
+        pack_scrollable_widget(self.tree, horizontal=True)
         self.tree.bind("<<TreeviewSelect>>", self.open_tree_file)
 
         ttk.Label(local_explorer_tab, text="Local commands: SerialController/Commands/PythonCommands").pack(anchor="w")
-        self.local_tree = ttk.Treeview(local_explorer_tab, show="tree")
-        self.local_tree.pack(fill="both", expand=True, side="left")
-        local_scroll = ttk.Scrollbar(local_explorer_tab, orient="vertical", command=self.local_tree.yview)
-        local_scroll.pack(fill="y", side="right")
-        self.local_tree.configure(yscrollcommand=local_scroll.set)
+        local_tree_frame = ttk.Frame(local_explorer_tab)
+        local_tree_frame.pack(fill="both", expand=True)
+        self.local_tree = ttk.Treeview(local_tree_frame, show="tree")
+        pack_scrollable_widget(self.local_tree, horizontal=True)
         self.local_tree.bind("<<TreeviewSelect>>", self.open_local_tree_file)
 
         sample_apply_pane = ttk.Panedwindow(sample_apply_tab, orient="vertical")
@@ -605,8 +658,11 @@ class DevStudio(tk.Tk):
         function_apply = ttk.Labelframe(sample_apply_pane, text="サンプル関数リスト")
         image_apply = ttk.Labelframe(sample_apply_pane, text="画像検知設定")
         sample_apply_pane.add(function_apply, weight=2); sample_apply_pane.add(image_apply, weight=3)
-        self.sample_apply_list = tk.Listbox(function_apply, exportselection=False)
-        self.sample_apply_list.pack(fill="both", expand=True, padx=4, pady=4)
+        function_list_frame = ttk.Frame(function_apply)
+        function_list_frame.pack(fill="both", expand=True, padx=4, pady=4)
+        self.sample_apply_list = tk.Listbox(
+            function_list_frame, exportselection=False)
+        pack_scrollable_widget(self.sample_apply_list, horizontal=True)
         function_buttons = ttk.Frame(function_apply); function_buttons.pack(fill="x")
         ttk.Button(function_buttons, text="リスト更新", command=self.refresh_sample_apply_lists).pack(side="left", padx=4, pady=4)
         ttk.Button(function_buttons, text="選択を反映", command=self.apply_selected_sample_list).pack(side="right", padx=4, pady=4)
@@ -619,22 +675,24 @@ class DevStudio(tk.Tk):
             "sample_apply_image_search", 150, self.refresh_sample_apply_image_tree))
         tree_frame = ttk.Frame(image_apply); tree_frame.pack(fill="both", expand=True, padx=4)
         self.sample_apply_image_tree = ttk.Treeview(tree_frame, show="tree", selectmode="extended", height=8)
-        self.sample_apply_image_tree.pack(side="left", fill="both", expand=True)
-        image_tree_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.sample_apply_image_tree.yview)
-        image_tree_scroll.pack(side="right", fill="y"); self.sample_apply_image_tree.configure(yscrollcommand=image_tree_scroll.set)
+        pack_scrollable_widget(self.sample_apply_image_tree, horizontal=True)
         image_add_row = ttk.Frame(image_apply); image_add_row.pack(fill="x", padx=4, pady=3)
         ttk.Button(image_add_row, text="＋必要リストへ追加", command=self.add_sample_apply_image_selection).pack(side="left")
         ttk.Button(image_add_row, text="－必要リストから外す", command=self.remove_sample_apply_image_selection).pack(side="left", padx=3)
-        self.sample_apply_image_selected = tk.Listbox(image_apply, exportselection=False, height=4)
-        self.sample_apply_image_selected.pack(fill="x", padx=4)
+        selected_image_frame = ttk.Frame(image_apply)
+        selected_image_frame.pack(fill="x", padx=4)
+        self.sample_apply_image_selected = tk.Listbox(
+            selected_image_frame, exportselection=False, height=4)
+        pack_scrollable_widget(
+            self.sample_apply_image_selected, horizontal=True)
         ttk.Button(image_apply, text="必要な画像検知を編集中ソースへ反映", command=self.apply_sample_apply_images).pack(fill="x", padx=4, pady=4)
 
         ttk.Label(search_tab, text="Search / tagged / reusable results (Ctrl+click to select multiple)").pack(anchor="w")
-        self.results = tk.Listbox(search_tab, selectmode="extended", exportselection=False)
-        self.results.pack(fill="both", expand=True, side="left")
-        result_scroll = ttk.Scrollbar(search_tab, orient="vertical", command=self.results.yview)
-        result_scroll.pack(fill="y", side="right")
-        self.results.configure(yscrollcommand=result_scroll.set)
+        result_frame = ttk.Frame(search_tab)
+        result_frame.pack(fill="both", expand=True)
+        self.results = tk.Listbox(
+            result_frame, selectmode="extended", exportselection=False)
+        pack_scrollable_widget(self.results, horizontal=True)
         self.results.bind("<<ListboxSelect>>", self.open_selected_result)
         actions = ttk.Frame(search_tab)
         actions.pack(fill="x", pady=(4, 0))
@@ -684,10 +742,16 @@ class DevStudio(tk.Tk):
         self.editor = tk.Text(editor_box, wrap="none", undo=True, background="#1e1e1e", foreground="#d4d4d4",
                               insertbackground="white", selectbackground="#264f78",
                               font=self.code_font, tabs=self.code_tabs)
-        self.editor.pack(fill="both", expand=True, side="left")
         editor_scroll = ttk.Scrollbar(editor_box, orient="vertical", command=self._scroll_editor)
         editor_scroll.pack(fill="y", side="right")
-        self.editor.configure(yscrollcommand=lambda first, last: self._sync_editor_scroll(editor_scroll, first, last))
+        editor_x_scroll = ttk.Scrollbar(
+            editor_box, orient="horizontal", command=self.editor.xview)
+        editor_x_scroll.pack(fill="x", side="bottom")
+        self.editor.pack(fill="both", expand=True, side="left")
+        self.editor.configure(
+            yscrollcommand=lambda first, last: self._sync_editor_scroll(
+                editor_scroll, first, last),
+            xscrollcommand=editor_x_scroll.set)
         self.editor.bind("<<Modified>>", self.editor_modified)
         self.editor.bind("<KeyRelease>", self.on_editor_key_release)
         self.editor.bind("<ButtonRelease-1>", lambda event: self.debounce(
@@ -725,9 +789,11 @@ class DevStudio(tk.Tk):
         ttk.Button(todo_top, text="＋項目", command=self.insert_todo_item).pack(side="right", padx=2)
         ttk.Button(todo_top, text="＋現在の関数へ紐づけ", command=self.insert_linked_todo_item).pack(side="right", padx=2)
         ttk.Button(todo_top, text="TODOを保存", command=self.save_current_todo).pack(side="right", padx=2)
-        self.todo_editor = tk.Text(todo_frame, height=8, wrap="word", undo=True,
+        todo_editor_frame = ttk.Frame(todo_frame)
+        todo_editor_frame.pack(fill="both", expand=True, padx=3, pady=3)
+        self.todo_editor = tk.Text(todo_editor_frame, height=8, wrap="word", undo=True,
                                    background="#171717", foreground="#dddddd", insertbackground="white")
-        self.todo_editor.pack(fill="both", expand=True, padx=3, pady=3)
+        pack_scrollable_widget(self.todo_editor)
         self.todo_editor.bind("<<Modified>>", self.todo_modified)
         self.todo_editor.bind("<FocusOut>", lambda event: self.save_current_todo(silent=True))
         self.todo_editor.bind("<Double-Button-1>", self.open_todo_source_location)
@@ -894,10 +960,7 @@ class DevStudio(tk.Tk):
         self.completion_tree.column("#0", width=210, stretch=True)
         self.completion_tree.column("kind", width=75, stretch=False)
         self.completion_tree.column("tags", width=130, stretch=True)
-        self.completion_tree.pack(side="left", fill="both", expand=True)
-        scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.completion_tree.yview)
-        scroll.pack(side="right", fill="y")
-        self.completion_tree.configure(yscrollcommand=scroll.set)
+        pack_scrollable_widget(self.completion_tree, horizontal=True)
         self.completion_tree.bind("<<TreeviewSelect>>", self.show_selected_completion_detail)
         self.completion_tree.bind("<Double-1>", self.insert_selected_completion)
         self.completion_tree.bind("<Return>", self.insert_selected_completion)
@@ -1021,7 +1084,8 @@ class DevStudio(tk.Tk):
         self.completion_popup_list = tk.Listbox(
             self.completion_popup, height=10, width=52, exportselection=False,
             background="#252526", foreground="#dddddd", selectbackground="#094771")
-        self.completion_popup_list.pack(fill="both", expand=True)
+        pack_scrollable_widget(
+            self.completion_popup_list, horizontal=True)
         self.completion_popup_list.bind("<Double-1>", self.completion_accept_key)
         self.completion_popup_list.bind("<ButtonRelease-1>", lambda event: self.editor.focus_set())
 
@@ -1146,10 +1210,7 @@ class DevStudio(tk.Tk):
         step_tree_frame = ttk.Frame(parent)
         step_tree_frame.grid(column=0, columnspan=4, row=3, padx=7, pady=4, sticky="nsew")
         self.step_tree = ttk.Treeview(step_tree_frame, show="tree", height=10)
-        self.step_tree.pack(side="left", fill="both", expand=True)
-        step_tree_scroll = ttk.Scrollbar(step_tree_frame, orient="vertical", command=self.step_tree.yview)
-        step_tree_scroll.pack(side="right", fill="y")
-        self.step_tree.configure(yscrollcommand=step_tree_scroll.set)
+        pack_scrollable_widget(self.step_tree, horizontal=True)
         ttk.Checkbutton(parent, text="Use loop to advance steps", variable=self.step_loop).grid(column=0, columnspan=2, row=4, padx=7, pady=3, sticky="w")
         ttk.Combobox(parent, state="readonly", width=34, textvariable=self.step_template_mode, values=("Step (state transition / 状態遷移)", "Step (nested chapters / 階層チャプター)")).grid(column=2, columnspan=2, row=4, padx=3, pady=3, sticky="e")
         ttk.Label(parent, text="First step:").grid(column=0, row=5, padx=7, pady=3, sticky="w")
@@ -1157,8 +1218,12 @@ class DevStudio(tk.Tk):
         special_box = ttk.Labelframe(parent, text="Special steps (called explicitly, not in normal order)")
         special_box.grid(column=0, columnspan=4, row=6, padx=7, pady=(5, 7), sticky="nsew")
         ttk.Entry(special_box, textvariable=self.special_step_entry, width=24).pack(side="left", padx=4, pady=4)
-        self.special_step_list = tk.Listbox(special_box, height=3, exportselection=False)
-        self.special_step_list.pack(side="left", fill="x", expand=True, padx=4, pady=4)
+        special_step_frame = ttk.Frame(special_box)
+        special_step_frame.pack(
+            side="left", fill="x", expand=True, padx=4, pady=4)
+        self.special_step_list = tk.Listbox(
+            special_step_frame, height=3, exportselection=False)
+        pack_scrollable_widget(self.special_step_list, horizontal=True)
         ttk.Button(special_box, text="Add", command=self.add_special_step).pack(side="left", padx=2)
         ttk.Button(special_box, text="Remove", command=self.remove_special_step).pack(side="left", padx=4)
         parent.columnconfigure(0, weight=1)
@@ -2796,14 +2861,15 @@ class DevStudio(tk.Tk):
         ttk.Entry(parent, textvariable=self.image_target_resolution, width=12).grid(column=6, row=2, padx=2, pady=3, sticky="w")
         ttk.Label(parent, text="説明:").grid(column=0, row=3, padx=(7, 2), pady=3, sticky="w")
         ttk.Entry(parent, textvariable=self.image_target_description).grid(column=1, columnspan=6, row=3, padx=2, pady=3, sticky="ew")
-        self.image_target_tree = ttk.Treeview(parent, columns=("name", "description", "image", "threshold", "roi", "mode", "resolution"), show="headings", height=12)
+        target_tree_frame = ttk.Frame(parent)
+        target_tree_frame.grid(
+            column=0, columnspan=7, row=4, padx=7, pady=(5, 5),
+            sticky="nsew")
+        self.image_target_tree = ttk.Treeview(target_tree_frame, columns=("name", "description", "image", "threshold", "roi", "mode", "resolution"), show="headings", height=12)
         for column, label, width in (("name", "Name", 110), ("description", "説明", 170), ("image", "Image", 300), ("threshold", "Threshold", 72), ("roi", "ROI", 100), ("mode", "Mode", 82), ("resolution", "Reference", 95)):
             self.image_target_tree.heading(column, text=label)
             self.image_target_tree.column(column, width=width, stretch=(column == "image"))
-        self.image_target_tree.grid(column=0, columnspan=6, row=4, padx=7, pady=(5, 5), sticky="nsew")
-        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=self.image_target_tree.yview)
-        scrollbar.grid(column=6, row=4, padx=(0, 5), pady=(5, 5), sticky="ns")
-        self.image_target_tree.configure(yscrollcommand=scrollbar.set)
+        pack_scrollable_widget(self.image_target_tree, horizontal=True)
         self.image_target_tree.bind("<<TreeviewSelect>>", self.load_selected_image_target)
         self.image_target_tree.bind("<Double-1>", self.enter_selected_image_target_change_mode)
         controls = ttk.Frame(parent)
@@ -2880,11 +2946,13 @@ class DevStudio(tk.Tk):
         ttk.Button(buttons, text="選択パターンを削除", command=self.delete_image_library_variant).pack(side="left", padx=2)
         form.columnconfigure(1, weight=1)
 
-        self.image_library_tree = ttk.Treeview(left, columns=("path", "threshold", "crop", "tags"), show="tree headings")
+        library_tree_frame = ttk.Frame(left)
+        library_tree_frame.pack(fill="both", expand=True)
+        self.image_library_tree = ttk.Treeview(library_tree_frame, columns=("path", "threshold", "crop", "tags"), show="tree headings")
         self.image_library_tree.heading("#0", text="検知名 / パターン")
         for column, label, width in (("path", "画像", 280), ("threshold", "閾値", 55), ("crop", "範囲", 120), ("tags", "タグ", 130)):
             self.image_library_tree.heading(column, text=label); self.image_library_tree.column(column, width=width)
-        self.image_library_tree.pack(fill="both", expand=True)
+        pack_scrollable_widget(self.image_library_tree, horizontal=True)
         self.image_library_tree.bind("<<TreeviewSelect>>", self.load_selected_image_library_variant)
 
         list_box = ttk.Labelframe(right, text="画像検知フォルダー（フォルダー内フォルダー対応）")
@@ -2897,16 +2965,22 @@ class DevStudio(tk.Tk):
         description_row = ttk.Frame(list_box); description_row.pack(fill="x", padx=5, pady=(0, 4))
         ttk.Label(description_row, text="フォルダー説明:").pack(side="left")
         ttk.Entry(description_row, textvariable=self.image_library_list_description).pack(side="left", fill="x", expand=True, padx=4)
-        self.image_library_lists = tk.Listbox(list_box, height=7, exportselection=False)
-        self.image_library_lists.pack(fill="x", padx=5)
+        library_lists_frame = ttk.Frame(list_box)
+        library_lists_frame.pack(fill="x", padx=5)
+        self.image_library_lists = tk.Listbox(
+            library_lists_frame, height=7, exportselection=False)
+        pack_scrollable_widget(self.image_library_lists, horizontal=True)
         self.image_library_lists.bind("<<ListboxSelect>>", self.load_image_detection_list)
         member_row = ttk.Frame(list_box); member_row.pack(fill="x", padx=5, pady=5)
         self.image_library_member_combo = ttk.Combobox(member_row, textvariable=self.image_library_member, state="readonly")
         self.image_library_member_combo.pack(side="left", fill="x", expand=True)
         ttk.Button(member_row, text="＋追加", command=self.add_image_detection_member).pack(side="left", padx=3)
         ttk.Button(member_row, text="－外す", command=self.remove_image_detection_member).pack(side="left")
-        self.image_library_members = tk.Listbox(list_box, height=9, exportselection=False)
-        self.image_library_members.pack(fill="both", expand=True, padx=5)
+        library_members_frame = ttk.Frame(list_box)
+        library_members_frame.pack(fill="both", expand=True, padx=5)
+        self.image_library_members = tk.Listbox(
+            library_members_frame, height=9, exportselection=False)
+        pack_scrollable_widget(self.image_library_members, horizontal=True)
         apply_row = ttk.Frame(right); apply_row.pack(fill="x", pady=6)
         ttk.Combobox(apply_row, textvariable=self.image_library_apply_target, state="readonly",
                      values=("サンプルプログラム", "ソース編集"), width=18).pack(side="left")
@@ -2930,12 +3004,14 @@ class DevStudio(tk.Tk):
         ttk.Label(top, text="検知名検索:").pack(side="left")
         ttk.Entry(top, textvariable=search_var).pack(side="left", fill="x", expand=True, padx=4)
         ttk.Checkbutton(top, text="不一致のみ表示", variable=mismatch_only).pack(side="left", padx=5)
-        tree = ttk.Treeview(dialog, columns=("status", "source", "library"), show="tree headings")
+        tree_frame = ttk.Frame(dialog)
+        tree_frame.pack(fill="both", expand=True, padx=7, pady=4)
+        tree = ttk.Treeview(tree_frame, columns=("status", "source", "library"), show="tree headings")
         tree.heading("#0", text="画像検知名"); tree.heading("status", text="状態")
         tree.heading("source", text="ソース設定"); tree.heading("library", text="画像検知記録")
         tree.column("#0", width=390); tree.column("status", width=150)
         tree.column("source", width=250); tree.column("library", width=250)
-        tree.pack(fill="both", expand=True, padx=7, pady=4)
+        pack_scrollable_widget(tree, horizontal=True)
         status_labels = {"match": "一致", "different": "設定不一致", "source_only": "ソースのみ", "library_only": "記録のみ"}
         tree.tag_configure("different", foreground="#b36b00")
         tree.tag_configure("source_only", foreground="#a00000")
@@ -3106,15 +3182,26 @@ class DevStudio(tk.Tk):
         ttk.Button(form, text="選択", command=self.choose_fragment_folder).grid(column=2, row=2, padx=3, pady=4)
         ttk.Button(form, text="+ フォルダ", command=self.add_fragment_folder).grid(column=3, row=2, padx=3, pady=4)
         ttk.Label(form, text="Imports（import / from形式・1行ずつ）:").grid(column=0, row=3, padx=6, pady=4, sticky="nw")
-        self.fragment_imports = tk.Text(form, height=4, undo=True)
-        self.fragment_imports.grid(column=1, row=3, padx=6, pady=4, sticky="ew")
+        fragment_imports_frame = ttk.Frame(form)
+        fragment_imports_frame.grid(
+            column=1, row=3, padx=6, pady=4, sticky="nsew")
+        self.fragment_imports = tk.Text(
+            fragment_imports_frame, height=4, undo=True, wrap="none")
+        pack_scrollable_widget(self.fragment_imports, horizontal=True)
         ttk.Label(form, text="クラス変数（1行ずつ）:").grid(column=0, row=4, padx=6, pady=4, sticky="nw")
-        self.fragment_class_vars = tk.Text(form, height=4, undo=True)
-        self.fragment_class_vars.grid(column=1, row=4, padx=6, pady=4, sticky="ew")
+        fragment_class_vars_frame = ttk.Frame(form)
+        fragment_class_vars_frame.grid(
+            column=1, row=4, padx=6, pady=4, sticky="nsew")
+        self.fragment_class_vars = tk.Text(
+            fragment_class_vars_frame, height=4, undo=True, wrap="none")
+        pack_scrollable_widget(self.fragment_class_vars, horizontal=True)
         ttk.Label(form, text="実行開始時の初期化コード:").grid(column=0, row=5, padx=6, pady=4, sticky="nw")
-        self.fragment_initializer = tk.Text(form, height=5, undo=True, wrap="none",
+        fragment_initializer_frame = ttk.Frame(form)
+        fragment_initializer_frame.grid(
+            column=1, row=5, padx=6, pady=4, sticky="nsew")
+        self.fragment_initializer = tk.Text(fragment_initializer_frame, height=5, undo=True, wrap="none",
                                             font=self.code_font, tabs=self.code_tabs)
-        self.fragment_initializer.grid(column=1, row=5, padx=6, pady=4, sticky="ew")
+        pack_scrollable_widget(self.fragment_initializer, horizontal=True)
         ttk.Label(form, text="Start後、関数処理より前に実行します。self.xxx = 0 やSteam画面のアクティブ化を記述します。").grid(
             column=2, columnspan=2, row=5, padx=6, pady=4, sticky="nw")
         ttk.Label(form, text="関数・処理コード:").grid(column=0, row=6, padx=6, pady=4, sticky="nw")
@@ -3452,7 +3539,14 @@ class DevStudio(tk.Tk):
         dialog.geometry("1150x760")
         dialog.minsize(760, 520)
         dialog.transient(self)
-        folder_var = tk.StringVar(value=self.fragment_folder.get() or self.fragment_root())
+        try:
+            initial_fragment_folder = resolve_fragment_folder(
+                self.fragment_root(),
+                self.fragment_folder.get() or self.fragment_root())
+        except ValueError:
+            initial_fragment_folder = self.fragment_root()
+        self.fragment_folder.set(initial_fragment_folder)
+        folder_var = tk.StringVar(value=initial_fragment_folder)
         source_path_var = tk.StringVar(value=(
             self.current_path if self.current_path and
             str(self.current_path).lower().endswith(".py") else ""))
@@ -3846,8 +3940,13 @@ class DevStudio(tk.Tk):
             refresh()
 
         def refresh():
-            root, folder = self.fragment_root(), folder_var.get()
+            root = self.fragment_root()
             try:
+                folder = resolve_fragment_folder(root, folder_var.get())
+                if os.path.normcase(os.path.abspath(folder_var.get())) != \
+                        os.path.normcase(folder):
+                    folder_var.set(folder)
+                    self.fragment_folder.set(folder)
                 source, source_path, source_mode = comparison_source()
             except (OSError, SyntaxError, ValueError) as error:
                 messagebox.showwarning("サンプル関数チェック", str(error), parent=dialog)
@@ -3860,6 +3959,12 @@ class DevStudio(tk.Tk):
                 if not dialog_alive(): return
                 state["comparisons"] = comparisons
                 populate()
+                if not comparisons:
+                    messagebox.showwarning(
+                        "サンプル関数チェック",
+                        "比較フォルダーにサンプル関数がありません。\n"
+                        "比較フォルダーと登録元ソースを確認してください。",
+                        parent=dialog)
             def failed(error):
                 if dialog_alive(): messagebox.showwarning("サンプル関数チェック", str(error), parent=dialog)
             self.run_background("sample_function_check", "サンプル関数を比較中",
@@ -3879,6 +3984,13 @@ class DevStudio(tk.Tk):
         def choose_folder():
             selected = filedialog.askdirectory(parent=dialog, initialdir=folder_var.get() or self.fragment_root())
             if selected:
+                try:
+                    selected = resolve_fragment_folder(
+                        self.fragment_root(), selected)
+                except ValueError as error:
+                    messagebox.showwarning(
+                        "サンプル関数チェック", str(error), parent=dialog)
+                    return
                 folder_var.set(selected)
                 self.fragment_folder.set(selected)
                 # Let the newly selected folder infer its recorded origin.
@@ -4804,14 +4916,16 @@ class DevStudio(tk.Tk):
                 picker,
                 text="重複しているサンプルを個別に選択してください。"
             ).pack(fill="x", padx=8, pady=(8, 4))
+            choices_frame = ttk.Frame(picker)
+            choices_frame.pack(fill="both", expand=True, padx=8, pady=4)
             choices = ttk.Treeview(
-                picker, columns=("source", "path"), show="headings",
+                choices_frame, columns=("source", "path"), show="headings",
                 selectmode="browse")
             choices.heading("source", text="現在ソースとの関係")
             choices.heading("path", text="サンプル関数ファイル")
             choices.column("source", width=170, anchor="center")
             choices.column("path", width=610)
-            choices.pack(fill="both", expand=True, padx=8, pady=4)
+            pack_scrollable_widget(choices, horizontal=True)
             by_iid = {}
             source_record = item.get("source")
             source_normalized = (
@@ -4943,17 +5057,23 @@ class DevStudio(tk.Tk):
             source_filter = ttk.Frame(source_frame); source_filter.pack(fill="x", padx=5, pady=5)
             ttk.Label(source_filter, text="検索:").pack(side="left")
             ttk.Entry(source_filter, textvariable=source_search_var).pack(side="left", fill="x", expand=True, padx=3)
-            source_tree = ttk.Treeview(source_frame, columns=("origin",), show="tree headings", selectmode="browse")
+            source_tree_frame = ttk.Frame(source_frame)
+            source_tree_frame.pack(
+                fill="both", expand=True, padx=5, pady=(0, 5))
+            source_tree = ttk.Treeview(source_tree_frame, columns=("origin",), show="tree headings", selectmode="browse")
             source_tree.heading("#0", text="関数名"); source_tree.heading("origin", text="取得元")
             source_tree.column("#0", width=240); source_tree.column("origin", width=280)
-            source_tree.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+            pack_scrollable_widget(source_tree, horizontal=True)
             target_filter = ttk.Frame(target_frame); target_filter.pack(fill="x", padx=5, pady=5)
             ttk.Label(target_filter, text="検索:").pack(side="left")
             ttk.Entry(target_filter, textvariable=target_search_var).pack(side="left", fill="x", expand=True, padx=3)
-            target_tree = ttk.Treeview(target_frame, columns=("line",), show="tree headings", selectmode="extended")
+            target_tree_frame = ttk.Frame(target_frame)
+            target_tree_frame.pack(
+                fill="both", expand=True, padx=5, pady=(0, 5))
+            target_tree = ttk.Treeview(target_tree_frame, columns=("line",), show="tree headings", selectmode="extended")
             target_tree.heading("#0", text="関数名"); target_tree.heading("line", text="現在ソースの行")
             target_tree.column("#0", width=300); target_tree.column("line", width=140)
-            target_tree.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+            pack_scrollable_widget(target_tree, horizontal=True)
 
             options = ttk.Frame(picker); options.pack(fill="x", padx=8, pady=3)
             propagate_check = ttk.Checkbutton(
@@ -5821,8 +5941,13 @@ class DevStudio(tk.Tk):
         ttk.Label(controls, text="検索:").grid(column=0, row=2, padx=6, pady=3, sticky="w")
         ttk.Entry(controls, textvariable=self.sample_list_filter).grid(column=1, columnspan=2, row=2, padx=4, pady=3, sticky="ew")
         self.sample_list_filter.trace_add("write", lambda *_: self.refresh_sample_lists_tab())
-        self.sample_lists_tree = tk.Listbox(controls, exportselection=False, height=5)
-        self.sample_lists_tree.grid(column=0, columnspan=3, row=3, padx=6, pady=3, sticky="nsew")
+        sample_lists_frame = ttk.Frame(controls)
+        sample_lists_frame.grid(
+            column=0, columnspan=3, row=3, padx=6, pady=3,
+            sticky="nsew")
+        self.sample_lists_tree = tk.Listbox(
+            sample_lists_frame, exportselection=False, height=5)
+        pack_scrollable_widget(self.sample_lists_tree, horizontal=True)
         self.sample_lists_tree.bind("<<ListboxSelect>>", self.load_selected_sample_list)
         ttk.Button(controls, text="新規作成 / 更新", command=self.create_sample_list).grid(column=1, row=4, padx=3, pady=3, sticky="ew")
         ttk.Button(controls, text="リスト削除", command=self.delete_sample_list).grid(column=2, row=4, padx=3, pady=3, sticky="ew")
@@ -5835,8 +5960,13 @@ class DevStudio(tk.Tk):
         self.sample_list_tag_picker.grid(column=0, columnspan=3, row=6, padx=6, pady=3, sticky="nsew")
         self.sample_list_details = tk.StringVar(value="選択したリストのサンプル数を表示します。")
         ttk.Label(controls, textvariable=self.sample_list_details).grid(column=0, columnspan=3, row=7, padx=6, pady=3, sticky="w")
-        self.sample_member_list = tk.Listbox(controls, exportselection=False, height=5)
-        self.sample_member_list.grid(column=0, columnspan=2, row=8, padx=6, pady=3, sticky="nsew")
+        sample_member_frame = ttk.Frame(controls)
+        sample_member_frame.grid(
+            column=0, columnspan=2, row=8, padx=6, pady=3,
+            sticky="nsew")
+        self.sample_member_list = tk.Listbox(
+            sample_member_frame, exportselection=False, height=5)
+        pack_scrollable_widget(self.sample_member_list, horizontal=True)
         self.sample_member_list.bind("<Double-Button-1>", lambda event: self.edit_selected_member_fragment())
         self.sample_member_list.bind("<Return>", lambda event: self.edit_selected_member_fragment())
         member_actions = ttk.Frame(controls)
@@ -5860,15 +5990,18 @@ class DevStudio(tk.Tk):
         folder_frame = ttk.Frame(controls)
         folder_frame.grid(column=0, columnspan=3, row=13, padx=6, pady=2, sticky="nsew")
         self.sample_catalog_folder_tree = ttk.Treeview(folder_frame, show="tree", height=5, selectmode="browse")
-        self.sample_catalog_folder_tree.pack(side="left", fill="both", expand=True)
-        folder_scroll = ttk.Scrollbar(folder_frame, orient="vertical", command=self.sample_catalog_folder_tree.yview)
-        folder_scroll.pack(side="right", fill="y")
-        self.sample_catalog_folder_tree.configure(yscrollcommand=folder_scroll.set)
+        pack_scrollable_widget(
+            self.sample_catalog_folder_tree, horizontal=True)
         self.sample_catalog_folder_tree.bind("<ButtonRelease-1>", self.toggle_catalog_folder)
         self.sample_catalog_folder_tree.bind("<space>", self.toggle_catalog_folder)
         ttk.Button(controls, text="候補を検索", command=self.refresh_sample_catalog).grid(column=2, row=14, padx=3, pady=2, sticky="e")
-        self.sample_catalog_list = tk.Listbox(controls, exportselection=False, height=5)
-        self.sample_catalog_list.grid(column=0, columnspan=2, row=14, rowspan=2, padx=6, pady=3, sticky="nsew")
+        sample_catalog_frame = ttk.Frame(controls)
+        sample_catalog_frame.grid(
+            column=0, columnspan=2, row=14, rowspan=2, padx=6, pady=3,
+            sticky="nsew")
+        self.sample_catalog_list = tk.Listbox(
+            sample_catalog_frame, exportselection=False, height=5)
+        pack_scrollable_widget(self.sample_catalog_list, horizontal=True)
         self.sample_catalog_list.bind("<Double-Button-1>", self.open_selected_catalog_fragment)
         self.sample_catalog_list.bind("<Return>", lambda event: self.edit_selected_catalog_fragment())
         candidate_actions = ttk.Frame(controls)
@@ -5876,8 +6009,13 @@ class DevStudio(tk.Tk):
         ttk.Button(candidate_actions, text="変更", command=self.edit_selected_catalog_fragment).pack(side="left", padx=1)
         ttk.Button(candidate_actions, text="+ 追加", command=self.add_catalog_sample_to_list).pack(side="left", padx=1)
         ttk.Label(controls, text="登録済みサンプルリスト候補:").grid(column=0, columnspan=3, row=16, padx=6, pady=(5, 2), sticky="w")
-        self.sample_nested_list = tk.Listbox(controls, exportselection=False, height=4)
-        self.sample_nested_list.grid(column=0, columnspan=2, row=17, padx=6, pady=3, sticky="nsew")
+        sample_nested_frame = ttk.Frame(controls)
+        sample_nested_frame.grid(
+            column=0, columnspan=2, row=17, padx=6, pady=3,
+            sticky="nsew")
+        self.sample_nested_list = tk.Listbox(
+            sample_nested_frame, exportselection=False, height=4)
+        pack_scrollable_widget(self.sample_nested_list, horizontal=True)
         ttk.Button(controls, text="+ リストを追加", command=self.add_sample_list_to_list).grid(column=2, row=17, padx=3, pady=3, sticky="n")
         controls.columnconfigure(1, weight=1)
         controls.columnconfigure(2, weight=1)
@@ -5990,7 +6128,8 @@ class DevStudio(tk.Tk):
                        font=self.code_font, height=13)
         right = tk.Text(right_frame, wrap="none", state="disabled",
                         font=self.code_font, height=13)
-        left.pack(fill="both", expand=True); right.pack(fill="both", expand=True)
+        pack_scrollable_widget(left, horizontal=True)
+        pack_scrollable_widget(right, horizontal=True)
         left.tag_configure("changed", background="#ffc7ce", foreground="#8a1010")
         right.tag_configure("changed", background="#c6efce", foreground="#126b12")
         left.tag_configure("missing", background="#f2f2f2", foreground="#888888")
@@ -7035,7 +7174,10 @@ class DevStudio(tk.Tk):
         try: code = self._current_image_detection_code()
         except ValueError as error: messagebox.showwarning("画像検知", str(error), parent=self); return
         dialog = tk.Toplevel(self); dialog.title("生成されるimage_check")
-        editor = tk.Text(dialog, wrap="none", background="#1e1e1e", foreground="#d4d4d4"); editor.pack(fill="both", expand=True)
+        editor_frame = ttk.Frame(dialog)
+        editor_frame.pack(fill="both", expand=True)
+        editor = tk.Text(editor_frame, wrap="none", background="#1e1e1e", foreground="#d4d4d4")
+        pack_scrollable_widget(editor, horizontal=True)
         editor.insert("1.0", code); editor.configure(state="disabled"); dialog.geometry("900x600")
 
     def apply_image_detection_code(self):
@@ -7239,8 +7381,7 @@ class DevStudio(tk.Tk):
         tree.heading("#0", text="フォルダ / 登録名 / パターン"); tree.heading("path", text="画像")
         tree.heading("threshold", text="閾値"); tree.heading("crop", text="検知範囲")
         tree.column("path", width=410); tree.column("threshold", width=70); tree.column("crop", width=140)
-        tree.pack(side="left", fill="both", expand=True)
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview); scrollbar.pack(side="right", fill="y"); tree.configure(yscrollcommand=scrollbar.set)
+        pack_scrollable_widget(tree, horizontal=True)
         nodes = {}
 
         def populate(*args):
@@ -8159,14 +8300,19 @@ class DevStudio(tk.Tk):
         ttk.Label(dialog, text="Insert target:").grid(column=0, row=2, padx=7, pady=4, sticky="w")
         ttk.Combobox(dialog, state="readonly", textvariable=target, values=("step_user_block", "command_helper", "class_import"), width=28).grid(column=1, row=2, padx=7, pady=4, sticky="w")
         ttk.Label(dialog, text="Imports (one per line):").grid(column=0, row=3, padx=7, pady=4, sticky="nw")
-        import_box = tk.Text(dialog, height=3, width=54)
-        import_box.grid(column=1, row=3, padx=7, pady=4, sticky="ew")
+        import_frame = ttk.Frame(dialog)
+        import_frame.grid(column=1, row=3, padx=7, pady=4, sticky="nsew")
+        import_box = tk.Text(import_frame, height=3, width=54, wrap="none")
+        pack_scrollable_widget(import_box, horizontal=True)
         ttk.Label(dialog, text="Requires (comma):").grid(column=0, row=4, padx=7, pady=4, sticky="w")
         ttk.Entry(dialog, textvariable=requires, width=44).grid(column=1, row=4, padx=7, pady=4, sticky="ew")
         ttk.Label(dialog, text="Fragment code:").grid(column=0, row=5, padx=7, pady=4, sticky="nw")
-        body = tk.Text(dialog, height=14, width=66, undo=True)
+        body_frame = ttk.Frame(dialog)
+        body_frame.grid(column=1, row=5, padx=7, pady=4, sticky="nsew")
+        body = tk.Text(body_frame, height=14, width=66, undo=True,
+                       wrap="none")
         body.insert("1.0", "# @pokedev-fragment: new_fragment\n# Inserted into the selected Step user block.\n")
-        body.grid(column=1, row=5, padx=7, pady=4, sticky="nsew")
+        pack_scrollable_widget(body, horizontal=True)
         def create_fragment():
             safe_name = python_identifier(name.get())
             root = os.path.join(self.fragment_root(), safe_name)
@@ -8282,8 +8428,12 @@ class DevStudio(tk.Tk):
         tag_box.grid(column=0, row=1, padx=8, pady=6, sticky="nsew")
         tag_cb = ttk.Combobox(tag_box, textvariable=tag_entry, values=self.existing_command_tags(), width=30)
         tag_cb.grid(column=0, row=0, padx=5, pady=4, sticky="ew")
-        tag_list = tk.Listbox(tag_box, height=4, exportselection=False)
-        tag_list.grid(column=0, row=1, padx=5, pady=4, sticky="ew")
+        tag_list_frame = ttk.Frame(tag_box)
+        tag_list_frame.grid(
+            column=0, row=1, padx=5, pady=4, sticky="nsew")
+        tag_list = tk.Listbox(
+            tag_list_frame, height=4, exportselection=False)
+        pack_scrollable_widget(tag_list, horizontal=True)
         def refresh_tags():
             tag_list.delete(0, "end")
             for value in tags:
