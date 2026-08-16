@@ -7,6 +7,7 @@ import tkinter.ttk as ttk
 import json
 import os
 import glob
+from UiResponsiveness import dialog_owner_attachment_allowed
 # from logging import getLogger, DEBUG, NullHandlerxx
 
 
@@ -33,14 +34,15 @@ class PokeConDialogue(object):
         self._ls = None
         self.isOK = None
 
+        attach_to_owner = dialog_owner_attachment_allowed()
         self.message_dialogue = parent
         self.message_dialogue.title(title)
-        # Keep this as a normal child of the current PokeCon window.  A
-        # system-wide topmost dialog also stays above a second PokeCon
-        # instance and prevents the user from choosing the window order.
+        # A transient dialog may reactivate its native owner when it closes.
+        # Attach it only when the user is already operating this PokeCon;
+        # Commands may open this dialog while another PokeCon is in front.
         try:
             owner = self.message_dialogue.master
-            if owner is not None:
+            if owner is not None and attach_to_owner:
                 self.message_dialogue.transient(owner)
         except tk.TclError:
             pass

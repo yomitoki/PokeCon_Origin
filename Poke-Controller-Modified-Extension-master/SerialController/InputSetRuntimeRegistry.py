@@ -233,6 +233,50 @@ def main_resource_conflicts(entries):
     return result
 
 
+def last_active_pokecon_pid(entries, foreground_pid=None):
+    """Return the PokeCon process which should receive global manual input.
+
+    A PokeCon which is currently in the Windows foreground wins immediately.
+    When Chrome or another non-PokeCon application is in front, retain the
+    most recently focused live PokeCon.  The newest live process is only a
+    startup fallback for registries which do not have a focus marker yet.
+    """
+    live = []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        try:
+            pid = int(entry.get("pid", 0))
+        except (TypeError, ValueError):
+            continue
+        if pid > 0:
+            live.append((pid, entry))
+    if not live:
+        return None
+
+    try:
+        foreground_pid = int(foreground_pid)
+    except (TypeError, ValueError):
+        foreground_pid = None
+    live_pids = {pid for pid, _entry in live}
+    if foreground_pid in live_pids:
+        return foreground_pid
+
+    focused = []
+    for pid, entry in live:
+        try:
+            marker = int(entry.get("last_focused_ns"))
+        except (TypeError, ValueError):
+            continue
+        focused.append((marker, str(entry.get("token", "")), pid))
+    if focused:
+        return max(focused)[2]
+
+    return max(
+        live,
+        key=lambda item: (str(item[1].get("started_at", "")), item[0]))[0]
+
+
 class ActiveInputSetRegistry:
     """Own one process entry and update it when the active InputSet changes."""
 

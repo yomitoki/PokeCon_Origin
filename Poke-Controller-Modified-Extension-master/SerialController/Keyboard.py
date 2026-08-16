@@ -75,6 +75,24 @@ class SwitchKeyboardController(Keyboard):
 
         self._logger.debug('Initialization finished')
 
+    def stop(self):
+        """Release forwarded keys before handing input to another PokeCon."""
+        pressed_keys = list(dict.fromkeys(self.holding + self.holdingDir))
+        forwarded = [self.key_map[key] for key in pressed_keys
+                     if key in self.key_map]
+        if forwarded and self.key is not None:
+            try:
+                self.key.inputEnd(
+                    forwarded,
+                    unset_hat=any(type(value) is Hat for value in forwarded))
+            except Exception as error:
+                self._logger.warning(
+                    "Could not release keyboard controller state: %s", error)
+        self.holding.clear()
+        self.holdingDir.clear()
+        self.holdingHatDir.clear()
+        super().stop()
+
     def on_press(self, key):
         # for debug (show row key data)
         # super().on_press(key)

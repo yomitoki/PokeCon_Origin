@@ -135,9 +135,9 @@ def resize_safe_preview_intervals(capture_interval, render_interval,
     return capture_interval, max(render_interval, 1.0 / 15.0)
 
 
-def keyboard_listener_should_run(enabled=False, window_focused=False):
-    """Global keyboard-to-Switch input belongs only to the focused PokeCon."""
-    return bool(enabled and window_focused)
+def keyboard_listener_should_run(enabled=False, input_owner=False):
+    """Run global keyboard input only in the retained active PokeCon."""
+    return bool(enabled and input_owner)
 
 
 def foreground_process_id(foreground_pid_provider=None):
@@ -174,6 +174,19 @@ def foreground_process_matches(pid=None, foreground_pid_provider=None):
         return None if os.name != "nt" and foreground_pid_provider is None \
             else False
     return foreground_pid == pid
+
+
+def dialog_owner_attachment_allowed(pid=None, foreground_pid_provider=None):
+    """Return whether a new dialog may be attached to this PokeCon window.
+
+    On Windows, destroying a transient/owned dialog can reactivate its owner
+    and leave that PokeCon above another instance.  Only attach a dialog while
+    this process is already the foreground process.  ``None`` is the
+    cross-platform/unknown result and keeps the normal Tk parent relationship.
+    """
+    active = foreground_process_matches(
+        pid=pid, foreground_pid_provider=foreground_pid_provider)
+    return active is not False
 
 
 def preview_render_interval(fps, focused=True, viewable=True, full_rate=False,

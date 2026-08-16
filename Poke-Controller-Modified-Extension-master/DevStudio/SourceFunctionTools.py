@@ -4,6 +4,8 @@
 from __future__ import print_function
 
 import ast
+import datetime
+import hashlib
 import io
 import json
 import keyword
@@ -16,6 +18,61 @@ from PythonSourceSafety import normalize_python_indentation
 
 
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_]\w*$")
+
+
+def normalized_function_text(value):
+    """Normalize one function for stable, function-scoped history hashes."""
+    return "\n".join(
+        line.rstrip() for line in
+        textwrap.dedent(str(value or "")).strip().splitlines())
+
+
+def function_content_hash(value):
+    """Return a hash that changes only when this function body changes."""
+    return hashlib.sha256(
+        normalized_function_text(value).encode("utf-8")).hexdigest()
+
+
+def function_sync_record(source_function, function_text, synced_at=None):
+    """Build the common-ancestor record used by sample/source comparison."""
+    if synced_at is None:
+        synced_at = datetime.datetime.now(
+            datetime.timezone.utc).isoformat(timespec="seconds")
+    return {
+        "source_function": str(source_function),
+        "base_hash": function_content_hash(function_text),
+        "synced_at": str(synced_at),
+    }
+
+
+def classify_function_registration(expected_text, candidates, target_name):
+    """Classify function-level registrations, including multi-function files."""
+    candidates = list(candidates or [])
+    expected_hash = function_content_hash(expected_text)
+    exact = [item for item in candidates
+             if function_content_hash(item.get("text", "")) == expected_hash]
+    overwrite_supported = bool(
+        len(candidates) == 1 and
+        candidates[0].get("metadata", {}).get("name") == str(target_name))
+    if len(candidates) == 1 and exact:
+        status = "登録済み"
+        fragment_id = candidates[0].get("id", "")
+    elif len(candidates) == 1:
+        status = "処理差あり"
+        fragment_id = candidates[0].get("id", "")
+    elif len(candidates) > 1:
+        status = "同名複数"
+        fragment_id = exact[0].get("id", "") if len(exact) == 1 else ""
+    else:
+        status = "未登録"
+        fragment_id = ""
+    return {
+        "status": status,
+        "fragment_id": fragment_id,
+        "overwrite_supported": overwrite_supported,
+        "candidate_count": len(candidates),
+        "exact_count": len(exact),
+    }
 
 
 def _node_end_line(node, lines):
@@ -293,6 +350,9 @@ def register_source_functions(source, names, fragment_root, folder="SourceImport
             body = rename_source_functions(
                 body, final_names, require_definitions=False)
         metadata = dict(existing_metadata)
+        function_sync = dict(metadata.get("function_sync", {}))
+        function_sync[final_name] = function_sync_record(
+            old_name, records[old_name]["text"])
         metadata.update({
             "schema_version": 1,
             "name": final_name,
@@ -301,6 +361,7 @@ def register_source_functions(source, names, fragment_root, folder="SourceImport
             "class_variables": list(metadata.get("class_variables", [])),
             "fragment": os.path.basename(body_path),
             "source": {"path": str(source_path or ""), "function": old_name},
+            "function_sync": function_sync,
         })
         os.makedirs(sample_dir, exist_ok=True)
         temporary_metadata = metadata_path + ".tmp"

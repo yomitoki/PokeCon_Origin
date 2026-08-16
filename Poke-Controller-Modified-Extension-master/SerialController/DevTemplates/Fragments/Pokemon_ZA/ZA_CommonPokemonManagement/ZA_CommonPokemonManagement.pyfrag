@@ -35,7 +35,7 @@ def ZA_common_skill_change_start_check(self):
             print("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_B")
         self.wait(2.0)
     else:
-        if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W"):
+        if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"): #FIELDから変更
             self.pressRep(Button.X, repeat=1, duration=0.15, wait=0.5, interval=0.1)
             self.wait(1.0)
         elif self.image_check("POKEMON_ZA_X_MENU_OPEN"):
@@ -220,7 +220,7 @@ def ZA_common_skill_change_skill_window_chtarget2(self,target2):
 def ZA_common_skill_change_skill_window_close(self):
     while True:
         self.pressRep(Button.B, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-        if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W"):
+        if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"): #FIELDから変更
             return "COMMON_SKILL_CHANGE_END"
     return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CLOSE"
 def ZA_common_skill_change_end(self):
@@ -445,8 +445,7 @@ def ZA_common_evolution_exec(self):
     return "COMMON_EVOLUTION_EXEC"
 def ZA_common_evolution_loop(self):
     if self.ZA_renda_button(rendabutton="B",
-                        endpicture="POKEMON_ZA_FIELD_W",
-                        endpicture2="POKEMON_ZA_FIELD_BACK_W",
+                        endpicture="POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK", #FIELDから変更
                         not_endpicture="POKEMON_ZA_ZA_ROYALE"):
         return "COMMON_EVOLUTION_END"
     return "COMMON_EVOLUTION_LOOP"
@@ -546,8 +545,7 @@ def ZA_common_item_use_target_high(self,target2,item_pic="POKEMON_ZA_TRUE_RETURN
     return self.common_item_use_current_state
 def ZA_common_item_use_window_close(self):
     if self.ZA_renda_button(rendabutton="B",
-                        endpicture="POKEMON_ZA_FIELD_W",
-                        endpicture2="POKEMON_ZA_FIELD_BACK_W",
+                        endpicture="POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK", #FIELDから変更
                         not_endpicture="POKEMON_ZA_ZA_ROYALE",
                         sub_button="A",sub_picture="POKEMON_ZA_TEXT_BLACK_COMMENT",):
         return "COMMON_ITEM_USE_END"

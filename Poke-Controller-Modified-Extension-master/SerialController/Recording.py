@@ -1,6 +1,7 @@
 """Synchronized-ish capture recorder and low-cost template-triggered segments."""
 from __future__ import annotations
 
+import ctypes
 import datetime
 import json
 import os
@@ -16,6 +17,38 @@ import cv2
 import numpy as np
 
 from AudioLevelControl import AdaptivePeakNormalizer
+
+
+def evenly_spaced_frame_indexes(total_frames, maximum_samples=120):
+    """Return bounded sample positions spanning the complete recording."""
+    try:
+        total_frames = max(0, int(total_frames))
+        maximum_samples = max(0, int(maximum_samples))
+    except (TypeError, ValueError, OverflowError):
+        return []
+    sample_count = min(total_frames, maximum_samples)
+    if sample_count <= 0:
+        return []
+    if sample_count == 1:
+        return [0]
+    return [
+        position * (total_frames - 1) // (sample_count - 1)
+        for position in range(sample_count)
+    ]
+
+
+def set_current_thread_below_normal():
+    """Keep a recording finalizer from starving capture and Tk on Windows."""
+    if os.name != "nt":
+        return False
+    try:
+        kernel32 = ctypes.windll.kernel32
+        current_thread = kernel32.GetCurrentThread()
+        # THREAD_PRIORITY_BELOW_NORMAL.  This changes only the finalizer
+        # worker, not Camera, native preview, or the Tk window thread.
+        return bool(kernel32.SetThreadPriority(current_thread, -1))
+    except (AttributeError, OSError):
+        return False
 
 
 def audio_callback_presentation_time(time_info, now=None):
@@ -73,6 +106,14 @@ class CaptureRecorder:
         self.audio_accepting_packets = False
         self.audio_first_presentation_at = 0.0
         self.audio_initial_alignment_frames = 0
+        self.audio_last_presentation_at = 0.0
+        self.audio_last_presentation_frames = 0
+        self.audio_presentation_frames = 0
+        self.audio_presentation_timestamp_regressions = 0
+        self.audio_stop_target_frames = None
+        self.audio_stop_overrun_frames = 0
+        self.audio_monitor_counter_start = {}
+        self.audio_monitor_counter_end = {}
         self.process_audio = None
         self.process_audio_gain = 1.0
         self.active = False
@@ -116,6 +157,10 @@ class CaptureRecorder:
         self.video_stop_pending_presentations = 0
         self.video_stop_drain_seconds = 0.0
         self.video_stop_drain_timeout = 0.0
+        self.video_queue_depth_samples = []
+        self.video_queue_last_sample_at = 0.0
+        self.audio_presentation_clock_samples = []
+        self.audio_presentation_clock_last_sample_at = 0.0
         # Final MP4 encoding runs after capture has stopped.  Keep an explicit
         # count so the window can avoid being destroyed while ffmpeg still has
         # the recording files open.
@@ -194,6 +239,14 @@ class CaptureRecorder:
         self.audio_accepting_packets = False
         self.audio_first_presentation_at = 0.0
         self.audio_initial_alignment_frames = 0
+        self.audio_last_presentation_at = 0.0
+        self.audio_last_presentation_frames = 0
+        self.audio_presentation_frames = 0
+        self.audio_presentation_timestamp_regressions = 0
+        self.audio_stop_target_frames = None
+        self.audio_stop_overrun_frames = 0
+        self.audio_monitor_counter_start = {}
+        self.audio_monitor_counter_end = {}
         self.video_first_presentation_at = 0.0
         self.video_last_presentation_at = 0.0
         self.video_presentation_frames = 0
@@ -201,6 +254,10 @@ class CaptureRecorder:
         self.video_stop_pending_presentations = 0
         self.video_stop_drain_seconds = 0.0
         self.video_stop_drain_timeout = 0.0
+        self.video_queue_depth_samples = []
+        self.video_queue_last_sample_at = 0.0
+        self.audio_presentation_clock_samples = []
+        self.audio_presentation_clock_last_sample_at = 0.0
         if cleanup_rules is not None:
             self.cleanup_rules = list(cleanup_rules)
             self.minimum_duration = max(0.0, float(minimum_duration))
@@ -393,6 +450,8 @@ class CaptureRecorder:
         self.audio_queue_drop_count = 0
         self.audio_write_error = None
         self.audio_accepting_packets = True
+        self.audio_stop_target_frames = None
+        self.audio_stop_overrun_frames = 0
         self.audio_queue = queue.Queue(maxsize=256)
         self.audio_writer_thread = threading.Thread(
             target=self._audio_writer_loop, daemon=True,
@@ -416,6 +475,12 @@ class CaptureRecorder:
         sample_rate = int(info["sample_rate"])
         channels = int(info["channels"])
         try:
+            if hasattr(monitor, "level_info"):
+                try:
+                    self.audio_monitor_counter_start = dict(
+                        monitor.level_info() or {})
+                except Exception:
+                    self.audio_monitor_counter_start = {}
             # Confirmation playback already contains the Audio-tab gain and
             # sample-rate conversion. Do not apply either a second time.
             self._prepare_audio_writer(
@@ -423,15 +488,38 @@ class CaptureRecorder:
                 level_options={"auto_level": False})
 
             def listener(outdata, frames, _time_info, status):
+                presented_at = audio_callback_presentation_time(
+                    _time_info)
                 if self.audio_first_presentation_at <= 0.0:
-                    presented_at = audio_callback_presentation_time(
-                        _time_info)
                     self.audio_first_presentation_at = presented_at
                     initial_frames = int(round(max(
                         0.0, presented_at - getattr(
                             self, "started_at", presented_at)) * sample_rate))
                     self.audio_initial_alignment_frames = initial_frames
                     self.audio_pending_gap_frames += initial_frames
+                if self.audio_last_presentation_at > 0.0 \
+                        and presented_at < self.audio_last_presentation_at:
+                    self.audio_presentation_timestamp_regressions += 1
+                self.audio_last_presentation_at = presented_at
+                self.audio_last_presentation_frames = max(0, int(frames))
+                self.audio_presentation_frames += max(0, int(frames))
+                if presented_at - self.audio_presentation_clock_last_sample_at \
+                        >= 1.0:
+                    presentation_span = max(
+                        0.0,
+                        presented_at
+                        + max(0, int(frames)) / max(1, sample_rate)
+                        - self.audio_first_presentation_at)
+                    self.audio_presentation_clock_samples.append({
+                        "offset_seconds": max(
+                            0.0, presented_at - getattr(
+                                self, "started_at", presented_at)),
+                        "clock_error_ms": (
+                            self.audio_presentation_frames
+                            / max(1, sample_rate)
+                            - presentation_span) * 1000.0,
+                    })
+                    self.audio_presentation_clock_last_sample_at = presented_at
                 pcm = np.clip(
                     np.asarray(outdata, dtype=np.float32), -1.0, 1.0)
                 pcm = np.rint(pcm * 32767.0).astype(np.int16)
@@ -481,6 +569,13 @@ class CaptureRecorder:
         token, self.audio_monitor_listener_token = (
             self.audio_monitor_listener_token, None)
         monitor = self.audio_monitor
+        if token is not None and monitor is not None \
+                and hasattr(monitor, "level_info"):
+            try:
+                self.audio_monitor_counter_end = dict(
+                    monitor.level_info() or {})
+            except Exception:
+                self.audio_monitor_counter_end = {}
         if token is not None and monitor is not None \
                 and hasattr(monitor, "remove_recording_output_listener"):
             try:
@@ -536,6 +631,11 @@ class CaptureRecorder:
 
     def _write_audio_silence(self, frame_count):
         frame_count = max(0, int(frame_count))
+        target_frames = self.audio_stop_target_frames
+        if target_frames is not None:
+            frame_count = min(
+                frame_count,
+                max(0, int(target_frames) - self.audio_frames_written))
         if not self.audio or not frame_count:
             return
         frame_width = max(1, int(self.audio_channels)) * 2
@@ -556,8 +656,17 @@ class CaptureRecorder:
         frame_width = max(1, int(self.audio_channels)) * 2
         gap_frames = max(0, int(gap_frames))
         if gap_frames:
+            before_gap = self.audio_frames_written
             self._write_audio_silence(gap_frames)
-            self.audio_gap_frames_written += gap_frames
+            self.audio_gap_frames_written += (
+                self.audio_frames_written - before_gap)
+        if frame_count <= 0:
+            return
+        target_frames = self.audio_stop_target_frames
+        if target_frames is not None:
+            frame_count = min(
+                frame_count,
+                max(0, int(target_frames) - self.audio_frames_written))
         if frame_count <= 0:
             return
         payload = payload[:frame_count * frame_width]
@@ -589,6 +698,12 @@ class CaptureRecorder:
         # Freeze the producer side before placing the sentinel.  In
         # particular, a confirmation-playback callback can otherwise append a
         # packet after the sentinel and leave that packet unwritten.
+        target_frames = None
+        if stopped_at is not None and self.audio_sample_rate:
+            target_frames = int(round(
+                max(0.0, float(stopped_at) - self.started_at)
+                * self.audio_sample_rate))
+        self.audio_stop_target_frames = target_frames
         self.audio_accepting_packets = False
         audio_queue = self.audio_queue
         writer = self.audio_writer_thread
@@ -600,14 +715,17 @@ class CaptureRecorder:
             writer.join(timeout=10)
         self.audio_writer_thread = None
         self.audio_queue = None
-        if self.audio and stopped_at is not None and self.audio_sample_rate:
-            target_frames = int(round(
-                max(0.0, float(stopped_at) - self.started_at)
-                * self.audio_sample_rate))
+        if self.audio and target_frames is not None:
             if target_frames > self.audio_frames_written:
                 trailing_frames = target_frames - self.audio_frames_written
                 self._write_audio_silence(trailing_frames)
                 self.audio_trailing_silence_frames += trailing_frames
+            elif self.audio_frames_written > target_frames:
+                # A writer may already be inside one small callback write when
+                # Stop fixes the target.  Record that bounded race explicitly;
+                # all queued packets after it are capped by the target above.
+                self.audio_stop_overrun_frames = (
+                    self.audio_frames_written - target_frames)
         if (self.audio_callback_warning_count or self.audio_queue_drop_count
                 or self.audio_write_error is not None):
             print(
@@ -638,7 +756,22 @@ class CaptureRecorder:
                 and self.audio_monitor is not None \
                 and hasattr(self.audio_monitor, "level_info"):
             try:
-                level_control = dict(self.audio_monitor.level_info() or {})
+                level_control = dict(
+                    self.audio_monitor_counter_end
+                    or self.audio_monitor.level_info() or {})
+                counter_start = self.audio_monitor_counter_start
+                for key in (
+                        "audio_input_status_count",
+                        "audio_output_status_count",
+                        "software_buffer_startup_silence_frames",
+                        "software_buffer_underflow_frames",
+                        "software_buffer_overflow_trimmed_frames",
+                        "software_buffer_drift_drop_frames",
+                        "software_buffer_drift_insert_frames"):
+                    if key in level_control and key in counter_start:
+                        level_control[key] = max(
+                            0, int(level_control[key])
+                            - int(counter_start[key]))
                 level_control["processing_source"] = "AudioMonitor"
             except Exception:
                 level_control = {}
@@ -677,6 +810,8 @@ class CaptureRecorder:
                 "stop_drain_seconds": float(self.video_stop_drain_seconds),
                 "stop_drain_timeout_seconds": float(
                     self.video_stop_drain_timeout),
+                "queue_depth_samples": list(
+                    self.video_queue_depth_samples),
                 "compositor_delivery_delay_average_ms": (
                     self.video_delivery_delay_total * 1000.0
                     / self.video_delivery_delay_samples
@@ -707,11 +842,48 @@ class CaptureRecorder:
                     if self.audio_first_presentation_at > 0.0 else None),
                 "initial_alignment_frames": int(
                     self.audio_initial_alignment_frames),
+                "presentation_frames": int(
+                    self.audio_presentation_frames),
+                "presentation_timestamp_regressions": int(
+                    self.audio_presentation_timestamp_regressions),
+                "presentation_span_seconds": (
+                    max(0.0,
+                        self.audio_last_presentation_at
+                        + self.audio_last_presentation_frames
+                        / max(1, self.audio_sample_rate)
+                        - self.audio_first_presentation_at)
+                    if self.audio_first_presentation_at > 0.0
+                    and self.audio_last_presentation_at > 0.0 else None),
+                "presentation_sample_duration_seconds": (
+                    self.audio_presentation_frames
+                    / max(1, self.audio_sample_rate)
+                    if self.audio_presentation_frames else None),
+                "presentation_clock_error_ms": (
+                    (self.audio_presentation_frames
+                     / max(1, self.audio_sample_rate)
+                     - max(0.0,
+                           self.audio_last_presentation_at
+                           + self.audio_last_presentation_frames
+                           / max(1, self.audio_sample_rate)
+                           - self.audio_first_presentation_at)) * 1000.0
+                    if self.audio_presentation_frames
+                    and self.audio_first_presentation_at > 0.0
+                    and self.audio_last_presentation_at > 0.0 else None),
+                "presentation_clock_samples": list(
+                    self.audio_presentation_clock_samples),
                 "sample_rate": wav_rate,
                 "channels": wav_channels,
                 "frames": wav_frames,
                 "duration_seconds": (
                     float(wav_frames) / wav_rate if wav_rate else 0.0),
+                "duration_error_ms": (
+                    (float(wav_frames) / wav_rate - float(elapsed)) * 1000.0
+                    if wav_rate else None),
+                "stop_target_frames": (
+                    int(self.audio_stop_target_frames)
+                    if self.audio_stop_target_frames is not None else None),
+                "stop_overrun_frames": int(
+                    self.audio_stop_overrun_frames),
                 "callback_status_count": int(self.audio_callback_warning_count),
                 "queue_drop_packets": int(self.audio_queue_drop_count),
                 "queue_dropped_frames": int(self.audio_queue_dropped_frames),
@@ -770,6 +942,14 @@ class CaptureRecorder:
                 self.video_frame_queue_max_depth = max(
                     self.video_frame_queue_max_depth,
                     len(self.video_frame_queue))
+                if timestamp - self.video_queue_last_sample_at >= 1.0:
+                    self.video_queue_depth_samples.append({
+                        "offset_seconds": max(
+                            0.0, timestamp - getattr(
+                                self, "started_at", timestamp)),
+                        "depth": len(self.video_frame_queue),
+                    })
+                    self.video_queue_last_sample_at = timestamp
                 self.video_delivery_delay_total += delivery_delay
                 self.video_delivery_delay_max = max(
                     self.video_delivery_delay_max, delivery_delay)
@@ -794,29 +974,19 @@ class CaptureRecorder:
             if self.writer_stop:
                 self.writer_stop.set()
             self.video_frame_condition.notify()
+
+        # Freeze audio at the same logical Stop timestamp before waiting for
+        # the ordered video queue.  A busy 60-fps writer can need many seconds
+        # to drain; leaving the speaker listener attached during that wait
+        # made WAV continue growing after the video timeline had already
+        # stopped (13.7 seconds in the 2026-08-16 reproduction).
+        drain_started_at = time.monotonic()
         if self.writer_thread:
-            # A small transient queue must never turn into missing AVI frames.
-            # The fast intermediate codec normally leaves this near zero; the
-            # dynamic allowance also gives a busy disk time to drain safely.
             self.video_stop_drain_timeout = max(
                 30.0, min(
                     300.0,
                     10.0 + self.video_stop_pending_presentations
                     / max(1.0, self.requested_fps * 0.5)))
-            drain_started_at = time.monotonic()
-            self.writer_thread.join(timeout=self.video_stop_drain_timeout)
-            self.video_stop_drain_seconds = max(
-                0.0, time.monotonic() - drain_started_at)
-            if self.writer_thread.is_alive():
-                raise RuntimeError(
-                    "表示時刻に基づく録画映像の書き込みを{:.0f}秒以内に"
-                    "完了できませんでした。".format(
-                        self.video_stop_drain_timeout))
-        self.writer_thread = None
-        self.writer_stop = None
-        # Stop the shared PokeCon-output producer before draining/closing its
-        # WAV writer.  This is intentionally independent of audio_stream,
-        # because confirmation playback is owned by AudioMonitor.
         self._stop_monitored_audio_listener()
         if self.audio_stream:
             self.audio_stream.stop()
@@ -840,6 +1010,24 @@ class CaptureRecorder:
         if self.audio:
             self.audio.close()
             self.audio = None
+
+        if self.writer_thread:
+            # A small transient queue must never turn into missing AVI frames.
+            # The fast intermediate codec normally leaves this near zero; the
+            # dynamic allowance also gives a busy disk time to drain safely.
+            remaining_timeout = max(
+                0.0, self.video_stop_drain_timeout
+                - (time.monotonic() - drain_started_at))
+            self.writer_thread.join(timeout=remaining_timeout)
+            self.video_stop_drain_seconds = max(
+                0.0, time.monotonic() - drain_started_at)
+            if self.writer_thread.is_alive():
+                raise RuntimeError(
+                    "表示時刻に基づく録画映像の書き込みを{:.0f}秒以内に"
+                    "完了できませんでした。".format(
+                        self.video_stop_drain_timeout))
+        self.writer_thread = None
+        self.writer_stop = None
         if self.video:
             self.video.release()
             self.video = None
@@ -882,6 +1070,7 @@ class CaptureRecorder:
 
     def _finalize_worker(self):
         """Serialize CPU-heavy mux/cleanup jobs without blocking capture."""
+        set_current_thread_below_normal()
         while True:
             job = self._finalize_queue.get()
             try:
@@ -924,26 +1113,45 @@ class CaptureRecorder:
         if not cleanup_rules:
             return None
         capture = cv2.VideoCapture(video_path)
-        total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-        step = max(1, total // 120)  # analyse at most about 120 frames per clip
+        total = capture.get(cv2.CAP_PROP_FRAME_COUNT)
         matches = [0] * len(cleanup_rules)
         sampled = 0
-        index = 0
-        while True:
-            ok, frame = capture.read()
-            if not ok:
-                break
-            if index % step == 0:
-                sampled += 1
-                for pos, rule in enumerate(cleanup_rules):
-                    image = rule.get("image")
-                    if image is None or frame.shape[0] < image.shape[0] or frame.shape[1] < image.shape[1]:
-                        continue
-                    _, score, _, _ = cv2.minMaxLoc(cv2.matchTemplate(frame, image, cv2.TM_CCOEFF_NORMED))
-                    if score >= float(rule.get("threshold", 0.9)):
-                        matches[pos] += 1
-            index += 1
-        capture.release()
+        sample_indexes = evenly_spaced_frame_indexes(total, 120)
+
+        def analyse(frame):
+            nonlocal sampled
+            sampled += 1
+            for pos, rule in enumerate(cleanup_rules):
+                image = rule.get("image")
+                if (image is None or frame.shape[0] < image.shape[0]
+                        or frame.shape[1] < image.shape[1]):
+                    continue
+                _, score, _, _ = cv2.minMaxLoc(cv2.matchTemplate(
+                    frame, image, cv2.TM_CCOEFF_NORMED))
+                if score >= float(rule.get("threshold", 0.9)):
+                    matches[pos] += 1
+
+        try:
+            if sample_indexes:
+                # The former loop decoded every frame and merely ran image
+                # matching every Nth frame.  A long 60-fps recording could
+                # therefore pin one CPU core for minutes.  Seek directly to
+                # the same bounded number of positions across the full clip.
+                for index in sample_indexes:
+                    capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+                    ok, frame = capture.read()
+                    if ok:
+                        analyse(frame)
+            else:
+                # Some containers do not report a frame count.  Keep even
+                # that fallback bounded instead of decoding the entire file.
+                for _ in range(120):
+                    ok, frame = capture.read()
+                    if not ok:
+                        break
+                    analyse(frame)
+        finally:
+            capture.release()
         if not sampled:
             return None
         for pos, rule in enumerate(cleanup_rules):
@@ -964,6 +1172,35 @@ class CaptureRecorder:
         if not ffmpeg or not os.path.isfile(wav_path):
             print("[RECORDING] Keeping video-only AVI (FFmpeg or WAV unavailable).")
             return video_path
+        mux_wav_path = wav_path
+        alignment_report = None
+        timing_path = os.path.join(
+            os.path.dirname(os.path.abspath(wav_path)),
+            "recording_timing.json")
+        if os.path.isfile(timing_path):
+            try:
+                from RecordingSyncRepair import (
+                    store_presentation_alignment_report,
+                    write_presentation_aligned_audio)
+                aligned_path = os.path.join(
+                    os.path.dirname(os.path.abspath(wav_path)),
+                    "recording_presentation_aligned.wav")
+                alignment_report = write_presentation_aligned_audio(
+                    wav_path, timing_path, aligned_path)
+                if alignment_report.get("applied"):
+                    mux_wav_path = aligned_path
+                    print(
+                        "[RECORDING] Correcting accumulated audio clock drift "
+                        "from presentation timestamps ({:.3f}s, fixed offset 0ms)."
+                        .format(alignment_report.get(
+                            "final_drift_seconds", 0.0)))
+                store_presentation_alignment_report(
+                    timing_path, alignment_report)
+            except Exception as error:
+                alignment_report = None
+                print(
+                    "[RECORDING] Presentation-clock audio alignment failed; "
+                    "keeping original WAV: {}".format(error))
         # Re-encode the AVI intermediate and explicitly map both tracks. CRF
         # 18 avoids compounding visible artefacts from the real-time MPEG-4
         # intermediate while ``veryfast`` keeps background finalization short.
@@ -972,17 +1209,52 @@ class CaptureRecorder:
             # timestamps at the configured CFR.  Keep that exact rate in MP4;
             # never substitute frames/elapsed measurement jitter here.
             ffmpeg, "-y", "-r", "{:.6f}".format(output_fps),
-            "-i", video_path, "-i", wav_path,
+            "-i", video_path, "-i", mux_wav_path,
             "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264",
-            "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-threads", "2", "-preset", "veryfast", "-crf", "18",
+            "-pix_fmt", "yuv420p",
         ]
         if abs(float(process_audio_gain) - 1.0) > 0.001:
             command.extend(["-filter:a", "volume={:.4f}".format(process_audio_gain)])
-        command.extend(["-c:a", "aac", "-shortest", "-movflags", "+faststart", mp4_path])
-        completed = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
-        if completed.returncode == 0 and os.path.isfile(mp4_path):
+        command.extend([
+            "-c:a", "aac", "-shortest",
+            # Use the Microsoft-compatible MP4 brand and an explicit AVC tag.
+            # The encoded streams are unchanged, but Windows Media Foundation
+            # is less likely to reject the container with 0xc00d36c4.
+            "-brand", "mp42", "-tag:v", "avc1",
+            "-video_track_timescale", "60000",
+            "-movflags", "+faststart", mp4_path])
+        run_options = {
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.PIPE,
+            "text": True,
+        }
+        if os.name == "nt":
+            # The main PokeCon intentionally runs above normal priority.  Do
+            # not let its ffmpeg child inherit that class and pre-empt Camera,
+            # preview, and Tk while an MP4 is being finalized.
+            run_options["creationflags"] = (
+                getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
+            )
+        completed = subprocess.run(command, **run_options)
+        if (completed.returncode == 0 and os.path.isfile(mp4_path)
+                and os.path.getsize(mp4_path) > 1024):
+            if alignment_report is not None:
+                try:
+                    alignment_report["used_for_final_mp4"] = bool(
+                        alignment_report.get("applied"))
+                    store_presentation_alignment_report(
+                        timing_path, alignment_report)
+                except Exception:
+                    pass
             print("[RECORDING] MP4 finalized: " + mp4_path)
             return mp4_path
+        if os.path.isfile(mp4_path) and os.path.getsize(mp4_path) <= 1024:
+            try:
+                os.remove(mp4_path)
+            except OSError:
+                pass
         print("[RECORDING] MP4 mux failed: " + completed.stderr[-500:])
         return video_path
 

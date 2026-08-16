@@ -40,8 +40,11 @@ from DiskSpaceGuard import disk_space_violations
 from SampleFunctionSync import (compare_folder as compare_sample_function_folder,
                                 comparison_source_text,
                                 create_sample_sync_backup,
+                                format_function_update_status,
+                                function_update_status,
                                 function_records as sample_sync_function_records,
                                 latest_sample_sync_backup,
+                                mark_comparisons_synchronized,
                                 merge_sample_names_with_source_bodies,
                                 reflect_fragment_function_text,
                                 fragment_function_stats,
@@ -50,6 +53,7 @@ from SampleFunctionSync import (compare_folder as compare_sample_function_folder
                                 replace_class_functions,
                                 restore_sample_sync_backup,
                                 resolve_fragment_folder,
+                                save_reflected_source,
                                 side_by_side_diff_rows,
                                 source_paths_equivalent,
                                 source_paths_for_folder,
@@ -63,11 +67,15 @@ from StepDebugSource import (apply_operation_replacements, extract_named_method_
                              build_runtime_replacement_function,
                              split_mixed_step_rule)
 from ThreadCancellation import raise_in_thread, request_stop_flags
-from SourceFunctionTools import (build_rename_map, register_source_functions,
+from SourceFunctionTools import (build_rename_map,
+                                 classify_function_registration,
+                                 function_content_hash,
+                                 register_source_functions,
                                  rename_source_functions, source_function_records,
                                  step_function_names)
 from SourceDependencyTools import (analyze_source_dependencies,
                                    analyze_state_dictionary_dependencies,
+                                   catalog_function_candidates,
                                    compare_preview_functions,
                                    compare_preview_support,
                                    generate_state_machine_main,
@@ -79,7 +87,7 @@ from SourceDependencyTools import (analyze_source_dependencies,
                                    state_dictionary_names,
                                    suggest_state_dictionary)
 from SampleLibrary import compose_preview, save_library
-from PokeConDevStudio import pack_scrollable_widget
+from PokeConDevStudio import find_match_index, pack_scrollable_widget
 from SampleOriginSync import (apply_sample_list_to_origins,
                               compare_sample_list_origins,
                               restore_origin_sync_backup)
@@ -99,6 +107,7 @@ from InputSetRuntimeRegistry import (ActiveInputSetRegistry,
                                      canonical_device_key,
                                      default_window_activity_registry_path,
                                      device_usage_conflicts,
+                                     last_active_pokecon_pid,
                                      main_resource_conflicts,
                                      process_identity, read_active_input_sets)
 from PokeConRecovery import (PokeConRecoveryError, discover_running_pokecon,
@@ -106,8 +115,11 @@ from PokeConRecovery import (PokeConRecoveryError, discover_running_pokecon,
                              validate_recovery_target)
 from ResourceControl import (clamp_cpu_target, resource_throttle_level,
                              throttle_multiplier)
-from ImageDetectionMonitor import (filter_target_names, format_show_value_entries,
+from ImageDetectionMonitor import (filter_target_names,
+                                   format_show_value_blocks,
+                                   format_show_value_entries,
                                    load_detection_library,
+                                   matched_show_value_spans,
                                    padded_search_crop,
                                    prune_show_value_entries,
                                    update_show_value_entries)
@@ -115,7 +127,9 @@ from ImageHealthCheck import audit_image_library, suggested_crop
 from ImageCheckReferenceAudit import (audit_image_check_references,
                                       merge_library_targets_into_source,
                                       preserve_library_import_block)
-from ImageDetectionLibrary import generate_image_check
+from ImageDetectionLibrary import (filter_image_library_variants,
+                                   generate_image_check,
+                                   image_preview_size)
 from CompletionEngine import CompletionEngine
 from Camera import (Camera, camera_fourcc_name,
                     camera_frame_freshness_timeout, camera_reader_backoff)
@@ -139,11 +153,14 @@ from GuiAssets import (CaptureArea, hold_last_preview_on_missing_frame,
                        prepare_preview_image)
 from PokeConShowInfo import (installed_distribution_version,
                              requirement_distribution_name)
-from Recording import CaptureRecorder, audio_callback_presentation_time
+from Recording import (CaptureRecorder, audio_callback_presentation_time,
+                       evenly_spaced_frame_indexes)
 from RecordingSyncRepair import (audio_advance_filter, wav_info,
+                                 write_presentation_aligned_audio,
                                  write_without_exact_zeros)
 from UiResponsiveness import (compensated_after_delay,
                               confirmation_audio_action,
+                              dialog_owner_attachment_allowed,
                               foreground_process_id,
                               foreground_process_matches,
                               keyboard_listener_should_run,
@@ -198,6 +215,7 @@ from CommandRecordingModel import (filtered_timeline, load_command_timeline,
                                    source_function_block, timeline_page)
 from Commands.CommandBase import Command
 from Commands.Keys import Button, Direction, Hat, KeyPress, Stick
+from Keyboard import SwitchKeyboardController
 try:
     from Commands.ProController import ProController
 except ModuleNotFoundError as error:
@@ -787,6 +805,29 @@ class InputSetRuntimeRegistryTests(unittest.TestCase):
             second.close()
             first.close()
 
+    def test_manual_input_follows_foreground_pokecon_then_survives_browser(self):
+        entries = [
+            {"pid": 501, "token": "first", "started_at": "2026-08-16T10:00:00",
+             "last_focused_ns": 100},
+            {"pid": 502, "token": "second", "started_at": "2026-08-16T10:01:00",
+             "last_focused_ns": 200},
+        ]
+        # Clicking a PokeCon switches immediately even before its asynchronous
+        # focus marker reaches the shared registry.
+        self.assertEqual(last_active_pokecon_pid(entries, foreground_pid=501), 501)
+        # Chrome is not a registered PokeCon, so the last selected PokeCon is
+        # retained as the keyboard/gamepad input target.
+        self.assertEqual(last_active_pokecon_pid(entries, foreground_pid=999), 502)
+        self.assertEqual(last_active_pokecon_pid(entries, foreground_pid=None), 502)
+
+    def test_manual_input_owner_uses_newest_only_before_any_focus_marker(self):
+        entries = [
+            {"pid": 601, "started_at": "2026-08-16T10:00:00"},
+            {"pid": 602, "started_at": "2026-08-16T10:01:00"},
+        ]
+        self.assertEqual(last_active_pokecon_pid(entries, foreground_pid=999), 602)
+        self.assertIsNone(last_active_pokecon_pid([], foreground_pid=602))
+
     def test_activity_registry_is_shared_outside_individual_profiles(self):
         path = default_window_activity_registry_path()
         self.assertEqual(os.path.basename(path), "active_windows.json")
@@ -1191,6 +1232,59 @@ class InputSetDataTests(unittest.TestCase):
 
 
 class ImageDetectionMonitorTests(unittest.TestCase):
+    def test_image_library_can_filter_grayscale_and_color_variants(self):
+        library = {"targets": {
+            "MIXED": {
+                "description": "two modes", "tags": ["Common"],
+                "variants": [
+                    {"template_path": "Template/gray.png", "use_gray": True},
+                    {"template_path": "Template/color.png", "use_gray": False},
+                ],
+            },
+            "DEFAULT_GRAY": {
+                "description": "use_gray omitted",
+                "variants": [{"template_path": "Template/default.png"}],
+            },
+        }}
+        self.assertEqual(filter_image_library_variants(library), [
+            ("DEFAULT_GRAY", 0), ("MIXED", 0), ("MIXED", 1),
+        ])
+        self.assertEqual(filter_image_library_variants(library, grayscale="ON"), [
+            ("DEFAULT_GRAY", 0), ("MIXED", 0),
+        ])
+        self.assertEqual(filter_image_library_variants(library, grayscale="OFF"), [
+            ("MIXED", 1),
+        ])
+        self.assertEqual(
+            filter_image_library_variants(library, "common", "OFF"),
+            [("MIXED", 1)])
+
+    def test_image_library_can_exclude_template_folders(self):
+        library = {"targets": {
+            "SAMPLE": {"variants": [{
+                "template_path": "Template/Samples/demo.png"}]},
+            "SAMPLE_TWO": {"variants": [{
+                "template_path": "Template/Samples2/keep.png"}]},
+            "DEBUG": {"variants": [{
+                "template_path": "Template/Debug/test.png"}]},
+            "STORY": {"variants": [{
+                "template_path": "Template/ZA_Story/event.png"}]},
+        }}
+        self.assertEqual(
+            filter_image_library_variants(
+                library, excluded_folders="Template/Samples; Template/Debug"),
+            [("SAMPLE_TWO", 0), ("STORY", 0)])
+        self.assertEqual(
+            filter_image_library_variants(
+                library, excluded_folders="Template\\Samples\nTemplate/Debug"),
+            [("SAMPLE_TWO", 0), ("STORY", 0)])
+
+    def test_image_library_preview_preserves_aspect_ratio(self):
+        self.assertEqual(image_preview_size(1280, 720), (391, 220))
+        self.assertEqual(image_preview_size(20, 10), (80, 40))
+        with self.assertRaises(ValueError):
+            image_preview_size(0, 10)
+
     def test_library_search_uses_names_descriptions_tags_and_paths(self):
         library = {"targets": {
             "HOTEL_DOOR": {"description": "入口", "tags": ["Pokemon_ZA"],
@@ -1232,7 +1326,14 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         text = format_show_value_entries(entries, "ShowValue")
         self.assertIn("[ShowValue] FIELD", text)
         self.assertIn("[ShowValue] MENU / パターン2", text)
-        self.assertIn("\n\n[ShowValue] MENU", text)
+        self.assertLess(text.index("[ShowValue] MENU"),
+                        text.index("[ShowValue] FIELD"))
+
+        blocks = format_show_value_blocks(entries, "ShowValue")
+        self.assertEqual([matched for _text, matched in blocks], [True, False])
+        self.assertEqual(
+            matched_show_value_spans(blocks),
+            [(0, len(blocks[0][0]))])
 
         removed = prune_show_value_entries(entries, 5.0, now=16.0)
         self.assertEqual(removed, [("FIELD", "")])
@@ -1287,8 +1388,16 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             "ZA_story", "ZA_story.py")
         with open(source_path, "r", encoding="utf-8-sig") as stream:
             source = stream.read()
-        self.assertIn(
-            'IMAGE_DETECTION_TARGETS["POKEMON_ZA_KOHUKI_ICON_GET5"]', source)
+        source_tree = ast.parse(source)
+        source_targets = ast.literal_eval(next(
+            node.value for node in ast.walk(source_tree)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "IMAGE_DETECTION_TARGETS"
+                    for target in node.targets)))
+        self.assertEqual(
+            source_targets["POKEMON_ZA_KOHUKI_ICON_GET5"],
+            targets["POKEMON_ZA_KOHUKI_ICON_GET5"]["variants"])
         self.assertRegex(
             source,
             r'image_check\("POKEMON_ZA_KOHUKI_ICON_GET4"\)\s*'
@@ -1316,10 +1425,526 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             "ZA_story", "ZA_story.py")
         with open(source_path, "r", encoding="utf-8-sig") as stream:
             source = stream.read()
-        self.assertIn(
-            'IMAGE_DETECTION_TARGETS["POKEMON_ZA_TEXT_WHITE_COMMENT"].extend(',
-            source)
+        source_tree = ast.parse(source)
+        source_targets = ast.literal_eval(next(
+            node.value for node in ast.walk(source_tree)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "IMAGE_DETECTION_TARGETS"
+                    for target in node.targets)))
+        self.assertEqual(
+            source_targets["POKEMON_ZA_TEXT_WHITE_COMMENT"], variants)
         self.assertNotIn("def image_check_confirmation", source)
+
+    def test_za_marker_positions_are_registered_and_steer_toward_center(self):
+        profile_path = os.path.join(
+            SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
+        with open(profile_path, "r", encoding="utf-8") as stream:
+            library = json.load(stream)
+
+        map_exclusion = [0, 0, 210, 210]
+        left_wide_upper = [210, 100, 680, 240]
+        regions = {
+            "CENTER": [640, 100, 680, 600],
+            "CENTER_WIDE": [600, 100, 720, 600],
+            "CENTER_WIDE_UPPER": [600, 0, 700, 130],
+            "CENTER_WIDE_UPPER_LEFT": [210, 0, 650, 130],
+            "CENTER_WIDE_UPPER_RIGHT": [650, 0, 1210, 130],
+            "CENTER_WIDE_UPPER_LEFT_NEAR": [450, 0, 650, 130],
+            "CENTER_WIDE_UPPER_RIGHT_NEAR": [650, 0, 850, 130],
+            "CENTER_WIDE_DOWNER": [600, 570, 700, 720],
+            "CENTER_WIDE_DOWNER_LEFT": [70, 570, 650, 720],
+            "CENTER_WIDE_DOWNER_RIGHT": [650, 570, 1210, 720],
+            "CENTER_WIDE_DOWNER_LEFT_NEAR": [450, 570, 650, 720],
+            "CENTER_WIDE_DOWNER_RIGHT_NEAR": [650, 570, 850, 720],
+            "CENTER_LEFT_SIDE": [0, 210, 100, 720],
+            "CENTER_RIGHT_SIDE": [1180, 0, 1280, 720],
+            "LEFT_WIDE": [70, 210, 680, 600],
+            "RIGHT_WIDE": [640, 100, 1210, 600],
+        }
+        minimum_overlap = 30
+        for upper, middle, downer in (
+                ("CENTER_WIDE_UPPER", "CENTER", "CENTER_WIDE_DOWNER"),
+                ("CENTER_WIDE_UPPER_RIGHT", "RIGHT_WIDE",
+                 "CENTER_WIDE_DOWNER_RIGHT")):
+            self.assertGreaterEqual(
+                regions[upper][3] - regions[middle][1], minimum_overlap)
+            self.assertGreaterEqual(
+                regions[middle][3] - regions[downer][1], minimum_overlap)
+        self.assertGreaterEqual(
+            regions["CENTER_WIDE_UPPER_LEFT"][3] - left_wide_upper[1],
+            minimum_overlap)
+        self.assertGreaterEqual(
+            left_wide_upper[3] - regions["LEFT_WIDE"][1],
+            minimum_overlap)
+        self.assertGreaterEqual(
+            regions["LEFT_WIDE"][3]
+            - regions["CENTER_WIDE_DOWNER_LEFT"][1], minimum_overlap)
+        for suffix in ("LEFT_WIDE", "CENTER_WIDE_DOWNER_LEFT"):
+            self.assertGreaterEqual(
+                regions["CENTER_LEFT_SIDE"][2] - regions[suffix][0],
+                minimum_overlap)
+        for suffix in ("RIGHT_WIDE", "CENTER_WIDE_UPPER_RIGHT",
+                       "CENTER_WIDE_DOWNER_RIGHT"):
+            self.assertGreaterEqual(
+                regions[suffix][2] - regions["CENTER_RIGHT_SIDE"][0],
+                minimum_overlap)
+        for center, left, right in (
+                ("CENTER_WIDE_UPPER", "CENTER_WIDE_UPPER_LEFT",
+                 "CENTER_WIDE_UPPER_RIGHT"),
+                ("CENTER_WIDE_DOWNER", "CENTER_WIDE_DOWNER_LEFT",
+                 "CENTER_WIDE_DOWNER_RIGHT")):
+            self.assertGreaterEqual(
+                regions[left][2] - regions[center][0], minimum_overlap)
+            self.assertGreaterEqual(
+                regions[center][2] - regions[right][0], minimum_overlap)
+        for center, left_near, right_near in (
+                ("CENTER_WIDE_UPPER", "CENTER_WIDE_UPPER_LEFT_NEAR",
+                 "CENTER_WIDE_UPPER_RIGHT_NEAR"),
+                ("CENTER_WIDE_DOWNER", "CENTER_WIDE_DOWNER_LEFT_NEAR",
+                 "CENTER_WIDE_DOWNER_RIGHT_NEAR")):
+            self.assertGreaterEqual(
+                regions[left_near][2] - regions[center][0], minimum_overlap)
+            self.assertGreaterEqual(
+                regions[center][2] - regions[right_near][0], minimum_overlap)
+        marker_settings = {
+            "EVENT_MARKER": ("event_marker.png", False),
+            "PIN_MARKER": ("pin_marker.png", True),
+            "SIDE_MARKER": ("side_marker.png", False),
+        }
+        common_members = {
+            member["id"]
+            for member in library["lists"]["POKEMON_ZA_FOLDER_COMMON"]["members"]
+            if member.get("type") == "target"
+        }
+        for marker, (template_name, use_gray) in marker_settings.items():
+            for suffix, crop in regions.items():
+                name = "POKEMON_ZA_{}_{}".format(marker, suffix)
+                expected_crops = [crop]
+                if suffix == "LEFT_WIDE":
+                    expected_crops.append(left_wide_upper)
+                variants = library["targets"][name]["variants"]
+                self.assertEqual(
+                    [variant["crop"] for variant in variants],
+                    expected_crops, name)
+                for variant in variants:
+                    self.assertTrue(
+                        variant["template_path"].endswith(template_name), name)
+                    self.assertEqual(variant["use_gray"], use_gray, name)
+                    self.assertEqual(variant["threshold"], 0.8, name)
+                    has_map_overlap = (
+                        max(variant["crop"][0], map_exclusion[0])
+                        < min(variant["crop"][2], map_exclusion[2])
+                        and max(variant["crop"][1], map_exclusion[1])
+                        < min(variant["crop"][3], map_exclusion[3]))
+                    self.assertFalse(has_map_overlap, name)
+                self.assertIn(name, common_members)
+
+        generated = generate_image_check(library, "POKEMON_ZA_ALL", "list")
+        for marker in marker_settings:
+            self.assertIn(
+                "POKEMON_ZA_{}_CENTER_WIDE_DOWNER".format(marker), generated)
+
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+        managed_imports = source.split(
+            "# POKECON_IMAGE_CHECK_LIBRARY_IMPORTS_BEGIN", 1)[1].split(
+                "# POKECON_IMAGE_CHECK_LIBRARY_IMPORTS_END", 1)[0]
+        managed_tree = ast.parse("def _managed_imports():\n" + managed_imports)
+        managed_update = next(
+            node for node in ast.walk(managed_tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "IMAGE_DETECTION_TARGETS"
+            and node.func.attr == "update")
+        managed_targets = ast.literal_eval(managed_update.args[0])
+        for marker in marker_settings:
+            for suffix in regions:
+                name = "POKEMON_ZA_{}_{}".format(marker, suffix)
+                self.assertIn(repr(name), managed_imports)
+                expected_crops = [regions[suffix]]
+                if suffix == "LEFT_WIDE":
+                    expected_crops.append(left_wide_upper)
+                self.assertEqual(
+                    [variant["crop"] for variant in managed_targets[name]],
+                    expected_crops, name)
+                self.assertTrue(all(
+                    variant["threshold"] == 0.8
+                    for variant in managed_targets[name]), name)
+
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "SourceImports",
+            "ZA_markerdir", "ZA_markerdir.pyfrag")
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment = stream.read()
+        namespace = {"Direction": Direction, "Stick": Stick}
+        exec(compile(fragment, fragment_path, "exec"), namespace)
+        markerdir = namespace["ZA_markerdir"]
+        fragment_function = ast.parse(fragment).body[0]
+        runtime_function = next(
+            node for node in ast.walk(ast.parse(source))
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_markerdir")
+        self.assertEqual(
+            ast.dump(runtime_function, include_attributes=False),
+            ast.dump(fragment_function, include_attributes=False))
+
+        class MarkerCommand:
+            def __init__(self, matched):
+                self.matched = set(matched)
+                self.pressed = []
+                self.press_durations = []
+                self.wait_durations = []
+
+            def image_check(self, name):
+                return name in self.matched
+
+            def press(self, direction, duration=0.0, wait=0.0):
+                self.pressed.append(direction)
+                self.press_durations.append(duration)
+
+            def wait(self, duration):
+                self.wait_durations.append(duration)
+
+        movement_cases = (
+            ("CENTER_WIDE_DOWNER", 270, 0.0),
+            ("CENTER_WIDE_UPPER", 90, 0.0),
+            ("CENTER_WIDE_DOWNER_LEFT", 180, 0.03),
+            ("CENTER_WIDE_DOWNER_RIGHT", 0, 0.03),
+            ("CENTER_WIDE_UPPER_LEFT", 180, 0.03),
+            ("CENTER_WIDE_UPPER_RIGHT", 0, 0.03),
+            ("CENTER_LEFT_SIDE", 180, 0.03),
+            ("CENTER_RIGHT_SIDE", 0, 0.03),
+        )
+        type_prefixes = {
+            "EVENT": "POKEMON_ZA_EVENT_MARKER",
+            "PIN": "POKEMON_ZA_PIN_MARKER",
+            "SIDE_MARKER": "POKEMON_ZA_SIDE_MARKER",
+        }
+        for marker_type, prefix in type_prefixes.items():
+            for suffix, angle, duration in movement_cases:
+                command = MarkerCommand({prefix + "_" + suffix})
+                self.assertFalse(markerdir(command, marker_type, nofiled=True))
+                self.assertEqual(command.pressed[-1].angle_for_show, angle)
+                self.assertAlmostEqual(command.press_durations[-1], duration)
+                self.assertEqual(command.wait_durations[-1], 0.1)
+
+        for marker_type, prefix in type_prefixes.items():
+            right_side = prefix + "_CENTER_RIGHT_SIDE"
+            command = MarkerCommand({right_side})
+            self.assertFalse(markerdir(command, marker_type, nofiled=True))
+            self.assertEqual(command.pressed[-1].angle_for_show, 0)
+            self.assertEqual(command.pressed[-1].mag, 1.0)
+            self.assertEqual(command.press_durations[-1], 0.03)
+
+            command.matched.clear()
+            press_count = len(command.pressed)
+            self.assertFalse(markerdir(command, marker_type, nofiled=True))
+            self.assertEqual(len(command.pressed), press_count + 1)
+            self.assertEqual(command.pressed[-1].angle_for_show, 0)
+            self.assertEqual(command.pressed[-1].mag, 1.0)
+            self.assertEqual(command.press_durations[-1], 0.03)
+
+            upper_left_near = prefix + "_CENTER_WIDE_UPPER_LEFT_NEAR"
+            command.matched.add(upper_left_near)
+            self.assertFalse(markerdir(command, marker_type, nofiled=True))
+            self.assertEqual(command.pressed[-1].angle_for_show, 180)
+            self.assertEqual(command.pressed[-1].mag, 0.2)
+            self.assertEqual(command.press_durations[-1], 0.0)
+
+            command.matched.clear()
+            self.assertFalse(markerdir(command, marker_type, nofiled=True))
+            self.assertEqual(command.pressed[-1].angle_for_show, 180)
+            self.assertEqual(command.pressed[-1].mag, 0.2)
+            self.assertEqual(command.press_durations[-1], 0.0)
+
+            command.matched.add(prefix + "_CENTER")
+            self.assertTrue(markerdir(command, marker_type, nofiled=True))
+            command.matched.clear()
+            self.assertFalse(markerdir(command, marker_type, nofiled=True))
+            self.assertEqual(command.pressed[-1].angle_for_show, 180)
+            self.assertEqual(command.pressed[-1].mag, 1.0)
+            self.assertEqual(command.press_durations[-1], 0.0)
+
+        near_movement_cases = (
+            ("CENTER_WIDE_DOWNER_LEFT_NEAR", 180),
+            ("CENTER_WIDE_DOWNER_RIGHT_NEAR", 0),
+            ("CENTER_WIDE_UPPER_LEFT_NEAR", 180),
+            ("CENTER_WIDE_UPPER_RIGHT_NEAR", 0),
+        )
+        for marker_type, prefix in type_prefixes.items():
+            for suffix, angle in near_movement_cases:
+                command = MarkerCommand({prefix + "_" + suffix})
+                self.assertFalse(markerdir(command, marker_type, nofiled=True))
+                self.assertEqual(command.pressed[-1].angle_for_show, angle)
+                self.assertEqual(command.pressed[-1].mag, 0.2)
+                self.assertEqual(command.press_durations[-1], 0.0)
+
+        for marker_type, prefix in type_prefixes.items():
+            for center_suffix, near_suffix, side_suffix, angle in (
+                    ("CENTER_WIDE_UPPER", "CENTER_WIDE_UPPER_LEFT_NEAR",
+                     "CENTER_WIDE_UPPER_LEFT", 90),
+                    ("CENTER_WIDE_UPPER", "CENTER_WIDE_UPPER_RIGHT_NEAR",
+                     "CENTER_WIDE_UPPER_RIGHT", 90),
+                    ("CENTER_WIDE_DOWNER", "CENTER_WIDE_DOWNER_LEFT_NEAR",
+                     "CENTER_WIDE_DOWNER_LEFT", 270),
+                    ("CENTER_WIDE_DOWNER", "CENTER_WIDE_DOWNER_RIGHT_NEAR",
+                     "CENTER_WIDE_DOWNER_RIGHT", 270)):
+                command = MarkerCommand({prefix + "_" + center_suffix,
+                                         prefix + "_" + near_suffix,
+                                         prefix + "_" + side_suffix})
+                self.assertFalse(
+                    markerdir(command, marker_type, nofiled=True))
+                self.assertEqual(command.pressed[-1].angle_for_show, angle)
+
+        for marker_type, prefix in type_prefixes.items():
+            for corner_suffix, edge_suffix, angle in (
+                    ("CENTER_WIDE_UPPER_LEFT", "CENTER_LEFT_SIDE", 180),
+                    ("CENTER_WIDE_DOWNER_LEFT", "CENTER_LEFT_SIDE", 180),
+                    ("CENTER_WIDE_UPPER_RIGHT", "CENTER_RIGHT_SIDE", 0),
+                    ("CENTER_WIDE_DOWNER_RIGHT", "CENTER_RIGHT_SIDE", 0)):
+                command = MarkerCommand({prefix + "_" + corner_suffix,
+                                         prefix + "_" + edge_suffix})
+                self.assertFalse(
+                    markerdir(command, marker_type, nofiled=True))
+                self.assertEqual(command.pressed[-1].angle_for_show, angle)
+
+        for suffix, angle in (("LEFT_WIDE", 180), ("RIGHT_WIDE", 0)):
+            prefix = type_prefixes["EVENT"]
+            command = MarkerCommand({prefix + "_" + suffix,
+                                     prefix + "_CENTER_WIDE"})
+            self.assertFalse(markerdir(command, "EVENT", nofiled=True))
+            self.assertEqual(command.pressed[-1].angle_for_show, angle)
+            self.assertEqual(command.pressed[-1].mag, 0.2)
+            self.assertEqual(command.press_durations[-1], 0.0)
+
+            command = MarkerCommand({prefix + "_" + suffix})
+            self.assertFalse(markerdir(command, "EVENT", nofiled=True))
+            self.assertEqual(command.pressed[-1].angle_for_show, angle)
+            self.assertEqual(command.pressed[-1].mag, 1.0)
+            self.assertAlmostEqual(command.press_durations[-1], 0.03)
+
+    def test_za_mega_battle_lockon_rclick_defaults_on_and_forces_dir1(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+
+        function_names = ("ZA_MOVE_LStick", "ZA_mega_evolution_battle")
+        source_functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in function_names
+        }
+        fragment_functions = {
+            node.name: node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in function_names
+        }
+        for name in function_names:
+            self.assertEqual(
+                ast.dump(source_functions[name], include_attributes=False),
+                ast.dump(fragment_functions[name], include_attributes=False),
+                name)
+
+        battle_node = fragment_functions["ZA_mega_evolution_battle"]
+        self.assertEqual(battle_node.args.args[-1].arg, "lockon_rclick")
+        self.assertEqual(ast.literal_eval(battle_node.args.defaults[-1]), 1)
+        battle_namespace = {"time": time, "Button": Button}
+        exec(compile(ast.Module(body=[battle_node], type_ignores=[]),
+                     fragment_path, "exec"), battle_namespace)
+        battle = battle_namespace["ZA_mega_evolution_battle"]
+
+        class BattleCommand:
+            def __init__(self):
+                self.ZL_state = 1
+                self.end_checks = 0
+                self.pressed = []
+                self.moves = []
+
+            def image_check(self, name):
+                if name == "END":
+                    self.end_checks += 1
+                    return self.end_checks >= 2
+                return name == "POKEMON_ZA_C+"
+
+            def press(self, button, *args):
+                self.pressed.append((button, args))
+
+            def ZA_MOVE_LStick(self, *args):
+                self.moves.append(args)
+
+            def ZA_MOVE_SEE(self, *args, **kwargs):
+                pass
+
+            def ZA_ZL_ACTION(self, *args, **kwargs):
+                pass
+
+            def wait(self, _duration):
+                pass
+
+        enabled = BattleCommand()
+        self.assertTrue(battle(enabled, endpicture="END"))
+        self.assertEqual(
+            [button for button, _args in enabled.pressed],
+            [Button.RCLICK])
+        self.assertIn((0, 0, 0, 0, 1, "RELOAD"), enabled.moves)
+
+        disabled = BattleCommand()
+        self.assertTrue(battle(
+            disabled, endpicture="END", lockon_rclick=0))
+        self.assertNotIn(
+            Button.RCLICK,
+            [button for button, _args in disabled.pressed])
+
+        move_node = fragment_functions["ZA_MOVE_LStick"]
+        move_namespace = {"time": time, "Direction": Direction,
+                          "Stick": Stick}
+        exec(compile(ast.Module(body=[move_node], type_ignores=[]),
+                     fragment_path, "exec"), move_namespace)
+        move = move_namespace["ZA_MOVE_LStick"]
+
+        class MoveCommand:
+            def __init__(self, until):
+                self._za_mega_rclick_dir1_until = until
+                self.Lstick_state = 0
+                self.Lstick_state2 = 0
+                self.Lstick_state3 = 0
+                self.Lstick_state4 = 0
+                self.Lstick_state_m1 = 0
+                self.Lstick_state_m2 = 0
+                self.held = []
+
+            def hold(self, direction):
+                self.held.append(direction)
+
+            def holdEnd(self, _direction):
+                pass
+
+            def wait(self, _duration):
+                pass
+
+        approaching = MoveCommand(time.monotonic() + 1.0)
+        move(approaching, 20, 340, 40, 300, 4, "RELOAD")
+        self.assertEqual(approaching.held[-1].angle_for_show, 20)
+
+        normal = MoveCommand(0.0)
+        move(normal, 20, 340, 40, 300, 4, "RELOAD")
+        self.assertEqual(normal.held[-1].angle_for_show, 300)
+
+    def test_za_field_reach_checks_use_no_battle_hard_guard(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+
+        tree = ast.parse(source)
+        protected = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_story_Template_Field_HardGaurd")
+        source_lines = source.splitlines(keepends=True)
+        audited_source = "".join(
+            source_lines[:protected.lineno - 1]
+            + source_lines[protected.end_lineno:])
+        position_targets = {
+            "POKEMON_ZA_FIELD_BACK_W",
+            *("POKEMON_ZA_FIELD{}".format(index) for index in range(1, 7)),
+            *("POKEMON_ZA_FIELD_BACK{}".format(index)
+              for index in range(1, 7)),
+        }
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "image_check"
+                    and node.args
+                    and isinstance(node.args[0], ast.Constant)
+                    and node.args[0].value in position_targets):
+                continue
+            if protected.lineno <= node.lineno <= protected.end_lineno:
+                continue
+            self.assertIn(
+                "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+                source_lines[node.lineno - 1])
+        old_pair = (
+            'self.image_check("POKEMON_ZA_FIELD_W") or '
+            'self.image_check("POKEMON_ZA_FIELD_BACK_W")')
+        self.assertNotIn(old_pair, audited_source)
+        self.assertNotIn(
+            'endpicture="POKEMON_ZA_FIELD_W"', audited_source)
+        self.assertNotIn(
+            'endpicture2="POKEMON_ZA_FIELD_BACK_W"', audited_source)
+
+        changed_lines = [
+            line for line in source.splitlines()
+            if "#FIELDから変更" in line]
+        self.assertEqual(len(changed_lines), 508)
+        self.assertTrue(all(
+            "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK" in line
+            for line in changed_lines))
+
+        fragment_paths = (
+            os.path.join("SourceImports", "ZA_markerdir", "ZA_markerdir.pyfrag"),
+            os.path.join("Pokemon_ZA", "ZA_BattleAndRoyale",
+                         "ZA_BattleAndRoyale.pyfrag"),
+            os.path.join("Pokemon_ZA", "ZA_CommonNavigation",
+                         "ZA_CommonNavigation.pyfrag"),
+            os.path.join("Pokemon_ZA", "ZA_CommonPokemonManagement",
+                         "ZA_CommonPokemonManagement.pyfrag"),
+            os.path.join("Pokemon_ZA", "ZA_MovementAndEvent",
+                         "ZA_MovementAndEvent.pyfrag"),
+        )
+        fragment_root = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments")
+        fragment_changes = 0
+        for relative_path in fragment_paths:
+            with open(os.path.join(fragment_root, relative_path),
+                      "r", encoding="utf-8") as stream:
+                fragment = stream.read()
+            fragment_tree = ast.parse(fragment)
+            fragment_lines = fragment.splitlines(keepends=True)
+            fragment_protected = next((
+                node for node in ast.walk(fragment_tree)
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "ZA_story_Template_Field_HardGaurd"), None)
+            for node in ast.walk(fragment_tree):
+                if not (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr == "image_check"
+                        and node.args
+                        and isinstance(node.args[0], ast.Constant)
+                        and node.args[0].value in position_targets):
+                    continue
+                if (fragment_protected is not None
+                        and fragment_protected.lineno <= node.lineno
+                        <= fragment_protected.end_lineno):
+                    continue
+                self.assertIn(
+                    "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+                    fragment_lines[node.lineno - 1], relative_path)
+            if fragment_protected is not None:
+                fragment = "".join(
+                    fragment_lines[:fragment_protected.lineno - 1]
+                    + fragment_lines[fragment_protected.end_lineno:])
+            self.assertNotIn(old_pair, fragment, relative_path)
+            self.assertNotIn(
+                'endpicture="POKEMON_ZA_FIELD_W"', fragment, relative_path)
+            self.assertNotIn(
+                'endpicture2="POKEMON_ZA_FIELD_BACK_W"',
+                fragment, relative_path)
+            fragment_changes += fragment.count("#FIELDから変更")
+        self.assertEqual(fragment_changes, 67)
 
 
 class ImageHealthCheckTests(unittest.TestCase):
@@ -2308,6 +2933,78 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
         self.assertFalse(foreground_process_matches(
             pid=123, foreground_pid_provider=lambda: 456))
 
+    def test_multi_pokecon_ownership_monitor_never_raises_a_window(self):
+        window_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with open(window_path, "r", encoding="utf-8-sig") as stream:
+            tree = ast.parse(stream.read())
+        monitored_methods = {
+            "_publish_window_focus",
+            "_window_activity_monitor_loop",
+            "_sync_manual_input_owner",
+            "_sync_pc_gamepad_input_for_owner",
+            "_drain_confirmation_audio_reconcile",
+            "_revoke_duplicate_main_request",
+            "_refresh_preview_priority_status",
+        }
+        forbidden_calls = {
+            "lift", "focus_force", "focus_set", "deiconify",
+            "SetForegroundWindow", "BringWindowToTop", "SetWindowPos",
+        }
+        found = {
+            node.name: node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in monitored_methods
+        }
+        self.assertEqual(set(found), monitored_methods)
+        for method_name, method in found.items():
+            for call in (node for node in ast.walk(method)
+                         if isinstance(node, ast.Call)):
+                function = call.func
+                name = function.attr if isinstance(function, ast.Attribute) \
+                    else function.id if isinstance(function, ast.Name) else ""
+                self.assertNotIn(name, forbidden_calls, method_name)
+                if name in {"attributes", "wm_attributes"} and call.args:
+                    self.assertNotEqual(
+                        getattr(call.args[0], "value", None),
+                        "-topmost", method_name)
+
+    def test_background_dialog_does_not_attach_to_pokecon_owner(self):
+        self.assertTrue(dialog_owner_attachment_allowed(
+            pid=123, foreground_pid_provider=lambda: 123))
+        self.assertFalse(dialog_owner_attachment_allowed(
+            pid=123, foreground_pid_provider=lambda: 456))
+
+        dialogue_path = os.path.join(
+            SERIAL_CONTROLLER, "PokeConDialogue.py")
+        with open(dialogue_path, "r", encoding="utf-8-sig") as stream:
+            dialogue_source = stream.read()
+        self.assertIn(
+            "attach_to_owner = dialog_owner_attachment_allowed()",
+            dialogue_source)
+        self.assertIn("owner is not None and attach_to_owner", dialogue_source)
+        self.assertNotIn('attributes("-topmost"', dialogue_source)
+
+        window_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with open(window_path, "r", encoding="utf-8-sig") as stream:
+            window_source = stream.read()
+        window_tree = ast.parse(window_source)
+        methods = {
+            node.name: ast.get_source_segment(window_source, node)
+            for node in ast.walk(window_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {
+                "_confirm_shared_device", "_choose_combined_set_dialog"}
+        }
+        self.assertEqual(
+            set(methods),
+            {"_confirm_shared_device", "_choose_combined_set_dialog"})
+        for method_name, source in methods.items():
+            self.assertIn(
+                "attach_to_owner = dialog_owner_attachment_allowed()",
+                source, method_name)
+        self.assertNotIn(
+            "focus_force", methods["_choose_combined_set_dialog"])
+
     def test_camera_reader_does_not_spin_faster_than_requested_fps(self):
         class ImmediateCapture:
             def __init__(self):
@@ -2417,10 +3114,30 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
             resizing=True, background_work=True)
         self.assertEqual(recording_capture, 1.0 / 60.0)
 
-    def test_keyboard_listener_runs_only_for_focused_pokecon(self):
+    def test_keyboard_listener_runs_only_for_active_input_owner(self):
         self.assertTrue(keyboard_listener_should_run(True, True))
         self.assertFalse(keyboard_listener_should_run(True, False))
         self.assertFalse(keyboard_listener_should_run(False, True))
+
+    def test_keyboard_listener_releases_held_input_before_owner_switch(self):
+        controller = SwitchKeyboardController.__new__(SwitchKeyboardController)
+        controller.holding = ["a", "h"]
+        controller.holdingDir = ["up"]
+        controller.holdingHatDir = []
+        controller.key_map = {
+            "a": Button.A, "h": Hat.TOP, "up": Direction.UP}
+        controller.key = mock.Mock()
+        controller.listener = mock.Mock()
+        controller._logger = mock.Mock()
+
+        controller.stop()
+
+        forwarded = controller.key.inputEnd.call_args.args[0]
+        self.assertEqual(forwarded, [Button.A, Hat.TOP, Direction.UP])
+        self.assertTrue(controller.key.inputEnd.call_args.kwargs["unset_hat"])
+        self.assertEqual(controller.holding, [])
+        self.assertEqual(controller.holdingDir, [])
+        controller.listener.stop.assert_called_once_with()
 
     def test_requested_fps_is_applied_to_an_open_capture_device(self):
         calls = []
@@ -2721,6 +3438,74 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
         recorder.audio_queue.get_nowait()
         self.assertTrue(recorder._queue_audio_packet(packet, 2))
         self.assertEqual(recorder.audio_queue.get_nowait()[:2], (2, 2))
+
+    def test_audio_writer_caps_queued_packets_at_the_logical_stop(self):
+        recorder = CaptureRecorder()
+        with tempfile.TemporaryDirectory() as folder:
+            recorder.wav_path = os.path.join(folder, "capped.wav")
+            recorder.audio = wave.open(recorder.wav_path, "wb")
+            recorder.audio.setnchannels(1)
+            recorder.audio.setsampwidth(2)
+            recorder.audio.setframerate(10)
+            recorder.audio_channels = 1
+            recorder.audio_sample_rate = 10
+            recorder.audio_frames_written = 0
+            recorder.audio_stop_target_frames = 10
+            payload = numpy.arange(20, dtype=numpy.int16).tobytes()
+
+            recorder._write_audio_packet(0, 20, payload)
+            recorder.audio.close()
+            recorder.audio = None
+
+            with wave.open(recorder.wav_path, "rb") as audio:
+                self.assertEqual(audio.getnframes(), 10)
+
+    def test_stop_freezes_audio_before_waiting_for_video_drain(self):
+        class FakeMonitor:
+            def __init__(self):
+                self.removed = []
+
+            @staticmethod
+            def level_info():
+                return {}
+
+            def remove_recording_output_listener(self, token):
+                self.removed.append(token)
+                return True
+
+        recorder = CaptureRecorder()
+        monitor = FakeMonitor()
+
+        class FakeWriterThread:
+            def join(self, timeout=None):
+                self.timeout = timeout
+                self.audio_was_frozen = (
+                    not recorder.audio_accepting_packets
+                    and recorder.audio_monitor_listener_token is None)
+
+            @staticmethod
+            def is_alive():
+                return False
+
+        writer = FakeWriterThread()
+        recorder.active = True
+        recorder.started_at = time.monotonic() - 1.0
+        recorder.requested_fps = 60.0
+        recorder.frames_written = 0
+        recorder.writer_thread = writer
+        recorder.writer_stop = threading.Event()
+        recorder.audio_accepting_packets = True
+        recorder.audio_monitor = monitor
+        recorder.audio_monitor_listener_token = 9
+        recorder.audio_sample_rate = 0
+        recorder.wav_path = os.path.join(tempfile.gettempdir(),
+                                         "missing-recording.wav")
+        recorder.video = mock.Mock()
+
+        recorder.stop()
+
+        self.assertTrue(writer.audio_was_frozen)
+        self.assertEqual(monitor.removed, [9])
 
     def test_truncated_mme_name_prefers_equivalent_wasapi_input(self):
         devices = [
@@ -3164,6 +3949,7 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
         completed = types.SimpleNamespace(returncode=0, stderr="")
         with mock.patch("Recording.shutil.which", return_value="ffmpeg.exe"), \
                 mock.patch("Recording.os.path.isfile", return_value=True), \
+                mock.patch("Recording.os.path.getsize", return_value=2048), \
                 mock.patch("Recording.subprocess.run",
                            return_value=completed) as run:
             result = recorder._mux(
@@ -3174,7 +3960,101 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
         self.assertEqual(command[rate_index + 1], "60.000000")
         self.assertEqual(command[command.index("-crf") + 1], "18")
         self.assertEqual(command[command.index("-preset") + 1], "veryfast")
+        self.assertEqual(command[command.index("-threads") + 1], "2")
+        self.assertEqual(command[command.index("-brand") + 1], "mp42")
+        self.assertEqual(command[command.index("-tag:v") + 1], "avc1")
+        self.assertEqual(
+            command[command.index("-video_track_timescale") + 1], "60000")
+        if os.name == "nt":
+            flags = run.call_args.kwargs["creationflags"]
+            self.assertTrue(flags & 0x00004000)  # below-normal process
+            self.assertTrue(flags & 0x08000000)  # no console window
         self.assertEqual(result, "recording.mp4")
+
+    def test_mp4_mux_uses_presentation_clock_audio_when_drift_accumulates(self):
+        recorder = CaptureRecorder()
+        completed = types.SimpleNamespace(returncode=0, stderr="")
+        alignment = {
+            "applied": True, "final_drift_seconds": 1.5,
+            "fixed_offset_ms": 0.0}
+        with mock.patch("Recording.shutil.which", return_value="ffmpeg.exe"), \
+                mock.patch("Recording.os.path.isfile", return_value=True), \
+                mock.patch("Recording.os.path.getsize", return_value=2048), \
+                mock.patch(
+                    "RecordingSyncRepair.write_presentation_aligned_audio",
+                    return_value=alignment) as align, \
+                mock.patch(
+                    "RecordingSyncRepair.store_presentation_alignment_report") as store, \
+                mock.patch("Recording.subprocess.run",
+                           return_value=completed) as run:
+            result = recorder._mux(
+                "recording.avi", "recording.wav", "recording.mp4", 60.0)
+
+        command = run.call_args.args[0]
+        self.assertIn("recording_presentation_aligned.wav", " ".join(command))
+        self.assertNotIn("adelay", " ".join(command))
+        self.assertNotIn("atrim", " ".join(command))
+        self.assertEqual(alignment["fixed_offset_ms"], 0.0)
+        self.assertTrue(alignment["used_for_final_mp4"])
+        align.assert_called_once()
+        self.assertEqual(store.call_count, 2)
+        self.assertEqual(result, "recording.mp4")
+
+    def test_cleanup_sampling_seeks_to_at_most_120_frames_across_clip(self):
+        class FakeCapture:
+            def __init__(self, total=72000):
+                self.total = total
+                self.positions = []
+                self.read_count = 0
+                self.released = False
+
+            def get(self, _property):
+                return self.total
+
+            def set(self, property_id, value):
+                self.positions.append((property_id, int(value)))
+                return True
+
+            def read(self):
+                self.read_count += 1
+                return True, numpy.zeros((4, 4, 3), dtype=numpy.uint8)
+
+            def release(self):
+                self.released = True
+
+        capture = FakeCapture()
+        recorder = CaptureRecorder()
+        rule = {
+            "image": numpy.zeros((1, 1, 3), dtype=numpy.uint8),
+            "threshold": 2.0,
+            "minimum_percent": 100.0,
+        }
+        with mock.patch("Recording.cv2.VideoCapture", return_value=capture):
+            self.assertIsNone(recorder._discard_reason(
+                "recording.avi", 1200.0, [rule], 0.0))
+
+        self.assertEqual(capture.read_count, 120)
+        self.assertEqual(len(capture.positions), 120)
+        self.assertEqual(capture.positions[0], (cv2.CAP_PROP_POS_FRAMES, 0))
+        self.assertEqual(capture.positions[-1],
+                         (cv2.CAP_PROP_POS_FRAMES, 71999))
+        self.assertTrue(capture.released)
+
+        unknown_length_capture = FakeCapture(total=0)
+        with mock.patch("Recording.cv2.VideoCapture",
+                        return_value=unknown_length_capture):
+            self.assertIsNone(recorder._discard_reason(
+                "unknown-length.avi", 1200.0, [rule], 0.0))
+        self.assertEqual(unknown_length_capture.read_count, 120)
+        self.assertEqual(unknown_length_capture.positions, [])
+        self.assertTrue(unknown_length_capture.released)
+
+    def test_cleanup_sample_indexes_are_bounded_and_cover_both_ends(self):
+        indexes = evenly_spaced_frame_indexes(72000, 120)
+        self.assertEqual(len(indexes), 120)
+        self.assertEqual((indexes[0], indexes[-1]), (0, 71999))
+        self.assertEqual(evenly_spaced_frame_indexes(3, 120), [0, 1, 2])
+        self.assertEqual(evenly_spaced_frame_indexes(0, 120), [])
 
     def test_timing_report_separates_container_and_wall_clock_fps(self):
         recorder = CaptureRecorder()
@@ -3223,6 +4103,96 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
         self.assertIn("atrim=start=0.500000", expression)
         self.assertIn("asetpts=PTS-STARTPTS", expression)
         self.assertIn("apad=pad_dur=0.500000", expression)
+
+    def test_presentation_clock_rebuild_repairs_accumulated_drift_without_offset(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = os.path.join(folder, "source.wav")
+            timing = os.path.join(folder, "recording_timing.json")
+            rebuilt = os.path.join(folder, "rebuilt.wav")
+            sample_rate = 48000
+            content_frames = sample_rate * 12
+            target_frames = sample_rate * 15
+            time_axis = numpy.arange(content_frames) / sample_rate
+            content_float = (
+                numpy.sin(2.0 * numpy.pi * 440.0 * time_axis) * 1500.0)
+            random = numpy.random.default_rng(7)
+            burst_frames = int(sample_rate * 0.040)
+            for burst_second in (2, 4, 6, 8, 10):
+                start = burst_second * sample_rate
+                content_float[start:start + burst_frames] += (
+                    random.standard_normal(burst_frames)
+                    * 9000.0 * numpy.hanning(burst_frames))
+            content = numpy.clip(numpy.rint(
+                content_float), -32768, 32767).astype(
+                    numpy.int16).reshape(-1, 1)
+            samples = numpy.vstack((
+                content,
+                numpy.zeros((target_frames - content_frames, 1),
+                            dtype=numpy.int16),
+            ))
+            with wave.open(source, "wb") as audio:
+                audio.setnchannels(1)
+                audio.setsampwidth(2)
+                audio.setframerate(sample_rate)
+                audio.writeframes(samples.tobytes())
+            with open(timing, "w", encoding="utf-8") as stream:
+                json.dump({"audio": {
+                    "frames": target_frames,
+                    # Shorter than the normal 80 ms crossfade.  The overlap
+                    # must shrink instead of allowing a 0-frame WAV.
+                    "first_presentation_offset_ms": 35.0,
+                    "initial_alignment_frames": int(sample_rate * 0.035),
+                    "trailing_padding_frames": target_frames - content_frames,
+                    "presentation_clock_samples": [{
+                        "offset_seconds": float(second),
+                        "clock_error_ms": -200.0 * second,
+                    } for second in range(1, 15)],
+                }}, stream)
+
+            report = write_presentation_aligned_audio(
+                source, timing, rebuilt, minimum_drift_ms=1.0)
+
+            self.assertTrue(report["applied"])
+            self.assertEqual(report["fixed_offset_ms"], 0.0)
+            self.assertTrue(report["pitch_preserved"])
+            self.assertEqual(report["pitch_scale"], 1.0)
+            self.assertIn(report["engine"], ("rubberband", "atempo"))
+            self.assertLessEqual(report["minimum_crossfade_ms"], 70.0)
+            self.assertEqual(
+                report["trailing_padding_frames_removed"], sample_rate * 3)
+            self.assertGreaterEqual(report["segment_count"], 4)
+            self.assertTrue(report["segment_output_length_enforced"])
+            with wave.open(rebuilt, "rb") as audio:
+                result = numpy.frombuffer(
+                    audio.readframes(audio.getnframes()), dtype=numpy.int16)
+            self.assertEqual(len(result), target_frames)
+            # Direct PCM resampling would lower this 440 Hz tone to about
+            # 352 Hz in the stretched section.  Pitch-preserving stretch must
+            # retain the original fundamental while changing only duration.
+            window = result[sample_rate * 8:sample_rate * 9].astype(float)
+            window *= numpy.hanning(len(window))
+            frequencies = numpy.fft.rfftfreq(len(window), 1.0 / sample_rate)
+            peak = frequencies[numpy.argmax(
+                numpy.abs(numpy.fft.rfft(window)))]
+            self.assertAlmostEqual(float(peak), 440.0, delta=2.0)
+            # Every Rubber Band segment has a small flush tail.  If those
+            # tails are concatenated instead of trimmed to their requested
+            # lengths, later transients advance by tens of milliseconds per
+            # boundary even though the final WAV duration still matches.
+            expected_frame = int((10.0 / 0.8) * sample_rate)
+            radius = int(sample_rate * 0.100)
+            energy_frames = int(sample_rate * 0.010)
+            region = result[
+                expected_frame - radius:expected_frame + radius].astype(float)
+            energy = numpy.convolve(
+                region * region,
+                numpy.ones(energy_frames) / energy_frames,
+                mode="valid")
+            realized_frame = (
+                expected_frame - radius + int(numpy.argmax(energy))
+                + energy_frames // 2)
+            self.assertLess(
+                abs(realized_frame - expected_frame), int(sample_rate * 0.020))
 
     def test_main_full_rate_does_not_skip_on_early_timer_jitter(self):
         self.assertTrue(preview_render_due(
@@ -3430,6 +4400,48 @@ def sample_function(self):
 
 
 class PythonSourceSafetyTests(unittest.TestCase):
+    def test_za_story_status_shows_only_the_active_story_and_common_states(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+        namespace = {}
+        exec(compile(records["ZA_story_status_text"], source_path, "exec"), namespace)
+
+        command = types.SimpleNamespace(
+            main_current_state="MAIN_1_Z_LANK",
+            _1_story_current_state="1_STORY_OUT_HOTEL_Z_47",
+            _2_story_current_state="2_STORY_START_CHECK",
+            _3_story_current_state="3_STORY_START_CHECK",
+            _4_story_current_state="4_STORY_START_CHECK",
+            _5_story_current_state="5_STORY_START_CHECK",
+            _6_story_current_state="6_STORY_START_CHECK",
+            _7_story_current_state="7_STORY_START_CHECK",
+            _8_story_current_state="8_STORY_START_CHECK",
+            common_skill_change_current_state="COMMON_SKILL_CHANGE_START",
+            common_box_change_current_state="COMMON_BOX_CHANGE_START",
+            common_item_give_current_state="COMMON_ITEM_GIVE_START",
+            common_evolution_current_state="COMMON_EVOLUTION_START",
+        )
+        status = namespace["ZA_story_status_text"](command)
+        self.assertEqual(status, """----------------------------
+ STATE_MAIN_FUNCTION   :: MAIN_1_Z_LANK :: 1_STORY_OUT_HOTEL_Z_47
+
+ ### STATE_2_VAR ###
+
+ SKILL_CHANGE_FUNCTION :: COMMON_SKILL_CHANGE_START
+ BOX_CHANGE_FUNCTION   :: COMMON_BOX_CHANGE_START
+ ITEM_GIVE_FUNCTION    :: COMMON_ITEM_GIVE_START
+ EVOLUTION_FUNCTION    :: COMMON_EVOLUTION_START
+----------------------------""")
+        self.assertNotIn("2_STORY_START_CHECK", status)
+        self.assertNotIn("BATTLE_COUNT", status)
+        self.assertNotIn("WHITE_CHECK", status)
+
     def test_mixed_leading_tabs_are_normalized_without_changing_string_data(self):
         source = ("def sample():\n"
                   "\tif True:\n"
@@ -3456,6 +4468,207 @@ class PythonSourceSafetyTests(unittest.TestCase):
 
 
 class SampleFunctionSyncTests(unittest.TestCase):
+    def test_sample_comparison_uses_function_sync_history_not_file_time(self):
+        base = "def sample(self):\n    return 1\n"
+        source_new = "def sample(self):\n    return 2\n"
+        sample_new = "def sample(self):\n    return 3\n"
+        base_hash = function_content_hash(base)
+
+        update = function_update_status(source_new, base, base_hash)
+        self.assertEqual(update["status"], "source_newer")
+        self.assertTrue(format_function_update_status(update).startswith(
+            "ソース関数が新しい"))
+
+        update = function_update_status(base, sample_new, base_hash)
+        self.assertEqual(update["status"], "sample_newer")
+        self.assertTrue(format_function_update_status(update).startswith(
+            "サンプル関数が新しい"))
+
+        update = function_update_status(source_new, sample_new, base_hash)
+        self.assertEqual(update["status"], "both_changed")
+        self.assertIn("両方変更", format_function_update_status(update))
+
+        update = function_update_status(source_new, sample_new)
+        self.assertEqual(update["status"], "unknown_history")
+        self.assertIn("同期履歴なし", format_function_update_status(update))
+
+        update = function_update_status(source_new, source_new)
+        self.assertEqual(update["status"], "synchronized")
+
+    def test_sample_comparison_includes_function_update_label(self):
+        source = (
+            "class Demo:\n"
+            "    def sample(self):\n"
+            "        return 2\n")
+        base = "def sample(self):\n    return 1\n"
+        with tempfile.TemporaryDirectory() as root:
+            source_path = os.path.join(root, "Demo.py")
+            fragment_path = os.path.join(root, "sample.pyfrag")
+            metadata_path = os.path.join(root, "sample.pokesample.json")
+            with open(source_path, "w", encoding="utf-8") as stream:
+                stream.write(source)
+            with open(fragment_path, "w", encoding="utf-8") as stream:
+                stream.write(base)
+            with open(metadata_path, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "name": "sample", "fragment": "sample.pyfrag",
+                    "source": {"path": source_path, "function": "sample"},
+                    "function_sync": {
+                        "sample": {
+                            "source_function": "sample",
+                            "base_hash": function_content_hash(base),
+                            "synced_at": "2026-08-01T00:00:00+00:00",
+                        },
+                    },
+                }, stream)
+
+            comparisons = compare_sample_function_folder(
+                source, root, root, source_path)
+            self.assertEqual(comparisons[0]["function_update"]["status"],
+                             "source_newer")
+            self.assertIn("ソース関数が新しい",
+                          comparisons[0]["function_update_label"])
+
+            with open(metadata_path, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "name": "sample", "fragment": "sample.pyfrag",
+                    "source": {"path": source_path, "function": "sample"},
+                }, stream)
+            comparisons = compare_sample_function_folder(
+                source, root, root, source_path)
+            self.assertEqual(
+                comparisons[0]["function_update"]["status"],
+                "unknown_history")
+
+    def test_source_to_sample_sync_records_a_function_baseline(self):
+        source = (
+            "class Demo:\n"
+            "    def sample(self):\n"
+            "        return 2\n")
+        with tempfile.TemporaryDirectory() as root:
+            source_path = os.path.join(root, "Demo.py")
+            fragment_path = os.path.join(root, "sample.pyfrag")
+            metadata_path = os.path.join(root, "sample.pokesample.json")
+            with open(source_path, "w", encoding="utf-8") as stream:
+                stream.write(source)
+            with open(fragment_path, "w", encoding="utf-8") as stream:
+                stream.write("def sample(self):\n    return 1\n")
+            with open(metadata_path, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "name": "sample", "fragment": "sample.pyfrag",
+                    "source": {"path": source_path, "function": "sample"},
+                }, stream)
+
+            comparisons = compare_sample_function_folder(
+                source, root, root, source_path)
+            self.assertEqual(
+                comparisons[0]["function_update"]["status"],
+                "unknown_history")
+            update_sample_fragments(source, comparisons, ["sample"])
+
+            with open(metadata_path, "r", encoding="utf-8") as stream:
+                metadata = json.load(stream)
+            expected_text = next(
+                item["text"] for item in source_function_records(source)
+                if item["name"] == "sample")
+            self.assertEqual(
+                metadata["function_sync"]["sample"]["base_hash"],
+                function_content_hash(expected_text))
+            comparisons = compare_sample_function_folder(
+                source, root, root, source_path)
+            self.assertEqual(
+                comparisons[0]["function_update"]["status"],
+                "synchronized")
+
+            changed_source = source.replace("return 2", "return 3")
+            comparisons = compare_sample_function_folder(
+                changed_source, root, root, source_path)
+            self.assertEqual(
+                comparisons[0]["function_update"]["status"],
+                "source_newer")
+
+    def test_reflected_source_is_atomically_saved_to_the_actual_file(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "Demo.py")
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write("class Demo:\n    value = 1\n")
+            updated = "class Demo:\n    value = 2\n"
+            saved_path = save_reflected_source(path, updated)
+            self.assertEqual(saved_path, os.path.abspath(path))
+            with open(path, "r", encoding="utf-8") as stream:
+                self.assertEqual(stream.read(), updated)
+            self.assertFalse(os.path.exists(
+                path + ".sample-source-save.tmp"))
+
+    def test_invalid_reflected_source_does_not_overwrite_actual_file(self):
+        with self.assertRaises(ValueError):
+            save_reflected_source("", "class Demo:\n    pass\n")
+        with tempfile.TemporaryDirectory() as root:
+            path = os.path.join(root, "Demo.py")
+            original = "class Demo:\n    value = 1\n"
+            with open(path, "w", encoding="utf-8") as stream:
+                stream.write(original)
+            with self.assertRaises(SyntaxError):
+                save_reflected_source(path, "class Demo\n    value = 2\n")
+            with open(path, "r", encoding="utf-8") as stream:
+                self.assertEqual(stream.read(), original)
+
+    def test_sample_check_source_reflections_save_the_actual_source(self):
+        studio_path = os.path.join(DEV_STUDIO, "PokeConDevStudio.py")
+        with open(studio_path, "r", encoding="utf-8-sig") as stream:
+            tree = ast.parse(stream.read())
+        outer = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "open_sample_function_check_mode")
+        nested = {
+            node.name: node for node in ast.walk(outer)
+            if isinstance(node, ast.FunctionDef)
+        }
+        for function_name in (
+                "library_to_source", "merge_names_and_source_bodies",
+                "rollback_last_batch", "apply_replacement",
+                "apply_to_all_usages"):
+            calls = {
+                call.func.id for call in ast.walk(nested[function_name])
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Name)
+            }
+            self.assertIn("save_reflected_source", calls, function_name)
+
+    def test_sample_reflection_saves_and_rechecks_from_disk(self):
+        source = (
+            "class Demo:\n"
+            "    def sample(self):\n"
+            "        return 1\n")
+        with tempfile.TemporaryDirectory() as root:
+            source_path = os.path.join(root, "Demo.py")
+            sample_dir = os.path.join(root, "Samples")
+            os.makedirs(sample_dir)
+            fragment_path = os.path.join(sample_dir, "sample.pyfrag")
+            with open(source_path, "w", encoding="utf-8") as stream:
+                stream.write(source)
+            with open(fragment_path, "w", encoding="utf-8") as stream:
+                stream.write("def sample(self):\n    return 2\n")
+
+            comparisons = compare_sample_function_folder(
+                source, root, root, source_path)
+            backup = create_sample_sync_backup(
+                source_path, source, comparisons, ["sample"],
+                os.path.join(root, "Backups"),
+                source_will_be_saved=True)
+            updated = update_source_from_samples(
+                source, comparisons, ["sample"])
+            save_reflected_source(source_path, updated)
+
+            with open(source_path, "r", encoding="utf-8") as stream:
+                saved_source = stream.read()
+            rechecked = compare_sample_function_folder(
+                saved_source, root, root, source_path)
+            self.assertIn("return 2", saved_source)
+            self.assertEqual(rechecked[0]["status"], "match")
+            self.assertTrue(backup["source_was_saved"])
+
     def test_fragment_stats_count_functions_and_references(self):
         fragment = (
             "def first(self):\n"
@@ -3850,6 +5063,7 @@ class Demo:
             }]
             backup = create_sample_sync_backup(
                 source_path, source_before, comparisons, ["sample"], backup_root)
+            self.assertFalse(backup["source_was_saved"])
             self.assertEqual(
                 latest_sample_sync_backup(backup_root), backup["manifest_path"])
             with open(body_path, "w", encoding="utf-8") as stream:
@@ -4075,6 +5289,37 @@ class Demo:
             self.assertTrue(members[0]["id"].endswith(
                 "DemoFlow__support/DemoFlow__support.pokesample.json"))
 
+    def test_dependency_group_records_reused_multi_function_history(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = os.path.join(root, "ExistingBundle")
+            os.makedirs(folder)
+            metadata_path = os.path.join(
+                folder, "ExistingBundle.pokesample.json")
+            body_path = os.path.join(folder, "ExistingBundle.pyfrag")
+            flow_main = next(
+                item["text"] for item in source_function_records(self.SOURCE)
+                if item["name"] == "flow_main")
+            with open(metadata_path, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "name": "ExistingBundle",
+                    "fragment": "ExistingBundle.pyfrag",
+                }, stream)
+            with open(body_path, "w", encoding="utf-8") as stream:
+                stream.write(flow_main)
+
+            plan, _members = register_dependency_group(
+                self.SOURCE, ["flow_main"], root,
+                "Imported/DemoFlow", "DemoFlow", source_path="Demo.py")
+            flow_row = next(
+                row for row in plan["registration"]
+                if row["name"] == "flow_main")
+            self.assertEqual(flow_row["status"], "reuse")
+            with open(metadata_path, "r", encoding="utf-8") as stream:
+                metadata = json.load(stream)
+            self.assertEqual(
+                metadata["function_sync"]["flow_main"]["base_hash"],
+                function_content_hash(flow_main))
+
 
 class SampleOriginSyncTests(unittest.TestCase):
     SOURCE = '''
@@ -4172,6 +5417,16 @@ class Demo:
         return self.move_old
 '''
 
+    def test_shared_find_selects_a_current_match_when_results_exist(self):
+        matches = [("1.2", "1.5"), ("1.10", "1.13"), ("3.0", "3.3")]
+        self.assertEqual(find_match_index(matches, cursor_index="1.0"), 0)
+        self.assertEqual(find_match_index(matches, cursor_index="1.9"), 1)
+        self.assertEqual(
+            find_match_index(matches, current_index="3.0", cursor_index="1.0"),
+            2)
+        self.assertEqual(find_match_index(matches, cursor_index="4.0"), 0)
+        self.assertEqual(find_match_index([], cursor_index="1.0"), -1)
+
     def test_discovers_class_functions_and_builds_bulk_names(self):
         records = source_function_records(self.SOURCE)
         self.assertEqual([item["name"] for item in records], ["move_old", "keep"])
@@ -4179,6 +5434,52 @@ class Demo:
             build_rename_map(["move_old"], "_old", "", prefix="ZA_"),
             {"move_old": "ZA_move"},
         )
+
+    def test_function_registration_actions_remain_above_the_function_tree(self):
+        studio_path = os.path.join(DEV_STUDIO, "PokeConDevStudio.py")
+        with open(studio_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+        tree = ast.parse(source)
+        method = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_build_source_functions_tab")
+        method_source = ast.get_source_segment(source, method)
+        self.assertIn('orient="vertical", command=tab_canvas.yview',
+                      method_source)
+        self.assertLess(
+            method_source.index('text="選択をサンプルへ登録"'),
+            method_source.index("self.source_function_tree = ttk.Treeview"))
+        self.assertLess(
+            method_source.index('text="選択1件の登録名を確認・変更"'),
+            method_source.index("self.source_function_tree = ttk.Treeview"))
+
+    def test_multi_function_fragment_is_recognized_as_registered(self):
+        body = (
+            "def first(self):\n    return 1\n\n"
+            "def second(self):\n    return 2\n")
+        with tempfile.TemporaryDirectory() as root:
+            folder = os.path.join(root, "Bundle")
+            os.makedirs(folder)
+            metadata_path = os.path.join(folder, "Bundle.pokesample.json")
+            body_path = os.path.join(folder, "Bundle.pyfrag")
+            with open(metadata_path, "w", encoding="utf-8") as stream:
+                json.dump({
+                    "name": "Bundle", "fragment": "Bundle.pyfrag",
+                }, stream)
+            with open(body_path, "w", encoding="utf-8") as stream:
+                stream.write(body)
+
+            candidates = catalog_function_candidates(root)
+            self.assertEqual(set(candidates), {"first", "second"})
+            registration = classify_function_registration(
+                "def second(self):\n    return 2\n",
+                candidates["second"], "second")
+            self.assertEqual(registration["status"], "登録済み")
+            self.assertEqual(
+                registration["fragment_id"],
+                "Bundle/Bundle.pokesample.json")
+            self.assertFalse(registration["overwrite_supported"])
 
     def test_source_record_ignores_shallow_comment_indent(self):
         source = '''
@@ -4249,6 +5550,14 @@ class Story:
                 body = stream.read()
             self.assertEqual(metadata["name"], "ZA_move")
             self.assertEqual(metadata["source"]["function"], "move_old")
+            self.assertEqual(
+                metadata["function_sync"]["ZA_move"]["source_function"],
+                "move_old")
+            self.assertEqual(
+                metadata["function_sync"]["ZA_move"]["base_hash"],
+                function_content_hash(next(
+                    item["text"] for item in source_function_records(self.SOURCE)
+                    if item["name"] == "move_old")))
             self.assertIn("from Commands.Keys import Button", metadata["imports"])
             self.assertIn("def ZA_move(self):", body)
             self.assertIn("self.ZA_move()", body)

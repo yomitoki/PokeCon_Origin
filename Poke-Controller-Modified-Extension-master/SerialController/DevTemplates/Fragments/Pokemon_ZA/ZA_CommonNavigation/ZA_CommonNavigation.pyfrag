@@ -12,7 +12,7 @@ def ZA_Common_map_open(self,check_pic1="POKEMON_ZA_FALSE_RETURN",check_pic2="POK
     if self.image_check("POKEMON_ZA_TEXT_BOX2"):
         self.pressRep(Button.A, repeat=5, duration=0.15, wait=0.01, interval=0.1)
         self.wait(0.1)         
-    elif self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W") or self.image_check("POKEMON_ZA_DEAD") or self.image_check(check_pic1) or self.image_check(check_pic2):
+    elif self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or self.image_check("POKEMON_ZA_DEAD") or self.image_check(check_pic1) or self.image_check(check_pic2): #FIELDから変更
         self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
         self.wait(0.1)
         return "COMMON_GOTO_SELECT1"
@@ -65,7 +65,7 @@ def ZA_Common_goto_select1(self,position,othermap="POKEMON_ZA_FALSE_RETURN"):
     #    return "CHECK_TIME"
     #elif self.image_check("NIGHT"):
     #    return "CHECK_TIME"
-    elif self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W") or self.image_check("POKEMON_ZA_DEAD"):
+    elif self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or self.image_check("POKEMON_ZA_DEAD"): #FIELDから変更
         for i in range(5):
             if self.image_check("POKEMON_ZA_MAP2") or self.image_check(othermap):
                 return "COMMON_GOTO_SELECT1"
@@ -158,7 +158,7 @@ def ZA_Common_change_time(self):
     #    else:
     #        return "BENCH_MAP_OPEN"
     #el
-    if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W"):
+    if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"): #FIELDから変更
         self.ZA_Benchi()
         return "COMMON_CHECK_TIME"
 
@@ -177,7 +177,7 @@ def ZA_Common_check_time(self,check_timing):
         while True:
             #ジャスティス会への話しかけが発生する可能性があるので、ループしてしまう場合はBボタンが必要になる場合がある                
             self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-            if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W") or self.image_check("POKEMON_ZA_DEAD"):
+            if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or self.image_check("POKEMON_ZA_DEAD"): #FIELDから変更
                 self.timecount=0
                 self.changetimecount+=1
                 if check_timing != "POKEMON_ZA_MORNING":
@@ -193,7 +193,7 @@ def ZA_Common_check_time(self,check_timing):
         while True:
             #ジャスティス会への話しかけが発生する可能性があるので、ループしてしまう場合はBボタンが必要になる場合がある       
             self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-            if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W") or self.image_check("POKEMON_ZA_DEAD"):
+            if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or self.image_check("POKEMON_ZA_DEAD"): #FIELDから変更
                 self.timecount=0
                 self.changetimecount+=1
                 if check_timing != "POKEMON_ZA_NIGHT":
@@ -232,10 +232,10 @@ def ZA_Common_event_marker_check(self,othermap="POKEMON_ZA_FALSE_RETURN",markert
         self.wait(1.0)
         #EVENTMARKER_CHECK
         if markertype==0 and self.image_check("POKEMON_ZA_EVENT_MARKER_RANGE"):
-            self.ZA_renda_button(rendabutton="B",endpicture="POKEMON_ZA_FIELD_W",endpicture2="POKEMON_ZA_FIELD_BACK_W")
+            self.ZA_renda_button(rendabutton="B",endpicture="POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") #FIELDから変更
             return "COMMON_START"
         
-    self.ZA_renda_button(rendabutton="B",endpicture="POKEMON_ZA_FIELD_W",endpicture2="POKEMON_ZA_FIELD_BACK_W")
+    self.ZA_renda_button(rendabutton="B",endpicture="POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") #FIELDから変更
     return "COMMON_FALSE_RETURN"
 def ZA_Common_false_return(self,othermap="POKEMON_ZA_FALSE_RETURN"):#dummy
     return "COMMON_FALSE_RETURN"
@@ -259,10 +259,10 @@ def ZA_Common_goto(self,position1,position2left,position2down,movepoint_check=0,
     else:
         return "EXEC"
 def ZA_Common_pokemon_recovery(self):  
-    if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W"):
+    if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"): #FIELDから変更
         self.press(Direction(Stick.LEFT, 90), duration=2.0, wait=0.1)
         self.pressRep(Button.A, repeat=10, duration=0.15, wait=0.2, interval=0.1)
-        if self.ZA_renda_button(rendabutton="B",endpicture="POKEMON_ZA_FIELD_W",endpicture2="POKEMON_ZA_FIELD_BACK_W",sub_button="A",sub_picture="POKEMON_ZA_TEXT_BLACK_COMMENT",sub2_button="A",sub2_picture="POKEMON_ZA_HELP_MARKER"):
+        if self.ZA_renda_button(rendabutton="B",endpicture="POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",sub_button="A",sub_picture="POKEMON_ZA_TEXT_BLACK_COMMENT",sub2_button="A",sub2_picture="POKEMON_ZA_HELP_MARKER"): #FIELDから変更
             return True
     else:
         return False

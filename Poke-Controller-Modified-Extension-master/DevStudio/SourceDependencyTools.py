@@ -9,7 +9,8 @@ import os
 import textwrap
 
 from SampleLibrary import catalog, load_fragment
-from SourceFunctionTools import register_source_functions, source_imports
+from SourceFunctionTools import (function_content_hash, function_sync_record,
+                                 register_source_functions, source_imports)
 
 
 FUNCTION_NODES = (ast.FunctionDef, ast.AsyncFunctionDef)
@@ -556,6 +557,36 @@ def register_dependency_group(source, roots, fragment_root, folder, list_name,
             })
     support_id = _write_support_fragment(
         fragment_root, folder, list_name, plan, source_path=source_path)
+    # Reused functions can live inside a multi-function fragment whose
+    # metadata name is not the function name.  Record the exact reused body as
+    # a synchronization baseline so both the registration tab and later
+    # function-level new/old checks recognize it correctly.
+    metadata_updates = {}
+    for row in plan["registration"]:
+        selected = row.get("selected")
+        if row.get("status") != "reuse" or not selected:
+            continue
+        source_text = plan["method_text"].get(row["name"], "")
+        if function_content_hash(source_text) != function_content_hash(
+                selected.get("text", "")):
+            continue
+        metadata_path = os.path.abspath(os.path.join(
+            fragment_root, selected["id"]))
+        metadata = metadata_updates.get(metadata_path)
+        if metadata is None:
+            with open(metadata_path, "r", encoding="utf-8") as stream:
+                metadata = json.load(stream)
+            metadata_updates[metadata_path] = metadata
+        history = dict(metadata.get("function_sync", {}))
+        history[row["name"]] = function_sync_record(
+            row["name"], source_text)
+        metadata["function_sync"] = history
+    for metadata_path, metadata in metadata_updates.items():
+        temporary = metadata_path + ".dependency-sync.tmp"
+        with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(metadata, stream, ensure_ascii=False, indent=2)
+            stream.write("\n")
+        os.replace(temporary, metadata_path)
     members = [{"type": "fragment", "id": support_id}]
     seen = set()
     for row in plan["registration"]:

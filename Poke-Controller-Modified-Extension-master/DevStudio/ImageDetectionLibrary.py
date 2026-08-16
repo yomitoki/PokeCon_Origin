@@ -90,6 +90,88 @@ def selected_targets(data, name, selection_type="list"):
     return {target_name: data["targets"][target_name]["variants"] for target_name in names if target_name in data["targets"]}
 
 
+def normalized_excluded_folders(value):
+    """Return portable, case-insensitive folder prefixes from a UI value."""
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        values = value.replace(";", ",").replace("\r", "\n").replace("\n", ",").split(",")
+    else:
+        try:
+            values = list(value)
+        except TypeError:
+            values = [value]
+    output = []
+    for item in values:
+        folder = str(item or "").strip().replace("\\", "/")
+        while folder.startswith("./"):
+            folder = folder[2:]
+        folder = folder.strip("/").casefold()
+        if folder and folder not in output:
+            output.append(folder)
+    return tuple(output)
+
+
+def template_path_is_excluded(template_path, excluded_folders):
+    """Return whether a template path belongs to an excluded folder."""
+    path = str(template_path or "").strip().replace("\\", "/").strip("/").casefold()
+    for folder in normalized_excluded_folders(excluded_folders):
+        if path == folder or path.startswith(folder + "/"):
+            return True
+    return False
+
+
+def image_preview_size(width, height, max_width=480, max_height=220,
+                       max_upscale=4.0):
+    """Fit an image into the preview area while keeping its aspect ratio."""
+    width, height = int(width), int(height)
+    max_width, max_height = int(max_width), int(max_height)
+    if width <= 0 or height <= 0 or max_width <= 0 or max_height <= 0:
+        raise ValueError("Image and preview dimensions must be positive")
+    scale = min(float(max_width) / width, float(max_height) / height,
+                max(1.0, float(max_upscale)))
+    return max(1, int(round(width * scale))), max(1, int(round(height * scale)))
+
+
+def filter_image_library_variants(data, query="", grayscale="all",
+                                  excluded_folders=None):
+    """Return ``(target name, variant index)`` rows matching the workspace filters."""
+    needle = str(query or "").strip().casefold()
+    gray_value = str(grayscale if grayscale is not None else "all").strip().casefold()
+    if grayscale is True or gray_value in ("on", "true", "1", "gray", "grayscale", "グレースケール"):
+        expected_gray = True
+    elif grayscale is False or gray_value in ("off", "false", "0", "color", "カラー"):
+        expected_gray = False
+    else:
+        expected_gray = None
+
+    results = []
+    targets = data.get("targets", {}) if isinstance(data, dict) else {}
+    for name in sorted(targets, key=str.casefold):
+        target = targets.get(name, {})
+        if not isinstance(target, dict):
+            continue
+        variants = target.get("variants", [])
+        searchable = [str(name), str(target.get("description", ""))]
+        searchable.extend(str(tag) for tag in target.get("tags", []))
+        searchable.extend(
+            str(variant.get("template_path", ""))
+            for variant in variants if isinstance(variant, dict))
+        if needle and needle not in " ".join(searchable).casefold():
+            continue
+        for index, variant in enumerate(variants):
+            if not isinstance(variant, dict):
+                continue
+            if template_path_is_excluded(
+                    variant.get("template_path", ""), excluded_folders):
+                continue
+            # Runtime image detection treats an omitted use_gray as enabled.
+            if expected_gray is not None and bool(variant.get("use_gray", True)) != expected_gray:
+                continue
+            results.append((str(name), index))
+    return results
+
+
 def generate_image_check(data, name, selection_type="list"):
     targets = selected_targets(data, name, selection_type)
     operators = {target_name: data["targets"].get(target_name, {}).get("operator", "OR") for target_name in targets}

@@ -1,36 +1,75 @@
 def ZA_markerdir(self,type,nofiled=False):
     if type == "EVENT":
-        center = "POKEMON_ZA_EVENT_MARKER_CENTER"
-        center_wide = "POKEMON_ZA_EVENT_MARKER_CENTER_WIDE"
-        left = "POKEMON_ZA_EVENT_MARKER_LEFT_WIDE"
-        right = "POKEMON_ZA_EVENT_MARKER_RIGHT_WIDE"
+        marker = "POKEMON_ZA_EVENT_MARKER"
     elif type == "PIN":
-        center = "POKEMON_ZA_PIN_MARKER_CENTER"
-        center_wide = "POKEMON_ZA_PIN_MARKER_CENTER_WIDE"
-        left = "POKEMON_ZA_PIN_MARKER_LEFT_WIDE"
-        right = "POKEMON_ZA_PIN_MARKER_RIGHT_WIDE"
+        marker = "POKEMON_ZA_PIN_MARKER"
     elif type == "SIDE_MARKER":
-        center = "POKEMON_ZA_SIDE_MARKER_CENTER"
-        center_wide = "POKEMON_ZA_SIDE_MARKER_CENTER_WIDE"
-        left = "POKEMON_ZA_SIDE_MARKER_LEFT_WIDE"
-        right = "POKEMON_ZA_SIDE_MARKER_RIGHT_WIDE"
+        marker = "POKEMON_ZA_SIDE_MARKER"
     else:
         return False
+
+    center = marker + "_CENTER"
+    center_wide = marker + "_CENTER_WIDE"
+    wide_upper = marker + "_CENTER_WIDE_UPPER"
+    wide_upper_left = marker + "_CENTER_WIDE_UPPER_LEFT"
+    wide_upper_right = marker + "_CENTER_WIDE_UPPER_RIGHT"
+    wide_upper_left_near = marker + "_CENTER_WIDE_UPPER_LEFT_NEAR"
+    wide_upper_right_near = marker + "_CENTER_WIDE_UPPER_RIGHT_NEAR"
+    wide_downer = marker + "_CENTER_WIDE_DOWNER"
+    wide_downer_left = marker + "_CENTER_WIDE_DOWNER_LEFT"
+    wide_downer_right = marker + "_CENTER_WIDE_DOWNER_RIGHT"
+    wide_downer_left_near = marker + "_CENTER_WIDE_DOWNER_LEFT_NEAR"
+    wide_downer_right_near = marker + "_CENTER_WIDE_DOWNER_RIGHT_NEAR"
+    left_side = marker + "_CENTER_LEFT_SIDE"
+    right_side = marker + "_CENTER_RIGHT_SIDE"
+    left = marker + "_LEFT_WIDE"
+    right = marker + "_RIGHT_WIDE"
+    last_movement_name = "_za_markerdir_last_movement_" + marker
     
-    if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W") or nofiled:
+    if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or nofiled: #FIELDから変更
         if self.image_check(center):
+            setattr(self, last_movement_name, None)
             return True
+        elif self.image_check(wide_downer):
+            movement = (270, 1.0, 0.0)
+        elif self.image_check(wide_upper):
+            movement = (90, 1.0, 0.0)
+        elif self.image_check(wide_downer_left_near):
+            movement = (180, 0.2, 0.0)
+        elif self.image_check(wide_downer_right_near):
+            movement = (0, 0.2, 0.0)
+        elif self.image_check(wide_upper_left_near):
+            movement = (180, 0.2, 0.0)
+        elif self.image_check(wide_upper_right_near):
+            movement = (0, 0.2, 0.0)
+        elif self.image_check(wide_downer_left):
+            movement = (180, 1.0, 0.03)
+        elif self.image_check(wide_downer_right):
+            movement = (0, 1.0, 0.03)
+        elif self.image_check(wide_upper_left):
+            movement = (180, 1.0, 0.03)
+        elif self.image_check(wide_upper_right):
+            movement = (0, 1.0, 0.03)
+        elif self.image_check(left_side):
+            movement = (180, 1.0, 0.03)
+        elif self.image_check(right_side):
+            movement = (0, 1.0, 0.03)
         elif self.image_check(left):
             if self.image_check(center_wide):
-                self.press(Direction(Stick.RIGHT,180,0.2), duration=0.0, wait=0.0)
+                movement = (180, 0.2, 0.0)
             else:
-                self.press(Direction(Stick.RIGHT,180), duration=0.0, wait=0.0)
+                movement = (180, 1.0, 0.03)
         elif self.image_check(right):
             if self.image_check(center_wide):
-                self.press(Direction(Stick.RIGHT,0,0.2), duration=0.0, wait=0.0)
+                movement = (0, 0.2, 0.0)
             else:
-                self.press(Direction(Stick.RIGHT,0), duration=0.0, wait=0.0)
+                movement = (0, 1.0, 0.03)
         else:
-            self.press(Direction(Stick.RIGHT,180), duration=0.0, wait=0.0)
-        self.wait(0.2)
+            movement = getattr(self, last_movement_name, None)
+            if movement is None:
+                movement = (180, 1.0, 0.0)
+        angle, magnitude, duration = movement
+        self.press(Direction(Stick.RIGHT,angle,magnitude), duration=duration, wait=0.0)
+        setattr(self, last_movement_name, movement)
+        self.wait(0.1)
     return False

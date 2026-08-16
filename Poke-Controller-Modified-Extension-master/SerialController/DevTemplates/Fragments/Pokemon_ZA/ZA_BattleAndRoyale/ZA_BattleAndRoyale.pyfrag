@@ -86,28 +86,28 @@ def ZA_battle_Cp_loop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endski
         print(f'noCp_count = {noCp_count} mode = {mode} battle_mode = {battle_mode}')
         self.checkIfAlive()
         
-        if nofiled==1 and (self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W")):
-            if (usenum==1 and (self.image_check("POKEMON_ZA_FIELD1") or self.image_check("POKEMON_ZA_FIELD_BACK1"))):
+        if nofiled==1 and (self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")): #FIELDから変更
+            if (usenum==1 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") and (self.image_check("POKEMON_ZA_FIELD1") or self.image_check("POKEMON_ZA_FIELD_BACK1"))): #FIELDから変更
                 self.wait(0.5)
                 self.etc_sendCommand("Lbutton_up")
                 nofiled=0
-            elif (usenum==2 and (self.image_check("POKEMON_ZA_FIELD2") or self.image_check("POKEMON_ZA_FIELD_BACK2"))):
+            elif (usenum==2 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") and (self.image_check("POKEMON_ZA_FIELD2") or self.image_check("POKEMON_ZA_FIELD_BACK2"))): #FIELDから変更
                 self.wait(0.5)
                 self.etc_sendCommand("Lbutton_up")
                 nofiled=0
-            elif (usenum==3 and (self.image_check("POKEMON_ZA_FIELD3") or self.image_check("POKEMON_ZA_FIELD_BACK3"))):
+            elif (usenum==3 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") and (self.image_check("POKEMON_ZA_FIELD3") or self.image_check("POKEMON_ZA_FIELD_BACK3"))): #FIELDから変更
                 self.wait(0.5)
                 self.etc_sendCommand("Lbutton_up")
                 nofiled=0
-            elif (usenum==4 and (self.image_check("POKEMON_ZA_FIELD4") or self.image_check("POKEMON_ZA_FIELD_BACK4"))):
+            elif (usenum==4 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") and (self.image_check("POKEMON_ZA_FIELD4") or self.image_check("POKEMON_ZA_FIELD_BACK4"))): #FIELDから変更
                 self.wait(0.5)
                 self.etc_sendCommand("Lbutton_up")
                 nofiled=0
-            elif (usenum==5 and (self.image_check("POKEMON_ZA_FIELD5") or self.image_check("POKEMON_ZA_FIELD_BACK5"))):
+            elif (usenum==5 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") and (self.image_check("POKEMON_ZA_FIELD5") or self.image_check("POKEMON_ZA_FIELD_BACK5"))): #FIELDから変更
                 self.wait(0.5)
                 self.etc_sendCommand("Lbutton_up")
                 nofiled=0
-            elif (usenum==6 and (self.image_check("POKEMON_ZA_FIELD6") or self.image_check("POKEMON_ZA_FIELD_BACK6"))):
+            elif (usenum==6 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") and (self.image_check("POKEMON_ZA_FIELD6") or self.image_check("POKEMON_ZA_FIELD_BACK6"))): #FIELDから変更
                 self.wait(0.5)
                 self.etc_sendCommand("Lbutton_up")
                 nofiled=0
@@ -624,7 +624,7 @@ def ZA_bench_change_time(self):
         self.pressRep(Button.A, repeat=10, duration=0.15, wait=0.2, interval=0.1)
         self.pressRep(Button.B, repeat=10, duration=0.15, wait=0.2, interval=0.1)
         for i in range(1,30):
-            if ((self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W")) and (not self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT"))):
+            if ((self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")) and (not self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT"))): #FIELDから変更
                 break
             else:
                 self.pressRep(Button.B, repeat=1, duration=0.15, wait=0.2, interval=0.5)
@@ -649,7 +649,7 @@ def ZA_bench_check_time(self):
     if self.timecount > 100:
     
         self.changetimemisscount+=1
-    if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W") or self.image_check("POKEMON_ZA_DEAD"):
+    if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or self.image_check("POKEMON_ZA_DEAD"): #FIELDから変更
         return "BENCH_START"
     elif self.image_check("POKEMON_ZA_MORNING") or self.timecount > 100:
         print("朝")
@@ -662,7 +662,7 @@ def ZA_bench_check_time(self):
             #if not self.image_check("MORNING") or self.timecount > 150:
             #    self.timecount=0
             #    return "BENCH_CHANGE_TIME"
-            if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W") or self.image_check("POKEMON_ZA_DEAD"):
+            if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or self.image_check("POKEMON_ZA_DEAD"): #FIELDから変更
                 self.timecount=0
                 self.changetimecount+=1
                 return "BENCH_CHANGE_TIME"
@@ -678,7 +678,7 @@ def ZA_bench_check_time(self):
             #if not self.image_check("NIGHT"):#解決後完全に削除 or self.timecount > 150:
             #    self.timecount=0
             #    return "BENCH_START"
-            if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W") or self.image_check("POKEMON_ZA_DEAD"):
+            if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or self.image_check("POKEMON_ZA_DEAD"): #FIELDから変更
                 self.timecount=0
                 self.changetimecount+=1
                 return "BENCH_START"
@@ -770,7 +770,7 @@ def ZA_battle_map_open(self):
         print("朝_loop battle_map_open")
         while True:
             self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-            if self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W") or self.image_check("POKEMON_ZA_DEAD"):
+            if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or self.image_check("POKEMON_ZA_DEAD"): #FIELDから変更
                 break
         self.ZA_MOVE_SEE("END")
         self.ZA_ZL_ACTION("END")
@@ -804,7 +804,7 @@ def ZA_battle_map_open(self):
         return "BATTLE_GOTO_BATTLE_ZONE1"
     elif self.image_check("POKEMON_ZA_DEAD"):
         return "BATTLE_START"
-    elif self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W"):
+    elif self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"): #FIELDから変更
         #マップコメントの捕捉失敗用
         if self.image_check("POKEMON_ZA_ESCAPE"):
             return "BATTLE_MOVE"
@@ -812,9 +812,9 @@ def ZA_battle_map_open(self):
             self.battlecheck=0
         self.pressRep(Button.PLUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
         return "BATTLE_GOTO_BATTLE_ZONE1"
-    elif not(self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W")):
+    elif not(self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")): #FIELDから変更
         for i in range(20):
-            if (self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W")):
+            if (self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")): #FIELDから変更
                  return "BATTLE_MAP_OPEN"
             self.wait(1.0)
         self.press(Direction(Stick.LEFT, 90), duration=6.0, wait=0.1)
@@ -928,9 +928,9 @@ def ZA_battle_move(self):
     
     count=0
     if self.battle_step_return == 0:
-        if not (self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W")):
+        if not (self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")): #FIELDから変更
             for i in range(20):
-                if (self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W")):
+                if (self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")): #FIELDから変更
                     return "BATTLE_MOVE"
                 self.wait(1.0)
             return "BATTLE_START"
@@ -1846,7 +1846,7 @@ def ZA_battle_lockon_test(self):
             self.ZA_MOVE_SEE("END")
             return
         
-        if self.image_check("POKEMON_ZA_ESCAPE") or self.image_check("POKEMON_ZA_FIELD_W") or self.image_check("POKEMON_ZA_FIELD_BACK_W"):
+        if self.image_check("POKEMON_ZA_ESCAPE") or self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"): #FIELDから変更
             #if self.image_check("TARGET_L_ALL"):
             self.battlemarker_skipcount+=1
             if ((self.battlemarker_skipcount > self.battlemarker_skipcount_threshold) and (self.image_check("POKEMON_ZA_TARGET_RIGHT_LOW") or self.image_check("POKEMON_ZA_TARGET_LEFT_LOW") or (self.Rstick_state == 0 and (self.image_check("POKEMON_ZA_TARGET_RIGHT_RIHGT_CHECK_LOW") or self.image_check("POKEMON_ZA_TARGET_LEFT_RIHGT_CHECK_LOW"))))):# LOWで数回確認後通常のマーカーでもチェックできた場合継続(画像検知位置は回転を考慮し左寄り) 視点回転していない場合右も確認

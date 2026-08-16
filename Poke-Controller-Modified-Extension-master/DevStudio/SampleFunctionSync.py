@@ -11,7 +11,8 @@ import os
 import re
 import textwrap
 
-from SourceFunctionTools import rename_source_functions
+from SourceFunctionTools import (function_content_hash, function_sync_record,
+                                 rename_source_functions)
 from PythonSourceSafety import normalize_python_indentation
 
 
@@ -254,10 +255,61 @@ def source_paths_equivalent(saved_path, current_path):
     return bool(saved_suffix) and saved_suffix == current_suffix
 
 
+def function_update_status(source_text, sample_text, base_hash="",
+                           source_unsaved=False):
+    """Classify changes against the last function-scoped synchronization."""
+    source_hash = (function_content_hash(source_text)
+                   if source_text is not None else "")
+    sample_hash = (function_content_hash(sample_text)
+                   if sample_text is not None else "")
+    base_hash = str(base_hash or "")
+    if not source_hash:
+        status = "source_missing"
+    elif source_hash == sample_hash:
+        status = "synchronized"
+    elif not base_hash:
+        status = "unknown_history"
+    elif source_hash == base_hash and sample_hash != base_hash:
+        status = "sample_newer"
+    elif sample_hash == base_hash and source_hash != base_hash:
+        status = "source_newer"
+    else:
+        status = "both_changed"
+    return {
+        "status": status,
+        "base_hash": base_hash,
+        "source_hash": source_hash,
+        "sample_hash": sample_hash,
+        "source_unsaved": bool(source_unsaved),
+    }
+
+
+def format_function_update_status(update):
+    """Return an honest function-scoped update label for the comparison UI."""
+    update = update or {}
+    status = update.get("status", "unknown_history")
+    if status == "source_newer":
+        return ("未保存ソース関数が新しい（同期後にソース側のみ変更）"
+                if update.get("source_unsaved") else
+                "ソース関数が新しい（同期後にソース側のみ変更）")
+    if status == "sample_newer":
+        return "サンプル関数が新しい（同期後にサンプル側のみ変更）"
+    if status == "synchronized":
+        return "同期済み（関数内容が同じ）"
+    if status == "both_changed":
+        return "判定不能（同期後に両方変更）"
+    if status == "source_missing":
+        return "ソース関数が未登録"
+    if status == "mixed":
+        return "判定混在（重複サンプルを個別確認）"
+    return "判定不能（関数単位の同期履歴なし）"
+
+
 def scan_folder(fragment_root, folder):
     root = os.path.abspath(fragment_root)
     folder = resolve_fragment_folder(root, folder)
     metadata_by_fragment = {}
+    metadata_path_by_fragment = {}
     for directory, _, names in os.walk(folder):
         for filename in names:
             if not filename.endswith(".pokesample.json"):
@@ -269,6 +321,7 @@ def scan_folder(fragment_root, folder):
                 body_path = os.path.abspath(os.path.join(
                     directory, str(metadata.get("fragment", ""))))
                 metadata_by_fragment[body_path] = metadata
+                metadata_path_by_fragment[body_path] = metadata_path
             except (OSError, ValueError, TypeError):
                 continue
     found = {}
@@ -282,6 +335,8 @@ def scan_folder(fragment_root, folder):
             records = _function_records(source)
             metadata = metadata_by_fragment.get(os.path.abspath(path), {})
             origin = metadata.get("source", {}) if isinstance(metadata, dict) else {}
+            function_sync = (metadata.get("function_sync", {})
+                             if isinstance(metadata, dict) else {})
             for name, record in records.items():
                 source_name = name
                 if isinstance(origin, dict) and origin.get("function") and \
@@ -299,6 +354,11 @@ def scan_folder(fragment_root, folder):
                     "source_name": source_name,
                     "source_path": str(origin.get("path", ""))
                     if isinstance(origin, dict) else "",
+                    "metadata_path": metadata_path_by_fragment.get(
+                        os.path.abspath(path), ""),
+                    "function_sync": dict(function_sync.get(name, {}))
+                    if isinstance(function_sync, dict) and
+                    isinstance(function_sync.get(name), dict) else {},
                     "comparison_text": comparison_text,
                     "comparison_normalized": "\n".join(
                         line.rstrip() for line in
@@ -306,6 +366,56 @@ def scan_folder(fragment_root, folder):
                 })
                 found.setdefault(source_name, []).append(item)
     return found
+
+
+def _linked_function_sync_metadata_updates(fragment_path, entries):
+    """Build metadata writes for function baselines linked to one fragment."""
+    updates = {}
+    directory = os.path.dirname(os.path.abspath(fragment_path))
+    for filename in os.listdir(directory):
+        if not filename.endswith(".pokesample.json"):
+            continue
+        metadata_path = os.path.join(directory, filename)
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as stream:
+                metadata = json.load(stream)
+            linked_body = os.path.abspath(os.path.join(
+                directory, str(metadata.get("fragment", ""))))
+        except (OSError, ValueError, TypeError):
+            continue
+        if linked_body != os.path.abspath(fragment_path):
+            continue
+        history = dict(metadata.get("function_sync", {}))
+        for sample_name, source_name, canonical_text in entries:
+            history[str(sample_name)] = function_sync_record(
+                source_name, canonical_text)
+        metadata["function_sync"] = history
+        updates[metadata_path] = (
+            json.dumps(metadata, ensure_ascii=False, indent=2) + "\n").encode(
+                "utf-8")
+    return updates
+
+
+def _apply_atomic_updates(planned_updates, temporary_suffix):
+    originals = {}
+    for path in planned_updates:
+        with open(path, "rb") as stream:
+            originals[path] = stream.read()
+    replaced = []
+    try:
+        for path, content in planned_updates.items():
+            temporary = path + temporary_suffix
+            with open(temporary, "wb") as stream:
+                stream.write(content)
+            os.replace(temporary, path)
+            replaced.append(path)
+    except Exception:
+        for path in replaced:
+            temporary = path + temporary_suffix + ".rollback"
+            with open(temporary, "wb") as stream:
+                stream.write(originals[path])
+            os.replace(temporary, path)
+        raise
 
 
 def source_paths_for_folder(fragment_root, folder):
@@ -347,7 +457,53 @@ def comparison_source_text(selected_path, editor_path="", editor_source="",
         return stream.read(), "disk"
 
 
-def compare_folder(source, fragment_root, folder, source_path=""):
+def save_reflected_source(source_path, source):
+    """Validate and atomically persist a sample-reflected Python source."""
+    requested_path = str(source_path or "").strip()
+    if not requested_path:
+        raise ValueError("反映先ソースの保存先が指定されていません。")
+    path = os.path.abspath(requested_path)
+    source = str(source)
+    ast.parse(source, filename=path)
+    parent = os.path.dirname(path)
+    if not os.path.isdir(parent):
+        raise OSError("反映先ソースのフォルダーがありません: " + parent)
+
+    original = None
+    if os.path.isfile(path):
+        with open(path, "rb") as stream:
+            original = stream.read()
+    temporary = path + ".sample-source-save.tmp"
+    replaced = False
+    try:
+        with open(temporary, "w", encoding="utf-8", newline="") as stream:
+            stream.write(source)
+        os.replace(temporary, path)
+        replaced = True
+        with open(path, "r", encoding="utf-8-sig", newline="") as stream:
+            saved = stream.read()
+        if saved != source:
+            raise OSError("反映先ソースの保存後検証に失敗しました: " + path)
+    except Exception:
+        try:
+            if replaced:
+                if original is None:
+                    os.remove(path)
+                else:
+                    rollback = path + ".sample-source-rollback.tmp"
+                    with open(rollback, "wb") as stream:
+                        stream.write(original)
+                    os.replace(rollback, path)
+            elif os.path.isfile(temporary):
+                os.remove(temporary)
+        except OSError:
+            pass
+        raise
+    return path
+
+
+def compare_folder(source, fragment_root, folder, source_path="",
+                   source_unsaved=False):
     source_functions = _function_records(source, class_only=True)
     fragment_functions = scan_folder(fragment_root, folder)
     result = []
@@ -401,11 +557,26 @@ def compare_folder(source, fragment_root, folder, source_path=""):
                       else "match")
         else:
             status = "different"
+        function_updates = [
+            function_update_status(
+                source_functions[name]["normalized"]
+                if name in source_functions else None,
+                item.get("comparison_normalized", ""),
+                item.get("function_sync", {}).get("base_hash", ""),
+                source_unsaved=source_unsaved)
+            for item in variants]
+        update_statuses = {item["status"] for item in function_updates}
+        function_update = (function_updates[0] if len(update_statuses) == 1
+                           else {"status": "mixed",
+                                 "source_unsaved": bool(source_unsaved)})
         result.append({"name": name,
                        "sample_name": variants[0].get("sample_name", name),
                        "source_path": variants[0].get("source_path", ""),
                        "status": status,
                        "duplicate_kind": duplicate_kind,
+                       "function_update": function_update,
+                       "function_update_label":
+                       format_function_update_status(function_update),
                        "fragments": variants,
                        "source": source_functions.get(name)})
     return result
@@ -472,47 +643,35 @@ def merge_sample_names_with_source_bodies(source, comparisons, names):
                 continue
             sample_names = {
                 item["fragments"][0]["sample_name"] for item in path_items}
-            if str(metadata.get("name", "")) not in sample_names and \
-                    len(sample_names) != 1:
-                continue
-            sample_name = (str(metadata.get("name", ""))
-                           if str(metadata.get("name", "")) in sample_names
-                           else next(iter(sample_names)))
-            origin = dict(metadata.get("source", {}))
-            origin["function"] = sample_name
-            metadata["source"] = origin
+            if str(metadata.get("name", "")) in sample_names or \
+                    len(sample_names) == 1:
+                sample_name = (str(metadata.get("name", ""))
+                               if str(metadata.get("name", "")) in sample_names
+                               else next(iter(sample_names)))
+                origin = dict(metadata.get("source", {}))
+                origin["function"] = sample_name
+                metadata["source"] = origin
+            history = dict(metadata.get("function_sync", {}))
+            for item in path_items:
+                sample_name = item["fragments"][0]["sample_name"]
+                history[sample_name] = function_sync_record(
+                    sample_name, source_functions[sample_name]["text"])
+            metadata["function_sync"] = history
             metadata_text = json.dumps(
                 metadata, ensure_ascii=False, indent=2) + "\n"
             planned_updates[metadata_path] = metadata_text.encode("utf-8")
 
     # Validate everything before touching any target.  If a filesystem error
     # occurs after one replace, restore every target from its in-memory copy.
-    originals = {}
-    for path in planned_updates:
-        with open(path, "rb") as stream:
-            originals[path] = stream.read()
-    replaced = []
-    try:
-        for path, content in planned_updates.items():
-            temporary = path + ".sample-sync.tmp"
-            with open(temporary, "wb") as stream:
-                stream.write(content)
-            os.replace(temporary, path)
-            replaced.append(path)
-    except Exception:
-        for path in replaced:
-            temporary = path + ".sample-sync-rollback.tmp"
-            with open(temporary, "wb") as stream:
-                stream.write(originals[path])
-            os.replace(temporary, path)
-        raise
+    _apply_atomic_updates(planned_updates, ".sample-sync.tmp")
     changed = sorted(
         path for path in planned_updates if path.lower().endswith(".pyfrag"))
     return updated_source, changed, mapping
 
 
 def create_sample_sync_backup(source_path, source_text, comparisons, names,
-                              backup_root, extra_paths=()):
+                              backup_root, extra_paths=(),
+                              source_will_be_saved=False):
     """Persist a restorable snapshot before a batch sample synchronization."""
     selected = set(names)
     paths = {
@@ -558,6 +717,7 @@ def create_sample_sync_backup(source_path, source_text, comparisons, names,
     manifest = {
         "created": stamp,
         "source_path": os.path.abspath(source_path) if source_path else "",
+        "source_was_saved": bool(source_will_be_saved and source_path),
         "source_backup": source_backup,
         "files": entries,
         "names": sorted(selected, key=str.casefold),
@@ -654,6 +814,29 @@ def update_source(source, comparisons, names):
     return updated
 
 
+def mark_comparisons_synchronized(source, comparisons, names):
+    """Record a new common function baseline after source was safely saved."""
+    selected = set(names)
+    source_functions = _function_records(source, class_only=True)
+    by_path = {}
+    for item in comparisons:
+        if item.get("name") not in selected or \
+                item.get("name") not in source_functions or \
+                len(item.get("fragments", [])) != 1:
+            continue
+        fragment = item["fragments"][0]
+        by_path.setdefault(fragment["path"], []).append((
+            fragment.get("sample_name", item["name"]), item["name"],
+            source_functions[item["name"]]["text"]))
+    planned_updates = {}
+    for path, entries in by_path.items():
+        planned_updates.update(
+            _linked_function_sync_metadata_updates(path, entries))
+    if planned_updates:
+        _apply_atomic_updates(planned_updates, ".function-sync.tmp")
+    return sorted(planned_updates, key=str.casefold)
+
+
 def replace_class_functions(source, function_texts):
     """Replace existing command-class methods from ``name -> function text``."""
     records = _function_records(source, class_only=True)
@@ -719,6 +902,7 @@ def update_fragments(source, comparisons, names):
         if item["name"] not in selected or item["status"] == "duplicate" or item["name"] not in source_functions:
             continue
         by_path.setdefault(item["fragments"][0]["path"], []).append(item)
+    planned_updates = {}
     changed = []
     for path, items in by_path.items():
         with open(path, "r", encoding="utf-8") as stream:
@@ -743,9 +927,17 @@ def update_fragments(source, comparisons, names):
             lines[record["start"]:record["end"]] = [replacement]
         updated = normalize_python_indentation("".join(lines))
         ast.parse(updated)
-        temporary = path + ".tmp"
-        with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
-            stream.write(updated)
-        os.replace(temporary, path)
+        planned_updates[path] = updated.encode("utf-8")
+        entries = []
+        for item in items:
+            source_name = item["name"]
+            sample_name = item["fragments"][0].get(
+                "sample_name", source_name)
+            entries.append((sample_name, source_name,
+                            source_functions[source_name]["text"]))
+        planned_updates.update(
+            _linked_function_sync_metadata_updates(path, entries))
         changed.append(path)
+    if planned_updates:
+        _apply_atomic_updates(planned_updates, ".sample-update.tmp")
     return changed

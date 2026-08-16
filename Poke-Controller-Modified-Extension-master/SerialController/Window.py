@@ -57,8 +57,9 @@ from WindowsAudioIdentity import (identity_for_audio_label,
                                   usb_connection_token)
 from ImageAnalysisAssist import ImageAnalysisAssist
 from ImageDetectionMonitor import (crop_search_region, filter_target_names,
-                                   format_show_value_entries,
+                                   format_show_value_blocks,
                                    load_detection_library, match_variant,
+                                   matched_show_value_spans,
                                    padded_search_crop,
                                    prune_show_value_entries,
                                    update_show_value_entries,
@@ -118,13 +119,15 @@ from InputSetRuntimeRegistry import (ActiveInputSetRegistry,
                                      canonical_device_key,
                                      default_window_activity_registry_path,
                                      device_usage_conflicts,
+                                     last_active_pokecon_pid,
                                      main_resource_conflicts,
                                      read_active_input_sets)
 from PokeConRecovery import show_recovery_dialog
 from ResourceControl import (SystemCpuSampler, clamp_cpu_target,
                              resource_throttle_level,
                              set_main_runtime_priority, throttle_multiplier)
-from UiResponsiveness import (foreground_process_id,
+from UiResponsiveness import (dialog_owner_attachment_allowed,
+                              foreground_process_id,
                               foreground_process_matches,
                               confirmation_audio_action,
                               keyboard_listener_should_run,
@@ -315,6 +318,8 @@ class PokeControllerApp:
         self._preview_shutdown_mode = False
         self._last_focus_mark_monotonic = 0.0
         self._keyboard_focus_after_id = None
+        self._last_active_input_owner = False
+        self._live_pokecon_pids = {os.getpid()}
         self._resource_cpu_sampler = SystemCpuSampler()
         self._resource_cpu_percent = None
         self._resource_throttle_level = "normal"
@@ -8710,8 +8715,11 @@ class PokeControllerApp:
             pass
 
     def _mark_window_focused_if_active(self):
+        actual_foreground = foreground_process_matches()
+        if actual_foreground is False:
+            return
         try:
-            if self.root.focus_displayof() is None:
+            if actual_foreground is None and self.root.focus_displayof() is None:
                 return
         except (tk.TclError, KeyError):
             return
@@ -8719,6 +8727,10 @@ class PokeControllerApp:
         if now - self._last_focus_mark_monotonic < 0.15:
             return
         self._last_focus_mark_monotonic = now
+        # Switch local input immediately; the shared marker makes the other
+        # PokeCon release its listener on the next monitor pass.
+        self._last_active_input_owner = True
+        self._sync_manual_input_owner()
         self._refresh_preview_priority_status()
         threading.Thread(
             target=self._publish_window_focus, daemon=True,
@@ -8731,15 +8743,25 @@ class PokeControllerApp:
         except tk.TclError:
             pass
 
+    def _current_process_owns_manual_input(self):
+        foreground_pid = foreground_process_id()
+        if foreground_pid == os.getpid():
+            return True
+        if foreground_pid in self._live_pokecon_pids:
+            return False
+        return bool(self._last_active_input_owner)
+
+    def _sync_manual_input_owner(self):
+        self._sync_keyboard_listener_for_focus()
+        self._sync_pc_gamepad_input_for_owner()
+
     def _sync_keyboard_listener_for_focus(self):
         try:
-            foreground = foreground_process_matches()
-            focused = (self.root.focus_displayof() is not None) \
-                if foreground is None else foreground
+            input_owner = self._current_process_owns_manual_input()
             enabled = self.is_use_keyboard.get()
         except (tk.TclError, KeyError):
-            focused, enabled = False, False
-        should_run = keyboard_listener_should_run(enabled, focused)
+            input_owner, enabled = False, False
+        should_run = keyboard_listener_should_run(enabled, input_owner)
         if should_run and self.keyboard is None:
             self.keyboard = SwitchKeyboardController(self.keyPress)
             self.keyboard.listen()
@@ -8877,6 +8899,13 @@ class PokeControllerApp:
                         entry for entry in live_entries
                         if int(entry.get("pid", 0)) != os.getpid()]
                     foreground_pid = foreground_process_id()
+                    active_input_owner_pid = last_active_pokecon_pid(
+                        live_entries, foreground_pid=foreground_pid)
+                    active_input_owner = bool(
+                        active_input_owner_pid == os.getpid())
+                    live_pokecon_pids = {
+                        int(entry.get("pid", 0)) for entry in live_entries
+                        if int(entry.get("pid", 0)) > 0}
                     other_pokecon_foreground = bool(
                         foreground_pid is not None
                         and foreground_pid != os.getpid()
@@ -8943,6 +8972,12 @@ class PokeControllerApp:
             if other_pokecon_foreground != self._other_pokecon_foreground:
                 self._other_pokecon_foreground = other_pokecon_foreground
                 self._queue_preview_status_refresh()
+            input_owner_changed = (
+                active_input_owner != self._last_active_input_owner)
+            self._last_active_input_owner = active_input_owner
+            self._live_pokecon_pids = live_pokecon_pids
+            if input_owner_changed:
+                self._gui_action_queue.put(self._sync_manual_input_owner)
             if newest_pokecon_instance != self._newest_pokecon_instance \
                     or other_main_preview_owner != self._other_main_preview_owner:
                 self._newest_pokecon_instance = newest_pokecon_instance
@@ -9229,9 +9264,11 @@ class PokeControllerApp:
         names = {"camera": "Camera", "serial": "Serial", "audio": "Audio"}
         device_name = names.get(kind, kind)
         owner = parent or self.root
+        attach_to_owner = dialog_owner_attachment_allowed()
         dialog = tk.Toplevel(owner)
         dialog.title("{}はほかのPokeConで使用中".format(device_name))
-        dialog.transient(owner)
+        if attach_to_owner:
+            dialog.transient(owner)
         dialog.resizable(False, False)
         accepted_state = {"value": False}
         ttk.Label(
@@ -9254,7 +9291,8 @@ class PokeControllerApp:
         dialog.protocol("WM_DELETE_WINDOW", lambda: finish(False))
         dialog.update_idletasks()
         dialog.wait_visibility()
-        dialog.lift()
+        if attach_to_owner:
+            dialog.lift()
         dialog.grab_set()
         dialog.wait_window()
         accepted = accepted_state["value"]
@@ -9501,7 +9539,7 @@ class PokeControllerApp:
 
     def toggle_pc_gamepad_input(self):
         if self.pc_gamepad_input_enabled.get():
-            self.pc_gamepad_input_event.set()
+            forwarding = self._sync_pc_gamepad_input_for_owner()
             running = (self.pro_controller_thread is not None
                        and self.pro_controller_thread.is_alive()
                        and ProController.flag_procon)
@@ -9510,11 +9548,26 @@ class PokeControllerApp:
             elif not running:
                 self.pc_gamepad_input_status.set("ゲームパッド再接続中")
                 self._schedule_pc_gamepad_bridge_restart()
-            else:
+            elif forwarding:
                 self.pc_gamepad_input_status.set("ニュートラル確認中")
         else:
             self.pc_gamepad_input_event.clear()
             self.pc_gamepad_input_status.set("操作停止中（許可OFF）")
+
+    def _sync_pc_gamepad_input_for_owner(self):
+        try:
+            requested = bool(self.pc_gamepad_input_enabled.get())
+            owns_input = self._current_process_owns_manual_input()
+        except (tk.TclError, KeyError):
+            requested, owns_input = False, False
+        if requested and owns_input:
+            self.pc_gamepad_input_event.set()
+        else:
+            self.pc_gamepad_input_event.clear()
+            if requested:
+                self.pc_gamepad_input_status.set(
+                    "別のPokeConが操作対象（この画面を選択すると切替）")
+        return bool(requested and owns_input)
 
     def _schedule_pc_gamepad_bridge_restart(self):
         if self._pc_gamepad_restart_pending:
@@ -9548,7 +9601,11 @@ class PokeControllerApp:
                         and self.pro_controller_thread is not None
                         and self.pro_controller_thread.is_alive()
                         and ProController.flag_procon)
-        if state == "ready" and self.pc_gamepad_input_enabled.get() and bridge_ready:
+        owns_input = self._current_process_owns_manual_input()
+        if self.pc_gamepad_input_enabled.get() and not owns_input:
+            self.pc_gamepad_input_status.set(
+                "別のPokeConが操作対象（この画面を選択すると切替）")
+        elif state == "ready" and self.pc_gamepad_input_enabled.get() and bridge_ready:
             self.pc_gamepad_input_status.set("操作可能（HOME無効）")
         elif (state.startswith("waiting_neutral")
               and self.pc_gamepad_input_enabled.get() and bridge_ready):
@@ -9611,17 +9668,14 @@ class PokeControllerApp:
             self.pc_gamepad_input_status.set("Commands終了後に自動で有効化します")
             return
         self.pc_gamepad_input_enabled.set(requested)
-        if requested:
-            self.pc_gamepad_input_event.set()
-        else:
-            self.pc_gamepad_input_event.clear()
+        self._sync_pc_gamepad_input_for_owner()
+        if not requested:
             self.pc_gamepad_input_status.set("操作停止中")
         if (self.is_use_Pro_Controller.get()
                 and self.pro_controller_thread is not None
                 and self.pro_controller_thread.is_alive()):
             if ProController.flag_procon:
-                self.pc_gamepad_input_event.set() if self.pc_gamepad_input_enabled.get() \
-                    else self.pc_gamepad_input_event.clear()
+                self._sync_pc_gamepad_input_for_owner()
                 return
             self.pc_gamepad_input_status.set("前回の接続終了待ち")
             self._schedule_pc_gamepad_bridge_restart()
@@ -9655,8 +9709,12 @@ class PokeControllerApp:
                 target=self.run_ProController, daemon=True, name="PCGamepadToSwitch")
             self.pro_controller_thread.start()
             self.pc_gamepad_input_status.set(
-                "ニュートラル確認中" if self.pc_gamepad_input_enabled.get()
-                else "操作停止中（許可OFF）")
+                "ニュートラル確認中"
+                if self.pc_gamepad_input_enabled.get()
+                and self._current_process_owns_manual_input()
+                else ("別のPokeConが操作対象（この画面を選択すると切替）"
+                      if self.pc_gamepad_input_enabled.get()
+                      else "操作停止中（許可OFF）"))
             self.start_top_button["state"] = "disabled"
             self.simplecon_top_button["state"] = "disabled"
 
@@ -13728,9 +13786,11 @@ class PokeControllerApp:
         if not names:
             tkmsg.showinfo(title, "全タブ情報を保持している組み合わせセットはありません。")
             return ""
+        attach_to_owner = dialog_owner_attachment_allowed()
         dialog = tk.Toplevel(self.root)
         dialog.title(title)
-        dialog.transient(self.root)
+        if attach_to_owner:
+            dialog.transient(self.root)
         dialog.resizable(True, True)
         dialog.geometry("1040x420")
         ttk.Label(dialog, text="読み込むセットを選択してください。全タブ保存済みか旧形式かを確認できます。").pack(
@@ -13831,7 +13891,8 @@ class PokeControllerApp:
                 if dialog.winfo_exists():
                     refresh_active_display()
                     dialog.grab_set()
-                    dialog.lift()
+                    if dialog_owner_attachment_allowed():
+                        dialog.lift()
 
         if allow_start_maximized:
             ttk.Checkbutton(
@@ -13855,8 +13916,8 @@ class PokeControllerApp:
         dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
         dialog.update_idletasks()
         dialog.wait_visibility()
-        dialog.lift()
-        dialog.focus_force()
+        if attach_to_owner:
+            dialog.lift()
         dialog.grab_set()
         tree.focus_set()
         dialog.wait_window()
@@ -17367,8 +17428,8 @@ class PokeControllerApp:
         except (TypeError, ValueError, tk.TclError):
             return 5.0
 
-    def _output_panel_current_text(self, panel):
-        """Read the assigned output text so stale cleanup never erases newer tools."""
+    def _output_panel_text_widget(self, panel):
+        """Return the Text widget currently assigned to an output name."""
         logical = "Log: " + str(panel).replace("Log: ", "", 1)
         slot = next((name for name, value in self.panel_slots.items()
                      if value.get() == logical), None)
@@ -17376,10 +17437,38 @@ class PokeControllerApp:
             slot = {"Output#1": "right_top", "Output#2": "right_bottom",
                     "Output#3": "left_top", "Output#4": "left_bottom"}.get(
                         str(panel).replace("Log: ", "", 1), "right_bottom")
+        return self.panel_widgets[slot][2]
+
+    def _output_panel_current_text(self, panel):
+        """Read the assigned output text so stale cleanup never erases newer tools."""
         try:
-            return self.panel_widgets[slot][2].get("1.0", "end-1c")
+            return self._output_panel_text_widget(panel).get("1.0", "end-1c")
         except (KeyError, tk.TclError):
             return ""
+
+    def _color_matched_image_detection_values(self, output, blocks):
+        """Highlight matched ShowValue blocks without changing other logs."""
+        text_area = None
+        restore_disabled = False
+        try:
+            text_area = self._output_panel_text_widget(output)
+            restore_disabled = str(text_area.cget("state")) == "disabled"
+            text_area.configure(state="normal")
+            tag = "show_value_matched"
+            text_area.tag_remove(tag, "1.0", "end")
+            text_area.tag_configure(
+                tag, foreground="#087f23", background="#e8f5e9")
+            for start, end in matched_show_value_spans(blocks):
+                text_area.tag_add(
+                    tag, "1.0+{}c".format(start), "1.0+{}c".format(end))
+        except (KeyError, tk.TclError):
+            pass
+        finally:
+            if restore_disabled and text_area is not None:
+                try:
+                    text_area.configure(state="disabled")
+                except tk.TclError:
+                    pass
 
     def _refresh_image_detection_value_output(self, force=False):
         now = time.time()
@@ -17392,9 +17481,10 @@ class PokeControllerApp:
         if not force and not removed:
             return
         output = self.image_detection_monitor_output.get()
-        text = format_show_value_entries(
+        blocks = format_show_value_blocks(
             self._image_detection_value_entries,
             self.image_detection_monitor_output_tag.get().strip() or "ShowValue")
+        text = "\n\n".join(block for block, _matched in blocks)
         previous_output = self._image_detection_value_rendered_output
         previous_text = self._image_detection_value_rendered_text
         if output == "Disabled":
@@ -17410,6 +17500,7 @@ class PokeControllerApp:
             self.show_output(previous_output, text="")
         if text:
             self.show_output(output, text=text)
+            self._color_matched_image_detection_values(output, blocks)
             self._image_detection_value_rendered_output = output
             self._image_detection_value_rendered_text = text
         else:

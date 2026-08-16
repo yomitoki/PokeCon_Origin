@@ -58,8 +58,8 @@ def update_show_value_entries(entries, detail, now=None, limit=24):
     value = dict(detail)
     value["display_timestamp"] = current
     key = show_value_entry_key(value)
-    # Reinsert updated items at the end, so the displayed order follows the
-    # latest actual output rather than alphabetical order.
+    # Reinsert updated items at the end for bounded-cache eviction and as the
+    # stable tie order; rendering separately sorts the current scores.
     entries.pop(key, None)
     entries[key] = value
     while len(entries) > max(1, int(limit)):
@@ -78,8 +78,8 @@ def prune_show_value_entries(entries, timeout_seconds, now=None):
     return stale
 
 
-def format_show_value_entries(entries, tag="ShowValue"):
-    """Render each currently active image detection as a separate block."""
+def format_show_value_blocks(entries, tag="ShowValue"):
+    """Return ``(text, matched)`` blocks ordered by highest score first."""
     blocks = []
     for detail in entries.values():
         try:
@@ -90,16 +90,38 @@ def format_show_value_entries(entries, tag="ShowValue"):
         position = detail.get("position") or ("-", "-")
         variant = detail.get("variant")
         variant_text = " / パターン{}".format(variant) if variant else ""
-        blocks.append(("[{}] {}{}\n"
-                       "一致度: {:.6f} / 閾値: {:.6f} / {}\n"
-                       "検出位置: {},{} / 取得元: {}").format(
-                           str(tag or "ShowValue"),
-                           detail.get("name", "image detection"), variant_text,
-                           score, threshold,
-                           "一致" if detail.get("matched") else "不一致",
-                           position[0], position[1],
-                           detail.get("source", "Commands")))
-    return "\n\n".join(blocks)
+        matched = bool(detail.get("matched"))
+        text = ("[{}] {}{}\n"
+                "一致度: {:.6f} / 閾値: {:.6f} / {}\n"
+                "検出位置: {},{} / 取得元: {}").format(
+                    str(tag or "ShowValue"),
+                    detail.get("name", "image detection"), variant_text,
+                    score, threshold, "一致" if matched else "不一致",
+                    position[0], position[1],
+                    detail.get("source", "Commands"))
+        blocks.append((score, text, matched))
+    # Python's sort is stable, so equal scores retain their existing cache
+    # order while the strongest current candidates stay at the top.
+    blocks.sort(key=lambda item: item[0], reverse=True)
+    return [(text, matched) for _score, text, matched in blocks]
+
+
+def matched_show_value_spans(blocks, separator="\n\n"):
+    """Return character spans for matched blocks in the joined output."""
+    spans = []
+    offset = 0
+    for text, matched in blocks:
+        end = offset + len(text)
+        if matched:
+            spans.append((offset, end))
+        offset = end + len(separator)
+    return spans
+
+
+def format_show_value_entries(entries, tag="ShowValue"):
+    """Render active detections by descending current similarity score."""
+    blocks = format_show_value_blocks(entries, tag)
+    return "\n\n".join(text for text, _matched in blocks)
 
 
 def resolve_template_path(serial_root, template_path):
