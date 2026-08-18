@@ -90,13 +90,51 @@ def load_command_timeline(folder):
 
 def event_search_text(event):
     location = event.get("location", {}) if isinstance(event, dict) else {}
+    stack = location.get("stack", []) if isinstance(location, dict) else []
+    stack_text = " ".join(
+        "{} {} {} {}".format(
+            frame.get("function", ""), frame.get("file", ""),
+            frame.get("line", ""), frame.get("source", ""))
+        for frame in stack if isinstance(frame, dict))
     return " ".join((
         str(event.get("index", "")), str(event.get("event", "")),
         str(event.get("step_text", "")), str(event.get("stop_variable", "")),
         str(event.get("stop_state", "")), str(event.get("controller_input", "")),
         str(location.get("function", "")), str(location.get("file", "")),
-        str(location.get("line", "")), str(location.get("source", "")),
+        str(location.get("line", "")), str(location.get("source", "")), stack_text,
     )).lower()
+
+
+def observed_source_lines(events, source_file):
+    """Return every source line observed for one file in a trace timeline."""
+    source_file = str(source_file or "").strip()
+    if not source_file:
+        return set()
+    wanted = os.path.normcase(os.path.abspath(source_file))
+    lines = set()
+    for event in events or ():
+        location = event.get("location", {}) if isinstance(event, dict) else {}
+        if not isinstance(location, dict):
+            continue
+        locations = [location]
+        locations.extend(
+            frame for frame in location.get("stack", [])
+            if isinstance(frame, dict))
+        for frame in locations:
+            path = str(frame.get("file", "") or "")
+            try:
+                matches = os.path.normcase(os.path.abspath(path)) == wanted
+            except (OSError, ValueError):
+                matches = False
+            if not matches:
+                continue
+            try:
+                line = int(frame.get("line", 0) or 0)
+            except (TypeError, ValueError):
+                line = 0
+            if line > 0:
+                lines.add(line)
+    return lines
 
 
 def filtered_timeline(events, query="", stops_only=False):

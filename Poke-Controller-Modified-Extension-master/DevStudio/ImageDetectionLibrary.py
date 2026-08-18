@@ -57,6 +57,30 @@ def save_library(path, data):
     os.replace(temporary, path)
 
 
+def rename_target(data, old_name, new_name):
+    """Rename a registered target and every list member that refers to it."""
+    old_name = str(old_name or "").strip()
+    new_name = str(new_name or "").strip()
+    if not old_name or old_name not in data.get("targets", {}):
+        raise ValueError("変更元の画像検知がありません: " + old_name)
+    if not new_name:
+        raise ValueError("変更後の画像検知名を入力してください。")
+    if new_name != old_name and new_name in data.get("targets", {}):
+        raise ValueError("変更後の画像検知名は既に登録されています: " + new_name)
+    if new_name == old_name:
+        return data
+    targets = data["targets"]
+    renamed = {}
+    for name, item in targets.items():
+        renamed[new_name if name == old_name else name] = item
+    data["targets"] = renamed
+    for item in data.get("lists", {}).values():
+        for member in item.get("members", []):
+            if member.get("type") == "target" and member.get("id") == old_name:
+                member["id"] = new_name
+    return data
+
+
 def folder_tags(template_root, image_path):
     try:
         relative = os.path.relpath(os.path.dirname(os.path.abspath(image_path)), os.path.abspath(template_root))

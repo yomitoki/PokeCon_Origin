@@ -228,6 +228,29 @@ def runtime_execution_location(command, project_root=None):
     return result
 
 
+def runtime_execution_snapshot(command, project_root=None):
+    """Capture one lightweight, read-only view of a running Commands worker.
+
+    This deliberately samples the worker only when called.  It does not
+    install ``sys.settrace`` or a line hook, so controller timing is unchanged
+    while the execution-path tab is not being used.
+    """
+    states = runtime_state_snapshot(command)
+    worker = getattr(command, "thread", None) if command is not None else None
+    try:
+        running = bool(worker is not None and worker.is_alive())
+    except (AttributeError, RuntimeError):
+        running = False
+    return {
+        "command": str(getattr(command, "NAME", "")) if command is not None else "",
+        "running": running,
+        "states": states,
+        "step_path": state_path_text(states),
+        "location": runtime_execution_location(command, project_root)
+        if running else {},
+    }
+
+
 def execution_location_key(location):
     if not isinstance(location, dict):
         return ()

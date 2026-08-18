@@ -100,7 +100,8 @@ def detect_image(
         crop=None,
         match_color="blue",
         no_match_color="red",
-        history=None):
+        history=None,
+        exclude_regions=None):
     """Return match details while remaining independent of PokeCon base APIs."""
     frame = _command_frame(command)
     resolved_template_path = str(template_path)
@@ -116,6 +117,27 @@ def detect_image(
     if source_match.shape[0] < template_match.shape[0] or source_match.shape[1] < template_match.shape[1]:
         raise ValueError("検知範囲がテンプレート画像より小さいです: " + str(name))
     result = cv2.matchTemplate(source_match, template_match, cv2.TM_CCOEFF_NORMED)
+    normalized_exclusions = []
+    if exclude_regions:
+        result = result.copy()
+        result_height, result_width = result.shape[:2]
+        template_height, template_width = template_match.shape[:2]
+        for exclusion in exclude_regions:
+            if not exclusion or len(exclusion) != 4:
+                continue
+            x1, y1, x2, y2 = [int(value) for value in exclusion]
+            if x2 <= x1 or y2 <= y1:
+                continue
+            normalized_exclusions.append((x1, y1, x2, y2))
+            # A match location represents the template's upper-left corner.
+            # Suppress every location whose template rectangle overlaps an
+            # excluded screen region, including matches crossing its border.
+            left = max(0, x1 - offset[0] - template_width + 1)
+            right = min(result_width, x2 - offset[0])
+            top = max(0, y1 - offset[1] - template_height + 1)
+            bottom = min(result_height, y2 - offset[1])
+            if left < right and top < bottom:
+                result[top:bottom, left:right] = -2.0
     _, score, _, location = cv2.minMaxLoc(result)
     matched = float(score) >= float(threshold)
     absolute_location = (location[0] + offset[0], location[1] + offset[1])
@@ -152,6 +174,7 @@ def detect_image(
         "threshold": float(threshold),
         "position": absolute_location,
         "template_size": (int(template.shape[1]), int(template.shape[0])),
+        "excluded_regions": normalized_exclusions,
         "show_value": bool(show_value),
         "timestamp": time.time(),
     }

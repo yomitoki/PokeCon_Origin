@@ -114,6 +114,231 @@ def _exception_names(tree):
     return result
 
 
+def _exception_rule_names(test, target_parameter):
+    if not isinstance(test, ast.Compare) or len(test.ops) != 1 \
+            or len(test.comparators) != 1:
+        return []
+    left, operator, right = test.left, test.ops[0], test.comparators[0]
+    if isinstance(left, ast.Name) and left.id == target_parameter:
+        if isinstance(operator, ast.Eq):
+            value = _literal_string(right)
+            return [value] if value is not None else []
+        if isinstance(operator, ast.In):
+            return [value for value in (
+                _literal_string(item)
+                for item in getattr(right, "elts", ())) if value is not None]
+    if isinstance(right, ast.Name) and right.id == target_parameter \
+            and isinstance(operator, ast.Eq):
+        value = _literal_string(left)
+        return [value] if value is not None else []
+    return []
+
+
+def _exception_function(tree):
+    return next((node for node in ast.walk(tree)
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                 and node.name == "image_check_exception"), None)
+
+
+def image_check_exception_rules(source):
+    """Return directly editable literal exception branches in source order."""
+    tree = ast.parse(source)
+    function = _exception_function(tree)
+    if function is None:
+        return []
+    parameters = [argument.arg for argument in function.args.args
+                  if argument.arg != "self"]
+    target = "targetimage" if "targetimage" in parameters \
+        else (parameters[0] if parameters else "")
+    rules = []
+    for branch in function.body:
+        if not isinstance(branch, ast.If) or len(branch.body) != 1 \
+                or not isinstance(branch.body[0], ast.Return) \
+                or branch.body[0].value is None:
+            continue
+        names = _exception_rule_names(branch.test, target)
+        if not names:
+            continue
+        expression = _source_expression(source, branch.body[0].value)
+        for name in names:
+            rules.append({
+                "name": name,
+                "expression": expression,
+                "line": int(getattr(branch, "lineno", 1)),
+                "names": list(names),
+                "node": branch,
+            })
+    return rules
+
+
+def _exception_branch_text(indent, names, expression, newline="\n"):
+    lines = []
+    for name in names:
+        lines.append("{}if targetimage == {!r}:{}".format(
+            indent, str(name), newline))
+        lines.append("{}    return {}{}".format(indent, expression, newline))
+    return "".join(lines)
+
+
+def _replace_source_lines(source, start_line, end_line, replacement):
+    lines = source.splitlines(True)
+    lines[start_line - 1:end_line] = [replacement]
+    return "".join(lines)
+
+
+def upsert_image_check_exception(source, new_name, expression,
+                                 old_name=None):
+    """Add or change one simple image_check_exception return branch."""
+    new_name = str(new_name or "").strip()
+    expression = str(expression or "").strip()
+    old_name = str(old_name or "").strip() or None
+    if not new_name or "\n" in new_name or "\r" in new_name:
+        raise ValueError("例外の画像検知名を1行で入力してください。")
+    if not expression:
+        raise ValueError("例外判定の戻り値式を入力してください。")
+    ast.parse(expression, mode="eval")
+    rules = image_check_exception_rules(source)
+    existing = {rule["name"] for rule in rules}
+    if new_name in existing and new_name != old_name:
+        raise ValueError("同じ例外判定名が既にあります: " + new_name)
+    newline = "\r\n" if "\r\n" in source else "\n"
+    if old_name:
+        rule = next((item for item in rules if item["name"] == old_name), None)
+        if rule is None:
+            raise ValueError("変更元の例外判定がありません: " + old_name)
+        node = rule["node"]
+        source_line = source.splitlines()[node.lineno - 1]
+        indent = source_line[:len(source_line) - len(source_line.lstrip())]
+        names = [name for name in rule["names"] if name != old_name]
+        names.append(new_name)
+        replacement = _exception_branch_text(indent, names, expression, newline)
+        # Keep the original expression for aliases that shared the old branch.
+        if len(rule["names"]) > 1:
+            replacement = _exception_branch_text(
+                indent, [name for name in rule["names"] if name != old_name],
+                rule["expression"], newline)
+            replacement += _exception_branch_text(
+                indent, [new_name], expression, newline)
+        updated = _replace_source_lines(
+            source, node.lineno, getattr(node, "end_lineno", node.lineno),
+            replacement)
+    else:
+        tree = ast.parse(source)
+        function = _exception_function(tree)
+        if function is None:
+            raise ValueError("image_check_exception()がソースにありません。")
+        function_lines = source.splitlines(True)
+        body_indent = " " * (int(function.col_offset) + 4)
+        marker_line = next((index for index in range(
+            function.lineno, getattr(function, "end_lineno", function.lineno))
+            if "POKECON_IMAGE_CHECK_EXCEPTION_USER_BEGIN" in
+            function_lines[index]), None)
+        if marker_line is None:
+            final_return = next((item for item in reversed(function.body)
+                                 if isinstance(item, ast.Return)), None)
+            insert_line = (final_return.lineno - 1) if final_return else \
+                getattr(function, "end_lineno", function.lineno) - 1
+        else:
+            insert_line = marker_line
+        function_lines[insert_line:insert_line] = [
+            _exception_branch_text(body_indent, [new_name], expression, newline)]
+        updated = "".join(function_lines)
+    compile(updated, "<image_check_exception>", "exec")
+    return updated
+
+
+def delete_image_check_exception(source, name):
+    """Delete one editable exception branch while keeping shared aliases."""
+    name = str(name or "").strip()
+    rules = image_check_exception_rules(source)
+    rule = next((item for item in rules if item["name"] == name), None)
+    if rule is None:
+        raise ValueError("削除する例外判定がありません: " + name)
+    node = rule["node"]
+    source_line = source.splitlines()[node.lineno - 1]
+    indent = source_line[:len(source_line) - len(source_line.lstrip())]
+    newline = "\r\n" if "\r\n" in source else "\n"
+    remaining = [item for item in rule["names"] if item != name]
+    replacement = _exception_branch_text(
+        indent, remaining, rule["expression"], newline) if remaining else ""
+    updated = _replace_source_lines(
+        source, node.lineno, getattr(node, "end_lineno", node.lineno),
+        replacement)
+    compile(updated, "<image_check_exception>", "exec")
+    return updated
+
+
+def _all_literal_nodes(node, value):
+    return [child for child in ast.walk(node)
+            if _literal_string(child) == value]
+
+
+def _replace_literal_nodes(source, nodes, replacement):
+    lines = source.splitlines(True)
+    starts, offset = [], 0
+    for line in lines:
+        starts.append(offset)
+        offset += len(line)
+
+    def character_column(line, byte_column):
+        raw = line.encode("utf-8")
+        return len(raw[:byte_column].decode("utf-8"))
+
+    spans = set()
+    for node in nodes:
+        if not hasattr(node, "end_lineno") or node.end_lineno is None:
+            raise ValueError("このPythonでは安全な名称変更位置を取得できません。")
+        start_line, end_line = node.lineno - 1, node.end_lineno - 1
+        start = starts[start_line] + character_column(
+            lines[start_line], node.col_offset)
+        end = starts[end_line] + character_column(
+            lines[end_line], node.end_col_offset)
+        spans.add((start, end))
+    updated = source
+    for start, end in sorted(spans, reverse=True):
+        updated = updated[:start] + repr(str(replacement)) + updated[end:]
+    return updated
+
+
+def rename_image_check_references(source, old_name, new_name,
+                                  include_definitions=False):
+    """Rename literal image_check callers and optional generated definitions."""
+    old_name = str(old_name or "").strip()
+    new_name = str(new_name or "").strip()
+    if not old_name or not new_name:
+        raise ValueError("変更前と変更後の画像検知名を入力してください。")
+    if old_name == new_name:
+        return source, 0
+    tree = ast.parse(source)
+    nodes = []
+    for call in (node for node in ast.walk(tree) if _is_image_check_call(node)):
+        if call.args and _literal_string(call.args[0]) == old_name:
+            nodes.append(call.args[0])
+    if include_definitions:
+        containers = {
+            "IMAGE_DETECTION_TARGETS", "IMAGE_DETECTION_OPERATORS",
+            "IMAGE_DETECTION_DESCRIPTIONS", "IMAGE_DETECTION_SETS",
+            "IMAGE_DETECTION_LISTS",
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                if any(_container_name(target) in containers for target in targets):
+                    nodes.extend(_all_literal_nodes(node.value, old_name))
+            elif isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                    and node.func.attr in ("update", "setdefault"):
+                container = _container_name(node.func.value)
+                nested = isinstance(node.func.value, ast.Call) and \
+                    isinstance(node.func.value.func, ast.Attribute) and \
+                    _container_name(node.func.value.func.value) in containers
+                if container in containers or nested:
+                    for argument in node.args:
+                        nodes.extend(_all_literal_nodes(argument, old_name))
+    updated = _replace_literal_nodes(source, nodes, new_name) if nodes else source
+    compile(updated, "<image_check_rename>", "exec")
+    return updated, len({(node.lineno, node.col_offset) for node in nodes})
+
+
 def _registered_names(tree):
     targets, sets = set(), set()
     container_sets = {

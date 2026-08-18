@@ -1,6 +1,7 @@
 import datetime
 import ast
 import inspect
+import math
 import os
 import queue
 import sys
@@ -8,6 +9,7 @@ import json
 import tempfile
 import threading
 import time
+import tokenize
 import types
 import unittest
 import struct
@@ -125,17 +127,23 @@ from ImageDetectionMonitor import (filter_target_names,
                                    update_show_value_entries)
 from ImageHealthCheck import audit_image_library, suggested_crop
 from ImageCheckReferenceAudit import (audit_image_check_references,
+                                      delete_image_check_exception,
+                                      image_check_exception_rules,
                                       merge_library_targets_into_source,
-                                      preserve_library_import_block)
+                                      preserve_library_import_block,
+                                      rename_image_check_references,
+                                      upsert_image_check_exception)
 from ImageDetectionLibrary import (filter_image_library_variants,
                                    generate_image_check,
-                                   image_preview_size)
+                                   image_preview_size,
+                                   rename_target as rename_image_library_target)
 from CompletionEngine import CompletionEngine
 from Camera import (Camera, camera_fourcc_name,
                     camera_frame_freshness_timeout, camera_reader_backoff)
 from Commands.PythonCommandBase import (ImageProcPythonCommand,
                                         PythonCommand)
-from LocalFunction.ImageDetection import _command_frame
+from LocalFunction.ImageDetection import (SimilarityHistory, _command_frame,
+                                           detect_image)
 from AudioMonitor import (AudioMonitor, StreamingAudioRateConverter,
                           fit_audio_block, plan_audio_buffer_consume)
 from AudioLevelControl import (AdaptivePeakNormalizer,
@@ -177,6 +185,7 @@ from CommandMonitorRecording import (CommandInputActivityTracker,
                                      command_source_descriptor,
                                      failure_evidence_end,
                                      runtime_execution_location,
+                                     runtime_execution_snapshot,
                                      historical_retention_ids,
                                      relevant_state_path,
                                      runtime_state_snapshot,
@@ -212,6 +221,7 @@ from OperationDebugCommand import (create_debug_command_package,
                                    intermediate_revisions,
                                    save_intermediate_revision)
 from CommandRecordingModel import (filtered_timeline, load_command_timeline,
+                                   observed_source_lines,
                                    source_function_block, timeline_page)
 from Commands.CommandBase import Command
 from Commands.Keys import Button, Direction, Hat, KeyPress, Stick
@@ -1581,7 +1591,14 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             "ZA_markerdir", "ZA_markerdir.pyfrag")
         with open(fragment_path, "r", encoding="utf-8") as stream:
             fragment = stream.read()
-        namespace = {"Direction": Direction, "Stick": Stick}
+
+        namespace = {
+            "cv2": cv2,
+            "Direction": Direction,
+            "os": os,
+            "Stick": Stick,
+            "time": time,
+        }
         exec(compile(fragment, fragment_path, "exec"), namespace)
         markerdir = namespace["ZA_markerdir"]
         fragment_function = ast.parse(fragment).body[0]
@@ -1592,16 +1609,77 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(
             ast.dump(runtime_function, include_attributes=False),
             ast.dump(fragment_function, include_attributes=False))
+        self.assertNotIn(
+            "detect_image",
+            {node.id for node in ast.walk(fragment_function)
+             if isinstance(node, ast.Name)})
+
+        marker_temp = tempfile.TemporaryDirectory()
+        self.addCleanup(marker_temp.cleanup)
+        marker_path = os.path.join(marker_temp.name, "marker.png")
+        marker_image = numpy.random.default_rng(12345).integers(
+            0, 256, (10, 10, 3), dtype=numpy.uint8)
+        self.assertTrue(cv2.imwrite(marker_path, marker_image))
+
+        type_prefixes = {
+            "EVENT": "POKEMON_ZA_EVENT_MARKER",
+            "PIN": "POKEMON_ZA_PIN_MARKER",
+            "SIDE_MARKER": "POKEMON_ZA_SIDE_MARKER",
+        }
+        marker_targets = {}
+        for prefix in type_prefixes.values():
+            for suffix, crop in regions.items():
+                crops = [crop]
+                if suffix == "LEFT_WIDE":
+                    crops.append(left_wide_upper)
+                marker_targets[prefix + "_" + suffix] = [
+                    {
+                        "crop": list(variant_crop),
+                        "template_path": marker_path,
+                        "threshold": 0.8,
+                        "use_gray": False,
+                        "show_position": True,
+                    }
+                    for variant_crop in crops
+                ]
 
         class MarkerCommand:
-            def __init__(self, matched):
-                self.matched = set(matched)
+            class Camera:
+                def __init__(self, command):
+                    self.command = command
+
+                def readFreshFrame(self, timeout=0.75):
+                    self.command.fresh_frame_timeouts.append(timeout)
+                    frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+                    position = self.command.position
+                    if position is not None:
+                        x, y = position
+                        frame[y:y + 10, x:x + 10] = marker_image
+                    return frame
+
+            def __init__(self, position=None):
+                self.position = position
+                self.template_size = (10, 10)
+                self.IMAGE_DETECTION_TARGETS = marker_targets
                 self.pressed = []
                 self.press_durations = []
                 self.wait_durations = []
+                self.fresh_frame_timeouts = []
+                self.rectangles = []
+                self.events = []
+                self.camera = self.Camera(self)
 
             def image_check(self, name):
-                return name in self.matched
+                return False
+
+            def get_filespec(self, path, mode="t"):
+                return path
+
+            def displayRectangle(self, *args, **kwargs):
+                self.rectangles.append((args, kwargs))
+
+            def image_detection_event(self, detail):
+                self.events.append(detail)
 
             def press(self, direction, duration=0.0, wait=0.0):
                 self.pressed.append(direction)
@@ -1611,37 +1689,38 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 self.wait_durations.append(duration)
 
         movement_cases = (
-            ("CENTER_WIDE_DOWNER", 270, 0.0),
-            ("CENTER_WIDE_UPPER", 90, 0.0),
-            ("CENTER_WIDE_DOWNER_LEFT", 180, 0.03),
-            ("CENTER_WIDE_DOWNER_RIGHT", 0, 0.03),
-            ("CENTER_WIDE_UPPER_LEFT", 180, 0.03),
-            ("CENTER_WIDE_UPPER_RIGHT", 0, 0.03),
-            ("CENTER_LEFT_SIDE", 180, 0.03),
-            ("CENTER_RIGHT_SIDE", 0, 0.03),
+            ((620, 600), 270, 1.0, 0.0),
+            ((620, 40), 90, 1.0, 0.0),
+            ((300, 600), 180, 1.0, 0.03),
+            ((900, 600), 0, 1.0, 0.03),
+            ((300, 40), 180, 1.0, 0.03),
+            ((900, 40), 0, 1.0, 0.03),
+            ((20, 300), 180, 1.0, 0.03),
+            ((1230, 300), 0, 1.0, 0.03),
         )
-        type_prefixes = {
-            "EVENT": "POKEMON_ZA_EVENT_MARKER",
-            "PIN": "POKEMON_ZA_PIN_MARKER",
-            "SIDE_MARKER": "POKEMON_ZA_SIDE_MARKER",
-        }
-        for marker_type, prefix in type_prefixes.items():
-            for suffix, angle, duration in movement_cases:
-                command = MarkerCommand({prefix + "_" + suffix})
+        for marker_type in type_prefixes:
+            for position, angle, magnitude, duration in movement_cases:
+                command = MarkerCommand(position)
                 self.assertFalse(markerdir(command, marker_type, nofiled=True))
                 self.assertEqual(command.pressed[-1].angle_for_show, angle)
+                self.assertEqual(command.pressed[-1].mag, magnitude)
                 self.assertAlmostEqual(command.press_durations[-1], duration)
                 self.assertEqual(command.wait_durations[-1], 0.1)
+                self.assertEqual(
+                    command.last_image_detection["excluded_regions"],
+                    [(0, 0, 210, 210)])
+                self.assertEqual(command.fresh_frame_timeouts[-1], 0.75)
+                self.assertEqual(command.events[-1],
+                                 command.last_image_detection)
 
-        for marker_type, prefix in type_prefixes.items():
-            right_side = prefix + "_CENTER_RIGHT_SIDE"
-            command = MarkerCommand({right_side})
+        for marker_type in type_prefixes:
+            command = MarkerCommand((1230, 300))
             self.assertFalse(markerdir(command, marker_type, nofiled=True))
             self.assertEqual(command.pressed[-1].angle_for_show, 0)
             self.assertEqual(command.pressed[-1].mag, 1.0)
             self.assertEqual(command.press_durations[-1], 0.03)
 
-            command.matched.clear()
+            command.position = None
             press_count = len(command.pressed)
             self.assertFalse(markerdir(command, marker_type, nofiled=True))
             self.assertEqual(len(command.pressed), press_count + 1)
@@ -1649,86 +1728,402 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             self.assertEqual(command.pressed[-1].mag, 1.0)
             self.assertEqual(command.press_durations[-1], 0.03)
 
-            upper_left_near = prefix + "_CENTER_WIDE_UPPER_LEFT_NEAR"
-            command.matched.add(upper_left_near)
+            command.position = (500, 40)
             self.assertFalse(markerdir(command, marker_type, nofiled=True))
             self.assertEqual(command.pressed[-1].angle_for_show, 180)
             self.assertEqual(command.pressed[-1].mag, 0.2)
             self.assertEqual(command.press_durations[-1], 0.0)
 
-            command.matched.clear()
+            command.position = None
             self.assertFalse(markerdir(command, marker_type, nofiled=True))
             self.assertEqual(command.pressed[-1].angle_for_show, 180)
             self.assertEqual(command.pressed[-1].mag, 0.2)
             self.assertEqual(command.press_durations[-1], 0.0)
 
-            command.matched.add(prefix + "_CENTER")
+            command.position = (645, 300)
             self.assertTrue(markerdir(command, marker_type, nofiled=True))
-            command.matched.clear()
+            command.position = None
             self.assertFalse(markerdir(command, marker_type, nofiled=True))
             self.assertEqual(command.pressed[-1].angle_for_show, 180)
             self.assertEqual(command.pressed[-1].mag, 1.0)
             self.assertEqual(command.press_durations[-1], 0.0)
 
         near_movement_cases = (
-            ("CENTER_WIDE_DOWNER_LEFT_NEAR", 180),
-            ("CENTER_WIDE_DOWNER_RIGHT_NEAR", 0),
-            ("CENTER_WIDE_UPPER_LEFT_NEAR", 180),
-            ("CENTER_WIDE_UPPER_RIGHT_NEAR", 0),
+            ((500, 600), 180),
+            ((750, 600), 0),
+            ((500, 40), 180),
+            ((750, 40), 0),
         )
-        for marker_type, prefix in type_prefixes.items():
-            for suffix, angle in near_movement_cases:
-                command = MarkerCommand({prefix + "_" + suffix})
+        for marker_type in type_prefixes:
+            for position, angle in near_movement_cases:
+                command = MarkerCommand(position)
                 self.assertFalse(markerdir(command, marker_type, nofiled=True))
                 self.assertEqual(command.pressed[-1].angle_for_show, angle)
                 self.assertEqual(command.pressed[-1].mag, 0.2)
                 self.assertEqual(command.press_durations[-1], 0.0)
 
-        for marker_type, prefix in type_prefixes.items():
-            for center_suffix, near_suffix, side_suffix, angle in (
-                    ("CENTER_WIDE_UPPER", "CENTER_WIDE_UPPER_LEFT_NEAR",
-                     "CENTER_WIDE_UPPER_LEFT", 90),
-                    ("CENTER_WIDE_UPPER", "CENTER_WIDE_UPPER_RIGHT_NEAR",
-                     "CENTER_WIDE_UPPER_RIGHT", 90),
-                    ("CENTER_WIDE_DOWNER", "CENTER_WIDE_DOWNER_LEFT_NEAR",
-                     "CENTER_WIDE_DOWNER_LEFT", 270),
-                    ("CENTER_WIDE_DOWNER", "CENTER_WIDE_DOWNER_RIGHT_NEAR",
-                     "CENTER_WIDE_DOWNER_RIGHT", 270)):
-                command = MarkerCommand({prefix + "_" + center_suffix,
-                                         prefix + "_" + near_suffix,
-                                         prefix + "_" + side_suffix})
-                self.assertFalse(
-                    markerdir(command, marker_type, nofiled=True))
-                self.assertEqual(command.pressed[-1].angle_for_show, angle)
-
-        for marker_type, prefix in type_prefixes.items():
-            for corner_suffix, edge_suffix, angle in (
-                    ("CENTER_WIDE_UPPER_LEFT", "CENTER_LEFT_SIDE", 180),
-                    ("CENTER_WIDE_DOWNER_LEFT", "CENTER_LEFT_SIDE", 180),
-                    ("CENTER_WIDE_UPPER_RIGHT", "CENTER_RIGHT_SIDE", 0),
-                    ("CENTER_WIDE_DOWNER_RIGHT", "CENTER_RIGHT_SIDE", 0)):
-                command = MarkerCommand({prefix + "_" + corner_suffix,
-                                         prefix + "_" + edge_suffix})
-                self.assertFalse(
-                    markerdir(command, marker_type, nofiled=True))
-                self.assertEqual(command.pressed[-1].angle_for_show, angle)
-
-        for suffix, angle in (("LEFT_WIDE", 180), ("RIGHT_WIDE", 0)):
-            prefix = type_prefixes["EVENT"]
-            command = MarkerCommand({prefix + "_" + suffix,
-                                     prefix + "_CENTER_WIDE"})
+        for position, angle, magnitude, duration in (
+                ((610, 300), 180, 0.2, 0.0),
+                ((690, 300), 0, 0.2, 0.0),
+                ((300, 300), 180, 1.0, 0.03),
+                ((900, 300), 0, 1.0, 0.03)):
+            command = MarkerCommand(position)
             self.assertFalse(markerdir(command, "EVENT", nofiled=True))
             self.assertEqual(command.pressed[-1].angle_for_show, angle)
-            self.assertEqual(command.pressed[-1].mag, 0.2)
-            self.assertEqual(command.press_durations[-1], 0.0)
+            self.assertEqual(command.pressed[-1].mag, magnitude)
+            self.assertAlmostEqual(command.press_durations[-1], duration)
 
-            command = MarkerCommand({prefix + "_" + suffix})
-            self.assertFalse(markerdir(command, "EVENT", nofiled=True))
-            self.assertEqual(command.pressed[-1].angle_for_show, angle)
-            self.assertEqual(command.pressed[-1].mag, 1.0)
-            self.assertAlmostEqual(command.press_durations[-1], 0.03)
+        map_command = MarkerCommand((205, 205))
+        self.assertFalse(markerdir(map_command, "EVENT", nofiled=True))
+        self.assertFalse(map_command.last_image_detection["matched"])
+        self.assertEqual(map_command.pressed[-1].angle_for_show, 180)
 
-    def test_za_mega_battle_lockon_rclick_defaults_on_and_forces_dir1(self):
+    def test_za_battle_missing_field_recovers_after_ten_consecutive_checks(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_BattleAndRoyale", "ZA_BattleAndRoyale.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            runtime_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        runtime_function = next(
+            node for node in ast.walk(runtime_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_battle_coCp_noloop")
+        runtime_recovery = next(
+            node for node in ast.walk(runtime_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_battle_missing_field_recovery")
+        fragment_function = next(
+            node for node in fragment_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_battle_coCp_noloop")
+        fragment_recovery = next(
+            node for node in fragment_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_battle_missing_field_recovery")
+        self.assertEqual(
+            ast.dump(runtime_function, include_attributes=False),
+            ast.dump(fragment_function, include_attributes=False))
+        self.assertEqual(
+            ast.dump(runtime_recovery, include_attributes=False),
+            ast.dump(fragment_recovery, include_attributes=False))
+
+        function_module = ast.Module(
+            body=[fragment_recovery, fragment_function], type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {"Button": Button}
+        exec(compile(function_module, fragment_path, "exec"), namespace)
+        battle_once = namespace["ZA_battle_coCp_noloop"]
+        recover = namespace["ZA_battle_missing_field_recovery"]
+
+        class RecoveryCommand:
+            def __init__(self, field_after_b=3, x_menu_open=False,
+                         menu_after_x=False):
+                self.stuck = True
+                self.field_after_b = field_after_b
+                self.x_menu_open = x_menu_open
+                self.menu_after_x = menu_after_x
+                self.b_count = 0
+                self.press_events = []
+                self.alive_checks = 0
+
+            def image_check(self, name):
+                return (
+                    name == "POKEMON_ZA_X_MENU_OPEN"
+                    and self.x_menu_open)
+
+            def etc_sendCommand(self, _command):
+                pass
+
+            def ZA_story_Template_Field_HardGaurd(self, mode=0):
+                if mode == 1:
+                    return self.stuck
+                return not self.stuck
+
+            def ZA_battle_missing_field_recovery(self, *args, **kwargs):
+                return recover(self, *args, **kwargs)
+
+            def checkIfAlive(self):
+                self.alive_checks += 1
+
+            def pressRep(self, button, repeat=1, **_kwargs):
+                self.press_events.append((button, repeat))
+                if button == Button.X and self.menu_after_x:
+                    self.x_menu_open = True
+                    # 背後のFIELDが見えていても、Xメニューを先に閉じる。
+                    self.stuck = False
+                if button == Button.B:
+                    self.x_menu_open = False
+                    self.b_count += repeat
+                    if self.b_count >= self.field_after_b:
+                        self.stuck = False
+
+            def ZA_ZL_ACTION(self, _action=""):
+                pass
+
+            def wait(self, _duration):
+                pass
+
+        menu_command = RecoveryCommand(x_menu_open=True)
+        menu_command.stuck = False
+        self.assertTrue(recover(
+            menu_command, "menu", enabled=False, attack_ready=True))
+        self.assertEqual(menu_command.press_events, [(Button.B, 1)])
+        self.assertEqual(
+            menu_command._za_battle_missing_field_count_menu, 0)
+
+        recovery_menu_command = RecoveryCommand(
+            field_after_b=999, menu_after_x=True)
+        for _ in range(10):
+            battle_once(recovery_menu_command)
+        self.assertEqual(
+            recovery_menu_command.press_events,
+            [(Button.X, 1), (Button.B, 1)])
+        self.assertEqual(recovery_menu_command.alive_checks, 1)
+        self.assertFalse(recovery_menu_command.x_menu_open)
+
+        command = RecoveryCommand(field_after_b=3)
+        for _ in range(9):
+            battle_once(command)
+        self.assertEqual(command.press_events, [])
+        self.assertEqual(command._za_battle_missing_field_count_cocp, 9)
+
+        battle_once(command)
+        self.assertEqual(
+            command.press_events,
+            [(Button.X, 1), (Button.B, 1),
+             (Button.B, 1), (Button.B, 1)])
+        self.assertEqual(command.alive_checks, 3)
+        self.assertEqual(command._za_battle_missing_field_count_cocp, 0)
+        self.assertFalse(command.stuck)
+
+        reset_command = RecoveryCommand(field_after_b=1)
+        for _ in range(5):
+            battle_once(reset_command)
+        reset_command.stuck = False
+        battle_once(reset_command)
+        self.assertEqual(
+            reset_command._za_battle_missing_field_count_cocp, 0)
+        reset_command.stuck = True
+        for _ in range(9):
+            battle_once(reset_command)
+        self.assertEqual(reset_command.press_events, [])
+
+        capped_command = RecoveryCommand(field_after_b=999)
+        for _ in range(10):
+            battle_once(capped_command)
+        self.assertEqual(capped_command.b_count, 20)
+        self.assertEqual(capped_command.alive_checks, 20)
+        self.assertTrue(capped_command.stuck)
+        self.assertEqual(
+            capped_command._za_battle_missing_field_count_cocp, 0)
+        battle_once(capped_command)
+        self.assertEqual(capped_command.b_count, 20)
+        self.assertEqual(
+            capped_command._za_battle_missing_field_count_cocp, 1)
+
+    def test_za_infi_uses_low_cplus_and_faces_marker_before_relock(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        battle_fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_BattleAndRoyale", "ZA_BattleAndRoyale.pyfrag")
+        movement_fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(battle_fragment_path, "r", encoding="utf-8") as stream:
+            battle_fragment_tree = ast.parse(stream.read())
+        with open(movement_fragment_path, "r", encoding="utf-8") as stream:
+            movement_fragment_tree = ast.parse(stream.read())
+
+        source_functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        battle_functions = {
+            node.name: node for node in battle_fragment_tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        movement_functions = {
+            node.name: node for node in movement_fragment_tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        synchronized = (
+            "ZA_battle_missing_field_recovery",
+            "ZA_battle_Cp_loop",
+            "ZA_battle_Cp_loop_move",
+            "ZA_infi_attack_ready",
+            "ZA_infi_target_marker_direction",
+            "ZA_infi_relock_toward_marker",
+            "ZA_battle_move_test",
+            "ZA_battle_lockon_test",
+        )
+        for name in synchronized:
+            self.assertEqual(
+                ast.dump(source_functions[name], include_attributes=False),
+                ast.dump(battle_functions[name], include_attributes=False),
+                name)
+        self.assertEqual(
+            ast.dump(
+                source_functions["ZA_battle_missing_field_recovery"],
+                include_attributes=False),
+            ast.dump(
+                movement_functions["ZA_battle_missing_field_recovery"],
+                include_attributes=False))
+
+        for name in (
+                "ZA_battle_Cp_loop", "ZA_battle_Cp_loop_move",
+                "ZA_battle_move_test"):
+            calls = {
+                node.func.attr for node in ast.walk(source_functions[name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+            }
+            self.assertIn("ZA_battle_missing_field_recovery", calls, name)
+        mega_calls = {
+            node.func.attr
+            for node in ast.walk(source_functions["ZA_mega_evolution_battle"])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        }
+        self.assertIn("ZA_battle_missing_field_recovery", mega_calls)
+
+        for name in (
+                "ZA_MOVE_ACTION", "ZA_MOVE_SEE",
+                "ZA_battle_move_test", "ZA_battle_lockon_test"):
+            direct_cplus_checks = [
+                node for node in ast.walk(source_functions[name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "image_check"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and node.args[0].value == "POKEMON_ZA_C+"
+            ]
+            self.assertEqual(direct_cplus_checks, [], name)
+
+        attack_ready = battle_functions["ZA_infi_attack_ready"]
+        attack_namespace = {}
+        exec(compile(ast.Module(
+            body=[attack_ready], type_ignores=[]),
+            battle_fragment_path, "exec"), attack_namespace)
+
+        class AttackCommand:
+            def __init__(self, matched):
+                self.matched = set(matched)
+                self.checks = []
+
+            def image_check(self, name):
+                self.checks.append(name)
+                return name in self.matched
+
+        normal_attack = AttackCommand({"POKEMON_ZA_C+"})
+        self.assertTrue(attack_namespace["ZA_infi_attack_ready"](
+            normal_attack))
+        self.assertEqual(normal_attack.checks, ["POKEMON_ZA_C+"])
+        low_attack = AttackCommand({"POKEMON_ZA_C+_LOW"})
+        self.assertTrue(attack_namespace["ZA_infi_attack_ready"](
+            low_attack))
+        self.assertEqual(
+            low_attack.checks,
+            ["POKEMON_ZA_C+", "POKEMON_ZA_C+_LOW"])
+
+        target_function = battle_functions[
+            "ZA_infi_target_marker_direction"]
+        target_namespace = {
+            "cv2": cv2,
+            "Direction": Direction,
+            "math": math,
+            "os": os,
+            "Stick": Stick,
+        }
+        exec(compile(ast.Module(
+            body=[target_function], type_ignores=[]),
+            battle_fragment_path, "exec"), target_namespace)
+        random_generator = numpy.random.default_rng(24680)
+        marker_template = random_generator.integers(
+            0, 256, (12, 12, 3), dtype=numpy.uint8)
+        marker_frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        marker_frame[100:112, 100:112] = marker_template
+        marker_frame[400:412, 300:312] = marker_template
+
+        class Camera:
+            def readFreshFrame(self, timeout=0.75):
+                self.timeout = timeout
+                return marker_frame.copy()
+
+        class TargetCommand:
+            def __init__(self, template_path):
+                self.camera = Camera()
+                self.IMAGE_DETECTION_TARGETS = {
+                    name: [{
+                        "template_path": template_path,
+                        "threshold": 0.99,
+                        "use_gray": False,
+                    }]
+                    for name in (
+                        "POKEMON_ZA_TARGET_LEFT_LOW",
+                        "POKEMON_ZA_TARGET_RIGHT_LOW")
+                }
+
+            def get_filespec(self, path, mode="t"):
+                return path
+
+        with tempfile.TemporaryDirectory() as marker_directory:
+            marker_path = os.path.join(marker_directory, "target.png")
+            self.assertTrue(cv2.imwrite(marker_path, marker_template))
+            target_command = TargetCommand(marker_path)
+            marker_direction = target_namespace[
+                "ZA_infi_target_marker_direction"](target_command)
+        self.assertIsInstance(marker_direction, Direction)
+        self.assertEqual(marker_direction.mag, 0.5)
+        self.assertEqual(
+            target_command.last_image_detection["position"], (300, 400))
+        self.assertAlmostEqual(
+            marker_direction.angle_for_show,
+            (math.degrees(math.atan2(314.0, -334.0)) + 360.0) % 360.0)
+
+        relock_function = battle_functions["ZA_infi_relock_toward_marker"]
+        relock_namespace = {"Button": Button}
+        exec(compile(ast.Module(
+            body=[relock_function], type_ignores=[]),
+            battle_fragment_path, "exec"), relock_namespace)
+
+        class RelockCommand:
+            def __init__(self):
+                self.events = []
+
+            def ZA_infi_target_marker_direction(self):
+                self.events.append(("detect",))
+                return Direction(Stick.LEFT, 126.5, 0.5)
+
+            def ZA_ZL_ACTION(self, action=""):
+                self.events.append(("zl", action))
+
+            def press(self, direction, duration=0.0, wait=0.0):
+                self.events.append(("move", direction, duration, wait))
+
+            def pressRep(self, button, **kwargs):
+                self.events.append(("press", button, kwargs))
+
+        relock_command = RelockCommand()
+        self.assertTrue(relock_namespace[
+            "ZA_infi_relock_toward_marker"](relock_command))
+        self.assertEqual(relock_command.events[0], ("detect",))
+        self.assertEqual(relock_command.events[1], ("zl", "END"))
+        self.assertEqual(relock_command.events[2][0], "move")
+        self.assertEqual(relock_command.events[2][2:], (0.2, 0.0))
+        self.assertEqual(relock_command.events[3][0:2], ("press", Button.L))
+        self.assertEqual(relock_command.events[4], ("zl", ""))
+
+    def test_za_mega_battle_faces_marker_and_forces_dir3_for_35_seconds(self):
         source_path = os.path.join(
             SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
             "ZA_story", "ZA_story.py")
@@ -1740,7 +2135,39 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         with open(fragment_path, "r", encoding="utf-8") as stream:
             fragment_tree = ast.parse(stream.read())
 
-        function_names = ("ZA_MOVE_LStick", "ZA_mega_evolution_battle")
+        profile_path = os.path.join(
+            SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
+        with open(profile_path, "r", encoding="utf-8") as stream:
+            image_library = json.load(stream)
+        normal_cplus = image_library["targets"][
+            "POKEMON_ZA_C+"]["variants"][0]
+        low_cplus = image_library["targets"][
+            "POKEMON_ZA_C+_LOW"]["variants"][0]
+        self.assertEqual(low_cplus["threshold"], 0.6)
+        self.assertEqual(low_cplus["template_path"],
+                         normal_cplus["template_path"])
+        self.assertEqual(low_cplus["crop"], normal_cplus["crop"])
+        source_targets = ast.literal_eval(next(
+            node.value for node in ast.walk(source_tree)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "IMAGE_DETECTION_TARGETS"
+                    for target in node.targets)))
+        self.assertEqual(
+            source_targets["POKEMON_ZA_C+_LOW"],
+            image_library["targets"]["POKEMON_ZA_C+_LOW"]["variants"])
+
+        function_names = (
+            "ZA_MOVE_LStick",
+            "ZA_battle_missing_field_recovery",
+            "ZA_mega_target_marker_direction",
+            "ZA_mega_relock_toward_marker",
+            "ZA_mega_nonfield_picture_confirmed",
+            "ZA_mega_choice_input_guard",
+            "ZA_mega_attack_ready",
+            "ZA_mega_keep_left_moving",
+            "ZA_mega_evolution_battle",
+        )
         source_functions = {
             node.name: node for node in ast.walk(source_tree)
             if isinstance(node, ast.FunctionDef)
@@ -1758,10 +2185,316 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 name)
 
         battle_node = fragment_functions["ZA_mega_evolution_battle"]
-        self.assertEqual(battle_node.args.args[-1].arg, "lockon_rclick")
-        self.assertEqual(ast.literal_eval(battle_node.args.defaults[-1]), 1)
-        battle_namespace = {"time": time, "Button": Button}
-        exec(compile(ast.Module(body=[battle_node], type_ignores=[]),
+        self.assertEqual(battle_node.args.args[-2].arg, "lockon_rclick")
+        self.assertEqual(ast.literal_eval(battle_node.args.defaults[-2]), 1)
+        self.assertEqual(
+            battle_node.args.args[-1].arg, "field_resume_dir4_seconds")
+        self.assertEqual(
+            ast.literal_eval(battle_node.args.defaults[-1]), 10.0)
+        initial_field_gate = next(
+            node for node in ast.walk(battle_node)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Call)
+                and isinstance(statement.value.func, ast.Attribute)
+                and statement.value.func.attr == "ZA_ZL_ACTION"
+                for statement in node.body)
+            and any(
+                isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Call)
+                and isinstance(statement.value.func, ast.Attribute)
+                and statement.value.func.attr == "ZA_MOVE_LStick"
+                for statement in node.body))
+        initial_calls = [
+            statement.value.func.attr
+            for statement in initial_field_gate.body
+            if isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Attribute)
+        ]
+        self.assertEqual(
+            initial_calls[:2], ["ZA_ZL_ACTION", "ZA_MOVE_LStick"])
+        position_check = next(
+            statement for statement in initial_field_gate.body
+            if isinstance(statement, ast.If))
+        success_calls = [
+            statement.value.func.attr
+            for statement in position_check.body
+            if isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Attribute)
+        ]
+        retry_calls = [
+            statement.value.func.attr
+            for statement in position_check.orelse
+            if isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Attribute)
+        ]
+        self.assertEqual(success_calls[:2], ["etc_sendCommand", "input"])
+        self.assertNotIn("wait", success_calls)
+        self.assertEqual(
+            retry_calls[:3], ["etc_sendCommand", "input", "wait"])
+        battle_constants = {
+            node.value for node in ast.walk(battle_node)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        self.assertNotIn("POKEMON_ZA_FIELD_W", battle_constants)
+        raw_plus_calls = [
+            node for node in ast.walk(battle_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "etc_sendCommand"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "plusbutton"
+        ]
+        self.assertEqual(raw_plus_calls, [])
+        select_down_once_calls = [
+            node for node in ast.walk(battle_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "etc_sendCommand"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "Lbutton_down"
+        ]
+        # BLACK_COMMENT経由と直接検知の2経路 × 2体／3体で、
+        # 通常選択時に下入力を1回だけ送る。
+        self.assertEqual(len(select_down_once_calls), 4)
+        attack_loop = next(
+            node for node in ast.walk(battle_node)
+            if isinstance(node, ast.For)
+            and any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "press"
+                and call.args
+                and isinstance(call.args[0], ast.Attribute)
+                and call.args[0].attr == "PLUS"
+                for call in ast.walk(node)))
+        self.assertIsInstance(attack_loop.body[0], ast.If)
+        self.assertTrue(any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "ZA_mega_choice_input_guard"
+            for call in ast.walk(attack_loop.body[0].test)))
+        self.assertEqual(
+            [statement.value.func.attr
+             for statement in attack_loop.body[0].body
+             if isinstance(statement, ast.Expr)
+             and isinstance(statement.value, ast.Call)
+             and isinstance(statement.value.func, ast.Attribute)][:2],
+            ["ZA_MOVE_LStick", "ZA_MOVE_SEE"])
+        attack_loop_count = next(
+            node for node in ast.walk(battle_node)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "attack_loop_count"
+                for target in node.targets))
+        self.assertIn(
+            10,
+            {constant.value for constant in ast.walk(attack_loop_count)
+             if isinstance(constant, ast.Constant)})
+        self.assertTrue(any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "press"
+            and node.args
+            and isinstance(node.args[0], ast.Attribute)
+            and isinstance(node.args[0].value, ast.Name)
+            and node.args[0].value.id == "Button"
+            and node.args[0].attr == "PLUS"
+            for node in ast.walk(battle_node)))
+        confirmation_pictures = {
+            node.args[0].value
+            for node in ast.walk(battle_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ZA_mega_nonfield_picture_confirmed"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        }
+        self.assertEqual(confirmation_pictures, {
+            "POKEMON_ZA_TEXT_BLACK_COMMENT",
+            "POKEMON_ZA_2_SELECT",
+            "POKEMON_ZA_3_SELECT",
+        })
+        outer_loop = next(
+            statement for statement in battle_node.body
+            if isinstance(statement, ast.While))
+        resume_move_gate = next(
+            statement for statement in outer_loop.body
+            if isinstance(statement, ast.If)
+            and isinstance(statement.test, ast.Name)
+            and statement.test.id == "field_resume_detected")
+        endpicture_gate = next(
+            statement for statement in outer_loop.body
+            if isinstance(statement, ast.If)
+            and any(
+                isinstance(name, ast.Name) and name.id == "endpicture"
+                for name in ast.walk(statement.test)))
+        recovery_gate = next(
+            statement for statement in outer_loop.body
+            if isinstance(statement, ast.If)
+            and isinstance(statement.test, ast.Call)
+            and isinstance(statement.test.func, ast.Attribute)
+            and statement.test.func.attr
+            == "ZA_battle_missing_field_recovery")
+        attack_ready_assignment = next(
+            statement for statement in outer_loop.body
+            if isinstance(statement, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "loop_attack_ready"
+                for target in statement.targets))
+        self.assertLess(endpicture_gate.lineno,
+                        attack_ready_assignment.lineno)
+        self.assertLess(attack_ready_assignment.lineno,
+                        recovery_gate.lineno)
+        self.assertLess(recovery_gate.lineno, resume_move_gate.lineno)
+        resume_calls = [
+            statement.value for statement in resume_move_gate.body
+            if isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Call)
+            and isinstance(statement.value.func, ast.Attribute)
+        ]
+        self.assertEqual(
+            [call.func.attr for call in resume_calls], ["ZA_MOVE_LStick"])
+        self.assertEqual(ast.literal_eval(resume_calls[0].args[4]), 4)
+        marker_lock_gate = next(
+            node for node in ast.walk(battle_node)
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "target_marker_count")
+        self.assertTrue(any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "ZA_mega_keep_left_moving"
+            for call in ast.walk(marker_lock_gate)))
+        self.assertTrue(any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "wait"
+            and call.args
+            and isinstance(call.args[0], ast.Constant)
+            and call.args[0].value == 0.2
+            for call in ast.walk(marker_lock_gate)))
+        self.assertTrue(any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ZA_mega_keep_left_moving"
+            for node in ast.walk(outer_loop)))
+        comment_guard = next(
+            node for node in ast.walk(battle_node)
+            if isinstance(node, ast.If)
+            and {
+                constant.value for constant in ast.walk(node.test)
+                if isinstance(constant, ast.Constant)
+                and isinstance(constant.value, str)
+            } >= {
+                "POKEMON_ZA_TEXT_GREEN_COMMENT",
+                "POKEMON_ZA_TEXT_BLACK_COMMENT",
+            }
+            and any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "ZA_mega_target_marker_direction"
+                for statement in node.body for call in ast.walk(statement)))
+        comment_view_actions = [
+            keyword.value.value
+            for statement in comment_guard.orelse
+            for call in ast.walk(statement)
+            if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "ZA_MOVE_SEE"
+            for keyword in call.keywords
+            if keyword.arg == "action"
+            and isinstance(keyword.value, ast.Constant)
+        ]
+        self.assertEqual(comment_view_actions, ["END"])
+
+        statement_lists = [
+            node.body for node in ast.walk(battle_node)
+            if isinstance(node, (ast.FunctionDef, ast.If, ast.For, ast.While))
+        ]
+        statement_lists.extend(
+            node.orelse for node in ast.walk(battle_node)
+            if isinstance(node, ast.If) and node.orelse)
+        left_stop_blocks = 0
+        for statements in statement_lists:
+            direct_calls = [
+                statement.value for statement in statements
+                if isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Call)
+                and isinstance(statement.value.func, ast.Attribute)
+            ]
+            stops_left = any(
+                call.func.attr == "ZA_MOVE_LStick"
+                and len(call.args) >= 6
+                and isinstance(call.args[5], ast.Constant)
+                and call.args[5].value == "END"
+                for call in direct_calls)
+            if not stops_left:
+                continue
+            left_stop_blocks += 1
+            self.assertTrue(any(
+                call.func.attr == "ZA_MOVE_SEE"
+                and any(
+                    keyword.arg == "action"
+                    and isinstance(keyword.value, ast.Constant)
+                    and keyword.value.value == "END"
+                    for keyword in call.keywords)
+                for call in direct_calls))
+        self.assertGreaterEqual(left_stop_blocks, 5)
+
+        final_statement = outer_loop.body[-1]
+        self.assertFalse(
+            isinstance(final_statement, ast.Expr)
+            and isinstance(final_statement.value, ast.Call)
+            and isinstance(final_statement.value.func, ast.Attribute)
+            and final_statement.value.func.attr == "wait"
+            and final_statement.value.args
+            and isinstance(final_statement.value.args[0], ast.Constant)
+            and final_statement.value.args[0].value == 0.5)
+        for statements in (
+                node.body for node in ast.walk(battle_node)
+                if isinstance(node, (ast.FunctionDef, ast.If, ast.For,
+                                     ast.While))):
+            for index, statement in enumerate(statements[:-1]):
+                if not (
+                        isinstance(statement, ast.Expr)
+                        and isinstance(statement.value, ast.Call)
+                        and isinstance(statement.value.func, ast.Attribute)
+                        and statement.value.func.attr == "etc_sendCommand"
+                        and statement.value.args
+                        and isinstance(statement.value.args[0], ast.Constant)
+                        and statement.value.args[0].value == "Lbutton_up"):
+                    continue
+                next_statement = statements[index + 1]
+                while isinstance(next_statement, ast.Expr) and isinstance(
+                        next_statement.value, ast.Constant):
+                    index += 1
+                    next_statement = statements[index + 1]
+                self.assertIsInstance(next_statement, ast.Expr)
+                self.assertIsInstance(next_statement.value, ast.Call)
+                self.assertIsInstance(next_statement.value.func, ast.Attribute)
+                self.assertEqual(next_statement.value.func.attr, "input")
+        battle_namespace = {
+            "time": time,
+            "math": math,
+            "os": os,
+            "cv2": cv2,
+            "Button": Button,
+            "Direction": Direction,
+            "Stick": Stick,
+        }
+        exec(compile(ast.Module(
+            body=[fragment_functions[name] for name in function_names],
+            type_ignores=[]),
                      fragment_path, "exec"), battle_namespace)
         battle = battle_namespace["ZA_mega_evolution_battle"]
 
@@ -1770,7 +2503,11 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 self.ZL_state = 1
                 self.end_checks = 0
                 self.pressed = []
+                self.pressed_reps = []
                 self.moves = []
+                self.move_deadlines = []
+                self.waits = []
+                self.serial_commands = []
 
             def image_check(self, name):
                 if name == "END":
@@ -1778,11 +2515,14 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                     return self.end_checks >= 2
                 return name == "POKEMON_ZA_C+"
 
-            def press(self, button, *args):
+            def press(self, button, *args, **kwargs):
                 self.pressed.append((button, args))
 
             def ZA_MOVE_LStick(self, *args):
                 self.moves.append(args)
+                self.move_deadlines.append(
+                    getattr(self, "_za_mega_rclick_dir3_until", 0.0)
+                    - time.monotonic())
 
             def ZA_MOVE_SEE(self, *args, **kwargs):
                 pass
@@ -1790,15 +2530,58 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             def ZA_ZL_ACTION(self, *args, **kwargs):
                 pass
 
-            def wait(self, _duration):
+            def ZA_mega_target_marker_direction(self):
+                return battle_namespace["ZA_mega_target_marker_direction"](self)
+
+            def ZA_mega_keep_left_moving(self, *args, **kwargs):
+                return battle_namespace["ZA_mega_keep_left_moving"](
+                    self, *args, **kwargs)
+
+            def ZA_mega_relock_toward_marker(self, *args, **kwargs):
+                return battle_namespace["ZA_mega_relock_toward_marker"](
+                    self, *args, **kwargs)
+
+            def ZA_mega_nonfield_picture_confirmed(self, picture):
+                return battle_namespace[
+                    "ZA_mega_nonfield_picture_confirmed"](self, picture)
+
+            def ZA_mega_choice_input_guard(self):
+                return battle_namespace[
+                    "ZA_mega_choice_input_guard"](self)
+
+            def ZA_mega_attack_ready(self):
+                return battle_namespace["ZA_mega_attack_ready"](self)
+
+            def ZA_battle_missing_field_recovery(self, *args, **kwargs):
+                return battle_namespace[
+                    "ZA_battle_missing_field_recovery"](
+                        self, *args, **kwargs)
+
+            def ZA_story_Template_Field_HardGaurd(self, mode=0):
+                return False
+
+            def checkIfAlive(self):
                 pass
+
+            def pressRep(self, button, *args, **kwargs):
+                self.pressed_reps.append((button, args, kwargs))
+
+            def etc_sendCommand(self, command):
+                self.serial_commands.append(command)
+
+            def wait(self, duration):
+                self.waits.append(duration)
 
         enabled = BattleCommand()
         self.assertTrue(battle(enabled, endpicture="END"))
         self.assertEqual(
             [button for button, _args in enabled.pressed],
             [Button.RCLICK])
-        self.assertIn((0, 0, 0, 0, 1, "RELOAD"), enabled.moves)
+        rclick_move_index = enabled.moves.index(
+            (0, 0, 0, 0, 3, "RELOAD"))
+        self.assertGreater(enabled.move_deadlines[rclick_move_index], 34.0)
+        self.assertLessEqual(enabled.move_deadlines[rclick_move_index], 35.0)
+        self.assertEqual(enabled.waits.count(1.0), 1)
 
         disabled = BattleCommand()
         self.assertTrue(battle(
@@ -1806,6 +2589,301 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertNotIn(
             Button.RCLICK,
             [button for button, _args in disabled.pressed])
+
+        class RclickAnimationCommand(BattleCommand):
+            def __init__(self):
+                super().__init__()
+                self.cplus_checks = 0
+
+            def image_check(self, name):
+                if name == "END":
+                    self.end_checks += 1
+                    return self.end_checks >= 2
+                if name == "POKEMON_ZA_C+":
+                    self.cplus_checks += 1
+                    # RCLICK前だけ表示され、演出後は一時的に消える。
+                    return self.cplus_checks == 1
+                return False
+
+        frequent = RclickAnimationCommand()
+        self.assertTrue(battle(
+            frequent, Aaction=1, Xaction=1, Yaction=1,
+            Baction=0, endpicture="END"))
+        self.assertEqual(frequent.cplus_checks, 1)
+        attack_buttons = [
+            button for button, _args, _kwargs in frequent.pressed_reps]
+        self.assertEqual(len(attack_buttons), 10)
+        self.assertEqual(set(attack_buttons), {Button.A, Button.X, Button.Y})
+        self.assertNotIn(Button.B, attack_buttons)
+
+        class LowCplusCommand(BattleCommand):
+            def image_check(self, name):
+                if name == "END":
+                    self.end_checks += 1
+                    return self.end_checks >= 2
+                return name == "POKEMON_ZA_C+_LOW"
+
+        low_ready = LowCplusCommand()
+        self.assertTrue(battle(
+            low_ready, Aaction=1, Xaction=1, Yaction=1,
+            Baction=0, endpicture="END"))
+        self.assertEqual(
+            [button for button, _args in low_ready.pressed],
+            [Button.RCLICK])
+        self.assertEqual(
+            len([button for button, _args, _kwargs
+                 in low_ready.pressed_reps
+                 if button in (Button.A, Button.X, Button.Y)]),
+            10)
+
+        class BlackMenuCommand(BattleCommand):
+            def image_check(self, name):
+                if name == "END":
+                    self.end_checks += 1
+                    return self.end_checks >= 2
+                if name == "POKEMON_ZA_TEXT_BLACK_COMMENT":
+                    return True
+                return False
+
+        black_menu = BlackMenuCommand()
+        self.assertTrue(battle(black_menu, endpicture="END"))
+        self.assertTrue(black_menu.moves)
+        self.assertTrue(all(
+            move[-1] == "END" for move in black_menu.moves))
+        self.assertEqual(black_menu.pressed, [])
+
+        class SelectMenuCommand(BattleCommand):
+            def __init__(self, picture):
+                super().__init__()
+                self.picture = picture
+
+            def image_check(self, name):
+                if name == "END":
+                    self.end_checks += 1
+                    return self.end_checks >= 2
+                return name == self.picture
+
+        for picture in ("POKEMON_ZA_2_SELECT", "POKEMON_ZA_3_SELECT"):
+            select_menu = SelectMenuCommand(picture)
+            self.assertTrue(battle(select_menu, endpicture="END"))
+            self.assertTrue(select_menu.moves)
+            self.assertTrue(all(
+                move[-1] == "END" for move in select_menu.moves))
+            self.assertEqual(select_menu.pressed, [])
+            self.assertEqual(
+                [button for button, _args, _kwargs
+                 in select_menu.pressed_reps],
+                [Button.A])
+            self.assertEqual(
+                select_menu.serial_commands,
+                ["Lbutton_down"])
+
+        class RelockCommand:
+            def __init__(self, matched):
+                self.matched = set(matched)
+                self.events = []
+
+            def image_check(self, name):
+                self.events.append(("check", name))
+                return name in self.matched
+
+            def ZA_mega_target_marker_direction(self):
+                return battle_namespace["ZA_mega_target_marker_direction"](self)
+
+            def ZA_mega_keep_left_moving(self, *args, **kwargs):
+                return battle_namespace["ZA_mega_keep_left_moving"](
+                    self, *args, **kwargs)
+
+            def ZA_ZL_ACTION(self, action="RELOAD"):
+                self.events.append(("zl", action))
+
+            def ZA_MOVE_LStick(self, *args):
+                self.events.append(("move", args))
+
+            def pressRep(self, button, **kwargs):
+                self.events.append(("pressRep", button, kwargs))
+
+            def wait(self, duration):
+                self.events.append(("wait", duration))
+
+        relock = battle_namespace["ZA_mega_relock_toward_marker"]
+
+        class CoordinateCamera:
+            def __init__(self, frame):
+                self.frame = frame
+                self.read_count = 0
+
+            def readFreshFrame(self, timeout=0.75):
+                self.read_count += 1
+                return self.frame.copy()
+
+        class CoordinateMarkerCommand:
+            def __init__(self, frame, left_path, right_path):
+                self.camera = CoordinateCamera(frame)
+                self.IMAGE_DETECTION_TARGETS = {
+                    "POKEMON_ZA_TARGET_LEFT_LOW": [{
+                        "template_path": left_path,
+                        "threshold": 0.99,
+                        "use_gray": False,
+                    }],
+                    "POKEMON_ZA_TARGET_RIGHT_LOW": [{
+                        "template_path": right_path,
+                        "threshold": 0.99,
+                        "use_gray": False,
+                    }],
+                }
+                self.image_checks = []
+
+            def get_filespec(self, path, mode="t"):
+                return path
+
+            def image_check(self, name):
+                self.image_checks.append(name)
+                return False
+
+        random_generator = numpy.random.default_rng(12345)
+        left_template = random_generator.integers(
+            0, 256, (12, 12, 3), dtype=numpy.uint8)
+        right_template = random_generator.integers(
+            0, 256, (12, 12, 3), dtype=numpy.uint8)
+        marker_frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        # 同じ完全一致を左上マップ内にも置き、除外が効くことを確認する。
+        marker_frame[100:112, 100:112] = left_template
+        marker_frame[400:412, 300:312] = left_template
+        with tempfile.TemporaryDirectory() as marker_directory:
+            left_path = os.path.join(marker_directory, "left.png")
+            right_path = os.path.join(marker_directory, "right.png")
+            self.assertTrue(cv2.imwrite(left_path, left_template))
+            self.assertTrue(cv2.imwrite(right_path, right_template))
+            coordinate_command = CoordinateMarkerCommand(
+                marker_frame, left_path, right_path)
+            coordinate_direction = battle_namespace[
+                "ZA_mega_target_marker_direction"](coordinate_command)
+        self.assertIsInstance(coordinate_direction, Direction)
+        self.assertEqual(coordinate_direction.stick, Stick.LEFT)
+        self.assertEqual(coordinate_direction.mag, 0.5)
+        self.assertAlmostEqual(
+            coordinate_direction.angle_for_show,
+            (math.degrees(math.atan2(314.0, -334.0)) + 360.0) % 360.0)
+        self.assertEqual(coordinate_command.image_checks, [])
+        self.assertEqual(coordinate_command.camera.read_count, 1)
+        self.assertEqual(
+            coordinate_command.last_image_detection["position"],
+            (300, 400))
+
+        left = RelockCommand({"POKEMON_ZA_TARGET_LEFT_LOW"})
+        relock(left, 20, 340, 40, 300, dodge_repeat=5)
+        self.assertTrue(any(event[0] == "check" for event in left.events))
+        self.assertIn(
+            ("move", (20, 340, 40, 300, 4, "RELOAD")),
+            left.events)
+        self.assertIn(("zl", "END"), left.events)
+        self.assertIn(("move", (20, 340, 40, 300, -2, "RELOAD")),
+                      left.events)
+        self.assertIn(("wait", 0.2), left.events)
+        marker_move_index = left.events.index(
+            ("move", (20, 340, 40, 300, -2, "RELOAD")))
+        marker_wait_index = left.events.index(("wait", 0.2))
+        center_view_index = next(
+            index for index, event in enumerate(left.events)
+            if event[0] == "pressRep" and event[1] == Button.L)
+        relock_index = left.events.index(("zl", ""))
+        self.assertLess(marker_move_index, marker_wait_index)
+        self.assertLess(marker_wait_index, center_view_index)
+        self.assertLess(center_view_index, relock_index)
+        self.assertIn(("zl", ""), left.events)
+        self.assertEqual(
+            left.events[-1],
+            ("move", (20, 340, 40, 300, 4, "RELOAD")))
+        self.assertTrue(any(
+            event[0] == "pressRep" and event[2]["repeat"] == 5
+            for event in left.events))
+
+        right = RelockCommand({"POKEMON_ZA_TARGET_RIGHT_LOW"})
+        relock(right, 20, 340, 40, 300)
+        self.assertIn(("move", (20, 340, 40, 300, -1, "RELOAD")),
+                      right.events)
+        self.assertTrue(any(
+            event[0] == "pressRep" and event[1] == Button.L
+            for event in right.events))
+        self.assertIn(("zl", ""), right.events)
+        self.assertEqual(
+            right.events[-1],
+            ("move", (20, 340, 40, 300, 4, "RELOAD")))
+
+        cooldown = RelockCommand({"POKEMON_ZA_TARGET_LEFT_LOW"})
+        cooldown._za_mega_relock_retry_at = time.monotonic() + 1.0
+        relock(cooldown, 20, 340, 40, 300)
+        self.assertEqual(
+            cooldown.events,
+            [("move", (20, 340, 40, 300, 4, "RELOAD"))])
+
+        resumed_relock = RelockCommand({"POKEMON_ZA_TARGET_LEFT_LOW"})
+        resumed_relock._za_mega_field_dir4_until = time.monotonic() + 10.0
+        relock(resumed_relock, 20, 340, 40, 300, dodge_repeat=5)
+        self.assertEqual(
+            resumed_relock.events[-1],
+            ("move", (20, 340, 40, 300, 4, "RELOAD")))
+        self.assertFalse(any(
+            event[0] in ("check", "zl", "wait")
+            for event in resumed_relock.events))
+        self.assertTrue(any(
+            event[0] == "pressRep" and event[2]["repeat"] == 5
+            for event in resumed_relock.events))
+
+        class NonfieldConfirmCommand:
+            def __init__(self, matched):
+                self.matched = set(matched)
+                self.waits = []
+
+            def image_check(self, name):
+                return name in self.matched
+
+            def wait(self, duration):
+                self.waits.append(duration)
+
+        confirm_nonfield = battle_namespace[
+            "ZA_mega_nonfield_picture_confirmed"]
+        menu = NonfieldConfirmCommand({"POKEMON_ZA_2_SELECT"})
+        self.assertTrue(confirm_nonfield(menu, "POKEMON_ZA_2_SELECT"))
+        self.assertEqual(menu.waits, [0.05])
+        active_field = NonfieldConfirmCommand({
+            "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+            "POKEMON_ZA_2_SELECT",
+        })
+        self.assertFalse(confirm_nonfield(
+            active_field, "POKEMON_ZA_2_SELECT"))
+
+        keep_moving = battle_namespace["ZA_mega_keep_left_moving"]
+
+        class KeepMovingCommand:
+            def __init__(self, active_state=None):
+                for state_name in (
+                        "Lstick_state", "Lstick_state2", "Lstick_state3",
+                        "Lstick_state4", "Lstick_state_m1",
+                        "Lstick_state_m2"):
+                    setattr(self, state_name, int(state_name == active_state))
+                self.moves = []
+
+            def ZA_MOVE_LStick(self, *args):
+                self.moves.append(args)
+
+        current_direction = KeepMovingCommand("Lstick_state3")
+        keep_moving(current_direction, 20, 340, 40, 300)
+        self.assertEqual(
+            current_direction.moves, [(20, 340, 40, 300, 3, "RELOAD")])
+
+        marker_direction = KeepMovingCommand("Lstick_state_m2")
+        marker_resume = keep_moving(
+            marker_direction, 20, 340, 40, 300)
+        self.assertEqual(
+            marker_direction.moves, [(20, 340, 40, 300, 4, "RELOAD")])
+        self.assertEqual(marker_resume, 4)
+
+        stopped = KeepMovingCommand()
+        keep_moving(stopped, 20, 340, 40, 300)
+        self.assertEqual(
+            stopped.moves, [(20, 340, 40, 300, 4, "RELOAD")])
 
         move_node = fragment_functions["ZA_MOVE_LStick"]
         move_namespace = {"time": time, "Direction": Direction,
@@ -1816,7 +2894,8 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
         class MoveCommand:
             def __init__(self, until):
-                self._za_mega_rclick_dir1_until = until
+                self._za_mega_rclick_dir3_until = until
+                self._za_mega_field_dir4_until = 0.0
                 self.Lstick_state = 0
                 self.Lstick_state2 = 0
                 self.Lstick_state3 = 0
@@ -1824,23 +2903,101 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 self.Lstick_state_m1 = 0
                 self.Lstick_state_m2 = 0
                 self.held = []
+                self.released = []
+                self.waits = []
+                self.keys = self
+                self.holdButton = []
+                self.input_packets = []
 
             def hold(self, direction):
                 self.held.append(direction)
 
-            def holdEnd(self, _direction):
-                pass
+            def holdEnd(self, direction):
+                self.released.append(direction)
 
-            def wait(self, _duration):
-                pass
+            def input(self, _buttons):
+                self.input_packets.append(tuple(self.holdButton))
+                held_left = [
+                    held for held in self.holdButton
+                    if isinstance(held, Direction)
+                    and held.stick == Stick.LEFT
+                ]
+                self.held.append(held_left[-1])
+
+            def wait(self, duration):
+                self.waits.append(duration)
 
         approaching = MoveCommand(time.monotonic() + 1.0)
         move(approaching, 20, 340, 40, 300, 4, "RELOAD")
-        self.assertEqual(approaching.held[-1].angle_for_show, 20)
+        self.assertEqual(approaching.held[-1].angle_for_show, 40)
+
+        marker_facing = MoveCommand(time.monotonic() + 1.0)
+        move(marker_facing, 20, 340, 40, 300, -2, "RELOAD")
+        self.assertEqual(marker_facing.held[-1].angle_for_show, 140)
+        self.assertEqual(marker_facing.held[-1].mag, 0.5)
+
+        coordinate_facing = MoveCommand(time.monotonic() + 1.0)
+        exact_marker_direction = Direction(Stick.LEFT, 126.5, 0.5)
+        move(
+            coordinate_facing, 20, 340, 40, 300,
+            exact_marker_direction, "RELOAD")
+        self.assertEqual(
+            coordinate_facing.held[-1].angle_for_show, 126.5)
+        self.assertEqual(coordinate_facing.held[-1].mag, 0.5)
+        move(
+            coordinate_facing, 20, 340, 40, 300,
+            exact_marker_direction, "END")
+        self.assertIn(exact_marker_direction, coordinate_facing.released)
 
         normal = MoveCommand(0.0)
         move(normal, 20, 340, 40, 300, 4, "RELOAD")
         self.assertEqual(normal.held[-1].angle_for_show, 300)
+
+        resumed = MoveCommand(0.0)
+        resumed._za_mega_field_dir4_until = time.monotonic() + 10.0
+        move(resumed, 20, 340, 40, 300, 1, "RELOAD")
+        self.assertEqual(resumed.held[-1].angle_for_show, 300)
+        self.assertEqual(resumed.Lstick_state4, 1)
+
+        resumed_marker = MoveCommand(0.0)
+        resumed_marker._za_mega_field_dir4_until = (
+            time.monotonic() + 10.0)
+        move(resumed_marker, 20, 340, 40, 300, -2, "RELOAD")
+        self.assertEqual(resumed_marker.held[-1].angle_for_show, 300)
+        self.assertEqual(resumed_marker.Lstick_state4, 1)
+
+        resumed_coordinate_marker = MoveCommand(0.0)
+        resumed_coordinate_marker._za_mega_field_dir4_until = (
+            time.monotonic() + 10.0)
+        move(
+            resumed_coordinate_marker, 20, 340, 40, 300,
+            Direction(Stick.LEFT, 126.5, 0.5), "RELOAD")
+        self.assertEqual(
+            resumed_coordinate_marker.held[-1].angle_for_show, 300)
+        self.assertEqual(resumed_coordinate_marker.Lstick_state4, 1)
+
+        rclick_over_resume = MoveCommand(time.monotonic() + 35.0)
+        rclick_over_resume._za_mega_field_dir4_until = (
+            time.monotonic() + 10.0)
+        move(rclick_over_resume, 20, 340, 40, 300, 1, "RELOAD")
+        self.assertEqual(rclick_over_resume.held[-1].angle_for_show, 40)
+        self.assertEqual(rclick_over_resume.Lstick_state3, 1)
+
+        same_direction = MoveCommand(0.0)
+        same_direction.Lstick_state3 = 1
+        move(same_direction, 20, 340, 40, 300, 3, "RELOAD")
+        self.assertEqual(same_direction.released, [])
+        self.assertEqual(same_direction.held[-1].angle_for_show, 40)
+        self.assertEqual(len(same_direction.input_packets), 1)
+        self.assertEqual(same_direction.waits, [])
+
+        direction_change = MoveCommand(0.0)
+        direction_change.Lstick_state3 = 1
+        move(direction_change, 20, 340, 40, 300, 4, "RELOAD")
+        self.assertEqual(direction_change.released, [])
+        self.assertEqual(direction_change.held[-1].angle_for_show, 300)
+        self.assertEqual(len(direction_change.input_packets), 1)
+        self.assertEqual(direction_change.waits, [])
 
     def test_za_field_reach_checks_use_no_battle_hard_guard(self):
         source_path = os.path.join(
@@ -1889,7 +3046,11 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         changed_lines = [
             line for line in source.splitlines()
             if "#FIELDから変更" in line]
-        self.assertEqual(len(changed_lines), 508)
+        # Mega battle now reuses one field_active result instead of repeating
+        # three identical hard-field checks inside the BLACK/select branches.
+        # FILED_HARD_CHECK_1 is an intentional mode=1 exception used by the
+        # evolution flow, not a migrated FIELD reach check.
+        self.assertEqual(len(changed_lines), 501)
         self.assertTrue(all(
             "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK" in line
             for line in changed_lines))
@@ -1944,7 +3105,132 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 'endpicture2="POKEMON_ZA_FIELD_BACK_W"',
                 fragment, relative_path)
             fragment_changes += fragment.count("#FIELDから変更")
-        self.assertEqual(fragment_changes, 67)
+        self.assertEqual(fragment_changes, 61)
+
+    def test_za_no_battle_hard_guard_supports_mode_zero_and_one_exceptions(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        movement_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        exception_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_InfiMainDependencies", "ZA_InfiImageCheckHelpers",
+            "ZA_InfiImageCheckHelpers.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+        with open(movement_path, "r", encoding="utf-8") as stream:
+            movement = stream.read()
+        with open(exception_path, "r", encoding="utf-8") as stream:
+            exceptions = stream.read()
+        source_tree, movement_tree = ast.parse(source), ast.parse(movement)
+        source_function = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_no_battle_filed_check_HardGaurd")
+        fragment_function = next(
+            node for node in movement_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_no_battle_filed_check_HardGaurd")
+        self.assertEqual(
+            ast.dump(source_function, include_attributes=False),
+            ast.dump(fragment_function, include_attributes=False))
+        self.assertEqual(
+            [default.value for default in fragment_function.args.defaults], [0])
+        function_text = ast.get_source_segment(source, source_function)
+        self.assertNotIn("POKEMON_ZA_FILED_HARD_CHECK_0", function_text)
+        self.assertIn("ZA_story_Template_Field_HardGaurd(mode)", function_text)
+
+        runtime_rules = {
+            item["name"]: item["expression"]
+            for item in image_check_exception_rules(source)}
+        fragment_rules = {
+            item["name"]: item["expression"]
+            for item in image_check_exception_rules(exceptions)}
+        expected = {
+            "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK":
+                "bool(self.ZA_no_battle_filed_check_HardGaurd())",
+            "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_0":
+                "bool(self.ZA_no_battle_filed_check_HardGaurd())",
+            "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_1":
+                "bool(self.ZA_no_battle_filed_check_HardGaurd(mode=1))",
+        }
+        for name, expression in expected.items():
+            self.assertEqual(runtime_rules[name], expression)
+            self.assertEqual(fragment_rules[name], expression)
+
+        module = ast.Module(body=[fragment_function], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {}
+        exec(compile(module, movement_path, "exec"), namespace)
+
+        class GuardCommand:
+            def __init__(self):
+                self.modes = []
+
+            def ZA_story_Template_Field_HardGaurd(self, mode=0):
+                self.modes.append(mode)
+                return True
+
+            def image_check(self, _name):
+                return False
+
+        command = GuardCommand()
+        self.assertTrue(namespace["ZA_no_battle_filed_check_HardGaurd"](
+            command, mode=1))
+        self.assertTrue(command.modes)
+        self.assertEqual(set(command.modes), {1})
+
+    def test_za_story_has_no_unregistered_literal_image_checks(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            result = audit_image_check_references(stream.read())
+
+        self.assertEqual(result["missing"], [])
+        registered = set(result["target_names"])
+        self.assertTrue({
+            "POKEMON_ZA_MERIP_ICON_GET5",
+            "POKEMON_ZA_BATTLE",
+            "POKEMON_ZA_WANINOKO_ICON",
+            "POKEMON_ZA_ODAIRU_ICON",
+            "POKEMON_ZA_ABSOL_ICON",
+            "POKEMON_ZA_DEAD",
+        }.issubset(registered))
+
+
+class ImageDetectionDetailTests(unittest.TestCase):
+    def test_excluded_region_removes_matches_crossing_its_border(self):
+        template = numpy.array(
+            [[[10 + x * 17, 20 + y * 23, 30 + (x + y) * 11]
+              for x in range(5)] for y in range(5)], dtype=numpy.uint8)
+        frame = numpy.zeros((80, 80, 3), dtype=numpy.uint8)
+        frame[10:15, 10:15] = template
+        frame[10:15, 27:32] = template
+        frame[50:55, 50:55] = template
+
+        class CameraStub:
+            def readFreshFrame(self, timeout=0.75):
+                return frame.copy()
+
+        command = types.SimpleNamespace(camera=CameraStub())
+        with tempfile.TemporaryDirectory() as root:
+            template_path = os.path.join(root, "marker.png")
+            self.assertTrue(cv2.imwrite(template_path, template))
+            detail = detect_image(
+                command,
+                name="MARKER_POSITION",
+                template_path=template_path,
+                threshold=0.99,
+                use_gray=False,
+                show_position=False,
+                exclude_regions=[[0, 0, 30, 30]])
+
+        self.assertTrue(detail["matched"])
+        self.assertEqual(detail["position"], (50, 50))
+        self.assertEqual(detail["excluded_regions"], [(0, 0, 30, 30)])
 
 
 class ImageHealthCheckTests(unittest.TestCase):
@@ -2162,6 +3448,70 @@ class Command:
         self.assertEqual(
             command.IMAGE_DETECTION_DESCRIPTIONS["targets"]["MARKER"], "marker")
 
+    def test_exception_settings_can_be_added_changed_deleted_and_rename_callers(self):
+        source = '''
+class Command:
+    IMAGE_DETECTION_TARGETS = {"FIELD": []}
+    def image_check_exception(self, targetimage):
+        if targetimage in ("TRUE_RETURN", "RETURN_TRUE"):
+            return True
+        if targetimage == "FIELD_GUARD_0":
+            return bool(self.guard())
+        # POKECON_IMAGE_CHECK_EXCEPTION_USER_BEGIN
+        # custom exceptions
+        # POKECON_IMAGE_CHECK_EXCEPTION_USER_END
+        return False
+    def run(self):
+        return self.image_check("FIELD_GUARD_0") or self.image_check("FIELD")
+'''
+        rules = image_check_exception_rules(source)
+        self.assertEqual(
+            [item["name"] for item in rules],
+            ["TRUE_RETURN", "RETURN_TRUE", "FIELD_GUARD_0"])
+
+        updated = upsert_image_check_exception(
+            source, "FIELD_GUARD_1", "bool(self.guard(mode=1))",
+            old_name="FIELD_GUARD_0")
+        updated, caller_count = rename_image_check_references(
+            updated, "FIELD_GUARD_0", "FIELD_GUARD_1")
+        self.assertEqual(caller_count, 1)
+        self.assertIn('self.image_check(\'FIELD_GUARD_1\')', updated)
+        self.assertIn("self.guard(mode=1)", updated)
+
+        updated = upsert_image_check_exception(updated, "ALWAYS_FALSE", "False")
+        self.assertIn("ALWAYS_FALSE", {
+            item["name"] for item in image_check_exception_rules(updated)})
+        updated = delete_image_check_exception(updated, "TRUE_RETURN")
+        remaining = {item["name"] for item in image_check_exception_rules(updated)}
+        self.assertNotIn("TRUE_RETURN", remaining)
+        self.assertIn("RETURN_TRUE", remaining)
+
+        updated, renamed_count = rename_image_check_references(
+            updated, "FIELD", "FIELD_RENAMED", include_definitions=True)
+        self.assertEqual(renamed_count, 2)
+        result = audit_image_check_references(updated)
+        self.assertIn("FIELD_RENAMED", result["target_names"])
+        self.assertNotIn("FIELD", result["target_names"])
+        compile(updated, "<exception-management>", "exec")
+
+    def test_registered_image_target_rename_updates_nested_lists(self):
+        data = {
+            "targets": {
+                "OLD": {"variants": [{"template_path": "old.png"}]},
+                "KEEP": {"variants": []},
+            },
+            "lists": {
+                "Child": {"members": [{"type": "target", "id": "OLD"}]},
+                "Root": {"members": [{"type": "list", "id": "Child"}]},
+            },
+        }
+        rename_image_library_target(data, "OLD", "NEW")
+        self.assertNotIn("OLD", data["targets"])
+        self.assertIn("NEW", data["targets"])
+        self.assertEqual(data["lists"]["Child"]["members"][0]["id"], "NEW")
+        with self.assertRaises(ValueError):
+            rename_image_library_target(data, "NEW", "KEEP")
+
 
 class ManualControllerResponsivenessTests(unittest.TestCase):
     class _ShowSerial:
@@ -2259,6 +3609,39 @@ class ManualControllerResponsivenessTests(unittest.TestCase):
         self.assertEqual(int(neutral[0], 16) >> 2, 0)
         self.assertEqual(neutral[1], str(int(Hat.CENTER)))
 
+    def test_held_stick_direction_can_change_without_core_extension(self):
+        class CaptureSender:
+            def __init__(self):
+                self.rows = []
+
+            def writeRow(self, row, is_show=False, priority=False):
+                self.rows.append(row)
+
+        sender = CaptureSender()
+        keys = KeyPress(sender)
+        keys.input(Button.ZL)
+        keys.hold(Direction(Stick.LEFT, 40, 1.0))
+        sender.rows.clear()
+
+        replacement = Direction(Stick.LEFT, 300, 1.0)
+        keys.holdButton = [
+            held for held in keys.holdButton
+            if not (isinstance(held, Direction)
+                    and held.stick == Stick.LEFT)
+        ]
+        keys.holdButton.append(replacement)
+        keys.input([])
+
+        self.assertEqual(len(sender.rows), 1)
+        self.assertTrue(keys.format.format["btn"] & Button.ZL)
+        self.assertEqual(keys.format.format["lx"], replacement.x)
+        self.assertEqual(keys.format.format["ly"], 255 - replacement.y)
+        held_left = [
+            held for held in keys.holdButton
+            if isinstance(held, Direction) and held.stick == Stick.LEFT
+        ]
+        self.assertEqual(held_left, [replacement])
+
     def test_tuple_stick_position_does_not_flood_standard_output(self):
         logger = Direction(Stick.LEFT, (128, 127))._logger
         before = len(logger.handlers)
@@ -2304,6 +3687,66 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             self.assertEqual((block["start_line"], block["end_line"]), (2, 4))
             self.assertIn("return value", block["text"])
 
+    def test_observed_source_lines_include_stack_and_reject_empty_path(self):
+        source = os.path.abspath(__file__)
+        events = [{
+            "location": {
+                "file": source,
+                "line": 12,
+                "stack": [
+                    {"file": source, "line": 18},
+                    {"file": os.path.join(os.path.dirname(source), "other.py"),
+                     "line": 30},
+                ],
+            },
+        }]
+        self.assertEqual(observed_source_lines(events, source), {12, 18})
+        self.assertEqual(observed_source_lines(events, ""), set())
+
+    def test_execution_path_trace_collects_fast_lines_for_ten_second_mode(self):
+        command = PythonCommand()
+        ready = threading.Event()
+        begin = threading.Event()
+
+        def fast_story_branch():
+            value = 1
+            if value:
+                value += 1
+            return value
+
+        def worker_body():
+            command.thread = threading.current_thread()
+            ready.set()
+            begin.wait(1.0)
+            command._service_execution_path_trace()
+            fast_story_branch()
+            command.request_execution_path_trace_stop()
+            # The following Python line lets the worker-local trace remove
+            # itself; no 0.1-second stack sampling is involved.
+            fast_story_branch()
+
+        worker = threading.Thread(target=worker_body)
+        command.thread = worker
+        worker.start()
+        try:
+            self.assertTrue(ready.wait(1.0))
+            project = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+            self.assertTrue(command.request_execution_path_trace(
+                duration=10.0, project_root=project))
+            begin.set()
+            worker.join(2.0)
+            trace = command.execution_path_trace_snapshot(include_events=True)
+            self.assertTrue(trace["complete"])
+            functions = {
+                event.get("location", {}).get("function")
+                for event in trace["events"]
+            }
+            self.assertIn("fast_story_branch", functions)
+            self.assertGreaterEqual(trace["event_count"], 3)
+        finally:
+            begin.set()
+            worker.join(2.0)
+
     def test_running_command_location_links_to_user_function_without_source_edit(self):
         ready = threading.Event()
         release = threading.Event()
@@ -2327,6 +3770,75 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         finally:
             release.set()
             worker.join(2.0)
+
+    def test_runtime_execution_snapshot_combines_step_and_call_stack_on_demand(self):
+        ready = threading.Event()
+        release = threading.Event()
+
+        def waiting_story_step():
+            ready.set()
+            release.wait(2.0)
+
+        command = type("SnapshotCommand", (), {"NAME": "Snapshot"})()
+        command.STATE_MAIN_FUNCTION = {"MAIN_1": object()}
+        command.main_current_state = "MAIN_1"
+        worker = threading.Thread(target=waiting_story_step)
+        command.thread = worker
+        worker.start()
+        try:
+            self.assertTrue(ready.wait(1.0))
+            snapshot = runtime_execution_snapshot(
+                command, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+            self.assertTrue(snapshot["running"])
+            self.assertEqual(snapshot["command"], "Snapshot")
+            self.assertEqual(snapshot["step_path"], "MAIN_1")
+            self.assertEqual(snapshot["location"]["function"], "waiting_story_step")
+            self.assertTrue(snapshot["location"]["stack"])
+        finally:
+            release.set()
+            worker.join(2.0)
+
+    def test_first_battle_closes_x_menu_before_battle_image_branches(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA", "ZA_story",
+            "ZA_story.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        command_class = next(
+            node for node in module.body
+            if isinstance(node, ast.ClassDef) and any(
+                isinstance(item, ast.FunctionDef)
+                and item.name == "_1_story_farst_battle"
+                for item in node.body))
+        method = next(
+            node for node in command_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_1_story_farst_battle")
+        function_module = ast.Module(body=[method], type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {"Button": Button}
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        class Dummy:
+            check_picture = 0
+
+            def __init__(self):
+                self.checked = []
+                self.pressed = []
+
+            def image_check(self, name):
+                self.checked.append(name)
+                return name == "POKEMON_ZA_X_MENU_OPEN"
+
+            def pressRep(self, button, **options):
+                self.pressed.append((button, options))
+
+        dummy = Dummy()
+        result = namespace["_1_story_farst_battle"](dummy)
+        self.assertEqual(result, "1_STORY_FARST_BATTLE")
+        self.assertEqual(dummy.checked, ["POKEMON_ZA_X_MENU_OPEN"])
+        self.assertEqual(dummy.pressed[0][0], Button.B)
 
     def test_kept_command_chunks_are_merged_with_step_and_output_logs(self):
         with tempfile.TemporaryDirectory() as root:

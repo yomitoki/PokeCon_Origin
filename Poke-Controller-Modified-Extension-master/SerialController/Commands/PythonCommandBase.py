@@ -13,6 +13,7 @@ from logging import getLogger, DEBUG, NullHandler
 import os
 import os.path
 import datetime
+import linecache
 import string
 import sys
 
@@ -66,8 +67,172 @@ class PythonCommand(CommandBase.Command):
         self._pause_bypass_threads = set()
         self._cleanup_started = False
         self.postProcess = None
+        # DevStudio execution-path capture is opt-in and is installed by the
+        # Commands worker itself.  This avoids a 0.1-second stack sampler that
+        # tends to observe only wait/sleep lines and miss short branches.
+        self._execution_trace_request = None
+        self._execution_trace_active = False
+        self._execution_trace_complete = False
+        self._execution_trace_stop_requested = False
+        self._execution_trace_started = 0.0
+        self._execution_trace_deadline = 0.0
+        self._execution_trace_previous = None
+        self._execution_trace_events = []
+        self._execution_trace_event_by_key = {}
+        self._execution_trace_file_cache = {}
+        self._execution_trace_lock = threading.Lock()
         self.Line = Line_Notify()
         self.Discord = Discord_Notify()
+
+    def request_execution_path_trace(self, duration=10.0, project_root=""):
+        """Ask the running Commands thread to collect executed source lines."""
+        worker = self.thread
+        if worker is None or not worker.is_alive():
+            return False
+        duration = min(30.0, max(1.0, float(duration)))
+        with self._execution_trace_lock:
+            if self._execution_trace_request or self._execution_trace_active:
+                return False
+            self._execution_trace_events = []
+            self._execution_trace_event_by_key = {}
+            self._execution_trace_file_cache = {}
+            self._execution_trace_complete = False
+            self._execution_trace_stop_requested = False
+            self._execution_trace_request = {
+                "duration": duration,
+                "project_root": os.path.normcase(os.path.abspath(
+                    str(project_root or os.getcwd()))),
+            }
+        return True
+
+    def request_execution_path_trace_stop(self):
+        """Request an early stop; the Commands thread removes its own hook."""
+        self._execution_trace_stop_requested = True
+
+    def execution_path_trace_snapshot(self, include_events=False):
+        """Return trace progress without inspecting the worker's call stack."""
+        with self._execution_trace_lock:
+            events = ([dict(event) for event in self._execution_trace_events]
+                      if include_events else [])
+            request = bool(self._execution_trace_request)
+            active = bool(self._execution_trace_active)
+            complete = bool(self._execution_trace_complete)
+            started = float(self._execution_trace_started or 0.0)
+            deadline = float(self._execution_trace_deadline or 0.0)
+        return {
+            "requested": request,
+            "active": active,
+            "complete": complete,
+            "started": started,
+            "deadline": deadline,
+            "elapsed": max(0.0, time.monotonic() - started) if started else 0.0,
+            "event_count": len(events) if include_events else len(
+                self._execution_trace_events),
+            "events": events,
+        }
+
+    def _service_execution_path_trace(self):
+        """Install the line hook from the Commands worker, never Tk's thread."""
+        if self.thread is not threading.current_thread():
+            return
+        with self._execution_trace_lock:
+            request = self._execution_trace_request
+            if not request or self._execution_trace_active:
+                return
+            self._execution_trace_request = None
+            self._execution_trace_active = True
+            self._execution_trace_complete = False
+            self._execution_trace_started = time.monotonic()
+            self._execution_trace_deadline = (
+                self._execution_trace_started + float(request["duration"]))
+            self._execution_trace_root = str(request["project_root"])
+            self._execution_trace_previous = sys.gettrace()
+        sys.settrace(self._execution_path_line_trace)
+
+    def _execution_path_file_is_target(self, filename):
+        filename = os.path.normcase(os.path.abspath(str(filename or "")))
+        cached = self._execution_trace_file_cache.get(filename)
+        if cached is not None:
+            return cached
+        try:
+            target = (filename.lower().endswith(".py") and os.path.commonpath(
+                [filename, self._execution_trace_root]) == self._execution_trace_root)
+        except (OSError, ValueError):
+            target = False
+        self._execution_trace_file_cache[filename] = target
+        return target
+
+    def _execution_path_line_trace(self, frame, event, _argument):
+        if (self._execution_trace_stop_requested
+                or time.monotonic() >= self._execution_trace_deadline):
+            previous = self._execution_trace_previous
+            self._finish_execution_path_trace()
+            return previous
+        if event != "line" or not self._execution_path_file_is_target(
+                frame.f_code.co_filename):
+            return self._execution_path_line_trace
+        filename = os.path.abspath(frame.f_code.co_filename)
+        line = int(frame.f_lineno)
+        key = (os.path.normcase(filename), line)
+        existing = self._execution_trace_event_by_key.get(key)
+        if existing is not None:
+            existing["hit_count"] = int(existing.get("hit_count", 1)) + 1
+            return self._execution_path_line_trace
+        if len(self._execution_trace_events) >= 12000:
+            self._execution_trace_stop_requested = True
+            return self._execution_path_line_trace
+        now = time.monotonic()
+        try:
+            from CommandMonitorRecording import runtime_state_snapshot, state_path_text
+            states = runtime_state_snapshot(self)
+            step_path = state_path_text(states)
+        except (ImportError, TypeError, ValueError):
+            states = {}
+            step_path = ""
+        trace_event = {
+            "time": datetime.datetime.now().isoformat(timespec="milliseconds"),
+            "event": "execution_path",
+            "states": states,
+            "step_path": step_path,
+            "chunk_time": max(0.0, now - self._execution_trace_started),
+            "command_time": max(0.0, now - self._execution_trace_started),
+            "video_time": max(0.0, now - self._execution_trace_started),
+            "hit_count": 1,
+            "location": {
+                "file": filename,
+                "function": str(frame.f_code.co_name),
+                "line": line,
+                "source": linecache.getline(filename, line).strip(),
+            },
+        }
+        self._execution_trace_event_by_key[key] = trace_event
+        self._execution_trace_events.append(trace_event)
+        return self._execution_path_line_trace
+
+    def _finish_execution_path_trace(self):
+        """Remove a worker-local hook and retain the collected coverage."""
+        if self.thread is not threading.current_thread():
+            self._execution_trace_stop_requested = True
+            return
+        with self._execution_trace_lock:
+            active = bool(self._execution_trace_active)
+            requested = bool(self._execution_trace_request)
+        if not active and not requested:
+            return
+        if requested and not active:
+            with self._execution_trace_lock:
+                self._execution_trace_request = None
+                self._execution_trace_complete = True
+                self._execution_trace_stop_requested = False
+            return
+        previous = self._execution_trace_previous
+        sys.settrace(previous)
+        with self._execution_trace_lock:
+            self._execution_trace_active = False
+            self._execution_trace_request = None
+            self._execution_trace_complete = True
+            self._execution_trace_stop_requested = False
+            self._execution_trace_previous = None
 
     def pausedecorator(func):
         """
@@ -207,6 +372,7 @@ class PythonCommand(CommandBase.Command):
                 traceback.print_exc(file=sys.__stderr__)
             self.alive = False
         finally:
+            self._finish_execution_path_trace()
             self._cleanup_started = True
             self.alive = False
             self.pause_requested = False
@@ -339,6 +505,7 @@ class PythonCommand(CommandBase.Command):
         """Yield the GIL while retaining prompt pause/stop checkpoints."""
         deadline = time.perf_counter() + max(0.0, float(seconds))
         while self.alive:
+            self._service_execution_path_trace()
             if (self.pause_requested or self.isPause) and \
                     threading.get_ident() not in self._pause_bypass_threads:
                 self.checkIfAlive()
@@ -364,6 +531,7 @@ class PythonCommand(CommandBase.Command):
         Aliveフラグの状態を確認する。
         AliveフラグがFalseなら終了処理を行う。
         """
+        self._service_execution_path_trace()
         showed_variables = False
         bypass_pause = threading.get_ident() in self._pause_bypass_threads
         while self.alive and (self.isPause or self.pause_requested) and not bypass_pause:

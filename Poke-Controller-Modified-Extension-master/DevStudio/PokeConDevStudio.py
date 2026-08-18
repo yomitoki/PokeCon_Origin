@@ -64,6 +64,7 @@ from ImageDetectionLibrary import (folder_tags as image_folder_tags,
                                    generate_image_check,
                                    image_preview_size,
                                    load_library as load_image_library,
+                                   rename_target as rename_image_library_target,
                                    resolve_list as resolve_image_list,
                                    save_library as save_image_library)
 from ImageDetectionSync import (compare_settings as compare_image_detection_settings,
@@ -71,8 +72,12 @@ from ImageDetectionSync import (compare_settings as compare_image_detection_sett
                                 update_library_from_source)
 from ImageHealthCheck import audit_image_library, suggested_crop
 from ImageCheckReferenceAudit import (audit_image_check_references,
+                                      delete_image_check_exception,
+                                      image_check_exception_rules,
                                       merge_library_targets_into_source,
-                                      preserve_library_import_block)
+                                      preserve_library_import_block,
+                                      rename_image_check_references,
+                                      upsert_image_check_exception)
 from CompletionEngine import CompletionEngine
 from SourceFunctionTools import (build_rename_map,
                                  classify_function_registration,
@@ -743,7 +748,7 @@ class DevStudio(tk.Tk):
         step_hierarchy_tab = ttk.Frame(self.right_tabs)
         completion_tab = ttk.Frame(self.right_tabs)
         source_functions_tab = ttk.Frame(self.right_tabs)
-        self.right_tabs.add(image_targets_tab, text="Image detection")
+        self.right_tabs.add(image_targets_tab, text="画像検知・例外")
         self.right_tabs.add(image_health_tab, text="画像チェック")
         self.right_tabs.add(step_hierarchy_tab, text="Step hierarchy")
         self.right_tabs.add(completion_tab, text="Completion")
@@ -756,6 +761,7 @@ class DevStudio(tk.Tk):
         self.source_functions_tab = source_functions_tab
         self.image_health_tab = image_health_tab
         self.image_reference_tab = image_reference_tab
+        self.image_targets_tab = image_targets_tab
         self.right_tabs.bind("<<NotebookTabChanged>>", self.on_right_tool_tab_changed)
         source_tab_bar = ttk.Frame(center)
         source_tab_bar.pack(fill="x")
@@ -2004,7 +2010,9 @@ class DevStudio(tk.Tk):
             self.edit_source_function_target_name()
 
     def on_right_tool_tab_changed(self, event=None):
-        if self.right_tabs.select() == str(self.image_health_tab):
+        if self.right_tabs.select() == str(self.image_targets_tab):
+            self._on_image_management_tab_changed()
+        elif self.right_tabs.select() == str(self.image_health_tab):
             self.run_image_health_check()
         elif self.right_tabs.select() == str(self.image_reference_tab):
             self.run_image_reference_check()
@@ -2951,6 +2959,25 @@ class DevStudio(tk.Tk):
         self.run_image_health_check()
 
     def _build_image_targets_tab(self, parent):
+        self.image_rename_calls = tk.BooleanVar(value=True)
+        self.image_management_tabs = ttk.Notebook(parent)
+        self.image_management_tabs.pack(fill="both", expand=True)
+        command_tab = ttk.Frame(self.image_management_tabs)
+        registered_tab = ttk.Frame(self.image_management_tabs)
+        exception_tab = ttk.Frame(self.image_management_tabs)
+        self.image_management_tabs.add(command_tab, text="ソース対象")
+        self.image_management_tabs.add(registered_tab, text="登録済み画像検知")
+        self.image_management_tabs.add(exception_tab, text="例外設定")
+        self.registered_image_management_tab = registered_tab
+        self.image_exception_management_tab = exception_tab
+        self._registered_image_management_loaded = False
+        self._build_command_image_targets_tab(command_tab)
+        self._build_registered_image_management_tab(registered_tab)
+        self._build_image_exception_management_tab(exception_tab)
+        self.image_management_tabs.bind(
+            "<<NotebookTabChanged>>", self._on_image_management_tab_changed)
+
+    def _build_command_image_targets_tab(self, parent):
         self.image_detection_targets = []
         self.image_target_name = tk.StringVar(value="target")
         self.image_target_path = tk.StringVar()
@@ -3000,6 +3027,394 @@ class DevStudio(tk.Tk):
         ttk.Button(library_actions, text="現在のコマンドへ反映", command=self.apply_image_targets_to_editor).pack(side="right", padx=2)
         parent.columnconfigure(3, weight=1)
         parent.rowconfigure(4, weight=1)
+
+    def _build_registered_image_management_tab(self, parent):
+        self.registered_image_search = tk.StringVar()
+        search = ttk.Frame(parent)
+        search.pack(fill="x", padx=6, pady=(6, 3))
+        ttk.Label(search, text="登録名・説明・画像検索:").pack(side="left")
+        ttk.Entry(search, textvariable=self.registered_image_search).pack(
+            side="left", fill="x", expand=True, padx=4)
+        ttk.Button(
+            search, text="再読込",
+            command=self.refresh_registered_image_management).pack(side="right")
+        self.registered_image_search.trace_add(
+            "write", lambda *args: self.debounce(
+                "registered_image_management", 120,
+                self.refresh_registered_image_management))
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill="both", expand=True, padx=6, pady=3)
+        self.registered_image_tree = ttk.Treeview(
+            tree_frame, columns=("description", "patterns", "operator"),
+            show="tree headings", selectmode="browse")
+        self.registered_image_tree.heading("#0", text="画像検知名")
+        self.registered_image_tree.heading("description", text="説明")
+        self.registered_image_tree.heading("patterns", text="画像数")
+        self.registered_image_tree.heading("operator", text="判定")
+        self.registered_image_tree.column("#0", width=220)
+        self.registered_image_tree.column("description", width=260)
+        self.registered_image_tree.column("patterns", width=55, anchor="center")
+        self.registered_image_tree.column("operator", width=50, anchor="center")
+        pack_scrollable_widget(self.registered_image_tree, horizontal=True)
+        self.registered_image_tree.bind(
+            "<Double-1>", lambda _event: self.open_registered_image_detail())
+
+        rename_row = ttk.Frame(parent)
+        rename_row.pack(fill="x", padx=6, pady=(2, 0))
+        ttk.Checkbutton(
+            rename_row, text="名称変更時にimage_check呼び出し側も変更",
+            variable=self.image_rename_calls).pack(side="left")
+        ttk.Button(
+            rename_row, text="呼び出し名を変更",
+            command=self.rename_registered_image_detection).pack(side="right")
+
+        actions = ttk.Frame(parent)
+        actions.pack(fill="x", padx=6, pady=(3, 6))
+        ttk.Button(
+            actions, text="新規追加（詳細設定へ）",
+            command=lambda: self.open_registered_image_detail(new=True)).pack(
+                side="left", padx=2)
+        ttk.Button(
+            actions, text="選択を変更（詳細設定へ）",
+            command=self.open_registered_image_detail).pack(side="left", padx=2)
+        ttk.Button(actions, text="ソースを保存", command=self.save_current).pack(
+            side="right", padx=2)
+        ttk.Button(
+            actions, text="選択登録を削除",
+            command=self.delete_registered_image_detection).pack(side="right", padx=2)
+
+    def _build_image_exception_management_tab(self, parent):
+        self.image_exception_name = tk.StringVar()
+        self.image_exception_expression = tk.StringVar(value="False")
+        form = ttk.Labelframe(parent, text="image_check_exception 設定")
+        form.pack(fill="x", padx=6, pady=6)
+        ttk.Label(form, text="呼び出し名:").grid(
+            column=0, row=0, padx=4, pady=4, sticky="w")
+        ttk.Entry(form, textvariable=self.image_exception_name).grid(
+            column=1, row=0, padx=4, pady=4, sticky="ew")
+        ttk.Label(form, text="戻り値式:").grid(
+            column=0, row=1, padx=4, pady=4, sticky="w")
+        ttk.Entry(form, textvariable=self.image_exception_expression).grid(
+            column=1, row=1, padx=4, pady=4, sticky="ew")
+        ttk.Checkbutton(
+            form, text="名称変更時にimage_check呼び出し側も変更",
+            variable=self.image_rename_calls).grid(
+                column=0, columnspan=2, row=2, padx=4, pady=2, sticky="w")
+        form.columnconfigure(1, weight=1)
+
+        tree_frame = ttk.Frame(parent)
+        tree_frame.pack(fill="both", expand=True, padx=6, pady=3)
+        self.image_exception_tree = ttk.Treeview(
+            tree_frame, columns=("expression", "line"),
+            show="tree headings", selectmode="browse")
+        self.image_exception_tree.heading("#0", text="例外の呼び出し名")
+        self.image_exception_tree.heading("expression", text="戻り値式")
+        self.image_exception_tree.heading("line", text="行")
+        self.image_exception_tree.column("#0", width=270)
+        self.image_exception_tree.column("expression", width=360)
+        self.image_exception_tree.column("line", width=55, anchor="e")
+        pack_scrollable_widget(self.image_exception_tree, horizontal=True)
+        self.image_exception_tree.bind(
+            "<<TreeviewSelect>>", self.load_selected_image_exception)
+        self.image_exception_tree.bind(
+            "<Double-1>", lambda _event: self.goto_selected_image_exception())
+
+        actions = ttk.Frame(parent)
+        actions.pack(fill="x", padx=6, pady=(3, 6))
+        ttk.Button(actions, text="新規追加", command=self.add_image_exception).pack(
+            side="left", padx=2)
+        ttk.Button(actions, text="選択内容を変更", command=self.change_image_exception).pack(
+            side="left", padx=2)
+        ttk.Button(actions, text="選択を削除", command=self.remove_image_exception).pack(
+            side="left", padx=2)
+        ttk.Button(
+            actions, text="同名画像検知の詳細",
+            command=self.open_exception_image_detail).pack(side="left", padx=8)
+        ttk.Button(actions, text="ソースを保存", command=self.save_current).pack(
+            side="right", padx=2)
+
+    def _on_image_management_tab_changed(self, event=None):
+        if not hasattr(self, "image_management_tabs"):
+            return
+        selected = self.image_management_tabs.select()
+        if selected == str(self.registered_image_management_tab):
+            self._registered_image_management_loaded = True
+            self.refresh_registered_image_management()
+        elif selected == str(self.image_exception_management_tab):
+            self.refresh_image_exception_management()
+
+    def _selected_registered_image_name(self, required=True):
+        selected = self.registered_image_tree.selection()
+        name = self.registered_image_tree_ids.get(selected[0]) \
+            if selected else None
+        if required and not name:
+            messagebox.showinfo(
+                "登録済み画像検知", "画像検知名を選択してください。", parent=self)
+        return name
+
+    def refresh_registered_image_management(self, select=None):
+        if not hasattr(self, "registered_image_tree"):
+            return
+        current = select or self._selected_registered_image_name(required=False)
+        data = self._read_image_library()
+        needle = self.registered_image_search.get().strip().casefold()
+        self.registered_image_tree.delete(
+            *self.registered_image_tree.get_children())
+        self.registered_image_tree_ids = {}
+        for index, name in enumerate(sorted(data["targets"], key=str.casefold)):
+            item = data["targets"][name]
+            searchable = " ".join(
+                [name, item.get("description", "")] +
+                [str(variant.get("template_path", ""))
+                 for variant in item.get("variants", [])]).casefold()
+            if needle and needle not in searchable:
+                continue
+            iid = "registered_{}".format(index)
+            self.registered_image_tree.insert(
+                "", "end", iid=iid, text=name,
+                values=(item.get("description", ""),
+                        len(item.get("variants", [])),
+                        item.get("operator", "OR")))
+            self.registered_image_tree_ids[iid] = name
+            if name == current:
+                self.registered_image_tree.selection_set(iid)
+                self.registered_image_tree.see(iid)
+
+    def open_registered_image_detail(self, new=False, name=None):
+        if not new:
+            name = name or self._selected_registered_image_name()
+            if not name:
+                return
+        self.workspace_tabs.select(self.image_library_workspace)
+        self._image_library_workspace_loaded = True
+        if new:
+            self.image_library_selected_variant = None
+            self.image_library_search.set("")
+            self.image_library_name.set("NEW_IMAGE_CHECK")
+            self.image_library_description.set("")
+            self.image_library_path.set("")
+            self.image_library_threshold.set(0.8)
+            self.image_library_crop.set("0,0,0,0")
+            self.image_library_gray.set(True)
+            self._clear_image_library_preview(
+                "画像を選択し、設定後に［＋別パターンとして保存］を押してください。")
+            self.refresh_image_library_workspace()
+            self.status.set("新しい画像検知の詳細設定を開きました。")
+            return
+        data = self._read_image_library()
+        if name not in data["targets"] or not data["targets"][name].get("variants"):
+            messagebox.showwarning(
+                "登録済み画像検知", "登録画像がありません: " + name,
+                parent=self)
+            return
+        self.image_library_search.set(name)
+        pending = getattr(self, "_debounce_jobs", {}).pop(
+            "image_library_search", None)
+        if pending is not None:
+            try:
+                self.after_cancel(pending)
+            except tk.TclError:
+                pass
+        self.refresh_image_library_workspace(select=(name, 0))
+        self.load_selected_image_library_variant()
+        self.status.set("画像検知の詳細設定を開きました: " + name)
+
+    def _replace_current_editor_source(self, source):
+        cursor = self.editor.index("insert")
+        self.editor.delete("1.0", "end")
+        self.editor.insert("1.0", source)
+        try:
+            self.editor.mark_set("insert", cursor)
+        except tk.TclError:
+            self.editor.mark_set("insert", "1.0")
+        self.editor_dirty = True
+        if self.active_editor_tab in self.editor_documents:
+            document = self.editor_documents[self.active_editor_tab]
+            document["content"] = source
+            document["dirty"] = True
+            self.editor_tabs.tab(
+                self.active_editor_tab, text=self._editor_tab_label(document))
+        self.update_editor_view()
+
+    def rename_registered_image_detection(self):
+        old_name = self._selected_registered_image_name()
+        if not old_name:
+            return
+        new_name = simpledialog.askstring(
+            "画像検知の呼び出し名を変更",
+            "変更後の呼び出し名:\n\n設定・画像検知リストも同時に更新します。",
+            initialvalue=old_name, parent=self)
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        source = self.editor.get("1.0", "end-1c")
+        updated_source, changed = source, 0
+        try:
+            if self.image_rename_calls.get() and source.strip():
+                updated_source, changed = rename_image_check_references(
+                    source, old_name, new_name, include_definitions=True)
+            data = self._read_image_library()
+            rename_image_library_target(data, old_name, new_name)
+        except (ValueError, SyntaxError) as error:
+            messagebox.showwarning(
+                "画像検知の呼び出し名を変更", str(error), parent=self)
+            return
+        save_image_library(self._image_library_config_path(), data)
+        if updated_source != source:
+            self._replace_current_editor_source(updated_source)
+        self.refresh_registered_image_management(select=new_name)
+        self.refresh_sample_apply_image_tree()
+        if getattr(self, "_image_library_workspace_loaded", False):
+            self.refresh_image_library_workspace()
+        suffix = " / ソース内{}箇所も変更（未保存）".format(changed) \
+            if changed else ""
+        self.status.set(
+            "画像検知名を変更しました: {} → {}{}".format(
+                old_name, new_name, suffix))
+
+    def delete_registered_image_detection(self):
+        name = self._selected_registered_image_name()
+        if not name:
+            return
+        try:
+            result = audit_image_check_references(
+                self.editor.get("1.0", "end-1c"))
+            use_count = next((item["count"] for item in result["references"]
+                              if item["name"] == name), 0)
+        except SyntaxError:
+            use_count = 0
+        warning = "\n\n編集中ソースのimage_check呼び出し{}件は残ります。".format(
+            use_count) if use_count else ""
+        if not messagebox.askyesno(
+                "登録済み画像検知を削除",
+                "{} の全パターンとリスト参照を削除しますか？{}".format(
+                    name, warning), parent=self):
+            return
+        data = self._read_image_library()
+        data["targets"].pop(name, None)
+        for item in data["lists"].values():
+            item["members"] = [
+                member for member in item.get("members", [])
+                if not (member.get("type") == "target"
+                        and member.get("id") == name)]
+        save_image_library(self._image_library_config_path(), data)
+        self.refresh_registered_image_management()
+        self.refresh_sample_apply_image_tree()
+        if getattr(self, "_image_library_workspace_loaded", False):
+            self.refresh_image_library_workspace()
+        self.status.set("登録済み画像検知を削除しました: " + name)
+
+    def refresh_image_exception_management(self, select=None):
+        if not hasattr(self, "image_exception_tree"):
+            return
+        current = select
+        if current is None:
+            selected = self.image_exception_tree.selection()
+            current = self.image_exception_tree_ids.get(selected[0], {}).get(
+                "name") if selected else None
+        try:
+            rules = image_check_exception_rules(
+                self.editor.get("1.0", "end-1c"))
+        except SyntaxError as error:
+            self.status.set("例外設定を読めません: " + str(error))
+            return
+        self.image_exception_tree.delete(
+            *self.image_exception_tree.get_children())
+        self.image_exception_tree_ids = {}
+        for index, rule in enumerate(rules):
+            iid = "exception_{}".format(index)
+            self.image_exception_tree.insert(
+                "", "end", iid=iid, text=rule["name"],
+                values=(rule["expression"], rule["line"]))
+            self.image_exception_tree_ids[iid] = rule
+            if rule["name"] == current:
+                self.image_exception_tree.selection_set(iid)
+                self.image_exception_tree.see(iid)
+
+    def _selected_image_exception(self, required=True):
+        selected = self.image_exception_tree.selection()
+        rule = self.image_exception_tree_ids.get(selected[0]) \
+            if selected else None
+        if required and not rule:
+            messagebox.showinfo(
+                "画像検知の例外設定", "例外設定を選択してください。", parent=self)
+        return rule
+
+    def load_selected_image_exception(self, event=None):
+        rule = self._selected_image_exception(required=False)
+        if not rule:
+            return
+        self.image_exception_name.set(rule["name"])
+        self.image_exception_expression.set(rule["expression"])
+
+    def goto_selected_image_exception(self):
+        rule = self._selected_image_exception()
+        if not rule:
+            return
+        line = max(1, int(rule["line"]))
+        self.editor.mark_set("insert", "{}.0".format(line))
+        self.editor.see("{}.0".format(line))
+        self.editor.focus_set()
+
+    def _apply_image_exception_change(self, old_name=None):
+        name = self.image_exception_name.get().strip()
+        expression = self.image_exception_expression.get().strip()
+        source = self.editor.get("1.0", "end-1c")
+        try:
+            updated = upsert_image_check_exception(
+                source, name, expression, old_name=old_name)
+            changed = 0
+            if old_name and old_name != name and self.image_rename_calls.get():
+                updated, changed = rename_image_check_references(
+                    updated, old_name, name)
+        except (ValueError, SyntaxError) as error:
+            messagebox.showwarning(
+                "画像検知の例外設定", str(error), parent=self)
+            return
+        self._replace_current_editor_source(updated)
+        self.refresh_image_exception_management(select=name)
+        suffix = " / image_check呼び出し{}件も変更".format(changed) \
+            if changed else ""
+        self.status.set("例外設定を反映しました（ソース未保存）: {}{}".format(
+            name, suffix))
+
+    def add_image_exception(self):
+        self._apply_image_exception_change()
+
+    def change_image_exception(self):
+        rule = self._selected_image_exception()
+        if rule:
+            self._apply_image_exception_change(old_name=rule["name"])
+
+    def remove_image_exception(self):
+        rule = self._selected_image_exception()
+        if not rule or not messagebox.askyesno(
+                "画像検知の例外設定",
+                "例外設定 {} を削除しますか？\n呼び出し側は変更しません。".format(
+                    rule["name"]), parent=self):
+            return
+        try:
+            updated = delete_image_check_exception(
+                self.editor.get("1.0", "end-1c"), rule["name"])
+        except (ValueError, SyntaxError) as error:
+            messagebox.showwarning(
+                "画像検知の例外設定", str(error), parent=self)
+            return
+        self._replace_current_editor_source(updated)
+        self.refresh_image_exception_management()
+        self.status.set(
+            "例外設定を削除しました（ソース未保存）: " + rule["name"])
+
+    def open_exception_image_detail(self):
+        name = self.image_exception_name.get().strip()
+        data = self._read_image_library()
+        if name not in data["targets"]:
+            messagebox.showinfo(
+                "画像検知の詳細", "同名の登録済み画像検知はありません: " + name,
+                parent=self)
+            return
+        self.open_registered_image_detail(name=name)
 
     def _build_image_library_workspace(self, parent):
         pane = ttk.Panedwindow(parent, orient="horizontal")
@@ -7542,9 +7957,36 @@ class DevStudio(tk.Tk):
         editor.insert("1.0", code); editor.configure(state="disabled"); dialog.geometry("900x600")
 
     def apply_image_detection_code(self):
-        try: code = self._current_image_detection_code()
+        try:
+            code = self._current_image_detection_code()
+            data = self._read_image_library()
+            list_name = self.image_library_list_name.get().strip()
+            selected_names = resolve_image_list(data, list_name)
         except ValueError as error: messagebox.showwarning("画像検知", str(error), parent=self); return
         editor = self.sample_program_editor if self.image_library_apply_target.get() == "サンプルプログラム" else self.editor
+        source = editor.get("1.0", "end-1c")
+        # A list-specific apply must not rebuild the complete generated block:
+        # doing so removes every registration outside the selected list.  Once
+        # image_check has been generated, update only the selected registrations.
+        if "# POKECON_IMAGE_CHECK_BEGIN" in source:
+            try:
+                updated, added = merge_library_targets_into_source(
+                    source, data, selected_names)
+            except (SyntaxError, ValueError) as error:
+                messagebox.showwarning("画像検知", str(error), parent=self)
+                return
+            editor.delete("1.0", "end")
+            editor.insert("1.0", updated)
+            if editor is self.sample_program_editor:
+                self.sample_program_dirty = True
+                self._update_sample_program_line_numbers()
+            else:
+                self.editor_dirty = True
+                self.update_editor_view()
+            self.status.set(
+                "画像検知{}件を追加/更新しました。既存登録は保持しています。保存してください。".format(
+                    len(added)))
+            return
         if self._apply_image_code_to_editor(editor, code):
             self.status.set("image_checkを生成/更新しました。保存してください。")
 

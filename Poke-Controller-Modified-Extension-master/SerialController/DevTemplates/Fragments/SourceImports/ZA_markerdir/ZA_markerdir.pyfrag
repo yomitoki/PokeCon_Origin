@@ -25,42 +25,152 @@ def ZA_markerdir(self,type,nofiled=False):
     left = marker + "_LEFT_WIDE"
     right = marker + "_RIGHT_WIDE"
     last_movement_name = "_za_markerdir_last_movement_" + marker
+
+    def is_detected_in(target, detail):
+        if not detail or not detail.get("matched"):
+            return False
+        x, y = detail["position"]
+        width, height = detail["template_size"]
+        for variant in self.IMAGE_DETECTION_TARGETS.get(target, []):
+            crop = variant.get("crop", [])
+            if not crop or len(crop) != 4 or not any(int(value) for value in crop):
+                return True
+            x1, y1, x2, y2 = [int(value) for value in crop]
+            if x >= x1 and y >= y1 and x + width <= x2 and y + height <= y2:
+                return True
+        return False
+
+    def detect_marker_position(variant):
+        # F5 Reloadだけで反映できるよう、LocalFunction側の追加引数に
+        # 依存せず、このサンプル関数内で全画面照合とマップ除外を行う。
+        camera = getattr(self, "camera", None)
+        if camera is None:
+            return None
+        if hasattr(camera, "readFreshFrame"):
+            frame = camera.readFreshFrame(timeout=0.75)
+        else:
+            frame = camera.readFrame() if hasattr(
+                camera, "readFrame") else None
+        if frame is None:
+            return None
+
+        template_path = str(variant.get("template_path", ""))
+        normalized_path = template_path.replace("\\", "/")
+        if (not os.path.isabs(template_path)
+                and normalized_path.startswith("Template/")):
+            template_path = self.get_filespec(
+                normalized_path[len("Template/"):], mode="t")
+        template = cv2.imread(template_path, cv2.IMREAD_COLOR)
+        if template is None:
+            return None
+
+        source_match = frame
+        template_match = template
+        if variant.get("use_gray", False):
+            source_match = cv2.cvtColor(
+                source_match, cv2.COLOR_BGR2GRAY)
+            template_match = cv2.cvtColor(
+                template_match, cv2.COLOR_BGR2GRAY)
+        if (source_match.shape[0] < template_match.shape[0]
+                or source_match.shape[1] < template_match.shape[1]):
+            return None
+
+        result = cv2.matchTemplate(
+            source_match, template_match, cv2.TM_CCOEFF_NORMED)
+        result = result.copy()
+        result_height, result_width = result.shape[:2]
+        template_height, template_width = template_match.shape[:2]
+        # テンプレート矩形が左上マップへ少しでも重なる候補を除外する。
+        exclusion_right = min(result_width, 210)
+        exclusion_bottom = min(result_height, 210)
+        if exclusion_right > 0 and exclusion_bottom > 0:
+            result[0:exclusion_bottom, 0:exclusion_right] = -2.0
+        _, score, _, location = cv2.minMaxLoc(result)
+        threshold = float(variant.get("threshold", 0.8))
+        matched = float(score) >= threshold
+        show_value = bool(variant.get("show_value", False))
+        if show_value:
+            print("{} ZNCC value: {:.6f} / threshold: {:.6f}".format(
+                marker + "_POSITION", score, threshold))
+        show_position = bool(variant.get("show_position", True))
+        show_only_true_rect = bool(
+            variant.get("show_only_true_rect", False))
+        if (show_position and hasattr(self, "displayRectangle")
+                and (matched or not show_only_true_rect)):
+            color = [
+                str(variant.get("match_color", "blue")), "orange"
+            ] if matched else [
+                str(variant.get("no_match_color", "red")), "orange"
+            ]
+            self.displayRectangle(
+                location,
+                int(template_width),
+                int(template_height),
+                str(time.perf_counter()),
+                int(variant.get("ms", 2000)),
+                color=color,
+                crop=[])
+        detail = {
+            "name": marker + "_POSITION",
+            "matched": matched,
+            "score": float(score),
+            "threshold": threshold,
+            "position": location,
+            "template_size": (
+                int(template_width), int(template_height)),
+            "excluded_regions": [(0, 0, 210, 210)],
+            "show_value": show_value,
+            "timestamp": time.time(),
+        }
+        event_callback = getattr(self, "image_detection_event", None)
+        if callable(event_callback):
+            try:
+                event_callback(detail)
+            except Exception:
+                pass
+        return detail
     
     if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or nofiled: #FIELDから変更
-        if self.image_check(center):
+        variants = self.IMAGE_DETECTION_TARGETS.get(center, [])
+        detail = None
+        if variants:
+            detail = detect_marker_position(variants[0])
+            self.last_image_detection = detail
+
+        if is_detected_in(center, detail):
             setattr(self, last_movement_name, None)
             return True
-        elif self.image_check(wide_downer):
+        elif is_detected_in(wide_downer, detail):
             movement = (270, 1.0, 0.0)
-        elif self.image_check(wide_upper):
+        elif is_detected_in(wide_upper, detail):
             movement = (90, 1.0, 0.0)
-        elif self.image_check(wide_downer_left_near):
+        elif is_detected_in(wide_downer_left_near, detail):
             movement = (180, 0.2, 0.0)
-        elif self.image_check(wide_downer_right_near):
+        elif is_detected_in(wide_downer_right_near, detail):
             movement = (0, 0.2, 0.0)
-        elif self.image_check(wide_upper_left_near):
+        elif is_detected_in(wide_upper_left_near, detail):
             movement = (180, 0.2, 0.0)
-        elif self.image_check(wide_upper_right_near):
+        elif is_detected_in(wide_upper_right_near, detail):
             movement = (0, 0.2, 0.0)
-        elif self.image_check(wide_downer_left):
+        elif is_detected_in(wide_downer_left, detail):
             movement = (180, 1.0, 0.03)
-        elif self.image_check(wide_downer_right):
+        elif is_detected_in(wide_downer_right, detail):
             movement = (0, 1.0, 0.03)
-        elif self.image_check(wide_upper_left):
+        elif is_detected_in(wide_upper_left, detail):
             movement = (180, 1.0, 0.03)
-        elif self.image_check(wide_upper_right):
+        elif is_detected_in(wide_upper_right, detail):
             movement = (0, 1.0, 0.03)
-        elif self.image_check(left_side):
+        elif is_detected_in(left_side, detail):
             movement = (180, 1.0, 0.03)
-        elif self.image_check(right_side):
+        elif is_detected_in(right_side, detail):
             movement = (0, 1.0, 0.03)
-        elif self.image_check(left):
-            if self.image_check(center_wide):
+        elif is_detected_in(left, detail):
+            if is_detected_in(center_wide, detail):
                 movement = (180, 0.2, 0.0)
             else:
                 movement = (180, 1.0, 0.03)
-        elif self.image_check(right):
-            if self.image_check(center_wide):
+        elif is_detected_in(right, detail):
+            if is_detected_in(center_wide, detail):
                 movement = (0, 0.2, 0.0)
             else:
                 movement = (0, 1.0, 0.03)

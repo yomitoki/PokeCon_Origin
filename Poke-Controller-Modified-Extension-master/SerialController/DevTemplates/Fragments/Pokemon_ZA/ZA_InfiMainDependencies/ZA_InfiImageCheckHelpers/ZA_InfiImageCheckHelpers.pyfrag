@@ -62,6 +62,10 @@ def image_check_exception(self, targetimage):
         return bool(self.ZA_story_Template_Field_HardGaurd(mode=1))
     if targetimage == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK":
         return bool(self.ZA_no_battle_filed_check_HardGaurd())
+    if targetimage == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_0":
+        return bool(self.ZA_no_battle_filed_check_HardGaurd())
+    if targetimage == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_1":
+        return bool(self.ZA_no_battle_filed_check_HardGaurd(mode=1))
     if targetimage == "POKEMON_ZA_ZONE12":
         return True
     # POKECON_IMAGE_CHECK_EXCEPTION_USER_BEGIN

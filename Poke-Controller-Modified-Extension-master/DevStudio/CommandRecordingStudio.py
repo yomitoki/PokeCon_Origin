@@ -23,7 +23,8 @@ except ImportError:
 
 from CommandRecordingModel import (filtered_timeline, load_command_recording,
                                    load_command_timeline, resolve_event_source,
-                                   source_function_block, timeline_page,
+                                   observed_source_lines, source_function_block,
+                                   timeline_page,
                                    video_candidates)
 from OperationSessionStudio import FrameCaptureDialog
 
@@ -179,6 +180,12 @@ class CommandRecordingWorkspace(ttk.Frame):
         actions.pack(fill="x", padx=3, pady=(0, 3))
         ttk.Button(actions, text="ソース編集タブで開く",
                    command=self.open_current_source).pack(side="left")
+        ttk.Button(actions, text="◀ 前の通過行",
+                   command=lambda: self.select_visited_line(False)).pack(
+                       side="left", padx=(3, 0))
+        ttk.Button(actions, text="次の通過行 ▶",
+                   command=lambda: self.select_visited_line(True)).pack(
+                       side="left", padx=3)
         ttk.Button(actions, text="停止地点を動画で再確認",
                    command=self.seek_current_event).pack(side="left", padx=3)
         frame = ttk.Frame(parent)
@@ -194,7 +201,10 @@ class CommandRecordingWorkspace(ttk.Frame):
         sx.grid(column=0, row=1, sticky="ew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        self.source_text.tag_configure("current", background="#664d00", foreground="white")
+        self.source_text.tag_configure(
+            "visited", background="#173f5f", foreground="white")
+        self.source_text.tag_configure(
+            "current", background="#664d00", foreground="white")
         self.source_text.configure(state="disabled")
 
     def _build_video(self, parent):
@@ -448,17 +458,61 @@ class CommandRecordingWorkspace(ttk.Frame):
                 block["text"].splitlines(True), start=block["start_line"]):
             rendered.append("{:6d} | {}".format(number, text))
         self.source_text.insert("1.0", "".join(rendered))
+        original = str(location.get("file", "") or self.current_source_path or path)
+        visited = observed_source_lines(self.events, original)
+        visible_visited = 0
+        for line in sorted(visited):
+            if block["start_line"] <= line <= block["end_line"]:
+                row = line - block["start_line"] + 1
+                self.source_text.tag_add(
+                    "visited", "{}.0".format(row), "{}.end".format(row))
+                visible_visited += 1
         highlight = int(block.get("highlight_line", 0) or 0)
         if block["start_line"] <= highlight <= block["end_line"]:
             row = highlight - block["start_line"] + 1
             self.source_text.tag_add("current", "{}.0".format(row), "{}.end".format(row))
+            self.source_text.tag_raise("current")
             self.source_text.see("{}.0".format(row))
         original = str(location.get("file", "") or "")
         source_kind = "録画時スナップショット" if os.path.abspath(path) != os.path.abspath(original or path) \
             else "現在のソース"
-        self.source_title.set("{} / {}() / {}行 / {}".format(
-            source_kind, location.get("function", "-"), location.get("line", "-"), path))
+        self.source_title.set("{} / {}() / {}行 / 通過行{}件 / {}".format(
+            source_kind, location.get("function", "-"), location.get("line", "-"),
+            visible_visited, path))
         self.source_text.configure(state="disabled")
+
+    def select_visited_line(self, forward):
+        """Jump between distinct source lines that were observed in the trace."""
+        distinct = []
+        seen = set()
+        for event in self.events:
+            location = event.get("location", {}) if isinstance(event, dict) else {}
+            if not isinstance(location, dict):
+                continue
+            path = str(location.get("file", "") or "")
+            try:
+                line = int(location.get("line", 0) or 0)
+            except (TypeError, ValueError):
+                line = 0
+            if not path or line <= 0:
+                continue
+            key = (os.path.normcase(os.path.abspath(path)), line)
+            if key not in seen:
+                seen.add(key)
+                distinct.append(event)
+        if not distinct:
+            self.status.set("この記録には通過したソース行がありません。")
+            return
+        current = int(self.current_event.get("index", 0)) if self.current_event else 0
+        if forward:
+            target = next(
+                (event for event in distinct if int(event.get("index", 0)) > current),
+                distinct[0])
+        else:
+            target = next(
+                (event for event in reversed(distinct)
+                 if int(event.get("index", 0)) < current), distinct[-1])
+        self.select_event(target, seek=True)
 
     def open_current_source(self):
         event = self.current_event or {}

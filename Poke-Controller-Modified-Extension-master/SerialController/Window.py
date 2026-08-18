@@ -76,6 +76,7 @@ from CommandMonitorRecording import (CommandInputActivityTracker,
                                      failure_evidence_end,
                                      historical_retention_ids,
                                      runtime_execution_location,
+                                     runtime_execution_snapshot,
                                      runtime_state_snapshot, state_path_text,
                                      temporary_chunk_ids_for_session)
 from CommandRecordingMerge import merge_command_recording_chunks
@@ -1588,6 +1589,85 @@ class PokeControllerApp:
         ttk.Label(self.command_watch_lf, textvariable=self.command_watch_status).grid(column=0, columnspan=4, row=5, padx=5, pady=(0, 4), sticky="w")
         self.command_watch_lf.pack(fill="x", padx=5, pady=5)
         self.controller_nb.add(self.command_watch_tab, padding="0", sticky="nsew", text="Command Watch")
+        self.execution_path_tab, self.execution_path_f = self._create_scrollable_tab()
+        self.execution_path_lf = ttk.Labelframe(
+            self.execution_path_f, text="実行中Commandsの現在位置／10秒経路記録")
+        execution_path_actions = ttk.Frame(self.execution_path_lf)
+        ttk.Button(
+            execution_path_actions, text="現在位置を取得",
+            command=self.capture_execution_path_snapshot).pack(side="left", padx=(0, 5))
+        self.execution_path_start_button = ttk.Button(
+            execution_path_actions, text="経路記録開始",
+            command=self.start_execution_path_trace)
+        self.execution_path_start_button.pack(side="left", padx=(0, 5))
+        self.execution_path_stop_button = ttk.Button(
+            execution_path_actions, text="記録停止",
+            command=self.stop_execution_path_trace, state="disabled")
+        self.execution_path_stop_button.pack(side="left", padx=(0, 5))
+        self.execution_path_devstudio_button = ttk.Button(
+            execution_path_actions, text="DevStudioで通過行を表示",
+            command=self.open_execution_path_in_dev_studio, state="disabled")
+        self.execution_path_devstudio_button.pack(side="left", padx=(0, 5))
+        ttk.Button(
+            execution_path_actions, text="履歴を消去",
+            command=self.clear_execution_path_snapshots).pack(side="left")
+        execution_path_actions.pack(fill="x", padx=5, pady=(5, 2))
+        self.execution_path_command = tk.StringVar(value="実行Commands: 停止中")
+        self.execution_path_step = tk.StringVar(value="Step: 未取得")
+        self.execution_path_status = tk.StringVar(
+            value=("単発取得、または［経路記録開始］→約10秒で自動停止→"
+                   "［DevStudioで通過行を表示］を使用します。"))
+        self._execution_path_trace_active = False
+        self._execution_path_trace_after_id = None
+        self._execution_path_trace_command = None
+        self._execution_path_trace_started = 0.0
+        self._execution_path_trace_started_wall = ""
+        self._execution_path_trace_events = []
+        self._execution_path_trace_last_status = 0.0
+        self._execution_path_last_session = ""
+        self._execution_path_stop_reason = ""
+        ttk.Label(
+            self.execution_path_lf, textvariable=self.execution_path_command,
+            anchor="w").pack(fill="x", padx=5, pady=1)
+        ttk.Label(
+            self.execution_path_lf, textvariable=self.execution_path_step,
+            anchor="w", wraplength=1100).pack(fill="x", padx=5, pady=1)
+        ttk.Label(
+            self.execution_path_lf, textvariable=self.execution_path_status,
+            anchor="w", wraplength=1100).pack(fill="x", padx=5, pady=(1, 4))
+        execution_path_tree_f = ttk.Frame(self.execution_path_lf)
+        self.execution_path_tree = ttk.Treeview(
+            execution_path_tree_f,
+            columns=("function", "location", "source"),
+            height=8, selectmode="browse")
+        self.execution_path_tree.heading("#0", text="取得時刻 / Step")
+        self.execution_path_tree.heading("function", text="関数")
+        self.execution_path_tree.heading("location", text="ファイル : 行")
+        self.execution_path_tree.heading("source", text="通過中の処理")
+        self.execution_path_tree.column("#0", width=270, stretch=False)
+        self.execution_path_tree.column("function", width=230, stretch=False)
+        self.execution_path_tree.column("location", width=330, stretch=False)
+        self.execution_path_tree.column("source", width=620, stretch=True)
+        execution_path_y = ttk.Scrollbar(
+            execution_path_tree_f, orient="vertical",
+            command=self.execution_path_tree.yview)
+        execution_path_x = ttk.Scrollbar(
+            execution_path_tree_f, orient="horizontal",
+            command=self.execution_path_tree.xview)
+        self.execution_path_tree.configure(
+            yscrollcommand=execution_path_y.set,
+            xscrollcommand=execution_path_x.set)
+        self.execution_path_tree.tag_configure(
+            "current", foreground="#006400", background="#dff5e1")
+        self.execution_path_tree.grid(column=0, row=0, sticky="nsew")
+        execution_path_y.grid(column=1, row=0, sticky="ns")
+        execution_path_x.grid(column=0, row=1, sticky="ew")
+        execution_path_tree_f.columnconfigure(0, weight=1)
+        execution_path_tree_f.rowconfigure(0, weight=1)
+        execution_path_tree_f.pack(fill="both", expand=True, padx=5, pady=(0, 5))
+        self.execution_path_lf.pack(fill="both", expand=True, padx=5, pady=5)
+        self.controller_nb.add(
+            self.execution_path_tab, padding="0", sticky="nsew", text="実行経路")
         self._build_commands_assist_tab()
         self._build_image_detection_monitor_tab()
         self._reorder_controller_tabs()
@@ -4089,6 +4169,7 @@ class PokeControllerApp:
             (self.analysis_tab, "Analysis"),
             (self.object_detection_tab, "Object Detection"),
             (self.command_watch_tab, "Command Watch"),
+            (self.execution_path_tab, "実行経路"),
             (self.notification_tab, "Notification"), (self.others_tab, "Others"),
         ]
         # Presets are superseded by the all-tab snapshot stored in InputSet.
@@ -4122,6 +4203,7 @@ class PokeControllerApp:
                 getattr(self, "analysis_tab", None),
                 getattr(self, "object_detection_tab", None),
                 getattr(self, "command_watch_tab", None),
+                getattr(self, "execution_path_tab", None),
             ) if tab is not None)
 
     def _apply_camera_feature_limited(self, notify=False):
@@ -8416,6 +8498,242 @@ class PokeControllerApp:
     def reset_command_watch(self):
         if hasattr(self, "command_watch_last_values"):
             self.command_watch_last_values = {}
+
+    def clear_execution_path_snapshots(self):
+        tree = getattr(self, "execution_path_tree", None)
+        if tree is None:
+            return
+        for item in tree.get_children(""):
+            tree.delete(item)
+        self.execution_path_status.set(
+            "履歴を消去しました。［現在位置を取得］で新しい位置を取得できます。")
+
+    def capture_execution_path_snapshot(self):
+        """Sample the Commands worker once; never install continuous tracing."""
+        command = getattr(self, "cur_command", None)
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        snapshot = runtime_execution_snapshot(command, project_root)
+        command_name = snapshot.get("command") or "停止中"
+        self.execution_path_command.set("実行Commands: " + command_name)
+        step_path = snapshot.get("step_path") or "Step取得待ち"
+        self.execution_path_step.set("Step: " + step_path)
+        if not snapshot.get("running"):
+            self.execution_path_status.set(
+                "Commandsは現在実行されていません。Start後にもう一度取得してください。")
+            return
+
+        location = snapshot.get("location") or {}
+        stack = list(location.get("stack") or ([] if not location else [location]))
+        captured = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
+        root_item = self.execution_path_tree.insert(
+            "", 0, text="{}  {}".format(captured, step_path),
+            values=(command_name, "", ""), open=True)
+        for depth, frame in enumerate(stack):
+            source_file = os.path.abspath(str(frame.get("file", "") or ""))
+            try:
+                display_file = os.path.relpath(source_file, project_root)
+            except (OSError, ValueError):
+                display_file = source_file
+            line = int(frame.get("line", 0) or 0)
+            self.execution_path_tree.insert(
+                root_item, "end", text="現在" if depth == 0 else "呼出元 {}".format(depth),
+                values=(
+                    str(frame.get("function", "")),
+                    "{} : {}".format(display_file, line),
+                    str(frame.get("source", ""))),
+                tags=("current",) if depth == 0 else ())
+        roots = self.execution_path_tree.get_children("")
+        for old_item in roots[30:]:
+            self.execution_path_tree.delete(old_item)
+        if stack:
+            current = stack[0]
+            self.execution_path_status.set(
+                "取得完了: {}（{}行） / 履歴 {}件".format(
+                    current.get("function", ""), current.get("line", 0),
+                    min(30, len(roots))))
+        else:
+            self.execution_path_status.set(
+                "Commandsは実行中ですが、プロジェクト内の実行位置を取得できませんでした。")
+
+    def start_execution_path_trace(self):
+        if self._execution_path_trace_active:
+            return
+        command = getattr(self, "cur_command", None)
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        snapshot = runtime_execution_snapshot(command, project_root)
+        if not snapshot.get("running"):
+            self.execution_path_status.set(
+                "Commandsは現在実行されていません。Start後に経路記録を開始してください。")
+            return
+        trace_root = os.path.dirname(os.path.abspath(__file__))
+        request_trace = getattr(command, "request_execution_path_trace", None)
+        if not callable(request_trace) or not request_trace(
+                duration=10.0, project_root=trace_root):
+            self.execution_path_status.set(
+                "経路記録を開始できません。PokeCon再起動後、Commands実行中に再試行してください。")
+            return
+        self._execution_path_trace_active = True
+        self._execution_path_trace_command = command
+        self._execution_path_trace_started = time.monotonic()
+        self._execution_path_trace_started_wall = datetime.datetime.now().isoformat(
+            timespec="milliseconds")
+        self._execution_path_trace_events = []
+        self._execution_path_trace_last_status = 0.0
+        self._execution_path_stop_reason = ""
+        self.execution_path_start_button.configure(state="disabled")
+        self.execution_path_stop_button.configure(state="normal")
+        self.execution_path_devstudio_button.configure(state="disabled")
+        self.execution_path_command.set(
+            "実行Commands: " + (snapshot.get("command") or "取得待ち"))
+        self.execution_path_status.set(
+            "経路記録を開始しました。約10秒間、実際に通った行を連続収集します。")
+        self._poll_execution_path_trace()
+
+    def _poll_execution_path_trace(self):
+        self._execution_path_trace_after_id = None
+        if not self._execution_path_trace_active:
+            return
+        command = self._execution_path_trace_command
+        trace_snapshot = command.execution_path_trace_snapshot(include_events=False)
+        now = time.monotonic()
+        elapsed = max(0.0, now - self._execution_path_trace_started)
+        if trace_snapshot.get("complete"):
+            self._complete_execution_path_trace()
+            return
+        worker = getattr(command, "thread", None)
+        if (command is not getattr(self, "cur_command", None)
+                or worker is None or not worker.is_alive()):
+            self._execution_path_stop_reason = "Commands終了により自動停止"
+            command.request_execution_path_trace_stop()
+            if not trace_snapshot.get("active") and not trace_snapshot.get("requested"):
+                self._complete_execution_path_trace()
+                return
+        if now - self._execution_path_trace_last_status >= 0.5:
+            self._execution_path_trace_last_status = now
+            self.execution_path_status.set(
+                "経路記録中：{:.1f}/10.0秒 / 通過行{}件{}".format(
+                    min(elapsed, 10.0), trace_snapshot.get("event_count", 0),
+                    "（開始待ち）" if trace_snapshot.get("requested") else ""))
+        try:
+            self._execution_path_trace_after_id = self.root.after(
+                100, self._poll_execution_path_trace)
+        except tk.TclError:
+            self._execution_path_trace_active = False
+
+    def stop_execution_path_trace(self, automatic=False, limit_reached=False):
+        if not self._execution_path_trace_active:
+            return self._execution_path_last_session
+        command = self._execution_path_trace_command
+        if command is not None:
+            command.request_execution_path_trace_stop()
+        self._execution_path_stop_reason = (
+            "上限に達したため自動停止" if limit_reached else
+            "Commands終了により自動停止" if automatic else "記録停止")
+        self.execution_path_stop_button.configure(state="disabled")
+        self.execution_path_status.set("経路記録を停止しています…")
+        return ""
+
+    def _complete_execution_path_trace(self):
+        if not self._execution_path_trace_active:
+            return self._execution_path_last_session
+        command = self._execution_path_trace_command
+        trace_snapshot = command.execution_path_trace_snapshot(include_events=True)
+        self._execution_path_trace_events = list(trace_snapshot.get("events") or [])
+        self._execution_path_trace_active = False
+        after_id, self._execution_path_trace_after_id = (
+            self._execution_path_trace_after_id, None)
+        if after_id is not None:
+            try:
+                self.root.after_cancel(after_id)
+            except tk.TclError:
+                pass
+        self.execution_path_start_button.configure(state="normal")
+        self.execution_path_stop_button.configure(state="disabled")
+        session = self._save_execution_path_trace()
+        if session:
+            self._execution_path_last_session = session
+            self.execution_path_devstudio_button.configure(state="normal")
+            reason = self._execution_path_stop_reason or "10秒収集完了"
+            self.execution_path_status.set(
+                "{}：通過行{}件を保存しました。DevStudioで確認できます。".format(
+                    reason, len(self._execution_path_trace_events)))
+        else:
+            self.execution_path_status.set("実行位置を観測できなかったため保存していません。")
+        self._execution_path_trace_command = None
+        return session
+
+    def _save_execution_path_trace(self):
+        events = list(self._execution_path_trace_events)
+        if not events:
+            return ""
+        command = self._execution_path_trace_command
+        serial_dir = os.path.dirname(os.path.abspath(__file__))
+        session_dir = os.path.join(
+            serial_dir, "ExecutionPaths",
+            datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f"))
+        try:
+            os.makedirs(session_dir, exist_ok=False)
+            trace = {"session_dir": session_dir, "source_snapshots": {}}
+            source = self._ensure_command_monitor_source_snapshot(
+                trace, command_source_descriptor(command))
+            for event in events:
+                event["location"] = self._ensure_command_monitor_source_snapshot(
+                    trace, event.get("location", {}))
+            steps_path = os.path.join(session_dir, "steps.jsonl")
+            with open(steps_path, "w", encoding="utf-8", newline="\n") as stream:
+                for event in events:
+                    json.dump(event, stream, ensure_ascii=False)
+                    stream.write("\n")
+            duration = max(
+                0.0, time.monotonic() - self._execution_path_trace_started)
+            states = []
+            for event in events:
+                step = str(event.get("step_path", "") or "")
+                if step and step not in states:
+                    states.append(step)
+            observed = {
+                execution_location_key(event.get("location", {}))
+                for event in events
+                if event.get("location")
+            }
+            metadata = {
+                "id": str(time.time_ns()),
+                "session_dir": session_dir,
+                "started_wall": self._execution_path_trace_started_wall,
+                "ended_wall": datetime.datetime.now().isoformat(timespec="milliseconds"),
+                "duration": duration,
+                "mode": "Execution path trace",
+                "command": str(getattr(command, "NAME", "")),
+                "command_session_id": "execution-path-" + str(time.time_ns()),
+                "source": source,
+                "source_snapshots": dict(trace.get("source_snapshots", {})),
+                "states": states,
+                "collection_mode": "python_line_events",
+                "duration_limit_seconds": 10.0,
+                "event_count": len(events),
+                "observed_line_count": len(observed),
+            }
+            temporary = os.path.join(session_dir, "command_monitor.json.tmp")
+            with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
+                json.dump(metadata, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+            os.replace(temporary, os.path.join(session_dir, "command_monitor.json"))
+            return session_dir
+        except (OSError, TypeError, ValueError) as error:
+            self._logger.warning("Execution path trace save failed: %s", error)
+            self.execution_path_status.set("経路の保存に失敗しました: " + str(error))
+            return ""
+
+    def open_execution_path_in_dev_studio(self):
+        if self._execution_path_trace_active:
+            self.stop_execution_path_trace()
+        session = self._execution_path_last_session
+        if not session or not os.path.isfile(
+                os.path.join(session, "command_monitor.json")):
+            self.execution_path_status.set(
+                "先に経路記録を開始し、しばらく動作させてから停止してください。")
+            return
+        self.open_dev_studio(command_recording=session)
 
     def poll_command_watch(self):
         """Publish only changed public variables; never block the UI/command thread."""
