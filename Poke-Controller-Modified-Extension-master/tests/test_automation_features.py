@@ -100,6 +100,7 @@ from InputSetData import (INPUT_SET_VARIABLES, SCHEMA_VERSION,
                           has_complete_snapshot, legacy_combined_snapshot,
                           input_set_commands_enabled, strip_commands_from_snapshot,
                           snapshot_values_with_defaults,
+                          sync_command_recovery_scripts,
                           sync_command_start_overrides, sync_commands_assist_rules,
                           sync_output_layout,
                           sync_quick_actions,
@@ -115,6 +116,8 @@ from InputSetRuntimeRegistry import (ActiveInputSetRegistry,
 from PokeConRecovery import (PokeConRecoveryError, discover_running_pokecon,
                              force_terminate, request_normal_close,
                              validate_recovery_target)
+from ProcessShutdown import (launch_recording_finalize_worker,
+                             terminate_after_gui_shutdown)
 from ResourceControl import (clamp_cpu_target, resource_throttle_level,
                              throttle_multiplier)
 from ImageDetectionMonitor import (filter_target_names,
@@ -161,8 +164,11 @@ from GuiAssets import (CaptureArea, hold_last_preview_on_missing_frame,
                        prepare_preview_image)
 from PokeConShowInfo import (installed_distribution_version,
                              requirement_distribution_name)
-from Recording import (CaptureRecorder, audio_callback_presentation_time,
-                       evenly_spaced_frame_indexes)
+from Recording import (CaptureRecorder, DETECTION_STOP_REQUESTED,
+                       audio_callback_presentation_time,
+                       discover_finalize_manifests,
+                       evenly_spaced_frame_indexes,
+                       load_finalize_manifest, write_finalize_manifest)
 from RecordingSyncRepair import (audio_advance_filter, wav_info,
                                  write_presentation_aligned_audio,
                                  write_without_exact_zeros)
@@ -191,6 +197,11 @@ from CommandMonitorRecording import (CommandInputActivityTracker,
                                      runtime_state_snapshot,
                                      temporary_chunk_ids_for_session)
 from CommandRecordingMerge import merge_command_recording_chunks
+from CommandRecoveryScripts import (CommandRecoveryExecutor,
+                                    delete_recovery_favorite,
+                                    normalize_recovery_favorites,
+                                    save_recovery_favorite,
+                                    validate_recovery_script)
 from OperationCaptureSession import (OperationCaptureSession,
                                      decode_serial_message,
                                      find_paused_session, load_manifest,
@@ -223,6 +234,11 @@ from OperationDebugCommand import (create_debug_command_package,
 from CommandRecordingModel import (filtered_timeline, load_command_timeline,
                                    observed_source_lines,
                                    source_function_block, timeline_page)
+from CommandDevelopmentTools import (analyze_command_source,
+                                     analyze_recording_events,
+                                     build_regression_case,
+                                     profile_recorded_video,
+                                     render_regression_unittest)
 from Commands.CommandBase import Command
 from Commands.Keys import Button, Direction, Hat, KeyPress, Stick
 from Keyboard import SwitchKeyboardController
@@ -353,6 +369,127 @@ class CommandRunOptionsTests(unittest.TestCase):
         self.assertTrue(result["enabled"])
         self.assertEqual(item["label"], "2_STORY_TOWER_79")
         self.assertEqual(item["variable"], "STATE_2_STORY_FUNCTION")
+
+    def test_runtime_state_fallback_keeps_za_start_selector_available(self):
+        source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        method = next(
+            item for node in module.body if isinstance(node, ast.ClassDef)
+            for item in node.body if isinstance(item, ast.FunctionDef)
+            and item.name == "_runtime_command_run_options")
+        method.decorator_list = []
+        function_module = ast.Module(body=[method], type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {}
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        command = types.SimpleNamespace(
+            COMMAND_RUN_SETTINGS=True,
+            COMMAND_STEP_DESCRIPTIONS={"START": "開始地点"},
+            STATE_MAIN_FUNCTION={"START": object(), "END": object()},
+            STATE_1_STORY_FUNCTION={"STEP_A": object()},
+            unrelated={"IGNORED": object()},
+            TESTADDCODE=0,
+        )
+        result = namespace["_runtime_command_run_options"](command)
+        self.assertTrue(result["enabled"])
+        self.assertTrue(result["runtime_fallback"])
+        self.assertEqual(
+            [(item["variable"], item["value"])
+             for item in result["locations"]],
+            [("STATE_MAIN_FUNCTION", "START"),
+             ("STATE_MAIN_FUNCTION", "END"),
+             ("STATE_1_STORY_FUNCTION", "STEP_A")])
+        self.assertEqual(result["locations"][0]["description"], "開始地点")
+        self.assertEqual(
+            [item["attribute"] for item in result["debug_options"]],
+            ["TESTADDCODE"])
+
+    def test_required_start_selector_uses_runtime_fallback_instead_of_skipping(self):
+        source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        method = next(
+            item for node in module.body if isinstance(node, ast.ClassDef)
+            for item in node.body if isinstance(item, ast.FunctionDef)
+            and item.name == "_prompt_command_run_settings")
+        calls = [
+            node.func.attr for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        ]
+        self.assertIn("_runtime_command_run_options", calls)
+        self.assertIn("_prompt_command_source_error_action", calls)
+        self.assertIn("_bring_command_console_to_front", calls)
+        self.assertIn("showerror", calls)
+
+        plain_calls = [
+            node.func.id for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+        ]
+        self.assertIn("print", plain_calls)
+
+    def test_source_error_popup_can_copy_the_complete_error(self):
+        source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        method = next(
+            item for node in module.body if isinstance(node, ast.ClassDef)
+            for item in node.body if isinstance(item, ast.FunctionDef)
+            and item.name == "_prompt_command_source_error_action")
+        calls = [
+            node.func.attr for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        ]
+        self.assertIn("clipboard_clear", calls)
+        self.assertIn("clipboard_append", calls)
+        self.assertIn("エラーをコピー", source)
+
+    def test_start_option_source_error_is_returned_for_analysis_output(self):
+        source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        method = next(
+            item for node in module.body if isinstance(node, ast.ClassDef)
+            for item in node.body if isinstance(item, ast.FunctionDef)
+            and item.name == "_command_run_options")
+        function_module = ast.Module(body=[method], type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {
+            "inspect": inspect,
+            "os": os,
+            "discover_command_run_options": discover_command_run_options,
+        }
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        class BrokenCommand:
+            pass
+
+        class Dummy:
+            def _command_classes(self, _command_name):
+                return [BrokenCommand]
+
+        with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".py", encoding="utf-8", delete=False) as stream:
+            stream.write("class BrokenCommand:\n    broken(:\n")
+            broken_path = stream.name
+        try:
+            with mock.patch.object(
+                    inspect, "getsourcefile", return_value=broken_path):
+                result = namespace["_command_run_options"](
+                    Dummy(), "Broken")
+        finally:
+            os.unlink(broken_path)
+        self.assertFalse(result["enabled"])
+        self.assertEqual(len(result["source_errors"]), 1)
+        self.assertIn("invalid syntax", result["source_errors"][0])
 
     def test_discovers_numbered_routes_and_debug_like_frlg(self):
         source = '''
@@ -1131,6 +1268,25 @@ class InputSetDataTests(unittest.TestCase):
             item["commands_assist"]["run_favorites"]["ZA_story"][0]["name"],
             "ホテルから")
 
+    def test_command_recovery_scripts_are_mirrored_to_input_set(self):
+        data = {"input_sets": {"Switch": {
+            "commands": {"enabled": True}, "all_tabs": {}}}}
+        scripts = [{"name": "メニューを閉じる",
+                    "code": "press(Button.B)"}]
+        self.assertTrue(sync_command_recovery_scripts(
+            data, "Switch", scripts, auto_open=False))
+        item = data["input_sets"]["Switch"]
+        self.assertEqual(
+            item["commands_assist"]["recovery_scripts"], scripts)
+        self.assertEqual(
+            item["all_tabs"]["commands_assist"]["recovery_scripts"], scripts)
+        self.assertFalse(
+            item["commands_assist"]["recovery_auto_open"])
+        scripts[0]["name"] = "changed"
+        self.assertEqual(
+            item["commands_assist"]["recovery_scripts"][0]["name"],
+            "メニューを閉じる")
+
     def test_manual_control_choices_belong_to_input_set(self):
         for name in (
                 "is_use_keyboard", "is_use_left_stick_mouse",
@@ -1822,16 +1978,23 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
         class RecoveryCommand:
             def __init__(self, field_after_b=3, x_menu_open=False,
-                         menu_after_x=False):
+                         menu_after_x=False, help_after_x=False,
+                         help_clear_after_a=1):
                 self.stuck = True
                 self.field_after_b = field_after_b
                 self.x_menu_open = x_menu_open
                 self.menu_after_x = menu_after_x
+                self.help_marker = False
+                self.help_after_x = help_after_x
+                self.help_clear_after_a = help_clear_after_a
                 self.b_count = 0
+                self.a_count = 0
                 self.press_events = []
                 self.alive_checks = 0
 
             def image_check(self, name):
+                if name == "POKEMON_ZA_HELP_MARKER":
+                    return self.help_marker
                 return (
                     name == "POKEMON_ZA_X_MENU_OPEN"
                     and self.x_menu_open)
@@ -1856,6 +2019,12 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                     self.x_menu_open = True
                     # 背後のFIELDが見えていても、Xメニューを先に閉じる。
                     self.stuck = False
+                if button == Button.X and self.help_after_x:
+                    self.help_marker = True
+                if button == Button.A:
+                    self.a_count += repeat
+                    if self.a_count >= self.help_clear_after_a:
+                        self.help_marker = False
                 if button == Button.B:
                     self.x_menu_open = False
                     self.b_count += repeat
@@ -1885,6 +2054,29 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             [(Button.X, 1), (Button.B, 1)])
         self.assertEqual(recovery_menu_command.alive_checks, 1)
         self.assertFalse(recovery_menu_command.x_menu_open)
+
+        help_command = RecoveryCommand(
+            field_after_b=1, help_after_x=True, help_clear_after_a=3)
+        for _ in range(10):
+            battle_once(help_command)
+        self.assertEqual(
+            help_command.press_events,
+            [(Button.X, 1), (Button.A, 1), (Button.A, 1),
+             (Button.A, 1), (Button.B, 1)])
+        self.assertEqual(help_command.a_count, 3)
+        self.assertEqual(help_command.b_count, 1)
+        self.assertFalse(help_command.help_marker)
+
+        persistent_help_command = RecoveryCommand(
+            field_after_b=1, help_after_x=True, help_clear_after_a=999)
+        for _ in range(10):
+            battle_once(persistent_help_command)
+        self.assertEqual(persistent_help_command.a_count, 10)
+        self.assertEqual(persistent_help_command.b_count, 0)
+        self.assertEqual(
+            persistent_help_command.press_events,
+            [(Button.X, 1)] + [(Button.A, 1)] * 10)
+        self.assertTrue(persistent_help_command.help_marker)
 
         command = RecoveryCommand(field_after_b=3)
         for _ in range(9):
@@ -2122,6 +2314,38 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(relock_command.events[2][2:], (0.2, 0.0))
         self.assertEqual(relock_command.events[3][0:2], ("press", Button.L))
         self.assertEqual(relock_command.events[4], ("zl", ""))
+
+    def test_za_infi_escape_confirmation_allows_for_party_switching(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        support_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_InfiMainDependencies", "ZA_battle_infi_main__support",
+            "ZA_battle_infi_main__support.pokesample.json")
+        battle_sample_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_BattleAndRoyale", "ZA_BattleAndRoyale.pokesample.json")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        values = [
+            ast.literal_eval(node.value)
+            for node in ast.walk(source_tree)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Attribute)
+                    and target.attr == "escapecheckrange"
+                    for target in node.targets)
+        ]
+        self.assertEqual(values, [149])
+
+        with open(support_path, "r", encoding="utf-8") as stream:
+            support = json.load(stream)["initializer"]
+        with open(battle_sample_path, "r", encoding="utf-8") as stream:
+            battle_sample = json.load(stream)["initializer"]
+        self.assertIn("self.escapecheckrange = 149", support)
+        self.assertIn("self.ZA_escapecheckrange = 149", battle_sample)
+        # outer condition + range(1, value) + final condition = value + 1
+        self.assertEqual(149 + 1, 150)
 
     def test_za_mega_battle_faces_marker_and_forces_dir3_for_35_seconds(self):
         source_path = os.path.join(
@@ -3323,6 +3547,59 @@ class ImageHealthCheckTests(unittest.TestCase):
         source = generate_image_check(data, "TEXT_COLOR", "target")
         self.assertIn("detect_settings.pop('health_ignored_warnings', None)", source)
 
+    def test_generated_image_check_waits_for_fresh_camera_without_crashing(self):
+        data = {"targets": {"FIELD": {
+            "operator": "OR", "description": "", "variants": [{
+                "template_path": "Template/field.png", "threshold": 0.8,
+            }]}}, "lists": {}}
+        source = generate_image_check(data, "FIELD", "target")
+        camera_available = {"value": False}
+
+        class History:
+            pass
+
+        def fake_detect(_command, **_settings):
+            if not camera_available["value"]:
+                raise RuntimeError(
+                    "Cameraの新しい映像を取得できません（入力停止または切替中）。")
+            return {
+                "matched": True, "score": 0.95, "threshold": 0.8,
+            }
+
+        namespace = {
+            "SimilarityHistory": History,
+            "detect_image": fake_detect,
+        }
+        exec(compile(source, "<generated-image-check>", "exec"), namespace)
+
+        class Logger:
+            def __init__(self):
+                self.warnings = []
+                self.infos = []
+
+            def warning(self, message):
+                self.warnings.append(message)
+
+            def info(self, message):
+                self.infos.append(message)
+
+        class Dummy:
+            IMAGE_DETECTION_TARGETS = namespace["IMAGE_DETECTION_TARGETS"]
+            IMAGE_DETECTION_OPERATORS = namespace["IMAGE_DETECTION_OPERATORS"]
+
+            def __init__(self):
+                self._logger = Logger()
+
+        dummy = Dummy()
+        check = namespace["_image_check_target"]
+        self.assertFalse(check(dummy, "FIELD"))
+        self.assertFalse(check(dummy, "FIELD"))
+        self.assertEqual(len(dummy._logger.warnings), 1)
+        camera_available["value"] = True
+        self.assertTrue(check(dummy, "FIELD"))
+        self.assertEqual(len(dummy._logger.infos), 1)
+        self.assertFalse(dummy._camera_frame_unavailable_logged)
+
 
 class ImageCheckReferenceAuditTests(unittest.TestCase):
     def test_missing_literal_is_compared_with_all_runtime_registration_forms(self):
@@ -3652,7 +3929,476 @@ class ManualControllerResponsivenessTests(unittest.TestCase):
         self.assertEqual(len(logger.handlers), before)
 
 
+class CommandRecoveryScriptTests(unittest.TestCase):
+    class _Sender:
+        def __init__(self):
+            self.rows = []
+            self.override_events = []
+
+        def begin_manual_override(self):
+            self.override_events.append("begin")
+
+        def end_manual_override(self):
+            self.override_events.append("end")
+
+        def writeRow(self, row, is_show=False, priority=False):
+            self.rows.append((row, bool(priority)))
+
+    def test_favorite_create_edit_delete_and_validation(self):
+        scripts = save_recovery_favorite(
+            [], "メニューを閉じる", "press(Button.B)")
+        self.assertEqual(scripts[0]["name"], "メニューを閉じる")
+        scripts = save_recovery_favorite(
+            scripts, "Xメニューを閉じる", "press(Button.B, wait=0.3)",
+            original_name="メニューを閉じる")
+        self.assertEqual(scripts, [{
+            "name": "Xメニューを閉じる",
+            "code": "press(Button.B, wait=0.3)"}])
+        self.assertEqual(delete_recovery_favorite(
+            scripts, "Xメニューを閉じる"), [])
+        with self.assertRaises(SyntaxError):
+            validate_recovery_script("if True:")
+        self.assertEqual(normalize_recovery_favorites([
+            {"name": "A", "code": "log('a')"},
+            {"name": "a", "code": "log('duplicate')"},
+            {"name": "", "code": "pass"},
+        ]), [{"name": "A", "code": "log('a')"}])
+
+    def test_executor_uses_priority_override_and_releases_input(self):
+        sender = self._Sender()
+        output = []
+        original_keys = object()
+
+        class RecoveryTarget:
+            def __init__(self):
+                self.keys = original_keys
+                self._pause_bypass_threads = set()
+
+            def custom_input(self):
+                self.keys.input(Button.A)
+
+        command = RecoveryTarget()
+        executor = CommandRecoveryExecutor(
+            sender, command=command, output=output.append)
+        result = executor.run(
+            "log('start')\npress(Button.B, duration=0, wait=0)\n"
+            "self.custom_input()\nlog('done')")
+        self.assertTrue(result["success"])
+        self.assertEqual(sender.override_events, ["begin", "end"])
+        self.assertEqual(output, ["start", "done"])
+        self.assertGreaterEqual(len(sender.rows), 4)
+        self.assertEqual(sender.rows[0], ("end", True))
+        self.assertEqual(sender.rows[-1], ("end", True))
+        self.assertTrue(all(priority for _row, priority in sender.rows))
+        self.assertIs(command.keys, original_keys)
+        self.assertEqual(command._pause_bypass_threads, set())
+
+    def test_recovery_namespace_blocks_original_command_lifecycle_stop(self):
+        sender = self._Sender()
+
+        class RecoveryTarget:
+            def __init__(self):
+                self.alive = True
+                self.keys = object()
+                self.finish = mock.Mock()
+
+        command = RecoveryTarget()
+        executor = CommandRecoveryExecutor(sender, command=command)
+        result = executor.run("self.finish()")
+        self.assertFalse(result["success"])
+        self.assertIn("元Commandsのfinish()", result["error"])
+        self.assertTrue(command.alive)
+        command.finish.assert_not_called()
+
+    def test_loop_alert_is_independent_from_monitor_recording(self):
+        from Window import PokeControllerApp
+
+        command = type("Story", (), {})()
+        command.alive = True
+        command.NAME = "Story"
+        command.STATE_1_STORY_FUNCTION = {"A": None, "B": None}
+        command._1_story_current_state = "A"
+        alerts = []
+        app = types.SimpleNamespace(
+            cur_command=command,
+            _command_recovery_detector_command=None,
+            _command_recovery_timeline=CommandStateTimeline(loop_cycles=3),
+            _command_recovery_input_tracker=CommandInputActivityTracker(60.0),
+            _command_recovery_last_check=0.0,
+            _command_recovery_executor=None,
+            _command_recovery_context_command=None,
+            _command_recovery_window_exists=lambda: False,
+            _command_recovery_context_text=lambda target: target.NAME,
+            _show_command_recovery_window=(
+                lambda reason, **options: alerts.append((reason, options))),
+        )
+        triggered = False
+        for index, value in enumerate(("A", "B", "A", "B", "A", "B")):
+            command._1_story_current_state = value
+            triggered = PokeControllerApp._poll_command_recovery_alerts(
+                app, now=float(index + 1))
+        self.assertTrue(triggered)
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("Stepループ", alerts[0][0])
+        self.assertTrue(alerts[0][1]["automatic"])
+        self.assertTrue(alerts[0][1]["pause_command"])
+
+    def test_key_inactivity_alone_never_pauses_commands(self):
+        from Window import PokeControllerApp
+
+        command = types.SimpleNamespace(alive=True, pause_requested=False)
+        timeline = mock.Mock()
+        timeline.add.return_value = {}
+        tracker = mock.Mock()
+        tracker.check.return_value = {
+            "stall_started": True,
+            "active": {"started_at": 0.0, "idle_seconds": 60.0},
+        }
+        app = types.SimpleNamespace(
+            cur_command=command,
+            _command_recovery_detector_command=command,
+            _command_recovery_timeline=timeline,
+            _command_recovery_input_tracker=tracker,
+            _command_recovery_last_check=0.0,
+            _commands_assist_busy=False,
+            _step_debug_session=None,
+            _step_debug_pending_session=None,
+            _show_command_recovery_window=mock.Mock(),
+        )
+
+        self.assertFalse(PokeControllerApp._poll_command_recovery_alerts(
+            app, now=60.0, running=True))
+        tracker.check.assert_not_called()
+        app._show_command_recovery_window.assert_not_called()
+        self.assertFalse(command.pause_requested)
+
+    def test_recovery_detector_does_not_alert_for_selected_but_unstarted_command(self):
+        from Window import PokeControllerApp
+
+        command = type("Selected", (), {"alive": True})()
+        timeline = mock.Mock()
+        tracker = mock.Mock()
+        app = types.SimpleNamespace(
+            cur_command=command,
+            _command_recovery_detector_command=command,
+            _command_recovery_timeline=timeline,
+            _command_recovery_input_tracker=tracker,
+            _command_recovery_last_check=20.0,
+        )
+        self.assertFalse(PokeControllerApp._poll_command_recovery_alerts(
+            app, now=21.0, running=False))
+        self.assertIsNone(app._command_recovery_detector_command)
+        timeline.reset.assert_called_once_with(loop_cycles=3)
+        tracker.reset.assert_called_once_with(21.0)
+
+    def test_recovery_pause_resumes_only_the_current_owned_command(self):
+        from Window import PokeControllerApp
+
+        class RecoveryTarget:
+            def __init__(self):
+                self.alive = True
+                self.pause_requested = False
+                self.resume_count = 0
+
+            def request_pause(self):
+                self.pause_requested = True
+
+            def resume(self):
+                self.pause_requested = False
+                self.resume_count += 1
+
+        command = RecoveryTarget()
+        app = types.SimpleNamespace(
+            cur_command=command,
+            _command_recovery_resume_when_safe=False,
+            _commands_dark_safety_paused_command=None,
+            _command_recovery_paused_command=None,
+            _commands_dark_safety_detector=types.SimpleNamespace(active=None),
+            _release_command_input_for_dark_pause=lambda _command: None,
+            _command_recovery_window_exists=lambda: False,
+        )
+        self.assertTrue(PokeControllerApp._claim_command_recovery_pause(
+            app, command))
+        self.assertIs(app._command_recovery_paused_command, command)
+        self.assertTrue(PokeControllerApp.resume_command_after_recovery(app))
+        self.assertEqual(command.resume_count, 1)
+
+        other = RecoveryTarget()
+        app._command_recovery_paused_command = command
+        command.pause_requested = True
+        app.cur_command = other
+        self.assertFalse(PokeControllerApp.resume_command_after_recovery(app))
+        self.assertEqual(command.resume_count, 1)
+
+    def test_stopping_recovery_only_stops_its_worker(self):
+        from Window import PokeControllerApp
+
+        executor = mock.Mock()
+        command = types.SimpleNamespace(
+            alive=True,
+            finish=mock.Mock(),
+            end=mock.Mock(),
+            sendStopRequest=mock.Mock(),
+            force_stop=mock.Mock())
+        status = types.SimpleNamespace(set=mock.Mock())
+        app = types.SimpleNamespace(
+            cur_command=command,
+            _command_recovery_executor=executor,
+            _command_recovery_window_exists=lambda: True,
+            _command_recovery_window=types.SimpleNamespace(status=status))
+
+        self.assertTrue(PokeControllerApp._stop_command_recovery_script(app))
+        executor.request_stop.assert_called_once_with(force=True)
+        self.assertTrue(command.alive)
+        command.finish.assert_not_called()
+        command.end.assert_not_called()
+        command.sendStopRequest.assert_not_called()
+        command.force_stop.assert_not_called()
+        self.assertIn("元Commandsは終了せず", status.set.call_args.args[0])
+
+    def test_commands_tab_has_persistent_recovery_window_button(self):
+        path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(path) as stream:
+            source = stream.read()
+        self.assertIn('text="復旧Pythonを開く"', source)
+        self.assertIn('command=self.open_command_recovery_window', source)
+
+    def test_recovery_window_source_does_not_force_focus_or_topmost(self):
+        path = os.path.join(SERIAL_CONTROLLER, "CommandRecoveryWindow.py")
+        with tokenize.open(path) as stream:
+            source = stream.read()
+        tree = ast.parse(source)
+        called = {
+            node.func.attr for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        }
+        self.assertFalse({"lift", "focus_force", "grab_set"} & called)
+        self.assertNotIn("-topmost", source)
+
+    def test_saved_recovery_script_can_be_executed_directly(self):
+        from CommandRecoveryWindow import CommandRecoveryWindow
+
+        class Value:
+            def __init__(self, value=None):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        class Editor:
+            def __init__(self):
+                self.value = "old"
+
+            def delete(self, *_args):
+                self.value = ""
+
+            def insert(self, _index, value):
+                self.value = value
+
+        executed = []
+        window = object.__new__(CommandRecoveryWindow)
+        window.running = False
+        window.selected_item = lambda: {
+            "name": "30_move",
+            "code": "stick(Stick.RIGHT, 30, duration=4.0)",
+        }
+        window.favorite_name = Value("")
+        window.auto_resume = Value(True)
+        window.status = Value("")
+        window.editor = Editor()
+        window.execute_callback = (
+            lambda code, auto_resume: executed.append((code, auto_resume)))
+
+        window.execute_selected()
+
+        self.assertEqual(window.favorite_name.get(), "30_move")
+        self.assertEqual(
+            window.editor.value, "stick(Stick.RIGHT, 30, duration=4.0)")
+        self.assertEqual(executed, [
+            ("stick(Stick.RIGHT, 30, duration=4.0)", True),
+        ])
+        self.assertIn("30_move", window.status.get())
+
+
 class CommandMonitorRecordingTests(unittest.TestCase):
+    def test_command_stop_recording_choice_does_not_wait_for_worker_exit(self):
+        source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        window_class = next(
+            node for node in module.body
+            if isinstance(node, ast.ClassDef) and any(
+                isinstance(item, ast.FunctionDef) and item.name == "stopPlay"
+                for item in node.body))
+        methods = {
+            item.name: item for item in window_class.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name in {
+                "stopPlay", "stopPlayPost",
+                "_confirm_requested_command_monitor_stop",
+                "_confirm_save_stopped_command_monitor_recordings",
+            }
+        }
+
+        def attribute_calls(method, name):
+            return [
+                node for node in ast.walk(method)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == name
+            ]
+
+        start_calls = attribute_calls(methods["stopPlay"], "start")
+        prompt_calls = attribute_calls(
+            methods["stopPlay"], "_confirm_requested_command_monitor_stop")
+        self.assertTrue(start_calls)
+        self.assertEqual(len(prompt_calls), 1)
+        self.assertGreater(prompt_calls[0].lineno, start_calls[-1].lineno)
+        self.assertEqual(len(attribute_calls(
+            methods["stopPlayPost"],
+            "_confirm_requested_command_monitor_stop")), 1)
+
+        ask_calls = [
+            node for node in ast.walk(
+                methods["_confirm_save_stopped_command_monitor_recordings"])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "tkmsg"
+            and node.func.attr == "askyesno"
+        ]
+        self.assertEqual(len(ask_calls), 1)
+        self.assertIn("parent", {
+            keyword.arg for keyword in ask_calls[0].keywords})
+
+    def test_force_stop_also_prompts_before_waiting_for_worker_exit(self):
+        source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        method = next(
+            item for node in module.body if isinstance(node, ast.ClassDef)
+            for item in node.body if isinstance(item, ast.FunctionDef)
+            and item.name == "force_stop_play")
+        calls = [
+            node.func.attr for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        ]
+        self.assertIn("_request_command_monitor_stop_cleanup", calls)
+        self.assertIn("_stop_command_monitor_capture_on_request", calls)
+        self.assertIn("_confirm_requested_command_monitor_stop", calls)
+
+    def test_manual_stop_confirmation_is_requested_even_without_a_recording(self):
+        source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        method = next(
+            item for node in module.body if isinstance(node, ast.ClassDef)
+            for item in node.body if isinstance(item, ast.FunctionDef)
+            and item.name == "_request_command_monitor_stop_cleanup")
+        function_module = ast.Module(body=[method], type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {"time": time}
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        command = object()
+        dummy = types.SimpleNamespace(
+            _command_monitor_command=None,
+            _command_monitor_session_id="",
+            _command_monitor_stop_cleanup_command=None,
+            _command_monitor_stop_cleanup_session_id="",
+        )
+        namespace["_request_command_monitor_stop_cleanup"](dummy, command)
+        self.assertIs(dummy._command_monitor_stop_cleanup_command, command)
+        self.assertTrue(dummy._command_monitor_stop_cleanup_session_id.startswith(
+            "no-recording-"))
+
+    def test_commands_auto_monitor_does_not_require_recording_tab_selection(self):
+        source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        method = next(
+            item for node in module.body if isinstance(node, ast.ClassDef)
+            for item in node.body if isinstance(item, ast.FunctionDef)
+            and item.name == "_auto_arm_command_monitor_recording")
+        function_module = ast.Module(body=[method], type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {}
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        command = object()
+        calls = []
+        dummy = types.SimpleNamespace(
+            record_monitor_auto_arm=Value(True),
+            record_mode=Value("Template"),
+            record_armed=False,
+            recorder=types.SimpleNamespace(active=False),
+            cur_command=command,
+            _command_monitor_previous_record_mode="",
+            _recording_normal_mode="Manual",
+            _select_recording_mode_page=lambda: calls.append("select"),
+            _arm_command_monitor_recording=lambda show_popup: (
+                setattr(dummy, "record_armed", True) or True),
+            _command_monitor_begin_session=lambda value: calls.append(value),
+            show_output=lambda *_args, **_kwargs: None,
+        )
+        namespace["_auto_arm_command_monitor_recording"](dummy)
+        self.assertEqual(dummy.record_mode.get(), "CommandMonitor")
+        self.assertEqual(dummy._command_monitor_previous_record_mode, "Template")
+        self.assertEqual(calls, ["select", command])
+
+    def test_command_stop_recording_choice_is_consumed_only_once(self):
+        source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        method = next(
+            item for node in module.body if isinstance(node, ast.ClassDef)
+            for item in node.body if isinstance(item, ast.FunctionDef)
+            and item.name == "_confirm_requested_command_monitor_stop")
+        function_module = ast.Module(body=[method], type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {}
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        class Dummy:
+            def __init__(self):
+                self.session_id = "run-1"
+                self.confirmed = []
+
+            def _consume_command_monitor_stop_cleanup(self, _command):
+                result = self.session_id
+                self.session_id = ""
+                return result
+
+            def _confirm_save_stopped_command_monitor_recordings(
+                    self, session_id):
+                self.confirmed.append(session_id)
+
+        dummy = Dummy()
+        helper = namespace["_confirm_requested_command_monitor_stop"]
+        self.assertTrue(helper(dummy, object()))
+        self.assertFalse(helper(dummy, object()))
+        self.assertEqual(dummy.confirmed, ["run-1"])
+
     class _SolidFrame:
         shape = (40, 60, 3)
 
@@ -3798,7 +4544,7 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             release.set()
             worker.join(2.0)
 
-    def test_first_battle_closes_x_menu_before_battle_image_branches(self):
+    def test_first_battle_and_after_delegate_to_common_templates(self):
         source_path = os.path.join(
             SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA", "ZA_story",
             "ZA_story.py")
@@ -3811,11 +4557,356 @@ class CommandMonitorRecordingTests(unittest.TestCase):
                 isinstance(item, ast.FunctionDef)
                 and item.name == "_1_story_farst_battle"
                 for item in node.body))
+        method_names = {
+            "_1_story_farst_pokemon_select",
+            "_1_story_farst_battle",
+            "_1_story_farst_battle_end",
+        }
+        methods = [
+            item for item in command_class.body
+            if isinstance(item, ast.FunctionDef) and item.name in method_names]
+        function_module = ast.Module(body=methods, type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {}
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        class Dummy:
+            def __init__(self):
+                self.calls = []
+
+            def ZA_story_Template_battle_before(self, **options):
+                self.calls.append(("before", options))
+                return "before-result"
+
+            def ZA_story_Template_battle_function(self, **options):
+                self.calls.append(("function", options))
+                return "function-result"
+
+            def ZA_story_Template_battle_after(self, **options):
+                self.calls.append(("after", options))
+                return "after-result"
+
+        dummy = Dummy()
+        self.assertEqual(
+            namespace["_1_story_farst_battle"](dummy),
+            "function-result")
+        self.assertEqual(
+            namespace["_1_story_farst_battle_end"](dummy),
+            "after-result")
+        self.assertEqual(dummy.calls, [
+            ("function", {
+                "bkprg_ret": "1_STORY_FARST_BATTLE",
+                "prg_ret": "1_STORY_FARST_BATTLE_END",
+                "noprg_ret": "1_STORY_FARST_BATTLE",
+                "Xaction": 1,
+                "Aaction": 1,
+                "Yaction": 0,
+                "Baction": 0,
+                "lockon_endskip": 0,
+                "get_chanceicon4": 0,
+                "noCp": 1,
+            }),
+            ("after", {
+                "bkprg_ret": "1_STORY_FARST_BATTLE",
+                "prg_ret": "1_STORY_FARST_BATTLE_ZONE_MOVE1",
+            }),
+        ])
+
+    def test_second_battle_triple_delegates_to_common_templates(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA", "ZA_story",
+            "ZA_story.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        command_class = next(
+            node for node in module.body
+            if isinstance(node, ast.ClassDef) and any(
+                isinstance(item, ast.FunctionDef)
+                and item.name == "_1_story_second_battle"
+                for item in node.body))
+        method_names = {
+            "_1_story_second_battle_start",
+            "_1_story_second_battle",
+            "_1_story_second_battle_end",
+        }
+        methods = [
+            item for item in command_class.body
+            if isinstance(item, ast.FunctionDef) and item.name in method_names]
+        function_module = ast.Module(body=methods, type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {}
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        class Dummy:
+            def __init__(self):
+                self.calls = []
+
+            def ZA_story_Template_battle_before(self, **options):
+                self.calls.append(("before", options))
+                return "before-result"
+
+            def ZA_story_Template_battle_function(self, **options):
+                self.calls.append(("function", options))
+                return "function-result"
+
+            def ZA_story_Template_battle_after(self, **options):
+                self.calls.append(("after", options))
+                return "after-result"
+
+        dummy = Dummy()
+        self.assertEqual(
+            namespace["_1_story_second_battle_start"](dummy),
+            "before-result")
+        self.assertEqual(
+            namespace["_1_story_second_battle"](dummy),
+            "function-result")
+        self.assertEqual(
+            namespace["_1_story_second_battle_end"](dummy),
+            "after-result")
+        self.assertEqual(dummy.calls, [
+            ("before", {
+                "noprg_ret": "1_STORY_SECOND_BATTLE_START",
+                "prg_ret": "1_STORY_SECOND_BATTLE",
+                "green_check": 0,
+            }),
+            ("function", {
+                "bkprg_ret": "1_STORY_SECOND_BATTLE_START",
+                "prg_ret": "1_STORY_SECOND_BATTLE_END",
+                "noprg_ret": "1_STORY_SECOND_BATTLE",
+                "Xaction": 1,
+                "Aaction": 1,
+                "Yaction": 1,
+                "Baction": 0,
+                "lockon_endskip": 0,
+                "get_chanceicon4": 0,
+                "noCp": 1,
+            }),
+            ("after", {
+                "bkprg_ret": "1_STORY_SECOND_BATTLE",
+                "prg_ret": "1_STORY_FARST_BATTLE_ZONE_MOVE2",
+            }),
+        ])
+
+    def test_battle_template_returns_immediately_after_no_cp_attack(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA", "ZA_story",
+            "ZA_story.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        command_class = next(
+            node for node in module.body
+            if isinstance(node, ast.ClassDef) and any(
+                isinstance(item, ast.FunctionDef)
+                and item.name == "ZA_story_Template_battle_function"
+                for item in node.body))
         method = next(
+            item for item in command_class.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name == "ZA_story_Template_battle_function")
+        function_module = ast.Module(body=[method], type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {}
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        class Dummy:
+            def __init__(self):
+                self.checked = []
+                self.attacks = []
+
+            def image_check(self, name):
+                self.checked.append(name)
+                return name == "POKEMON_ZA_BATTLE_BALL_CHECK"
+
+            def ZA_battle_coCp_noloop(self, **options):
+                self.attacks.append(options)
+
+        dummy = Dummy()
+        result = namespace["ZA_story_Template_battle_function"](
+            dummy,
+            bkprg_ret="BEFORE",
+            prg_ret="AFTER",
+            noprg_ret="BATTLE",
+            Xaction=1,
+            Aaction=1,
+            Yaction=0,
+            Baction=0,
+            noCp=1)
+        self.assertEqual(result, "BATTLE")
+        self.assertEqual(dummy.checked, [
+            "POKEMON_ZA_X_MENU_OPEN",
+            "POKEMON_ZA_HELP_MARKER",
+            "POKEMON_ZA_BATTLE_BALL_CHECK",
+        ])
+        self.assertEqual(dummy.attacks, [{
+            "Xaction": 1,
+            "Aaction": 1,
+            "Yaction": 0,
+            "Baction": 0,
+            "battle_mode": 0,
+        }])
+
+    def test_battle_template_runs_help_and_x_menu_loops_only_on_match(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA", "ZA_story",
+            "ZA_story.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        command_class = next(
+            node for node in module.body
+            if isinstance(node, ast.ClassDef) and any(
+                isinstance(item, ast.FunctionDef)
+                and item.name == "ZA_story_Template_battle_function"
+                for item in node.body))
+        method = next(
+            item for item in command_class.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name == "ZA_story_Template_battle_function")
+        function_module = ast.Module(body=[method], type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {"Button": Button}
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        class Dummy:
+            def __init__(self, matched_name):
+                self.matched_name = matched_name
+                self.remaining_matches = 2
+                self.checked = []
+                self.pressed = []
+
+            def checkIfAlive(self):
+                return None
+
+            def image_check(self, name):
+                self.checked.append(name)
+                if name != self.matched_name:
+                    return False
+                if self.remaining_matches <= 0:
+                    return False
+                self.remaining_matches -= 1
+                return True
+
+            def pressRep(self, button, **options):
+                self.pressed.append((button, options))
+
+        for matched_name, expected_button, expected_count in (
+                ("POKEMON_ZA_HELP_MARKER", Button.A, 2),
+                ("POKEMON_ZA_X_MENU_OPEN", Button.B, 1)):
+            dummy = Dummy(matched_name)
+            result = namespace["ZA_story_Template_battle_function"](
+                dummy,
+                bkprg_ret="BEFORE",
+                prg_ret="AFTER",
+                noprg_ret="BATTLE",
+                noCp=1)
+            self.assertEqual(result, "BATTLE")
+            self.assertEqual(
+                [button for button, _ in dummy.pressed],
+                [expected_button] * expected_count)
+            self.assertEqual(dummy.checked[:2], [
+                "POKEMON_ZA_X_MENU_OPEN",
+                "POKEMON_ZA_HELP_MARKER",
+            ])
+            self.assertNotIn(
+                "POKEMON_ZA_BATTLE_BALL_CHECK", dummy.checked)
+
+        no_match = Dummy(None)
+        result = namespace["ZA_story_Template_battle_function"](
+            no_match,
+            bkprg_ret="BEFORE",
+            prg_ret="AFTER",
+            noprg_ret="BATTLE",
+            noCp=1)
+        self.assertEqual(result, "BATTLE")
+        self.assertEqual(
+            [button for button, _ in no_match.pressed], [Button.B])
+        self.assertEqual(
+            no_match.checked.count("POKEMON_ZA_X_MENU_OPEN"), 1)
+        self.assertEqual(
+            no_match.checked.count("POKEMON_ZA_HELP_MARKER"), 1)
+
+    def test_battle_template_switches_from_x_menu_to_new_help_immediately(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA", "ZA_story",
+            "ZA_story.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        command_class = next(
+            node for node in module.body
+            if isinstance(node, ast.ClassDef) and any(
+                isinstance(item, ast.FunctionDef)
+                and item.name == "ZA_story_Template_battle_function"
+                for item in node.body))
+        method = next(
+            item for item in command_class.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name == "ZA_story_Template_battle_function")
+        function_module = ast.Module(body=[method], type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {"Button": Button}
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        class Dummy:
+            def __init__(self):
+                self.help_checks = 0
+                self.menu_open = True
+                self.checked = []
+                self.pressed = []
+
+            def checkIfAlive(self):
+                return None
+
+            def image_check(self, name):
+                self.checked.append(name)
+                if name == "POKEMON_ZA_X_MENU_OPEN":
+                    return self.menu_open
+                if name == "POKEMON_ZA_HELP_MARKER":
+                    self.help_checks += 1
+                    # 初回判定は不一致。その後HELPが2回表示され、
+                    # それぞれ消失するまでA処理を必要とする。
+                    return self.help_checks in (2, 3, 5)
+                return False
+
+            def pressRep(self, button, **options):
+                self.pressed.append((button, options))
+                if button == Button.B:
+                    self.menu_open = False
+
+        dummy = Dummy()
+        result = namespace["ZA_story_Template_battle_function"](
+            dummy,
+            bkprg_ret="BEFORE",
+            prg_ret="AFTER",
+            noprg_ret="BATTLE",
+            noCp=1)
+        self.assertEqual(result, "BATTLE")
+        self.assertEqual(
+            [button for button, _ in dummy.pressed],
+            [Button.A, Button.A, Button.A, Button.B])
+        self.assertNotIn("POKEMON_ZA_BATTLE_BALL_CHECK", dummy.checked)
+
+    def _legacy_test_first_battle_closes_x_menu_before_battle_image_branches(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA", "ZA_story",
+            "ZA_story.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        command_class = next(
+            node for node in module.body
+            if isinstance(node, ast.ClassDef) and any(
+                isinstance(item, ast.FunctionDef)
+                and item.name == "_1_story_farst_battle"
+                for item in node.body))
+        methods = [
             node for node in command_class.body
             if isinstance(node, ast.FunctionDef)
-            and node.name == "_1_story_farst_battle")
-        function_module = ast.Module(body=[method], type_ignores=[])
+            and node.name in {
+                "_1_story_farst_help_advance", "_1_story_farst_battle"}]
+        function_module = ast.Module(body=methods, type_ignores=[])
         ast.fix_missing_locations(function_module)
         namespace = {"Button": Button}
         exec(compile(function_module, source_path, "exec"), namespace)
@@ -3827,6 +4918,9 @@ class CommandMonitorRecordingTests(unittest.TestCase):
                 self.checked = []
                 self.pressed = []
 
+            def checkIfAlive(self):
+                return None
+
             def image_check(self, name):
                 self.checked.append(name)
                 return name == "POKEMON_ZA_X_MENU_OPEN"
@@ -3834,11 +4928,311 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             def pressRep(self, button, **options):
                 self.pressed.append((button, options))
 
+        Dummy._1_story_farst_help_advance = namespace[
+            "_1_story_farst_help_advance"]
         dummy = Dummy()
         result = namespace["_1_story_farst_battle"](dummy)
         self.assertEqual(result, "1_STORY_FARST_BATTLE")
-        self.assertEqual(dummy.checked, ["POKEMON_ZA_X_MENU_OPEN"])
+        self.assertEqual(dummy.checked, [
+            "POKEMON_ZA_HELP_MARKER", "POKEMON_ZA_X_MENU_OPEN"])
         self.assertEqual(dummy.pressed[0][0], Button.B)
+
+    def _legacy_test_first_battle_dialog_handles_reappeared_help_before_battle(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA", "ZA_story",
+            "ZA_story.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        command_class = next(
+            node for node in module.body
+            if isinstance(node, ast.ClassDef) and any(
+                isinstance(item, ast.FunctionDef)
+                and item.name == "_1_story_farst_dialog_until_battle"
+                for item in node.body))
+        method = next(
+            node for node in command_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_1_story_farst_dialog_until_battle")
+        function_module = ast.Module(body=[method], type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {"Button": Button}
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        class Dummy:
+            def __init__(self):
+                self.help_checks = 0
+                self.non_help_cycles = 0
+                self.pressed = []
+
+            def checkIfAlive(self):
+                return None
+
+            def image_check(self, name):
+                if name == "POKEMON_ZA_HELP_MARKER":
+                    self.help_checks += 1
+                    return self.help_checks <= 30 or self.help_checks == 32
+                if name == "POKEMON_ZA_2_SELECT":
+                    return False
+                if name == "POKEMON_ZA_BATTLE_BALL_CHECK":
+                    self.non_help_cycles += 1
+                    return self.non_help_cycles >= 2
+                return False
+
+            def pressRep(self, button, **options):
+                self.pressed.append((button, options))
+
+            def wait(self, duration):
+                return None
+
+        dummy = Dummy()
+        result = namespace["_1_story_farst_dialog_until_battle"](dummy)
+        self.assertTrue(result)
+        pressed_buttons = [button for button, _ in dummy.pressed]
+        self.assertEqual(pressed_buttons.count(Button.A), 31)
+        self.assertEqual(pressed_buttons.count(Button.B), 1)
+
+    def _legacy_test_first_battle_help_clears_stale_completed_state_before_end(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA", "ZA_story",
+            "ZA_story.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        command_class = next(
+            node for node in module.body
+            if isinstance(node, ast.ClassDef) and any(
+                isinstance(item, ast.FunctionDef)
+                and item.name == "_1_story_farst_battle"
+                for item in node.body))
+        methods = [
+            item for item in command_class.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name in {
+                "_1_story_farst_help_advance", "_1_story_farst_battle"}]
+        function_module = ast.Module(body=methods, type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {"Button": Button}
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        class Dummy:
+            check_picture = 0
+
+            def __init__(self):
+                self._za_first_battle_started = True
+                self.help_checks = 0
+                self.pressed = []
+
+            def checkIfAlive(self):
+                return None
+
+            def image_check(self, name):
+                if name == "POKEMON_ZA_X_MENU_OPEN":
+                    return False
+                if name == "POKEMON_ZA_HELP_MARKER":
+                    self.help_checks += 1
+                    return self.help_checks <= 2
+                if name == "POKEMON_ZA_TEXT_WHITE_COMMENT":
+                    return True
+                return name == "POKEMON_ZA_BATTLE_BALL_CHECK"
+
+            def pressRep(self, button, **options):
+                self.pressed.append((button, options))
+
+        Dummy._1_story_farst_help_advance = namespace[
+            "_1_story_farst_help_advance"]
+        dummy = Dummy()
+        result = namespace["_1_story_farst_battle"](dummy)
+        self.assertEqual(result, "1_STORY_FARST_BATTLE")
+        self.assertFalse(dummy._za_first_battle_started)
+        self.assertEqual([button for button, _ in dummy.pressed], [Button.A, Button.A])
+
+    def _legacy_test_first_battle_single_battle_match_then_white_does_not_end(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA", "ZA_story",
+            "ZA_story.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        command_class = next(
+            node for node in module.body
+            if isinstance(node, ast.ClassDef) and any(
+                isinstance(item, ast.FunctionDef)
+                and item.name == "_1_story_farst_battle"
+                for item in node.body))
+        methods = [
+            item for item in command_class.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name in {
+                "_1_story_farst_help_advance", "_1_story_farst_battle"}]
+        function_module = ast.Module(body=methods, type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {"Button": Button}
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        class Dummy:
+            check_picture = 0
+
+            def __init__(self):
+                self._za_first_battle_started = False
+                self._za_first_battle_confirm_count = 0
+                self.white_remaining = 0
+                self.pressed = []
+                self.attack_calls = 0
+
+            def checkIfAlive(self):
+                return None
+
+            def image_check(self, name):
+                if name in {
+                        "POKEMON_ZA_HELP_MARKER",
+                        "POKEMON_ZA_X_MENU_OPEN"}:
+                    return False
+                if name == "POKEMON_ZA_TEXT_WHITE_COMMENT":
+                    if self.white_remaining > 0:
+                        self.white_remaining -= 1
+                        return True
+                    return False
+                return name == "POKEMON_ZA_BATTLE_BALL_CHECK"
+
+            def pressRep(self, button, **options):
+                self.pressed.append((button, options))
+
+            def ZA_battle_coCp_noloop(self, **options):
+                self.attack_calls += 1
+
+        Dummy._1_story_farst_help_advance = namespace[
+            "_1_story_farst_help_advance"]
+        dummy = Dummy()
+
+        first_result = namespace["_1_story_farst_battle"](dummy)
+        self.assertEqual(first_result, "1_STORY_FARST_BATTLE")
+        self.assertEqual(dummy._za_first_battle_confirm_count, 1)
+        self.assertFalse(dummy._za_first_battle_started)
+        self.assertEqual(dummy.attack_calls, 0)
+
+        dummy.white_remaining = 1
+        second_result = namespace["_1_story_farst_battle"](dummy)
+        self.assertEqual(second_result, "1_STORY_FARST_BATTLE")
+        self.assertEqual(dummy._za_first_battle_confirm_count, 0)
+        self.assertFalse(dummy._za_first_battle_started)
+        self.assertEqual(dummy.attack_calls, 0)
+        self.assertEqual([button for button, _ in dummy.pressed], [Button.A])
+
+    def _legacy_test_first_battle_requires_three_battle_matches_before_attack(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA", "ZA_story",
+            "ZA_story.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        command_class = next(
+            node for node in module.body
+            if isinstance(node, ast.ClassDef) and any(
+                isinstance(item, ast.FunctionDef)
+                and item.name == "_1_story_farst_battle"
+                for item in node.body))
+        methods = [
+            item for item in command_class.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name in {
+                "_1_story_farst_help_advance", "_1_story_farst_battle"}]
+        function_module = ast.Module(body=methods, type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {"Button": Button}
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        class Dummy:
+            check_picture = 0
+
+            def __init__(self):
+                self._za_first_battle_started = False
+                self._za_first_battle_confirm_count = 0
+                self.attack_calls = 0
+
+            def checkIfAlive(self):
+                return None
+
+            def image_check(self, name):
+                if name in {
+                        "POKEMON_ZA_HELP_MARKER",
+                        "POKEMON_ZA_X_MENU_OPEN",
+                        "POKEMON_ZA_TEXT_WHITE_COMMENT"}:
+                    return False
+                return name == "POKEMON_ZA_BATTLE_BALL_CHECK"
+
+            def pressRep(self, button, **options):
+                return None
+
+            def ZA_battle_coCp_noloop(self, **options):
+                self.attack_calls += 1
+
+        Dummy._1_story_farst_help_advance = namespace[
+            "_1_story_farst_help_advance"]
+        dummy = Dummy()
+
+        for expected_count in (1, 2):
+            result = namespace["_1_story_farst_battle"](dummy)
+            self.assertEqual(result, "1_STORY_FARST_BATTLE")
+            self.assertEqual(
+                dummy._za_first_battle_confirm_count, expected_count)
+            self.assertFalse(dummy._za_first_battle_started)
+            self.assertEqual(dummy.attack_calls, 0)
+
+        result = namespace["_1_story_farst_battle"](dummy)
+        self.assertEqual(result, "1_STORY_FARST_BATTLE")
+        self.assertEqual(dummy._za_first_battle_confirm_count, 3)
+        self.assertTrue(dummy._za_first_battle_started)
+        self.assertEqual(dummy.attack_calls, 1)
+
+    def _legacy_test_first_battle_end_handles_reappeared_help_before_field(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA", "ZA_story",
+            "ZA_story.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        command_class = next(
+            node for node in module.body
+            if isinstance(node, ast.ClassDef) and any(
+                isinstance(item, ast.FunctionDef)
+                and item.name == "_1_story_farst_battle_end"
+                for item in node.body))
+        methods = [
+            item for item in command_class.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name in {
+                "_1_story_farst_help_advance", "_1_story_farst_battle_end"}]
+        function_module = ast.Module(body=methods, type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {"Button": Button}
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        class Dummy:
+            check_picture = 0
+
+            def __init__(self):
+                self.help_checks = 0
+                self.pressed = []
+
+            def checkIfAlive(self):
+                return None
+
+            def image_check(self, name):
+                if name == "POKEMON_ZA_HELP_MARKER":
+                    self.help_checks += 1
+                    return self.help_checks == 1
+                return True
+
+            def pressRep(self, button, **options):
+                self.pressed.append((button, options))
+
+        Dummy._1_story_farst_help_advance = namespace[
+            "_1_story_farst_help_advance"]
+        dummy = Dummy()
+        result = namespace["_1_story_farst_battle_end"](dummy)
+        self.assertEqual(result, "1_STORY_FARST_BATTLE_END")
+        self.assertEqual([button for button, _ in dummy.pressed], [Button.A])
 
     def test_kept_command_chunks_are_merged_with_step_and_output_logs(self):
         with tempfile.TemporaryDirectory() as root:
@@ -3865,6 +5259,13 @@ class CommandMonitorRecordingTests(unittest.TestCase):
                             "file": "story.py", "function": "step_{}".format(index),
                             "line": 1, "snapshot": snapshot_relative,
                         },
+                    }) + "\n")
+                    # This stale event is outside the three-second source
+                    # video and must not survive in the retained path.
+                    stream.write(json.dumps({
+                        "event": "execution", "step_path": "STALE",
+                        "chunk_time": 99.0,
+                        "location": {"file": "story.py", "line": 99},
                     }) + "\n")
                 with open(os.path.join(session_dir, "commands.log"),
                           "w", encoding="utf-8") as stream:
@@ -3913,6 +5314,11 @@ class CommandMonitorRecordingTests(unittest.TestCase):
                       "r", encoding="utf-8") as stream:
                 metadata = json.load(stream)
             self.assertEqual(metadata["source_chunk_ids"], ["chunk1", "chunk2"])
+            self.assertEqual(metadata["execution_path"]["scope"],
+                             "retained_video_only")
+            self.assertEqual(metadata["execution_path"]["video_start"], 0.0)
+            self.assertEqual(metadata["execution_path"]["video_end"], 6.0)
+            self.assertEqual(metadata["execution_path"]["event_count"], 2)
             timeline = load_command_timeline(merged["session_dir"])
             self.assertEqual(len(timeline), 2)
             self.assertEqual(timeline[0]["video_time"], 1.25)
@@ -3922,6 +5328,73 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             # Source deletion is deliberately a later GUI step, only after a
             # fully written merged folder is returned.
             self.assertTrue(os.path.isdir(chunks[0]["session_dir"]))
+
+    def test_devstudio_hides_execution_events_outside_saved_video(self):
+        with tempfile.TemporaryDirectory() as root:
+            with open(os.path.join(root, "command_monitor.json"),
+                      "w", encoding="utf-8") as stream:
+                json.dump({"duration": 5.0}, stream)
+            with open(os.path.join(root, "steps.jsonl"),
+                      "w", encoding="utf-8") as stream:
+                for value in (0.0, 2.5, 5.1, 8.0):
+                    stream.write(json.dumps({
+                        "event": "execution", "video_time": value,
+                        "location": {"file": "story.py", "line": int(value * 10) + 1},
+                    }) + "\n")
+            timeline = load_command_timeline(root)
+            self.assertEqual([row["video_time"] for row in timeline],
+                             [0.0, 2.5, 5.0])
+
+    def test_command_recording_source_uses_bright_video_time_line_highlight(self):
+        path = os.path.join(DEV_STUDIO, "CommandRecordingStudio.py")
+        with tokenize.open(path) as stream:
+            source = stream.read()
+        self.assertIn('background="#fff176"', source)
+        self.assertIn("動画 {} に対応する実行行", source)
+        module = ast.parse(source)
+        method = next(
+            item for node in module.body if isinstance(node, ast.ClassDef)
+            and node.name == "CommandRecordingWorkspace"
+            for item in node.body if isinstance(item, ast.FunctionDef)
+            and item.name == "show_event_source")
+        calls = [
+            node.func.attr for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        ]
+        self.assertIn("tag_add", calls)
+        self.assertIn("tag_raise", calls)
+        self.assertIn("see", calls)
+
+    def test_command_recording_path_navigation_seeks_video_for_lines_and_functions(self):
+        path = os.path.join(DEV_STUDIO, "CommandRecordingStudio.py")
+        with tokenize.open(path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        methods = {
+            item.name: item
+            for node in module.body if isinstance(node, ast.ClassDef)
+            and node.name == "CommandRecordingWorkspace"
+            for item in node.body if isinstance(item, ast.FunctionDef)
+            and item.name in {"select_path_event", "select_visited_function"}
+        }
+        self.assertEqual(set(methods),
+                         {"select_path_event", "select_visited_function"})
+        for method in methods.values():
+            select_calls = [
+                node for node in ast.walk(method)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "select_event"
+            ]
+            self.assertEqual(len(select_calls), 1)
+            self.assertEqual(
+                next(keyword.value.value for keyword in select_calls[0].keywords
+                     if keyword.arg == "seek"), True)
+        self.assertIn("◀ 前の実行行", source)
+        self.assertIn("次の実行行 ▶", source)
+        self.assertIn("◀ 前の関数", source)
+        self.assertIn("次の関数 ▶", source)
 
     def test_runtime_snapshot_includes_story_and_za_infi_states(self):
         command = type("Story", (), {})()
@@ -4035,6 +5508,19 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         self.assertFalse(any(result.get("stall_started") for result in results))
         self.assertIsNone(detector.active)
 
+    def test_dark_still_detector_default_waits_sixty_seconds(self):
+        detector = DarkStillFrameDetector()
+        dark = self._SolidFrame(0)
+
+        detector.add(dark, 0.0)
+        detector.add(dark, 0.5)
+        before_limit = detector.add(dark, 59.5)
+        at_limit = detector.add(dark, 60.0)
+
+        self.assertEqual(detector.hold_seconds, 60.0)
+        self.assertFalse(before_limit["stall_started"])
+        self.assertTrue(at_limit["stall_started"])
+
     def test_dark_still_detector_marks_failure_then_recovers_on_change(self):
         detector = DarkStillFrameDetector(hold_seconds=2.0, sample_interval=0.5)
         dark = self._SolidFrame(0)
@@ -4047,6 +5533,329 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         recovered = detector.add(changed, 3.5)
         self.assertTrue(recovered["recovered"])
         self.assertIsNone(detector.active)
+
+    def test_dark_still_safety_pauses_commands_and_resumes_on_video_change(self):
+        from Window import PokeControllerApp
+
+        class FakeCommand:
+            def __init__(self):
+                self.alive = True
+                self.pause_requested = False
+                self.pause_count = 0
+                self.resume_count = 0
+
+            def request_pause(self):
+                self.pause_requested = True
+                self.pause_count += 1
+
+            def resume(self):
+                self.pause_requested = False
+                self.resume_count += 1
+
+        class Status:
+            def __init__(self):
+                self.value = ""
+
+            def set(self, value):
+                self.value = value
+
+        command = FakeCommand()
+        releases = []
+        outputs = []
+        recovery_windows = []
+        app = types.SimpleNamespace(
+            cur_command=command,
+            start_button={"text": "Stop"},
+            _commands_dark_safety_detector=DarkStillFrameDetector(
+                hold_seconds=0.5, sample_interval=0.1),
+            _commands_dark_safety_command=None,
+            _commands_dark_safety_paused_command=None,
+            _software_controller_override_active=False,
+            _logger=mock.Mock(),
+            record_monitor_status=Status(),
+            show_output=lambda name, text: outputs.append((name, text)),
+            _release_command_input_for_dark_pause=(
+                lambda target: releases.append(target)),
+            command_recovery_auto_open=types.SimpleNamespace(get=lambda: True),
+            _show_command_recovery_window=(
+                lambda reason, **options:
+                recovery_windows.append((reason, options))),
+        )
+        dark = self._SolidFrame(0)
+        # Allow one sampling interval beyond the exact floating-point boundary;
+        # production frames likewise arrive just after the nominal interval.
+        pause_results = []
+        for index in range(8):
+            pause_results.append(PokeControllerApp._update_commands_dark_safety(
+                app, dark, now=index * 0.1))
+        self.assertTrue(any(result["command_paused"]
+                            for result in pause_results))
+        self.assertTrue(command.pause_requested)
+        self.assertEqual(command.pause_count, 1)
+        self.assertEqual(releases, [command])
+        self.assertEqual(len(recovery_windows), 1)
+        self.assertFalse(recovery_windows[0][1]["pause_command"])
+
+        result = PokeControllerApp._update_commands_dark_safety(
+            app, self._SolidFrame(160), now=0.8)
+        self.assertTrue(result["command_resumed"])
+        self.assertFalse(command.pause_requested)
+        self.assertEqual(command.resume_count, 1)
+        self.assertEqual(len(outputs), 2)
+
+    def test_dark_still_pause_can_be_manually_resumed_before_video_changes(self):
+        from Window import PokeControllerApp
+
+        command = types.SimpleNamespace(
+            alive=True, pause_requested=True, resume=mock.Mock())
+        detector = mock.Mock()
+        detector.active = {"started_at": 0.0}
+        app = types.SimpleNamespace(
+            cur_command=command,
+            _command_recovery_resume_when_safe=False,
+            _command_recovery_paused_command=None,
+            _commands_dark_safety_paused_command=command,
+            _commands_dark_safety_detector=detector,
+            _command_recovery_window_exists=lambda: False,
+        )
+
+        self.assertTrue(PokeControllerApp.resume_command_after_recovery(
+            app, wait_for_visual=False))
+        command.resume.assert_called_once_with()
+        detector.reset.assert_called_once_with()
+        self.assertIsNone(app._commands_dark_safety_paused_command)
+
+    def test_dark_still_safety_ignores_selected_unstarted_command(self):
+        from Window import PokeControllerApp
+
+        command = types.SimpleNamespace(
+            alive=True, pause_requested=False,
+            request_pause=mock.Mock(), resume=mock.Mock())
+        recovery_windows = []
+        app = types.SimpleNamespace(
+            cur_command=command,
+            start_button={"text": "Start"},
+            _commands_dark_safety_detector=DarkStillFrameDetector(
+                hold_seconds=0.5, sample_interval=0.1),
+            _commands_dark_safety_command=None,
+            _commands_dark_safety_paused_command=None,
+            _software_controller_override_active=False,
+            _logger=mock.Mock(),
+            command_recovery_auto_open=types.SimpleNamespace(get=lambda: True),
+            show_output=mock.Mock(),
+            _release_command_input_for_dark_pause=mock.Mock(),
+            _show_command_recovery_window=(
+                lambda *args, **kwargs: recovery_windows.append((args, kwargs))),
+        )
+
+        results = [
+            PokeControllerApp._update_commands_dark_safety(
+                app, self._SolidFrame(0), now=index * 0.1)
+            for index in range(12)
+        ]
+        self.assertFalse(any(result["command_paused"] for result in results))
+        command.request_pause.assert_not_called()
+        app._release_command_input_for_dark_pause.assert_not_called()
+        self.assertEqual(recovery_windows, [])
+        self.assertIsNone(app._commands_dark_safety_detector.active)
+
+    def test_feature_limited_pokecon_skips_dark_still_safety(self):
+        from Window import PokeControllerApp
+
+        command = types.SimpleNamespace(
+            alive=True, pause_requested=False,
+            request_pause=mock.Mock(), resume=mock.Mock())
+        detector = mock.Mock()
+        app = types.SimpleNamespace(
+            camera_feature_limited=types.SimpleNamespace(get=lambda: True),
+        )
+        app.cur_command = command
+        app.start_button = {"text": "Stop"}
+        app._commands_dark_safety_detector = detector
+        app._commands_dark_safety_command = command
+        app._commands_dark_safety_paused_command = None
+        app._show_command_recovery_window = mock.Mock()
+
+        result = PokeControllerApp._update_commands_dark_safety(
+            app, self._SolidFrame(0), now=120.0)
+
+        self.assertFalse(result["sampled"])
+        self.assertFalse(result["command_paused"])
+        detector.add.assert_not_called()
+        detector.reset.assert_called_once_with()
+        command.request_pause.assert_not_called()
+        app._show_command_recovery_window.assert_not_called()
+        self.assertIsNone(app._commands_dark_safety_command)
+
+    def test_feature_limited_pokecon_skips_all_recovery_alerts(self):
+        from Window import PokeControllerApp
+
+        timeline = mock.Mock()
+        tracker = mock.Mock()
+        app = types.SimpleNamespace(
+            camera_feature_limited=types.SimpleNamespace(get=lambda: True),
+            _command_recovery_detector_command=object(),
+            _command_recovery_timeline=timeline,
+            _command_recovery_input_tracker=tracker,
+            _command_recovery_last_check=10.0,
+            _show_command_recovery_window=mock.Mock(),
+        )
+
+        self.assertFalse(PokeControllerApp._poll_command_recovery_alerts(
+            app, now=120.0, running=True))
+        timeline.add.assert_not_called()
+        tracker.check.assert_not_called()
+        timeline.reset.assert_called_once_with(loop_cycles=3)
+        tracker.reset.assert_called_once_with(120.0)
+        app._show_command_recovery_window.assert_not_called()
+        self.assertIsNone(app._command_recovery_detector_command)
+
+    def test_feature_limited_pokecon_skips_monitor_video_detection(self):
+        from Window import PokeControllerApp
+
+        detector = mock.Mock()
+        app = types.SimpleNamespace(
+            _camera_feature_limited_runtime=True,
+            _command_monitor_visual_detector=detector,
+        )
+
+        result = PokeControllerApp._update_command_monitor_visual_state(
+            app, self._SolidFrame(0), now=120.0)
+
+        self.assertFalse(result["sampled"])
+        self.assertFalse(result["stall_started"])
+        detector.add.assert_not_called()
+        detector.reset.assert_called_once_with()
+
+    def test_idle_feature_limited_preview_skips_all_recording_frame_work(self):
+        from Window import PokeControllerApp
+
+        app = types.SimpleNamespace(
+            _camera_feature_limited_runtime=True,
+            recorder=types.SimpleNamespace(active=False),
+            operation_recorder=types.SimpleNamespace(active=False),
+            record_armed=False,
+            _update_commands_dark_safety=mock.Mock(),
+            _sync_audio_device_usage=mock.Mock(),
+            _process_operation_capture_frame=mock.Mock(),
+        )
+
+        PokeControllerApp.process_recording_frame(
+            app, numpy.zeros((2, 2, 3), dtype=numpy.uint8))
+
+        app._update_commands_dark_safety.assert_not_called()
+        app._sync_audio_device_usage.assert_not_called()
+        app._process_operation_capture_frame.assert_not_called()
+
+    def test_command_monitor_chunk_stop_can_drain_off_tk_thread(self):
+        from Window import PokeControllerApp
+
+        stop_started = threading.Event()
+        allow_stop = threading.Event()
+        chunk = {"started": 1.0, "ended": None}
+        command = type("Command", (), {"alive": True})()
+        app = types.SimpleNamespace(
+            _command_monitor_lock=threading.Lock(),
+            _command_monitor_current_chunk=chunk,
+            _command_monitor_stop_in_progress=False,
+            _command_monitor_command=command,
+            _command_monitor_last_snapshot={},
+            _command_monitor_session_started=1.0,
+            _gui_action_queue=queue.Queue(),
+            _logger=mock.Mock(),
+            record_armed=True,
+            cur_command=command,
+            _write_command_monitor_event=lambda *args, **kwargs: None,
+            _write_command_monitor_output_log=lambda *args, **kwargs: None,
+            _write_command_monitor_metadata=lambda *args, **kwargs: None,
+            _sync_audio_device_usage=lambda: None,
+            _refresh_command_monitor_tree=lambda: None,
+            _start_command_monitor_chunk=lambda *args, **kwargs: None,
+        )
+
+        def stop_recorder():
+            stop_started.set()
+            allow_stop.wait(2.0)
+
+        app._stop_capture_recorder = stop_recorder
+        app._complete_command_monitor_chunk_finish = types.MethodType(
+            PokeControllerApp._complete_command_monitor_chunk_finish, app)
+        app._finish_command_monitor_chunk = types.MethodType(
+            PokeControllerApp._finish_command_monitor_chunk, app)
+
+        started_at = time.monotonic()
+        self.assertTrue(app._finish_command_monitor_chunk(
+            "chunk_rotated", background=True))
+        self.assertLess(time.monotonic() - started_at, 0.2)
+        self.assertTrue(stop_started.wait(1.0))
+        self.assertTrue(app._command_monitor_stop_in_progress)
+        self.assertIs(app._command_monitor_current_chunk, chunk)
+        allow_stop.set()
+        callback = app._gui_action_queue.get(timeout=2.0)
+        callback()
+        self.assertFalse(app._command_monitor_stop_in_progress)
+        self.assertIsNone(app._command_monitor_current_chunk)
+
+    def test_template_segment_stop_returns_before_avi_drain_finishes(self):
+        from Window import PokeControllerApp
+
+        stop_started = threading.Event()
+        allow_stop = threading.Event()
+        completed = []
+        recorder = types.SimpleNamespace(active=True, defer_finalization=False)
+
+        def stop_recorder():
+            stop_started.set()
+            allow_stop.wait(2.0)
+
+        app = types.SimpleNamespace(
+            recorder=recorder,
+            _template_finalize_after_stop=False,
+            _template_exit_after_stop=False,
+            _template_recording_stop_in_progress=False,
+            _stop_capture_recorder=stop_recorder,
+            _gui_action_queue=queue.Queue(),
+            _complete_template_recording_stop=(
+                lambda error=None: completed.append(error)),
+        )
+
+        started_at = time.monotonic()
+        self.assertTrue(PokeControllerApp._request_template_recording_stop(app))
+        self.assertLess(time.monotonic() - started_at, 0.2)
+        self.assertTrue(stop_started.wait(1.0))
+        self.assertTrue(app._template_recording_stop_in_progress)
+        self.assertTrue(recorder.defer_finalization)
+        allow_stop.set()
+        callback = app._gui_action_queue.get(timeout=2.0)
+        callback()
+        self.assertEqual(completed, [None])
+
+    def test_exit_after_recording_stop_launches_worker_before_destroy(self):
+        from Window import PokeControllerApp
+
+        events = []
+        button = mock.Mock()
+        app = types.SimpleNamespace(
+            _template_finalize_after_stop=False,
+            _template_exit_after_stop=True,
+            _template_recording_stop_in_progress=True,
+            record_armed=False,
+            record_button=button,
+            _launch_deferred_template_finalizer=(
+                lambda wait_for_exit=False:
+                events.append(("launch", wait_for_exit)) or True),
+            _exit_now=(
+                lambda confirm=True: events.append(("exit", confirm))),
+            _preview_shutdown_mode=True,
+            _refresh_preview_priority_status=mock.Mock(),
+            _logger=mock.Mock(),
+            show_output=mock.Mock(),
+        )
+
+        self.assertTrue(PokeControllerApp._complete_template_recording_stop(app))
+
+        self.assertEqual(events, [("launch", True), ("exit", False)])
+        self.assertFalse(app._template_recording_stop_in_progress)
 
     def test_loop_anchor_is_released_after_different_step(self):
         timeline = CommandStateTimeline(loop_cycles=3)
@@ -4138,6 +5947,222 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         self.assertFalse(chunks[2]["delete_pending"])
 
 
+class CommandDevelopmentToolsTests(unittest.TestCase):
+    def test_source_analysis_is_static_and_reports_state_quality(self):
+        source = '''
+raise RuntimeError("source must never execute")
+
+class Demo:
+    def __init__(self):
+        self.STATE_MAIN_FUNCTION = {
+            "START": self.start,
+            "BROKEN": self.missing,
+            "BROKEN": self.missing,
+        }
+
+    def start(self):
+        self.image_check("TARGET_A")
+        while True:
+            return "UNKNOWN_STATE"
+'''
+        result = analyze_command_source(source, "dangerous_command.py")
+        self.assertEqual(result["syntax_error"], "")
+        self.assertEqual(result["image_checks"], ["TARGET_A"])
+        codes = {item["code"] for item in result["issues"]}
+        self.assertTrue({
+            "duplicate_state", "missing_state_method",
+            "loop_without_alive_check", "unknown_return_state",
+        }.issubset(codes))
+        self.assertIn(
+            ("START", "UNKNOWN_STATE"),
+            {(item["from_state"], item["to_state"])
+             for item in result["transitions"]})
+
+    def test_source_image_exception_is_not_treated_as_missing_registration(self):
+        source = '''
+class Demo:
+    def run(self):
+        return self.image_check("SPECIAL_CASE")
+    def image_check_exception(self, targetimage):
+        if targetimage == "SPECIAL_CASE":
+            return self.check_something_else()
+        return None
+'''
+        result = analyze_command_source(source, "demo.py")
+        self.assertIn(
+            "SPECIAL_CASE",
+            result["image_reference_audit"]["exception_names"])
+
+    def test_recording_analysis_keeps_step_edges_watch_history_and_cycles(self):
+        events = []
+        for index, step in enumerate(("A", "B", "A", "B", "A", "B")):
+            event = {
+                "video_time": index * 0.25,
+                "step_text": step,
+                "states": {"STATE_MAIN_FUNCTION": step},
+            }
+            if index in (0, 3):
+                event["watch_values"] = {"counter": repr(index)}
+            events.append(event)
+        result = analyze_recording_events(events)
+        edges = {(item["from_step"], item["to_step"]): item["count"]
+                 for item in result["transitions"]}
+        self.assertEqual(edges[("A", "B")], 3)
+        self.assertEqual(edges[("B", "A")], 2)
+        counter = [item for item in result["variable_history"]
+                   if item["name"] == "counter"]
+        self.assertEqual([item["after"] for item in counter], ["0", "3"])
+        self.assertTrue(any(item["steps"] == ["A", "B"]
+                            for item in result["loops"]))
+
+    def test_regression_bundle_checks_symbols_without_starting_commands(self):
+        source = '''
+class Demo:
+    def __init__(self):
+        self.STATE_MAIN_FUNCTION = {"START": self.start}
+    def start(self):
+        return "START"
+'''
+        analysis = analyze_command_source(source, "demo.py")
+        case = build_regression_case(
+            {"command": "Demo", "session_dir": "recording"},
+            [{"video_time": 0.0, "step_text": "START"}], analysis,
+            source_text=source, source_path="demo.py")
+        self.assertEqual(case["command"], "Demo")
+        self.assertEqual(case["source"]["state_names"], ["START"])
+        rendered = render_regression_unittest("case.json")
+        self.assertIn("ast.parse", rendered)
+        self.assertNotIn("subprocess", rendered)
+        self.assertNotIn("PythonCommand", rendered)
+
+    def test_recorded_image_profile_matches_runtime_crop_and_exclusions(self):
+        with tempfile.TemporaryDirectory() as root:
+            template_root = os.path.join(root, "Template")
+            os.makedirs(template_root)
+            rng = numpy.random.default_rng(22)
+            pattern = rng.integers(0, 256, (18, 18, 3), dtype=numpy.uint8)
+            template_path = os.path.join(template_root, "pattern.png")
+            self.assertTrue(cv2.imwrite(template_path, pattern))
+            video_path = os.path.join(root, "recording.avi")
+            writer = cv2.VideoWriter(
+                video_path, cv2.VideoWriter_fourcc(*"MJPG"), 10.0,
+                (1280, 720))
+            self.assertTrue(writer.isOpened())
+            for _index in range(3):
+                frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+                frame[100:118, 200:218] = pattern
+                writer.write(frame)
+            writer.release()
+            # Use the decoded recording pixels as the template so the test
+            # measures crop/exclusion parity rather than MJPG colour loss.
+            capture = cv2.VideoCapture(video_path)
+            ok, decoded = capture.read()
+            capture.release()
+            self.assertTrue(ok)
+            self.assertTrue(cv2.imwrite(
+                template_path, decoded[100:118, 200:218]))
+            base = {
+                "template_path": "Template/pattern.png", "threshold": 0.8,
+                "use_gray": False, "crop": [180, 80, 240, 140],
+            }
+            library = {"targets": {
+                "FOUND": {"operator": "OR", "variants": [dict(base)]},
+                "EXCLUDED": {"operator": "OR", "variants": [dict(
+                    base, exclude_regions=[[200, 100, 218, 118]])]},
+            }}
+            result = profile_recorded_video(
+                video_path, library, template_root,
+                ["FOUND", "EXCLUDED"], sample_interval=0.1, max_samples=3)
+            rows = {item["name"]: item for item in result["targets"]}
+            self.assertEqual(rows["FOUND"]["matches"], 3)
+            self.assertEqual(rows["EXCLUDED"]["matches"], 0)
+            self.assertEqual(result["processed_samples"], 3)
+
+    def test_devstudio_analysis_is_bounded_non_modal_and_openable(self):
+        studio_path = os.path.join(DEV_STUDIO, "CommandDevelopmentStudio.py")
+        with tokenize.open(studio_path) as stream:
+            source = stream.read()
+        self.assertIn("DISPLAY_LIMIT = 500", source)
+        self.assertIn("to=2000", source)
+        self.assertIn("daemon=True", source)
+        for forbidden in ("grab_set(", "focus_force(", "attributes(\"-topmost\"", ".lift("):
+            self.assertNotIn(forbidden, source)
+        recording_path = os.path.join(DEV_STUDIO, "CommandRecordingStudio.py")
+        with tokenize.open(recording_path) as stream:
+            recording_source = stream.read()
+        self.assertIn("Commands開発解析…", recording_source)
+        self.assertIn("open_command_development", recording_source)
+
+    def test_command_watch_history_is_opt_in_and_change_only(self):
+        path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        method = next(
+            item for node in ast.walk(module) if isinstance(node, ast.ClassDef)
+            for item in node.body if isinstance(item, ast.FunctionDef)
+            and item.name == "poll_command_watch")
+        text = ast.get_source_segment(source, method)
+        self.assertIn("values != self.command_watch_last_values", text)
+        self.assertIn('"variable_watch"', text)
+        self.assertIn("_command_monitor_current_chunk", text)
+        self.assertIn('location={}', text)
+
+    def test_command_watch_writes_changed_values_only_to_active_recording(self):
+        from Window import PokeControllerApp
+
+        class Variable:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        class Root:
+            def __init__(self):
+                self.scheduled = []
+
+            def after(self, delay, callback):
+                self.scheduled.append((delay, callback))
+
+        command = types.SimpleNamespace(
+            NAME="Demo", counter=1,
+            STATE_MAIN_FUNCTION={"START": object()},
+            main_current_state="START")
+        app = types.SimpleNamespace(
+            command_watch_enabled=Variable(True),
+            command_watch_variables=["counter"],
+            command_watch_command=Variable("Demo"),
+            command_watch_target=Variable("Analysis"),
+            command_watch_status=Variable(""),
+            command_watch_last_values={},
+            cur_command=command,
+            _command_monitor_current_chunk={"id": "chunk"},
+            _command_monitor_command=command,
+            root=Root())
+        app.poll_command_watch = lambda: None
+        output, written = [], []
+        app.show_output = lambda target, text="": output.append((target, text))
+        app._write_command_monitor_event = lambda *args, **kwargs: \
+            written.append((args, kwargs))
+
+        PokeControllerApp.poll_command_watch(app)
+        PokeControllerApp.poll_command_watch(app)
+        self.assertEqual(len(output), 1)
+        self.assertEqual(len(written), 1)
+        self.assertEqual(written[0][0][2], "variable_watch")
+        self.assertEqual(written[0][1]["extra"]["watch_values"], {"counter": "1"})
+
+        command.counter = 2
+        app._command_monitor_current_chunk = None
+        PokeControllerApp.poll_command_watch(app)
+        self.assertEqual(len(output), 2)
+        self.assertEqual(len(written), 1)
+
+
 class PackageVersionCompatibilityTests(unittest.TestCase):
     def test_requirement_name_supports_versions_and_environment_markers(self):
         self.assertEqual(
@@ -4148,6 +6173,232 @@ class PackageVersionCompatibilityTests(unittest.TestCase):
 
     def test_standard_library_distribution_lookup_does_not_need_pkg_resources(self):
         self.assertIsNotNone(installed_distribution_version("pip"))
+
+
+class ProcessShutdownTests(unittest.TestCase):
+    def test_mp4_progress_gui_polls_slowly_in_background(self):
+        from RecordingFinalizeWorker import FinalizeProgressWindow
+
+        self.assertGreaterEqual(
+            FinalizeProgressWindow.BACKGROUND_POLL_MS, 1000)
+        self.assertGreater(
+            FinalizeProgressWindow.BACKGROUND_POLL_MS,
+            FinalizeProgressWindow.FOREGROUND_POLL_MS)
+
+    def test_deferred_mp4_launcher_uses_separate_low_priority_process(self):
+        with tempfile.TemporaryDirectory() as folder:
+            manifest = os.path.join(folder, "mp4_finalize_job.json")
+            with open(manifest, "w", encoding="utf-8") as stream:
+                json.dump({"version": 1, "status": "pending"}, stream)
+            started = mock.Mock(pid=98765)
+            popen = mock.Mock(return_value=started)
+            queue_dir = os.path.join(folder, "queue")
+
+            result = launch_recording_finalize_worker(
+                [manifest], wait_pid=4321, popen=popen,
+                executable=sys.executable, queue_dir=queue_dir)
+
+            self.assertIs(result, started)
+            command = popen.call_args.args[0]
+            self.assertIn("RecordingFinalizeWorker.py", " ".join(command))
+            self.assertEqual(
+                command[command.index("--queue-dir") + 1], queue_dir)
+            requests = [
+                name for name in os.listdir(queue_dir)
+                if name.startswith("request_")]
+            self.assertEqual(len(requests), 1)
+            with open(os.path.join(queue_dir, requests[0]), "r",
+                      encoding="utf-8") as stream:
+                request = json.load(stream)
+            self.assertEqual(request["jobs"], [os.path.abspath(manifest)])
+            self.assertEqual(request["wait_pid"], 4321)
+            if os.name == "nt":
+                flags = popen.call_args.kwargs["creationflags"]
+                self.assertTrue(flags & 0x00004000)
+                self.assertTrue(flags & 0x00000008)
+
+    def test_additional_mp4_jobs_join_existing_worker_without_new_window(self):
+        with tempfile.TemporaryDirectory() as folder:
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(queue_dir)
+            manifests = []
+            for name in ("first", "second"):
+                recording = os.path.join(folder, name)
+                os.makedirs(recording)
+                manifest = os.path.join(recording, "mp4_finalize_job.json")
+                with open(manifest, "w", encoding="utf-8") as stream:
+                    json.dump({"version": 1, "status": "pending"}, stream)
+                manifests.append(manifest)
+            with open(os.path.join(queue_dir, "worker.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump({"pid": 2468, "accepting": True}, stream)
+            popen = mock.Mock()
+
+            with mock.patch(
+                    "ProcessShutdown.process_is_alive", return_value=True):
+                first = launch_recording_finalize_worker(
+                    [manifests[0]], wait_pid=10, popen=popen,
+                    queue_dir=queue_dir)
+                second = launch_recording_finalize_worker(
+                    [manifests[1]], wait_pid=20, popen=popen,
+                    queue_dir=queue_dir)
+
+            self.assertIsNone(first)
+            self.assertIsNone(second)
+            popen.assert_not_called()
+            requests = [
+                name for name in os.listdir(queue_dir)
+                if name.startswith("request_")]
+            self.assertEqual(len(requests), 2)
+
+    def test_mp4_worker_collects_added_jobs_and_deduplicates_processed_paths(self):
+        from RecordingFinalizeWorker import collect_finalize_requests
+
+        with tempfile.TemporaryDirectory() as folder:
+            manifests = []
+            for name in ("first", "second"):
+                recording = os.path.join(folder, name)
+                os.makedirs(recording)
+                manifest = os.path.join(recording, "mp4_finalize_job.json")
+                with open(manifest, "w", encoding="utf-8") as stream:
+                    json.dump({"version": 1, "status": "pending"}, stream)
+                manifests.append(os.path.abspath(manifest))
+            for index, payload in enumerate((
+                    {"jobs": [manifests[0]], "wait_pid": 10},
+                    {"jobs": manifests, "wait_pid": 20})):
+                with open(os.path.join(folder, "request_{}.json".format(index)),
+                          "w", encoding="utf-8") as stream:
+                    json.dump(payload, stream)
+
+            known = set()
+            additions = collect_finalize_requests(folder, known=known)
+
+            self.assertEqual(
+                [item["manifest"] for item in additions], manifests)
+            self.assertEqual(
+                [item["wait_pid"] for item in additions], [10, 20])
+            self.assertEqual(known, set(manifests))
+            self.assertEqual(collect_finalize_requests(folder, known), [])
+
+    def test_mp4_worker_processes_jobs_added_after_the_first_batch(self):
+        from RecordingFinalizeWorker import FinalizeProgressWindow
+
+        with tempfile.TemporaryDirectory() as folder:
+            manifests = []
+            for name in ("first", "second"):
+                recording = os.path.join(folder, name)
+                os.makedirs(recording)
+                manifest = os.path.abspath(os.path.join(
+                    recording, "mp4_finalize_job.json"))
+                with open(manifest, "w", encoding="utf-8") as stream:
+                    json.dump({"version": 1, "status": "pending"}, stream)
+                manifests.append(manifest)
+
+            worker = object.__new__(FinalizeProgressWindow)
+            worker.queue_dir = folder
+            worker.events = queue.Queue()
+            worker.stop_event = threading.Event()
+            thread = threading.Thread(target=worker._run_jobs)
+
+            def add_request(name, jobs):
+                with open(os.path.join(folder, name), "w",
+                          encoding="utf-8") as stream:
+                    json.dump({"jobs": jobs, "wait_pid": 0}, stream)
+
+            add_request("request_001.json", [manifests[0]])
+            with mock.patch(
+                    "RecordingFinalizeWorker.finalize_recording_manifest",
+                    return_value="recording.mp4") as finalize:
+                thread.start()
+                deadline = time.monotonic() + 3.0
+                while finalize.call_count < 1 and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                add_request(
+                    "request_002.json", [manifests[0], manifests[1]])
+                deadline = time.monotonic() + 3.0
+                while finalize.call_count < 2 and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                worker.stop_event.set()
+                thread.join(timeout=2.0)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(
+                [call.args[0] for call in finalize.call_args_list], manifests)
+            event_kinds = []
+            while not worker.events.empty():
+                event_kinds.append(worker.events.get_nowait()[0])
+            self.assertEqual(event_kinds.count("added"), 2)
+            self.assertEqual(event_kinds.count("completed"), 2)
+
+    def test_controlled_shutdown_flushes_then_terminates_current_process(self):
+        events = []
+
+        class Stream:
+            def __init__(self, name):
+                self.name = name
+
+            def flush(self):
+                events.append(("flush", self.name))
+
+        result = terminate_after_gui_shutdown(
+            7,
+            exit_function=lambda code: events.append(("exit", code)),
+            streams=(Stream("stdout"), Stream("stderr")),
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(events, [
+            ("flush", "stdout"),
+            ("flush", "stderr"),
+            ("exit", 7),
+        ])
+
+    def test_window_forces_exit_only_after_its_controlled_cleanup_path(self):
+        window_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(window_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+
+        app_class = next(
+            node for node in module.body
+            if isinstance(node, ast.ClassDef) and node.name == "PokeControllerApp")
+        exit_method = next(
+            node for node in app_class.body
+            if isinstance(node, ast.FunctionDef) and node.name == "_exit_now")
+        exit_calls = [
+            node for node in ast.walk(exit_method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "destroy"
+        ]
+        ready_assignments = [
+            node for node in ast.walk(exit_method)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Attribute)
+                    and target.attr == "_process_exit_ready"
+                    for target in node.targets)
+        ]
+
+        self.assertTrue(exit_calls)
+        self.assertTrue(ready_assignments)
+        self.assertIn("terminate_after_gui_shutdown(0)", source)
+
+    def test_generated_profile_launcher_does_not_pause_after_pokecon_closes(self):
+        menubar_path = os.path.join(SERIAL_CONTROLLER, "Menubar.py")
+        with tokenize.open(menubar_path) as stream:
+            source = stream.read()
+        method = next(
+            item for node in ast.parse(source).body
+            if isinstance(node, ast.ClassDef)
+            for item in node.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name == "GenerateNewBat")
+        literals = "".join(
+            node.value for node in ast.walk(method)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str))
+
+        self.assertIn("exit /b %ERRORLEVEL%", literals)
+        self.assertNotIn("pause", literals.lower())
 
 
 class MultiInstanceResponsivenessTests(unittest.TestCase):
@@ -4768,6 +7019,23 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
                 high_precision=False)
         self.assertEqual(delays, [4])
 
+    def test_capture_listener_failure_does_not_escape_preview_callback(self):
+        logger = mock.Mock()
+
+        def fail(_frame):
+            raise RuntimeError("recording failed")
+
+        preview = types.SimpleNamespace(
+            record_listener=fail,
+            frame_listener=lambda _frame: None,
+            _logger=logger)
+        frame = numpy.zeros((4, 4, 3), dtype=numpy.uint8)
+        self.assertFalse(CaptureArea._notify_capture_listener(
+            preview, "record_listener", frame))
+        self.assertTrue(CaptureArea._notify_capture_listener(
+            preview, "frame_listener", frame, copy_frame=True))
+        logger.warning.assert_called_once()
+
     def test_audio_packet_gap_becomes_silence_without_shifting_later_audio(self):
         class FakeWave:
             def __init__(self):
@@ -5018,6 +7286,69 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
 
         self.assertTrue(writer.audio_was_frozen)
         self.assertEqual(monitor.removed, [9])
+
+    def test_template_stop_defers_mp4_to_a_durable_manifest(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "20260822_120000_000000")
+            os.makedirs(session)
+            recorder = CaptureRecorder(folder, start_finalize_worker=False)
+            recorder.active = True
+            recorder.defer_finalization = True
+            recorder.session_dir = session
+            recorder.video_path = os.path.join(session, "recording.avi")
+            recorder.wav_path = os.path.join(session, "recording.wav")
+            recorder.mp4_path = os.path.join(session, "recording.mp4")
+            with open(recorder.video_path, "wb") as stream:
+                stream.write(b"avi")
+            recorder.video = mock.Mock()
+            recorder.frames_written = 60
+            recorder.started_at = 100.0
+            recorder.requested_fps = 60.0
+            recorder.video_codec = "mp4v"
+
+            with mock.patch("Recording.time.monotonic", return_value=101.0):
+                result = recorder.stop()
+
+            self.assertEqual(result, recorder.mp4_path)
+            self.assertFalse(recorder.is_finalizing)
+            manifests = recorder.deferred_finalize_manifests()
+            self.assertEqual(len(manifests), 1)
+            payload = load_finalize_manifest(manifests[0])
+            self.assertEqual(payload["status"], "pending")
+            self.assertEqual(payload["output_fps"], 60.0)
+            self.assertEqual(payload["video_path"], recorder.video_path)
+
+    def test_finalize_manifest_omits_image_arrays_and_is_discoverable(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            os.makedirs(session)
+            video = os.path.join(session, "recording.avi")
+            manifest = write_finalize_manifest(
+                video, os.path.join(session, "recording.wav"),
+                os.path.join(session, "recording.mp4"), 60.0, 2.0,
+                cleanup_rules=[{
+                    "path": "cleanup.png", "threshold": 0.9,
+                    "image": numpy.zeros((2, 2, 3), dtype=numpy.uint8),
+                }])
+
+            payload = load_finalize_manifest(manifest)
+            self.assertNotIn("image", payload["cleanup_rules"][0])
+            self.assertEqual(discover_finalize_manifests(folder), [manifest])
+
+    def test_template_detection_requests_stop_without_blocking_itself(self):
+        recorder = CaptureRecorder(start_finalize_worker=False)
+        recorder.active = True
+        recorder.template = numpy.zeros((1, 1, 3), dtype=numpy.uint8)
+        recorder.last_check = 100.0
+        recorder.last_detection = 0.0
+        with mock.patch("Recording.time.monotonic", return_value=100.1):
+            result = recorder.process_detection(
+                numpy.zeros((2, 2, 3), dtype=numpy.uint8),
+                60.0, "", 100, 0.9, (0, 0, 2, 2),
+                interval=1.0, release_seconds=5.0, allow_start=True)
+
+        self.assertEqual(result, DETECTION_STOP_REQUESTED)
+        self.assertTrue(recorder.active)
 
     def test_truncated_mme_name_prefers_equivalent_wasapi_input(self):
         devices = [

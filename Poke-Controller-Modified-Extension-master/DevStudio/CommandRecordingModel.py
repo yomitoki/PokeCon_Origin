@@ -41,6 +41,12 @@ def _state_text(event):
 def load_command_timeline(folder):
     folder = os.path.abspath(str(folder or ""))
     path = os.path.join(folder, "steps.jsonl")
+    metadata = _load_json(os.path.join(folder, "command_monitor.json"), {})
+    try:
+        video_duration = max(0.0, float(metadata.get("duration", 0.0) or 0.0)) \
+            if isinstance(metadata, dict) else 0.0
+    except (TypeError, ValueError):
+        video_duration = 0.0
     rows = []
     first_wall = None
     try:
@@ -72,6 +78,12 @@ def load_command_timeline(folder):
                 video_time = max(0.0, float(video_time or 0.0))
             except (TypeError, ValueError):
                 video_time = 0.0
+            if video_duration and video_time > video_duration + 0.25:
+                # The retained clip can start midway through the Commands run.
+                # Do not show path events that belong before/after that video.
+                continue
+            if video_duration:
+                video_time = min(video_time, video_duration)
             location = item.get("location", {})
             if not isinstance(location, dict):
                 location = {}

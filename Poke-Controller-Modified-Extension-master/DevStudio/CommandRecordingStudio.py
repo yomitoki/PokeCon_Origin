@@ -50,10 +50,12 @@ class CommandRecordingWorkspace(ttk.Frame):
     """Timeline, recorded video, and the executed source in one tab."""
 
     def __init__(self, parent, initial_recording="", open_source_callback=None,
-                 open_image_callback=None):
+                 open_image_callback=None, template_root_provider=None):
         ttk.Frame.__init__(self, parent)
         self.open_source_callback = open_source_callback
         self.open_image_callback = open_image_callback
+        self.template_root_provider = template_root_provider
+        self.command_development_window = None
         self.folder = ""
         self.metadata = {}
         self.events = []
@@ -96,6 +98,8 @@ class CommandRecordingWorkspace(ttk.Frame):
         self.video_time_text = tk.StringVar(value="00:00.000 / 00:00.000")
         self.video_sync = tk.DoubleVar(value=0.0)
         self.source_title = tk.StringVar(value="関数を選ぶと、録画時ソースを表示します。")
+        self.current_execution_text = tk.StringVar(
+            value="▶ 動画を移動すると、その時刻の実行行を表示します。")
 
         guide = ttk.Label(
             self,
@@ -113,6 +117,9 @@ class CommandRecordingWorkspace(ttk.Frame):
         self.load_button = ttk.Button(opener, text="読込", command=self.load_typed_folder)
         self.load_button.pack(side="left", padx=3)
         ttk.Button(opener, text="フォルダを開く", command=self.open_folder).pack(side="left")
+        ttk.Button(
+            opener, text="Commands開発解析…",
+            command=self.open_command_development).pack(side="left", padx=(3, 0))
         ttk.Label(self, textvariable=self.summary, anchor="w").pack(
             fill="x", padx=10, pady=(0, 4))
 
@@ -176,6 +183,12 @@ class CommandRecordingWorkspace(ttk.Frame):
                   foreground="#174a7e").pack(anchor="w", padx=3)
         ttk.Label(parent, textvariable=self.source_title, anchor="w", wraplength=480).pack(
             fill="x", padx=3, pady=3)
+        tk.Label(
+            parent, textvariable=self.current_execution_text,
+            anchor="w", justify="left", wraplength=480,
+            background="#fff176", foreground="#111111",
+            font=("TkDefaultFont", 9, "bold"), padx=5, pady=3).pack(
+                fill="x", padx=3, pady=(0, 3))
         actions = ttk.Frame(parent)
         actions.pack(fill="x", padx=3, pady=(0, 3))
         ttk.Button(actions, text="ソース編集タブで開く",
@@ -188,6 +201,22 @@ class CommandRecordingWorkspace(ttk.Frame):
                        side="left", padx=3)
         ttk.Button(actions, text="停止地点を動画で再確認",
                    command=self.seek_current_event).pack(side="left", padx=3)
+        path_actions = ttk.Frame(parent)
+        path_actions.pack(fill="x", padx=3, pady=(0, 3))
+        ttk.Button(
+            path_actions, text="◀ 前の実行行",
+            command=lambda: self.select_path_event(False)).pack(side="left")
+        ttk.Button(
+            path_actions, text="次の実行行 ▶",
+            command=lambda: self.select_path_event(True)).pack(side="left", padx=3)
+        ttk.Button(
+            path_actions, text="◀ 前の関数",
+            command=lambda: self.select_visited_function(False)).pack(
+                side="left", padx=(10, 0))
+        ttk.Button(
+            path_actions, text="次の関数 ▶",
+            command=lambda: self.select_visited_function(True)).pack(
+                side="left", padx=3)
         frame = ttk.Frame(parent)
         frame.pack(fill="both", expand=True, padx=3)
         self.source_text = tk.Text(
@@ -204,7 +233,9 @@ class CommandRecordingWorkspace(ttk.Frame):
         self.source_text.tag_configure(
             "visited", background="#173f5f", foreground="white")
         self.source_text.tag_configure(
-            "current", background="#664d00", foreground="white")
+            "current", background="#fff176", foreground="#111111",
+            relief="raised", borderwidth=1,
+            font=("Consolas", 9, "bold"))
         self.source_text.configure(state="disabled")
 
     def _build_video(self, parent):
@@ -431,6 +462,17 @@ class CommandRecordingWorkspace(ttk.Frame):
     def show_event_source(self, event):
         path, location = resolve_event_source(self.folder, self.metadata, event)
         self.current_source_path = str(location.get("file", "") or path)
+        try:
+            linked_video_time = max(
+                0.0, float(event.get("video_time", 0.0) or 0.0)
+                + float(self.video_sync.get()))
+        except (TypeError, ValueError, tk.TclError):
+            linked_video_time = 0.0
+        self.current_execution_text.set(
+            "▶ 動画 {} に対応する実行行: {}() / {}行".format(
+                _clock(linked_video_time),
+                location.get("function", "-") or "-",
+                location.get("line", "-") or "-"))
         self.source_text.configure(state="normal")
         self.source_text.delete("1.0", "end")
         if not path:
@@ -473,6 +515,10 @@ class CommandRecordingWorkspace(ttk.Frame):
             self.source_text.tag_add("current", "{}.0".format(row), "{}.end".format(row))
             self.source_text.tag_raise("current")
             self.source_text.see("{}.0".format(row))
+            self.status.set(
+                "動画 {} → {}() {}行を表示中".format(
+                    _clock(linked_video_time),
+                    location.get("function", "-") or "-", highlight))
         original = str(location.get("file", "") or "")
         source_kind = "録画時スナップショット" if os.path.abspath(path) != os.path.abspath(original or path) \
             else "現在のソース"
@@ -514,6 +560,63 @@ class CommandRecordingWorkspace(ttk.Frame):
                  if int(event.get("index", 0)) < current), distinct[-1])
         self.select_event(target, seek=True)
 
+    def select_path_event(self, forward):
+        """Move one recorded execution event and seek the linked video."""
+        candidates = []
+        for event in self.events:
+            location = event.get("location", {}) if isinstance(event, dict) else {}
+            if not isinstance(location, dict):
+                continue
+            try:
+                line = int(location.get("line", 0) or 0)
+            except (TypeError, ValueError):
+                line = 0
+            if location.get("file") and line > 0:
+                candidates.append(event)
+        if not candidates:
+            self.status.set("この動画範囲には実行行が記録されていません。")
+            return
+        current = int(self.current_event.get("index", 0)) if self.current_event else 0
+        if forward:
+            target = next(
+                (event for event in candidates
+                 if int(event.get("index", 0)) > current), candidates[0])
+        else:
+            target = next(
+                (event for event in reversed(candidates)
+                 if int(event.get("index", 0)) < current), candidates[-1])
+        self.select_event(target, seek=True)
+
+    def select_visited_function(self, forward):
+        """Move to the previous/next function transition and seek the video."""
+        transitions = []
+        previous_key = None
+        for event in self.events:
+            location = event.get("location", {}) if isinstance(event, dict) else {}
+            if not isinstance(location, dict):
+                continue
+            path = str(location.get("file", "") or "")
+            function = str(location.get("function", "") or "")
+            if not path or not function:
+                continue
+            key = (os.path.normcase(os.path.abspath(path)), function)
+            if key != previous_key:
+                transitions.append(event)
+                previous_key = key
+        if not transitions:
+            self.status.set("この動画範囲には関数の実行経路が記録されていません。")
+            return
+        current = int(self.current_event.get("index", 0)) if self.current_event else 0
+        if forward:
+            target = next(
+                (event for event in transitions
+                 if int(event.get("index", 0)) > current), transitions[0])
+        else:
+            target = next(
+                (event for event in reversed(transitions)
+                 if int(event.get("index", 0)) < current), transitions[-1])
+        self.select_event(target, seek=True)
+
     def open_current_source(self):
         event = self.current_event or {}
         location = event.get("location", {})
@@ -521,6 +624,47 @@ class CommandRecordingWorkspace(ttk.Frame):
         path = original if os.path.isfile(original) else self.current_source_path
         if path and self.open_source_callback:
             self.open_source_callback(path, int(location.get("line", 1) or 1))
+
+    def _development_source_path(self):
+        """Prefer the selected event's real source, then recording metadata."""
+        event = self.current_event or {}
+        location = event.get("location", {}) if isinstance(event, dict) else {}
+        candidates = []
+        if isinstance(location, dict):
+            candidates.append(str(location.get("file", "") or ""))
+        candidates.append(str(self.current_source_path or ""))
+        source = self.metadata.get("source", {}) if isinstance(self.metadata, dict) else {}
+        if isinstance(source, dict):
+            candidates.append(str(source.get("file", "") or ""))
+        for item in candidates:
+            if item and os.path.isfile(item):
+                return os.path.abspath(item)
+        return ""
+
+    def open_command_development(self):
+        """Open bounded post-recording analysis without touching live Commands."""
+        window = self.command_development_window
+        try:
+            if window is not None and window.winfo_exists():
+                window.update_context(
+                    folder=self.folder, metadata=self.metadata,
+                    events=self.events, source_path=self._development_source_path())
+                window.deiconify()
+                return
+        except tk.TclError:
+            pass
+        try:
+            from CommandDevelopmentStudio import CommandDevelopmentWindow
+            template_root = self.template_root_provider() \
+                if callable(self.template_root_provider) else ""
+            self.command_development_window = CommandDevelopmentWindow(
+                self, folder=self.folder, metadata=self.metadata,
+                events=self.events, source_path=self._development_source_path(),
+                template_root=template_root,
+                open_source_callback=self.open_source_callback)
+        except Exception as error:
+            self.command_development_window = None
+            messagebox.showerror("Commands開発解析", str(error), parent=self)
 
     def seek_current_event(self):
         if self.current_event:
@@ -699,6 +843,12 @@ class CommandRecordingWorkspace(ttk.Frame):
 
     def destroy(self):
         self._load_generation += 1
+        window, self.command_development_window = self.command_development_window, None
+        try:
+            if window is not None and window.winfo_exists():
+                window.close()
+        except tk.TclError:
+            pass
         self._cancel_source_refresh()
         self.stop_video()
         self.close_video()

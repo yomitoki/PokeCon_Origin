@@ -859,7 +859,8 @@ class DevStudio(tk.Tk):
             command_recording_workspace,
             initial_recording=self.initial_command_recording,
             open_image_callback=self.open_operation_image_in_library,
-            open_source_callback=self.show_file)
+            open_source_callback=self.show_file,
+            template_root_provider=lambda: self.template_root())
         self.command_recording_studio.pack(fill="both", expand=True)
         for widget, label, replace in (
                 (self.operation_session_workspace.intermediate_text,

@@ -19,6 +19,103 @@ import numpy as np
 from AudioLevelControl import AdaptivePeakNormalizer
 
 
+DETECTION_STOP_REQUESTED = "template_stop_requested"
+FINALIZE_MANIFEST_NAME = "mp4_finalize_job.json"
+
+
+def _json_cleanup_rules(cleanup_rules):
+    """Remove decoded image arrays while keeping enough data to reload them."""
+    serialized = []
+    for rule in cleanup_rules or []:
+        item = {
+            str(key): value for key, value in dict(rule).items()
+            if key != "image" and isinstance(
+                value, (str, int, float, bool, type(None)))
+        }
+        if item.get("path"):
+            item["path"] = os.path.abspath(str(item["path"]))
+        serialized.append(item)
+    return serialized
+
+
+def _write_json_atomic(path, payload):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    temporary = "{}.{}.{}.tmp".format(
+        path, os.getpid(), threading.get_ident())
+    try:
+        with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            try:
+                os.fsync(stream.fileno())
+            except OSError:
+                pass
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
+
+
+def write_finalize_manifest(video_path, wav_path, mp4_path, output_fps,
+                            elapsed, process_audio_gain=1.0, discard=False,
+                            cleanup_rules=None, minimum_duration=0.0):
+    """Persist one MP4 job so PokeCon may close before encoding starts."""
+    manifest_path = os.path.join(
+        os.path.dirname(os.path.abspath(video_path)), FINALIZE_MANIFEST_NAME)
+    payload = {
+        "version": 1,
+        "status": "pending",
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "video_path": os.path.abspath(video_path),
+        "wav_path": os.path.abspath(wav_path),
+        "mp4_path": os.path.abspath(mp4_path),
+        "output_fps": float(output_fps),
+        "elapsed": float(elapsed),
+        "process_audio_gain": float(process_audio_gain),
+        "discard": bool(discard),
+        "cleanup_rules": _json_cleanup_rules(cleanup_rules),
+        "minimum_duration": float(minimum_duration),
+    }
+    _write_json_atomic(manifest_path, payload)
+    return manifest_path
+
+
+def load_finalize_manifest(manifest_path):
+    with open(manifest_path, "r", encoding="utf-8") as stream:
+        payload = json.load(stream)
+    if not isinstance(payload, dict) or int(payload.get("version", 0)) != 1:
+        raise ValueError("未対応のMP4作成ジョブです。")
+    return payload
+
+
+def discover_finalize_manifests(output_dir):
+    """Find durable pending/failed jobs without touching active recordings."""
+    root = os.path.abspath(output_dir or "Recordings")
+    if not os.path.isdir(root):
+        return []
+    found = []
+    try:
+        entries = list(os.scandir(root))
+    except OSError:
+        return []
+    for entry in entries:
+        if not entry.is_dir(follow_symlinks=False):
+            continue
+        path = os.path.join(entry.path, FINALIZE_MANIFEST_NAME)
+        if not os.path.isfile(path):
+            continue
+        try:
+            status = str(load_finalize_manifest(path).get("status", "pending"))
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            status = "failed"
+        if status in ("pending", "failed"):
+            found.append(os.path.abspath(path))
+    return sorted(found)
+
+
 def evenly_spaced_frame_indexes(total_frames, maximum_samples=120):
     """Return bounded sample positions spanning the complete recording."""
     try:
@@ -72,7 +169,7 @@ def audio_callback_presentation_time(time_info, now=None):
 
 
 class CaptureRecorder:
-    def __init__(self, output_dir="Recordings"):
+    def __init__(self, output_dir="Recordings", start_finalize_worker=True):
         self.output_dir = output_dir
         self.video = None
         self.audio = None
@@ -170,10 +267,14 @@ class CaptureRecorder:
         # capture, eventually taking CPU away from Commands and controller
         # input.  Keep the jobs durable on disk and encode them one at a time.
         self._finalize_queue = queue.Queue()
-        self._finalize_thread = threading.Thread(
-            target=self._finalize_worker, daemon=True,
-            name="CaptureRecordingFinalizer")
-        self._finalize_thread.start()
+        self._finalize_thread = None
+        self.defer_finalization = False
+        self._deferred_finalize_manifests = []
+        if start_finalize_worker:
+            self._finalize_thread = threading.Thread(
+                target=self._finalize_worker, daemon=True,
+                name="CaptureRecordingFinalizer")
+            self._finalize_thread.start()
 
     def start(self, frame, fps, audio_device="", audio_gain_percent=100,
               cleanup_rules=None, minimum_duration=0,
@@ -1047,13 +1148,22 @@ class CaptureRecorder:
         wall_clock_frame_rate = max(1.0, self.frames_written / elapsed)
         self._write_timing_report(
             elapsed, output_fps, wall_clock_frame_rate)
+        process_audio_gain = self.process_audio_gain
+        cleanup_rules = list(self.cleanup_rules)
+        minimum_duration = float(self.minimum_duration)
+        if self.defer_finalization:
+            manifest_path = write_finalize_manifest(
+                video_path, wav_path, mp4_path, output_fps, elapsed,
+                process_audio_gain, bool(discard), cleanup_rules,
+                minimum_duration)
+            if manifest_path not in self._deferred_finalize_manifests:
+                self._deferred_finalize_manifests.append(manifest_path)
+            print("[RECORDING] MP4 creation deferred: " + manifest_path)
+            return mp4_path
         # Re-encoding can take seconds.  Never wait for it in the Tk/capture
         # thread: recording is already stopped and the UI may continue.
         with self.lock:
             self._finalizing_count += 1
-        process_audio_gain = self.process_audio_gain
-        cleanup_rules = list(self.cleanup_rules)
-        minimum_duration = float(self.minimum_duration)
         self._finalize_queue.put((
             video_path, wav_path, mp4_path, output_fps, elapsed,
             process_audio_gain, bool(discard), cleanup_rules,
@@ -1067,6 +1177,17 @@ class CaptureRecorder:
     def is_finalizing(self):
         with self.lock:
             return self._finalizing_count > 0
+
+    def deferred_finalize_manifests(self):
+        """Return durable jobs for this output root, including older failures."""
+        known = list(self._deferred_finalize_manifests)
+        known.extend(discover_finalize_manifests(self.output_dir))
+        unique = []
+        for path in known:
+            path = os.path.abspath(path)
+            if path not in unique and os.path.isfile(path):
+                unique.append(path)
+        return unique
 
     def _finalize_worker(self):
         """Serialize CPU-heavy mux/cleanup jobs without blocking capture."""
@@ -1298,7 +1419,7 @@ class CaptureRecorder:
             return None
         if now - self.last_check < interval:
             if allow_start and self.active and now - self.last_detection > release_seconds:
-                return self.stop()
+                return DETECTION_STOP_REQUESTED
             return None
         self.last_check = now
         self.last_detection_checked_at = now
@@ -1346,5 +1467,57 @@ class CaptureRecorder:
                     frame, fps, audio_device, audio_gain_percent,
                     audio_level_options=audio_level_options)
         elif allow_start and self.active and now - self.last_detection > release_seconds:
-            return self.stop()
+            return DETECTION_STOP_REQUESTED
         return None
+
+
+def finalize_recording_manifest(manifest_path):
+    """Run one durable MP4 job outside the PokeCon GUI process."""
+    manifest_path = os.path.abspath(manifest_path)
+    payload = load_finalize_manifest(manifest_path)
+    payload["status"] = "processing"
+    payload["worker_pid"] = os.getpid()
+    payload["started_at"] = datetime.datetime.now().isoformat(timespec="seconds")
+    payload.pop("error", None)
+    _write_json_atomic(manifest_path, payload)
+
+    cleanup_rules = []
+    for saved in payload.get("cleanup_rules", []):
+        item = dict(saved)
+        path = str(item.get("path", "") or "")
+        image = cv2.imread(path, cv2.IMREAD_COLOR) if path else None
+        if image is not None:
+            item["image"] = image
+            cleanup_rules.append(item)
+    recorder = CaptureRecorder(
+        os.path.dirname(os.path.dirname(manifest_path)),
+        start_finalize_worker=False)
+    try:
+        result = recorder._finalize(
+            payload["video_path"], payload["wav_path"], payload["mp4_path"],
+            float(payload.get("output_fps", 60.0)),
+            float(payload.get("elapsed", 0.001)),
+            float(payload.get("process_audio_gain", 1.0)),
+            bool(payload.get("discard", False)), cleanup_rules,
+            float(payload.get("minimum_duration", 0.0)))
+        if not os.path.exists(manifest_path):
+            return result
+        succeeded = (result == payload["mp4_path"]
+                     and os.path.isfile(payload["mp4_path"])
+                     and os.path.getsize(payload["mp4_path"]) > 1024)
+        if not succeeded:
+            raise RuntimeError("MP4を作成できませんでした。AVI/WAVとジョブを保持します。")
+        os.remove(manifest_path)
+        return result
+    except Exception as error:
+        if os.path.isfile(manifest_path):
+            try:
+                payload = load_finalize_manifest(manifest_path)
+                payload["status"] = "failed"
+                payload["error"] = str(error)
+                payload["failed_at"] = datetime.datetime.now().isoformat(
+                    timespec="seconds")
+                _write_json_atomic(manifest_path, payload)
+            except Exception:
+                pass
+        raise

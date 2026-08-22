@@ -326,7 +326,7 @@ class DarkStillFrameDetector:
     """
 
     def __init__(self, dark_threshold=28.0, difference_threshold=1.5,
-                 hold_seconds=5.0, sample_interval=0.5, sample_size=24):
+                 hold_seconds=60.0, sample_interval=0.5, sample_size=24):
         self.dark_threshold = float(dark_threshold)
         self.difference_threshold = float(difference_threshold)
         self.hold_seconds = max(0.5, float(hold_seconds))

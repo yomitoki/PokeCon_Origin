@@ -10,7 +10,27 @@ def _image_check_target(self, targetimage):
         show_value = bool(detect_settings.get('show_value', False) or getattr(self, 'show_value_bool', False))
         if output_panel and show_value:
             detect_settings['show_value'] = False
-        result = detect_image(self, name=targetimage, history=self._image_similarity_history, **detect_settings)
+        try:
+            result = detect_image(
+                self, name=targetimage,
+                history=self._image_similarity_history,
+                **detect_settings)
+        except RuntimeError as error:
+            if "Cameraの新しい映像を取得できません" not in str(error):
+                raise
+            if not getattr(self, '_camera_frame_unavailable_logged', False):
+                message = "Cameraの新しい映像がないため画像検知を待機します。"
+                print(message)
+                logger = getattr(self, '_logger', None)
+                if logger is not None:
+                    logger.warning(message)
+                self._camera_frame_unavailable_logged = True
+            return False
+        if getattr(self, '_camera_frame_unavailable_logged', False):
+            logger = getattr(self, '_logger', None)
+            if logger is not None:
+                logger.info("Cameraの映像入力が復帰しました。画像検知を再開します。")
+            self._camera_frame_unavailable_logged = False
         self.last_image_detection = result
         if output_panel and show_value:
             self.show_output(output_panel, text=("{} ZNCC value: {:.6f} / threshold: {:.6f} {}".format(

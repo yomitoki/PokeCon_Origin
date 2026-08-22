@@ -258,3 +258,23 @@ def sync_command_start_overrides(data, input_set_name, overrides, favorites=None
                 "commands_assist", {})["run_favorites"] = copy.deepcopy(
                     saved_favorites)
     return True
+
+
+def sync_command_recovery_scripts(data, input_set_name, favorites,
+                                  auto_open=True):
+    """Continuously save recovery snippets into the active Commands InputSet."""
+    if (not isinstance(data, dict) or not input_set_name
+            or not isinstance(favorites, list)):
+        return False
+    item = data.get("input_sets", {}).get(input_set_name)
+    if not isinstance(item, dict) or not input_set_commands_enabled(item):
+        return False
+    saved = copy.deepcopy(favorites)
+    top = item.setdefault("commands_assist", {})
+    top["recovery_scripts"] = saved
+    top["recovery_auto_open"] = bool(auto_open)
+    if isinstance(item.get("all_tabs"), dict):
+        tab = item["all_tabs"].setdefault("commands_assist", {})
+        tab["recovery_scripts"] = copy.deepcopy(saved)
+        tab["recovery_auto_open"] = bool(auto_open)
+    return True

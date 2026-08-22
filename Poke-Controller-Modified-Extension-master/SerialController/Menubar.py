@@ -196,7 +196,7 @@ class PokeController_Menubar(tk.Menu):
                 f"ExecutePokeConModified-Extension_{ret[0]}.bat",
             )
             if not os.path.exists(exe_path):
-                txt = f"python SerialController/PokeConUpdateChecker.py\ncd SerialController\npython Window.py --profile {ret[0]}\npause\n"
+                txt = f"@echo off\npython SerialController/PokeConUpdateChecker.py\ncd SerialController\npython Window.py --profile {ret[0]}\nexit /b %ERRORLEVEL%\n"
                 with open(exe_path, "w", encoding="utf-8") as file:
                     file.write(txt)
             else:

@@ -511,6 +511,39 @@ class CaptureArea(tk.Canvas):
         """Set a callback for every capture frame, before preview throttling."""
         self.record_listener = listener
 
+    @staticmethod
+    def _notify_capture_listener(preview, listener_name, image_bgr,
+                                 copy_frame=False):
+        """Keep one failed consumer from terminating the preview timer.
+
+        Tk does not reschedule ``capture`` when an exception escapes its
+        callback. Recording and analysis are optional consumers, so their
+        failure must be reported without freezing the displayed image.
+        """
+        listener = getattr(preview, listener_name, None)
+        if listener is None or image_bgr is None:
+            return False
+        try:
+            listener(image_bgr.copy() if copy_frame else image_bgr)
+            return True
+        except Exception as error:
+            now = time.monotonic()
+            error_times = getattr(
+                preview, "_capture_listener_error_times", None)
+            if not isinstance(error_times, dict):
+                error_times = {}
+                preview._capture_listener_error_times = error_times
+            # A failed listener can be called at 60 Hz. Keep the log useful
+            # without turning the same failure into a new load source.
+            if now - float(error_times.get(listener_name, 0.0)) >= 1.0:
+                error_times[listener_name] = now
+                logger = getattr(preview, "_logger", None)
+                if logger is not None:
+                    logger.warning(
+                        "%s failed; preview capture will continue: %s",
+                        listener_name, error)
+            return False
+
     def set_presentation_listener(self, listener):
         """Observe frames after they were actually drawn in the preview."""
         self.presentation_listener = listener
@@ -1440,11 +1473,13 @@ class CaptureArea(tk.Canvas):
         if image_bgr is not None and new_capture_frame:
             self._last_consumed_frame_sequence = frame_sequence
             if self.record_listener is not None:
-                self.record_listener(image_bgr)
+                self._notify_capture_listener(
+                    self, "record_listener", image_bgr)
             if frame_work and self.frame_listener is not None \
                     and now - self._last_listener_time >= 0.25:
                 self._last_listener_time = now
-                self.frame_listener(image_bgr.copy())
+                self._notify_capture_listener(
+                    self, "frame_listener", image_bgr, copy_frame=True)
 
         render_interval = preview_render_interval(
             self._requested_fps, focused=prioritized, viewable=viewable,

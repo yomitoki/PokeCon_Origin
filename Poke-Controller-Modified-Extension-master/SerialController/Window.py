@@ -67,7 +67,7 @@ from ImageDetectionMonitor import (crop_search_region, filter_target_names,
 from AnalysisRules import AnalysisRuleEngine, ANALYSIS_TYPES, CONDITION_TYPES
 from ObjectDetectionAssist import ObjectDetectionAssistWindow
 from DiskSpaceGuard import disk_space_violations
-from Recording import CaptureRecorder
+from Recording import CaptureRecorder, DETECTION_STOP_REQUESTED
 from CommandMonitorRecording import (CommandInputActivityTracker,
                                      CommandStateTimeline, DarkStillFrameDetector,
                                      apply_stopped_session_recording_choice,
@@ -80,6 +80,12 @@ from CommandMonitorRecording import (CommandInputActivityTracker,
                                      runtime_state_snapshot, state_path_text,
                                      temporary_chunk_ids_for_session)
 from CommandRecordingMerge import merge_command_recording_chunks
+from CommandRecoveryScripts import (CommandRecoveryExecutor,
+                                    delete_recovery_favorite,
+                                    normalize_recovery_favorites,
+                                    save_recovery_favorite,
+                                    validate_recovery_script)
+from CommandRecoveryWindow import CommandRecoveryWindow
 from OperationCaptureSession import (OperationCaptureSession,
                                      find_paused_session,
                                      finalize_operation_session,
@@ -112,6 +118,7 @@ from InputSetData import (COMMAND_INPUT_SET_VARIABLES, INPUT_SET_VARIABLES,
                           has_complete_snapshot, legacy_combined_snapshot,
                           input_set_commands_enabled, strip_commands_from_snapshot,
                           snapshot_values_with_defaults,
+                          sync_command_recovery_scripts,
                           sync_command_start_overrides, sync_commands_assist_rules,
                           sync_output_layout,
                           sync_quick_actions,
@@ -124,6 +131,8 @@ from InputSetRuntimeRegistry import (ActiveInputSetRegistry,
                                      main_resource_conflicts,
                                      read_active_input_sets)
 from PokeConRecovery import show_recovery_dialog
+from ProcessShutdown import (launch_recording_finalize_worker,
+                             terminate_after_gui_shutdown)
 from ResourceControl import (SystemCpuSampler, clamp_cpu_target,
                              resource_throttle_level,
                              set_main_runtime_priority, throttle_multiplier)
@@ -178,6 +187,9 @@ class PokeControllerApp:
         self._logger.debug(f"User Profile Name: '{profile}'")
 
         self.root = master
+        # Set only after the controlled close path has saved settings and
+        # released recording, audio, camera, and shared runtime resources.
+        self._process_exit_ready = False
         self._main_thread = threading.current_thread()
         self._gui_action_queue = queue.Queue()
         self._pending_panel_outputs = {}
@@ -256,6 +268,23 @@ class PokeControllerApp:
         # adding synchronous disk I/O to controller or preview processing.
         self._command_trace_queue = queue.Queue()
         self._command_monitor_lock = threading.Lock()
+        self._command_monitor_stop_in_progress = False
+        # Commands must not keep sending inputs when the visible capture is a
+        # sustained black/still frame. This detector is independent from the
+        # optional monitor recording so a recording failure cannot disable it.
+        self._commands_dark_safety_detector = DarkStillFrameDetector()
+        self._commands_dark_safety_command = None
+        self._commands_dark_safety_paused_command = None
+        self._command_recovery_window = None
+        self._command_recovery_executor = None
+        self._command_recovery_worker = None
+        self._command_recovery_context_command = None
+        self._command_recovery_paused_command = None
+        self._command_recovery_resume_when_safe = False
+        self._command_recovery_detector_command = None
+        self._command_recovery_timeline = CommandStateTimeline(loop_cycles=3)
+        self._command_recovery_input_tracker = CommandInputActivityTracker(60.0)
+        self._command_recovery_last_check = 0.0
         self._command_trace_writer = threading.Thread(
             target=self._command_trace_writer_loop, daemon=True,
             name="CommandRecordingTraceWriter")
@@ -269,6 +298,10 @@ class PokeControllerApp:
         # Template mode is an armed detector.  It must not create a file
         # until the configured image is actually found.
         self.record_armed = False
+        self._template_recording_stop_in_progress = False
+        self._template_finalize_after_stop = False
+        self._template_exit_after_stop = False
+        self._template_finalize_launched_paths = set()
         self._record_disk_last_check = 0.0
         self._record_disk_last_ok = True
         self._record_disk_violation_key = None
@@ -538,6 +571,7 @@ class PokeControllerApp:
                    command=self.reload_image_analysis_assist).grid(
                        column="3", padx="5", pady=(0, 3), row="2", sticky="w")
         self.camera_feature_limited = tk.BooleanVar(value=False)
+        self._camera_feature_limited_runtime = False
         ttk.Checkbutton(
             self.display_settings_lf,
             text="機能制限版（Commands・解析・映像範囲指定・Tk重ね描画を無効）",
@@ -1294,9 +1328,14 @@ class PokeControllerApp:
         self.pause_button.configure(text="Pause")
         self.pause_button.grid(column="8", padx="10", pady="5", row="0", sticky="ew")
         self.pause_button.configure(command=self.pausePlay)
+        self.command_recovery_button = ttk.Button(
+            self.action_commands_f, text="復旧Pythonを開く",
+            command=self.open_command_recovery_window)
+        self.command_recovery_button.grid(
+            column="9", padx=(0, 5), pady="5", row="0", sticky="ew")
         ttk.Label(self.action_commands_f, textvariable=self.command_start_status,
                   foreground="#174a7e").grid(
-                      column="4", columnspan="5", padx="5", pady=(0, 5), row="1", sticky="w")
+                      column="4", columnspan="6", padx="5", pady=(0, 5), row="1", sticky="w")
         self.action_commands_f.configure(height="200", width="200")
         self.action_commands_f.grid(column="0", row="1", sticky="e")
 
@@ -4206,8 +4245,22 @@ class PokeControllerApp:
                 getattr(self, "execution_path_tab", None),
             ) if tab is not None)
 
+    def _camera_feature_limited_active(self):
+        """Return whether Commands/analysis runtime work is disabled."""
+        cached = getattr(self, "_camera_feature_limited_runtime", None)
+        if cached is not None:
+            return bool(cached)
+        variable = getattr(self, "camera_feature_limited", None)
+        try:
+            return bool(variable is not None and variable.get())
+        except (AttributeError, tk.TclError):
+            return False
+
     def _apply_camera_feature_limited(self, notify=False):
         limited = bool(self.camera_feature_limited.get())
+        # Frame listeners can run outside Tk. Keep a plain bool so their
+        # limited-mode guard never has to read a Tk variable cross-thread.
+        self._camera_feature_limited_runtime = limited
         limited_tabs = self._feature_limited_hidden_tabs()
         if limited:
             selected = self.controller_nb.select()
@@ -6481,8 +6534,10 @@ class PokeControllerApp:
     def _command_run_options(self, command_name):
         """Discover start/end/debug metadata without constructing Commands."""
         empty = {"enabled": False, "locations": [], "debug_options": [],
-                 "save_recovery": {"available": False, "method": ""}}
+                 "save_recovery": {"available": False, "method": ""},
+                 "source_errors": []}
         for command_class in self._command_classes(command_name):
+            path = ""
             try:
                 path = inspect.getsourcefile(command_class)
                 if not path or not os.path.isfile(path):
@@ -6490,15 +6545,185 @@ class PokeControllerApp:
                 with open(path, "r", encoding="utf-8-sig") as stream:
                     return discover_command_run_options(
                         stream.read(), class_name=command_class.__name__)
-            except (OSError, SyntaxError, TypeError, ValueError):
+            except (OSError, SyntaxError, TypeError, ValueError) as error:
+                empty["source_errors"].append(
+                    "{}: {}".format(path or command_class.__name__, error))
                 continue
         return empty
+
+    @staticmethod
+    def _runtime_command_run_options(command_instance):
+        """Build a safe Start selector fallback from an already loaded command."""
+        descriptions = getattr(
+            command_instance, "COMMAND_STEP_DESCRIPTIONS", {})
+        descriptions = descriptions if isinstance(descriptions, dict) else {}
+        locations = []
+        for variable, mapping in vars(command_instance).items():
+            if (not str(variable).startswith("STATE_")
+                    or not str(variable).endswith("_FUNCTION")
+                    or not isinstance(mapping, dict)):
+                continue
+            for order, state in enumerate(mapping):
+                if not isinstance(state, str):
+                    continue
+                locations.append({
+                    "id": "state:{}:{}".format(variable, state),
+                    "kind": "state", "mode": "state",
+                    "variable": str(variable), "value": state,
+                    "label": state,
+                    "description": str(descriptions.get(state, "")),
+                    "group": str(variable), "order": order,
+                })
+        debug_options = []
+        for attribute in (
+                "DEBUG", "debug", "TESTADDCODE", "testcode", "fastread"):
+            if hasattr(command_instance, attribute):
+                debug_options.append({
+                    "id": attribute, "attribute": attribute,
+                    "label": attribute, "description": "",
+                    "default": bool(getattr(command_instance, attribute)),
+                })
+        return {
+            "enabled": bool(getattr(
+                command_instance, "COMMAND_RUN_SETTINGS", False)),
+            "locations": locations,
+            "debug_options": debug_options,
+            "save_recovery": {"available": False, "method": ""},
+            "runtime_fallback": True,
+        }
+
+    @staticmethod
+    def _bring_command_console_to_front():
+        """Restore this process' Windows console after an explicit request."""
+        if os.name != "nt":
+            return False
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            kernel32.GetConsoleWindow.argtypes = []
+            kernel32.GetConsoleWindow.restype = wintypes.HWND
+            user32.ShowWindowAsync.argtypes = [wintypes.HWND, ctypes.c_int]
+            user32.ShowWindowAsync.restype = wintypes.BOOL
+            user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+            user32.SetForegroundWindow.restype = wintypes.BOOL
+            console_hwnd = kernel32.GetConsoleWindow()
+            if not console_hwnd:
+                return False
+            # SW_RESTORE: 最小化されているCMDも復元してから前面へ出す。
+            user32.ShowWindowAsync(console_hwnd, 9)
+            return bool(user32.SetForegroundWindow(console_hwnd))
+        except (AttributeError, ImportError, OSError, ValueError):
+            return False
+
+    def _prompt_command_source_error_action(self, message):
+        """Choose whether Start continues or the command console is shown."""
+        result = {"action": "cancel"}
+        attach_to_owner = dialog_owner_attachment_allowed()
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Commands Start - ソース解析エラー")
+        if attach_to_owner:
+            dialog.transient(self.root)
+        dialog.resizable(True, True)
+        dialog.geometry("820x360")
+        dialog.minsize(680, 300)
+
+        ttk.Label(
+            dialog,
+            text=("ソース解析に失敗しました。詳細はCMDとAnalysisへ出力しました。\n"
+                  "読込済みSTATEから開始位置を復元して続けるか、"
+                  "CMDを前面に出して確認してください。"),
+            foreground="#a13d00", justify="left", wraplength=780).pack(
+                fill="x", padx=14, pady=(14, 8))
+        detail_frame = ttk.Labelframe(dialog, text="解析エラー")
+        detail_frame.pack(fill="both", expand=True, padx=14, pady=6)
+        detail = tk.Text(detail_frame, height=8, wrap="word")
+        detail.pack(fill="both", expand=True, padx=6, pady=6)
+        detail.insert("1.0", str(message))
+        detail.configure(state="disabled")
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=14, pady=(4, 14))
+        copy_status = tk.StringVar(value="")
+
+        def finish(action):
+            result["action"] = action
+            dialog.destroy()
+
+        def copy_error():
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(str(message))
+                copy_status.set("エラー全文をコピーしました")
+            except tk.TclError as error:
+                copy_status.set("コピーできませんでした: {}".format(error))
+
+        ttk.Button(
+            buttons, text="そのまま開始",
+            command=lambda: finish("start")).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            buttons, text="CMDを前面に表示",
+            command=lambda: finish("cmd")).pack(side="left", padx=(0, 8))
+        ttk.Button(
+            buttons, text="エラーをコピー",
+            command=copy_error).pack(side="left")
+        ttk.Label(
+            buttons, textvariable=copy_status,
+            foreground="#176b38").pack(side="left", padx=(12, 0))
+        dialog.protocol("WM_DELETE_WINDOW", lambda: finish("cancel"))
+        dialog.update_idletasks()
+        dialog.wait_visibility()
+        if attach_to_owner:
+            dialog.lift()
+        dialog.grab_set()
+        dialog.wait_window()
+        return result["action"]
 
     def _prompt_command_run_settings(self, command_instance):
         """Show the Commands-owned Step selector after Start was requested."""
         command_name = str(getattr(command_instance, "NAME", "") or "")
         options = self._command_run_options(command_name)
         locations = list(options.get("locations", []))
+        must_prompt = bool(getattr(
+            command_instance, "COMMAND_RUN_SETTINGS", False))
+        if must_prompt and (not options.get("enabled") or not locations):
+            source_errors = list(options.get("source_errors", []))
+            if source_errors:
+                message = (
+                    "ZA_Storyの開始位置ソース解析に失敗しました。"
+                    "読込済みSTATEから開始候補を復元します: "
+                    + "\n".join(source_errors))
+            else:
+                message = (
+                    "ZA_Storyの開始位置メタデータを取得できないため、"
+                    "読込済みSTATEから開始候補を復元します。")
+            self._logger.warning(message)
+            self.show_output("Analysis", text=message)
+            print("\n[Commands Start ソース解析エラー]\n{}".format(message),
+                  flush=True)
+            action = self._prompt_command_source_error_action(message)
+            if action == "cmd":
+                if not self._bring_command_console_to_front():
+                    tkmsg.showwarning(
+                        "Commands Start - CMD表示",
+                        "CMDを前面へ移動できませんでした。\n"
+                        "タスクバーからCMDを選択して確認してください。",
+                        parent=self.root)
+                return False
+            if action != "start":
+                return False
+            # DevStudioで実ソースを編集中に構文エラーがあっても、現在
+            # 読込済みのZA_StoryのSTATE辞書から必ず開始画面を作る。
+            options = self._runtime_command_run_options(command_instance)
+            locations = list(options.get("locations", []))
+        if must_prompt and not locations:
+            tkmsg.showerror(
+                "Commands Step実行設定",
+                "開始位置候補を取得できないためCommandsを開始しません。\n"
+                "ZA_Storyのソースを保存してReloadしてください。",
+                parent=self.root)
+            return False
         if not options.get("enabled") or not locations:
             return True
 
@@ -7036,6 +7261,20 @@ class PokeControllerApp:
         if not sync_command_start_overrides(
                 data, name, self.command_start_overrides,
                 favorites=self.command_run_favorites):
+            return False
+        self._write_input_sets(data)
+        return True
+
+    def _sync_command_recovery_scripts_to_active_input_set(self):
+        name = str(getattr(self, "_active_input_set_name", "") or "").strip()
+        if not name or not hasattr(self, "input_set_name"):
+            return False
+        if self.input_set_name.get().strip() != name:
+            return False
+        data = self._read_input_sets()
+        if not sync_command_recovery_scripts(
+                data, name, self.command_recovery_favorites,
+                auto_open=self.command_recovery_auto_open.get()):
             return False
         self._write_input_sets(data)
         return True
@@ -8172,8 +8411,16 @@ class PokeControllerApp:
                 self._commands_assist_recovery_done = False
                 self._finish_commands_assist()
             command = getattr(self, "cur_command", None)
-            running = command is not None and self.start_button["text"] == "Stop"
-            if (self.commands_assist_enabled.get() and not self._commands_assist_busy and running
+            running = (command is not None
+                       and self.start_button["text"] == "Stop"
+                       and not PokeControllerApp._camera_feature_limited_active(self))
+            recovery_triggered = self._poll_command_recovery_alerts(
+                running=running)
+            recovery_paused = getattr(
+                self, "_command_recovery_paused_command", None) is command
+            if (not recovery_triggered and not recovery_paused
+                    and self.commands_assist_enabled.get()
+                    and not self._commands_assist_busy and running
                     and self._step_debug_session is None
                     and self._step_debug_pending_session is None):
                 command_name = getattr(command, "NAME", "")
@@ -8758,6 +9005,17 @@ class PokeControllerApp:
                         message = "[Command Watch] " + expected + "\n" + "\n".join(
                             "{} = {}".format(name, value) for name, value in values.items()) + "\n"
                         self.show_output(self.command_watch_target.get(), text=message)
+                        # Retain explicitly watched changes only when the
+                        # bounded Commands recorder is already active.  An
+                        # empty location deliberately avoids sampling the
+                        # Commands worker stack from this optional UI poll.
+                        chunk = getattr(self, "_command_monitor_current_chunk", None)
+                        if (chunk is not None
+                                and command is getattr(self, "_command_monitor_command", None)):
+                            self._write_command_monitor_event(
+                                chunk, runtime_state_snapshot(command),
+                                "variable_watch", location={},
+                                extra={"watch_values": dict(values)})
                     self.command_watch_status.set("Watching {} variable(s).".format(len(values)))
         finally:
             try:
@@ -10872,6 +11130,8 @@ class PokeControllerApp:
         self._request_command_monitor_stop_cleanup(command)
         self._stop_command_monitor_capture_on_request(
             command, "force_stop_requested")
+        # Force Stopでもワーカー終了を待たず、通常Stopと同じ保存確認を出す。
+        self._confirm_requested_command_monitor_stop(command)
         Command.isPause = False
         interrupted = False
         try:
@@ -10942,6 +11202,9 @@ class PokeControllerApp:
                 self._gui_action_queue.put(lambda: self.show_output(
                     "Analysis", text="通常停止要求に失敗しました。Force stopを使用できます: " + str(error)))
         threading.Thread(target=request_stop, daemon=True, name="CommandStopRequest").start()
+        # Commands本体が停止待ちになっても保存確認を失わないよう、
+        # 録画確定と停止要求の送信直後に今回分の選択を表示する。
+        self._confirm_requested_command_monitor_stop(command)
 
     def stopPlayPost(self, source_command=None):
         if threading.current_thread() is not self._main_thread:
@@ -10949,15 +11212,15 @@ class PokeControllerApp:
             return
         if source_command is not None and source_command is not getattr(self, "cur_command", None):
             return
-        cleanup_session_id = self._consume_command_monitor_stop_cleanup(source_command)
         if (getattr(self, "record_mode", None) is not None
                 and self.record_mode.get() == "CommandMonitor"
                 and getattr(self, "_command_monitor_current_chunk", None) is not None):
             self._finish_command_monitor_chunk("command_finished")
             self.record_monitor_status.set(
                 "Commands終了を検出しました。録画とログは確認待ちで保持しています。")
-        if cleanup_session_id:
-            self._confirm_save_stopped_command_monitor_recordings(cleanup_session_id)
+        # 旧経路や、Stop直後の確認前に終了通知が来た場合のフォールバック。
+        # Stop側で確認済みなら要求は消費済みのため二重表示しない。
+        self._confirm_requested_command_monitor_stop(source_command)
         self.start_button["text"] = "Start"
         self.force_stop_button.configure(state="disabled", text="Force stop")
         self.start_top_button["text"] = "Start"
@@ -11021,10 +11284,44 @@ class PokeControllerApp:
 
     def exit(self):
         """Avoid destroying the window while the background MP4 encoder runs."""
-        if getattr(self, "_exit_waiting", False):
+        if (getattr(self, "_exit_waiting", False)
+                or getattr(self, "_template_exit_after_stop", False)):
             return
         self._preview_shutdown_mode = True
         self._refresh_preview_priority_status()
+
+        recording_mode = (self.record_mode.get()
+                          if getattr(self, "record_mode", None) is not None
+                          else "")
+        deferred_jobs = self._template_finalize_candidates()
+        external_exit_work = bool(
+            deferred_jobs
+            or (recording_mode in ("Template", "Manual", "Variable")
+                and (getattr(self.recorder, "active", False)
+                     or self._template_recording_stop_in_progress)))
+        if external_exit_work:
+            if not tkmsg.askyesno(
+                    "確認",
+                    "Poke Controllerを終了しますか？\n\n"
+                    "録画中のAVI/WAVを安全に閉じた後、PokeCon本体を終了し、"
+                    "別画面でMP4をまとめて作成します。",
+                    parent=self.root):
+                self._preview_shutdown_mode = False
+                self._refresh_preview_priority_status()
+                return
+            self.record_armed = False
+            if hasattr(self, "record_button"):
+                self.record_button.configure(text="Closing AVI/WAV...")
+            if (getattr(self.recorder, "active", False)
+                    or self._template_recording_stop_in_progress):
+                self._request_template_recording_stop(exit_after=True)
+                return
+            if self._launch_deferred_template_finalizer(wait_for_exit=True):
+                self._exit_now(confirm=False)
+            else:
+                self._preview_shutdown_mode = False
+                self._refresh_preview_priority_status()
+            return
 
         # In Template mode the Start button arms monitoring.  Disarm it before
         # closing so that a camera callback cannot begin another segment.
@@ -11249,6 +11546,7 @@ class PokeControllerApp:
             self._close_active_input_set_registry()
             self._logger.debug("Stop Poke Controller")
             self.root.destroy()
+            self._process_exit_ready = True
 
     def closingController(self):
         self.controller.destroy()
@@ -13188,6 +13486,10 @@ class PokeControllerApp:
                 "step_debug_rules": list(self.step_debug_rules),
                 "start_overrides": dict(self.command_start_overrides),
                 "run_favorites": copy.deepcopy(self.command_run_favorites),
+                "recovery_scripts": copy.deepcopy(
+                    self.command_recovery_favorites),
+                "recovery_auto_open": bool(
+                    self.command_recovery_auto_open.get()),
             }
             result["shared_debug"] = self._shared_debug_config()
         return result
@@ -13510,6 +13812,17 @@ class PokeControllerApp:
             else top_assist.get("run_favorites")
         self.command_run_favorites = copy.deepcopy(saved_run_favorites) \
             if use_commands and isinstance(saved_run_favorites, dict) else {}
+        saved_recovery_scripts = tab_assist.get("recovery_scripts") \
+            if isinstance(tab_assist.get("recovery_scripts"), list) \
+            else top_assist.get("recovery_scripts")
+        self.command_recovery_favorites = normalize_recovery_favorites(
+            saved_recovery_scripts if use_commands else [])
+        saved_recovery_auto_open = tab_assist.get(
+            "recovery_auto_open",
+            top_assist.get("recovery_auto_open", True))
+        self.command_recovery_auto_open.set(
+            bool(saved_recovery_auto_open) if use_commands else True)
+        self._refresh_command_recovery_window_favorites()
         self._refresh_command_start_status()
         self._refresh_inline_command_run_panel()
         self._write_step_debug_rules()
@@ -13818,7 +14131,11 @@ class PokeControllerApp:
                                 "rules": list(self.commands_assist_rules),
                                 "step_debug_rules": list(self.step_debug_rules),
                                 "start_overrides": dict(self.command_start_overrides),
-                                "run_favorites": copy.deepcopy(self.command_run_favorites)},
+                                "run_favorites": copy.deepcopy(self.command_run_favorites),
+                                "recovery_scripts": copy.deepcopy(
+                                    self.command_recovery_favorites),
+                                "recovery_auto_open": bool(
+                                    self.command_recovery_auto_open.get())},
             "analysis_rules": list(self.analysis_rules),
             "controller_recordings": self._read_controller_recordings(),
             "quick_actions": self._quick_actions_snapshot(),
@@ -13956,6 +14273,12 @@ class PokeControllerApp:
             if commands_enabled and isinstance(assist.get("start_overrides"), dict) else {}
         self.command_run_favorites = copy.deepcopy(assist.get("run_favorites", {})) \
             if commands_enabled and isinstance(assist.get("run_favorites"), dict) else {}
+        self.command_recovery_favorites = normalize_recovery_favorites(
+            assist.get("recovery_scripts", []) if commands_enabled else [])
+        self.command_recovery_auto_open.set(
+            bool(assist.get("recovery_auto_open", True))
+            if commands_enabled else True)
+        self._refresh_command_recovery_window_favorites()
         if commands_enabled and isinstance(assist.get("step_debug_rules"), list):
             self.step_debug_rules = list(assist.get("step_debug_rules", []))
             self._write_step_debug_rules()
@@ -15970,6 +16293,8 @@ class PokeControllerApp:
         return True
 
     def _build_command_monitor_recording_tab(self, parent):
+        self.command_recovery_favorites = []
+        self.command_recovery_auto_open = tk.BooleanVar(value=True)
         self.record_monitor_chunk_seconds = tk.DoubleVar(value=30.0)
         self.record_monitor_keep_steps = tk.IntVar(value=15)
         self.record_monitor_loop_cycles = tk.IntVar(value=3)
@@ -15998,6 +16323,7 @@ class PokeControllerApp:
         self._command_monitor_command = None
         self._command_monitor_stop_cleanup_command = None
         self._command_monitor_stop_cleanup_session_id = ""
+        self._command_monitor_previous_record_mode = ""
         self._command_monitor_failure_capture_until = None
         self._command_monitor_failure_capture_mode = ""
         self._command_monitor_merge_active = 0
@@ -16055,10 +16381,16 @@ class PokeControllerApp:
             settings, text="Commands Start時に自動で監視開始",
             variable=self.record_monitor_auto_arm).grid(
                 column=0, columnspan=4, row=3, padx=6, pady=(1, 5), sticky="w")
-        ttk.Checkbutton(
-            settings, text="Commands Stop時に今回の録画を保存確認",
-            variable=self.record_monitor_confirm_delete_on_stop).grid(
+        ttk.Label(
+            settings, text="Commands Stop時は今回の録画を必ず保存確認",
+            foreground="#174a7e").grid(
                 column=4, columnspan=5, row=3, padx=6, pady=(1, 5), sticky="w")
+        ttk.Checkbutton(
+            settings,
+            text="Stepループ・暗転停止で復旧Pythonを自動表示",
+            variable=self.command_recovery_auto_open,
+            command=self._sync_command_recovery_scripts_to_active_input_set).grid(
+                column=0, columnspan=9, row=4, padx=6, pady=(1, 5), sticky="w")
 
         actions = ttk.Frame(parent)
         actions.pack(fill="x", padx=8, pady=5)
@@ -16075,6 +16407,9 @@ class PokeControllerApp:
                    command=self.discard_command_monitor_temporary).pack(side="left", padx=2)
         ttk.Button(actions, text="動画・ソース比較",
                    command=self.open_selected_command_recording_in_dev_studio).pack(
+                       side="left", padx=2)
+        ttk.Button(actions, text="復旧Python",
+                   command=self.open_command_recovery_window).pack(
                        side="left", padx=2)
         ttk.Button(actions, text="保存先を開く",
                    command=self.open_record_output_dir).pack(side="right", padx=2)
@@ -16165,12 +16500,27 @@ class PokeControllerApp:
         return True
 
     def _auto_arm_command_monitor_recording(self):
-        if (self.record_mode.get() == "CommandMonitor"
-                and self.record_monitor_auto_arm.get() and not self.record_armed):
+        if not self.record_monitor_auto_arm.get():
+            return
+        if self.record_mode.get() != "CommandMonitor":
+            # Recordingタブを開いていなくても、Commands Start時の自動監視
+            # 指定を有効にする。実行中／待機中の通常録画だけは上書きしない。
+            if self.recorder.active or self.record_armed:
+                self.show_output(
+                    "Analysis",
+                    text=("通常録画が実行中または待機中のため、Commands監視録画を"
+                          "自動開始できませんでした。Stop時に録画なしを通知します。"))
+                return
+            self._command_monitor_previous_record_mode = (
+                self.record_mode.get() or "Manual")
+            self._recording_normal_mode = self._command_monitor_previous_record_mode
+            self.record_mode.set("CommandMonitor")
+            self._select_recording_mode_page()
+        if not self.record_armed:
             if not self._arm_command_monitor_recording(show_popup=True):
                 self.show_output(
                     "Analysis", text="Commands監視録画を自動開始できませんでした。Commandsは継続します。")
-        if (self.record_mode.get() == "CommandMonitor" and self.record_armed
+        if (self.record_armed
                 and getattr(self, "cur_command", None) is not None):
             # A selected Command object can be reused. Start a distinct session
             # for every Start so Stop cleanup never reaches an earlier run.
@@ -16374,6 +16724,13 @@ class PokeControllerApp:
         payload["duration"] = max(
             0.0, (chunk.get("ended") or time.monotonic()) - chunk.get("started", 0.0))
         payload["mode"] = "Commands monitoring recording"
+        payload["execution_path"] = {
+            "file": "steps.jsonl",
+            "scope": "retained_video_only",
+            "video_start": 0.0,
+            "video_end": payload["duration"],
+            "sample_interval_seconds": 0.1,
+        }
         try:
             with open(os.path.join(chunk["session_dir"], "command_monitor.json"),
                       "w", encoding="utf-8", newline="\n") as stream:
@@ -16393,25 +16750,414 @@ class PokeControllerApp:
         except (OSError, tk.TclError) as error:
             self._logger.warning("Command monitor output log failed: %s", error)
 
-    def _finish_command_monitor_chunk(self, reason="chunk_end", frame=None, restart=False):
+    def _complete_command_monitor_chunk_finish(
+            self, chunk, restart=False, frame=None, error=None):
+        """Complete a monitor stop on Tk after its writer drain finishes."""
+        self._command_monitor_stop_in_progress = False
+        try:
+            self._sync_audio_device_usage()
+        except Exception as sync_error:
+            self._logger.warning(
+                "Command monitor audio usage refresh failed: %s", sync_error)
+        with self._command_monitor_lock:
+            if self._command_monitor_current_chunk is chunk:
+                self._command_monitor_current_chunk = None
+        self._refresh_command_monitor_tree()
+        if error is not None:
+            # The recorder has already rejected new frames at this point.
+            # Do not reuse it while its old writer may still be draining.
+            self.record_armed = False
+            message = (
+                "Commands監視録画の停止に失敗したため監視録画を停止しました。"
+                "PokeCon画面とCommandsの安全監視は継続します: {}"
+            ).format(error)
+            self._logger.error(message)
+            self.record_monitor_status.set(message)
+            self.show_output("Analysis", text=message)
+            return False
+        command = getattr(self, "cur_command", None)
+        if (restart and frame is not None and self.record_armed
+                and command is self._command_monitor_command
+                and getattr(command, "alive", False)):
+            self._start_command_monitor_chunk(
+                frame, command, time.monotonic())
+        return True
+
+    def _finish_command_monitor_chunk(
+            self, reason="chunk_end", frame=None, restart=False,
+            background=False):
         with self._command_monitor_lock:
             chunk = self._command_monitor_current_chunk
-        if chunk is None:
-            return
+        if chunk is None or self._command_monitor_stop_in_progress:
+            return False
         chunk["ended"] = time.monotonic()
         self._write_command_monitor_event(
             chunk, runtime_state_snapshot(self._command_monitor_command), reason)
         self._write_command_monitor_output_log(chunk)
         self._write_command_monitor_metadata(chunk)
-        self._stop_capture_recorder()
-        self._sync_audio_device_usage()
-        with self._command_monitor_lock:
-            if self._command_monitor_current_chunk is chunk:
-                self._command_monitor_current_chunk = None
-        self._refresh_command_monitor_tree()
-        if restart and frame is not None and self.record_armed:
-            self._start_command_monitor_chunk(
-                frame, self._command_monitor_command, time.monotonic())
+        self._command_monitor_stop_in_progress = True
+        restart_frame = None
+        if restart and frame is not None:
+            try:
+                restart_frame = frame.copy()
+            except (AttributeError, TypeError, ValueError):
+                restart_frame = frame
+
+        def stop_recorder():
+            error = None
+            try:
+                self._stop_capture_recorder()
+            except Exception as stop_error:
+                error = stop_error
+            if background:
+                self._gui_action_queue.put(
+                    lambda error=error: self._complete_command_monitor_chunk_finish(
+                        chunk, restart=restart,
+                        frame=restart_frame, error=error))
+            else:
+                self._complete_command_monitor_chunk_finish(
+                    chunk, restart=restart,
+                    frame=restart_frame, error=error)
+
+        if background:
+            threading.Thread(
+                target=stop_recorder, daemon=True,
+                name="CommandMonitorChunkStop").start()
+            return True
+        stop_recorder()
+        return True
+
+    def _command_recovery_window_exists(self):
+        window = getattr(self, "_command_recovery_window", None)
+        return window is not None and window.exists()
+
+    def _refresh_command_recovery_window_favorites(self):
+        if self._command_recovery_window_exists():
+            self._command_recovery_window.refresh_favorites()
+
+    @staticmethod
+    def _command_recovery_context_text(command):
+        if command is None:
+            return "Commands: 停止済みまたは未実行"
+        snapshot = runtime_state_snapshot(command)
+        step = state_path_text(snapshot) or "Step取得待ち"
+        return "Commands: {} / Step: {} / alive={}".format(
+            getattr(command, "NAME", command.__class__.__name__), step,
+            bool(getattr(command, "alive", False)))
+
+    def _claim_command_recovery_pause(self, command):
+        """Pause one command without stealing another pause owner's resume."""
+        if command is None or not getattr(command, "alive", False):
+            return False
+        self._command_recovery_resume_when_safe = False
+        if getattr(self, "_commands_dark_safety_paused_command", None) is command:
+            # The recovery window now owns this pause. A visual change must not
+            # resume Commands while the user is still editing recovery code.
+            self._commands_dark_safety_paused_command = None
+            self._command_recovery_paused_command = command
+        elif getattr(self, "_command_recovery_paused_command", None) is not command:
+            if not getattr(command, "pause_requested", False):
+                if hasattr(command, "request_pause"):
+                    command.request_pause()
+                else:
+                    command.pause_requested = True
+                self._command_recovery_paused_command = command
+        self._release_command_input_for_dark_pause(command)
+        return getattr(command, "pause_requested", False)
+
+    def pause_command_for_recovery(self):
+        command = getattr(self, "cur_command", None)
+        if command is None or not getattr(command, "alive", False):
+            if self._command_recovery_window_exists():
+                self._command_recovery_window.status.set(
+                    "一時停止できる実行中Commandsがありません。")
+            return False
+        self._command_recovery_context_command = command
+        paused = self._claim_command_recovery_pause(command)
+        if self._command_recovery_window_exists():
+            self._command_recovery_window.set_context(
+                self._command_recovery_window.reason.get(),
+                self._command_recovery_context_text(command))
+            self._command_recovery_window.status.set(
+                "Commandsを現在のStepで一時停止しました。" if paused else
+                "Commandsは別の機能によって一時停止中です。")
+        return paused
+
+    def resume_command_after_recovery(self, wait_for_visual=True):
+        command = getattr(self, "_command_recovery_paused_command", None)
+        dark_pause = getattr(
+            self, "_commands_dark_safety_paused_command", None)
+        if command is None:
+            command = dark_pause
+        if command is None:
+            if self._command_recovery_window_exists():
+                self._command_recovery_window.status.set(
+                    "この画面から再開できるCommands一時停止はありません。")
+            return False
+        if command is not getattr(self, "cur_command", None):
+            if getattr(self, "_command_recovery_paused_command", None) is command:
+                self._command_recovery_paused_command = None
+            if getattr(self, "_commands_dark_safety_paused_command", None) is command:
+                self._commands_dark_safety_paused_command = None
+            self._command_recovery_resume_when_safe = False
+            if self._command_recovery_window_exists():
+                self._command_recovery_window.status.set(
+                    "実行対象Commandsが切り替わったため、以前のCommandsは再開しません。")
+            return False
+        dark_active = getattr(
+            getattr(self, "_commands_dark_safety_detector", None),
+            "active", None)
+        if wait_for_visual and dark_active:
+            self._command_recovery_resume_when_safe = True
+            if self._command_recovery_window_exists():
+                self._command_recovery_window.status.set(
+                    "まだ暗転・停止中のため、映像変化を検出してから自動再開します。")
+            return False
+        self._command_recovery_resume_when_safe = False
+        if getattr(self, "_command_recovery_paused_command", None) is command:
+            self._command_recovery_paused_command = None
+        if getattr(self, "_commands_dark_safety_paused_command", None) is command:
+            self._commands_dark_safety_paused_command = None
+            # An explicit resume is a manual override of the current dark
+            # interval. Re-arm detection so a further 60 seconds of a dark,
+            # still screen can pause it again instead of disabling safety for
+            # the rest of the Commands run.
+            detector = getattr(self, "_commands_dark_safety_detector", None)
+            if not wait_for_visual and detector is not None:
+                detector.reset()
+        if getattr(command, "alive", False):
+            if hasattr(command, "resume"):
+                command.resume()
+            else:
+                command.pause_requested = False
+        if self._command_recovery_window_exists():
+            self._command_recovery_window.status.set(
+                "Commandsを同じStep位置から再開しました。")
+        return True
+
+    def _save_command_recovery_favorite(self, name, code, original_name=""):
+        try:
+            self.command_recovery_favorites = save_recovery_favorite(
+                self.command_recovery_favorites, name, code,
+                original_name=original_name)
+        except (SyntaxError, TypeError, ValueError) as error:
+            return False, "登録できません: {}".format(error)
+        persisted = self._sync_command_recovery_scripts_to_active_input_set()
+        suffix = "現在のInputSetへ保存しました。" if persisted else (
+            "作業中設定へ保存しました。InputSet登録・変更保存で永続化されます。")
+        return True, "お気に入り「{}」を{}".format(
+            str(name).strip(), suffix)
+
+    def _delete_command_recovery_favorite(self, name):
+        before = len(self.command_recovery_favorites)
+        self.command_recovery_favorites = delete_recovery_favorite(
+            self.command_recovery_favorites, name)
+        if len(self.command_recovery_favorites) == before:
+            return False, "削除するお気に入りが見つかりません。"
+        persisted = self._sync_command_recovery_scripts_to_active_input_set()
+        suffix = "現在のInputSetから削除しました。" if persisted else (
+            "作業中設定から削除しました。")
+        return True, "お気に入り「{}」を{}".format(name, suffix)
+
+    def _command_recovery_window_closed(self):
+        self._command_recovery_window = None
+
+    def _show_command_recovery_window(
+            self, reason, command=None, automatic=False, pause_command=True):
+        command = command if command is not None else getattr(
+            self, "cur_command", None)
+        if automatic and not self.command_recovery_auto_open.get():
+            return False
+        self._command_recovery_context_command = command
+        if pause_command and command is not None and getattr(command, "alive", False):
+            self._claim_command_recovery_pause(command)
+        context = self._command_recovery_context_text(command)
+        if self._command_recovery_window_exists():
+            self._command_recovery_window.set_context(reason, context)
+            return True
+        self._command_recovery_window = CommandRecoveryWindow(
+            self.root,
+            favorites_provider=lambda: self.command_recovery_favorites,
+            save_favorite=self._save_command_recovery_favorite,
+            delete_favorite=self._delete_command_recovery_favorite,
+            execute=self._run_command_recovery_script,
+            stop=self._stop_command_recovery_script,
+            pause=self.pause_command_for_recovery,
+            # This button is an explicit user override and can resume even if
+            # the current game image is still dark/static. Automatic recovery
+            # after a script continues to wait for a visible frame change.
+            resume=lambda: self.resume_command_after_recovery(
+                wait_for_visual=False),
+            closed=self._command_recovery_window_closed)
+        self._command_recovery_window.set_context(reason, context)
+        return True
+
+    def open_command_recovery_window(self):
+        """Explicit editor entry point; execution itself claims the pause."""
+        return self._show_command_recovery_window(
+            "手動で復旧Pythonを開きました。",
+            command=getattr(self, "cur_command", None),
+            automatic=False, pause_command=False)
+
+    def _append_command_recovery_output(self, text):
+        if self._command_recovery_window_exists():
+            self._command_recovery_window.append_output(text)
+
+    def _run_command_recovery_script(self, code, auto_resume=True):
+        worker = getattr(self, "_command_recovery_worker", None)
+        if worker is not None and worker.is_alive():
+            self._append_command_recovery_output("すでに復旧Pythonを実行中です。")
+            return False
+        if getattr(self, "_software_controller_override_active", False):
+            self._append_command_recovery_output(
+                "Software Controller操作中は復旧Pythonを開始できません。入力を離してから再実行してください。")
+            return False
+        if (getattr(self, "_commands_assist_busy", False)
+                or getattr(self, "_step_debug_session", None) is not None
+                or getattr(self, "_step_debug_pending_session", None) is not None):
+            self._append_command_recovery_output(
+                "CommandsAssist／Stepデバッグの処理中は復旧Pythonを開始できません。先にその処理を終了してください。")
+            return False
+        try:
+            validate_recovery_script(code)
+        except (SyntaxError, TypeError, ValueError) as error:
+            self._append_command_recovery_output(
+                "構文エラー: {}".format(error))
+            return False
+        command = getattr(self, "_command_recovery_context_command", None)
+        if command is None or command is not getattr(self, "cur_command", None):
+            command = getattr(self, "cur_command", None)
+            self._command_recovery_context_command = command
+        if command is not None and getattr(command, "alive", False):
+            self._claim_command_recovery_pause(command)
+
+        def output(text):
+            self._gui_action_queue.put(
+                lambda text=str(text): self._append_command_recovery_output(text))
+
+        executor = CommandRecoveryExecutor(
+            self.ser, command=command, output=output)
+        self._command_recovery_executor = executor
+        if self._command_recovery_window_exists():
+            self._command_recovery_window.set_running(
+                True, "元Commandsを終了せず同じStepで一時停止し、復旧コードを再指示として実行しています。")
+            self._command_recovery_window.append_output("--- 実行開始 ---")
+
+        def run():
+            result = executor.run(code)
+            self._gui_action_queue.put(
+                lambda result=result, auto_resume=bool(auto_resume):
+                self._finish_command_recovery_script(result, auto_resume))
+
+        self._command_recovery_worker = threading.Thread(
+            target=run, daemon=True, name="CommandRecoveryPython")
+        self._command_recovery_worker.start()
+        return True
+
+    def _stop_command_recovery_script(self):
+        executor = getattr(self, "_command_recovery_executor", None)
+        if executor is None:
+            return False
+        executor.request_stop(force=True)
+        if self._command_recovery_window_exists():
+            self._command_recovery_window.status.set(
+                "復旧コードだけに停止要求を送りました。元Commandsは終了せず、一時停止を維持します。")
+        return True
+
+    def _finish_command_recovery_script(self, result, auto_resume):
+        self._command_recovery_executor = None
+        self._command_recovery_worker = None
+        elapsed = float(result.get("elapsed", 0.0))
+        resumed = False
+        if result.get("success"):
+            message = "正常終了（{:.2f}秒）".format(elapsed)
+            self._append_command_recovery_output(message)
+            if auto_resume:
+                resumed = self.resume_command_after_recovery(
+                    wait_for_visual=True)
+        else:
+            message = result.get("error") or "実行に失敗しました。"
+            self._append_command_recovery_output(message)
+            if result.get("traceback"):
+                self._append_command_recovery_output(result["traceback"])
+            self.show_output("Analysis", text="Commands復旧Python: " + message)
+        if self._command_recovery_window_exists():
+            if result.get("success") and resumed:
+                status = "復旧Pythonが正常終了し、Commandsを再開しました。"
+            elif (result.get("success") and auto_resume
+                  and self._command_recovery_resume_when_safe):
+                status = "復旧Pythonは正常終了しました。映像変化を待ってCommandsを再開します。"
+            elif result.get("success"):
+                status = "復旧Pythonは正常終了しました。Commandsは一時停止を維持します。"
+            else:
+                status = "復旧Pythonを停止しました。Commandsは一時停止を維持します。"
+            self._command_recovery_window.set_running(
+                False, status)
+
+    def _poll_command_recovery_alerts(self, now=None, running=None):
+        """Detect Step loops even when monitor recording is off.
+
+        Commands can legitimately wait on an image without sending controller
+        input for longer than 60 seconds. Key inactivity is recording evidence
+        only and must never claim a Commands pause.
+        """
+        now = time.monotonic() if now is None else float(now)
+        if PokeControllerApp._camera_feature_limited_active(self):
+            # A limited PokeCon does not run Commands. Do not spend preview
+            # time on recovery detection or carry an old timer into full mode.
+            self._command_recovery_detector_command = None
+            self._command_recovery_timeline.reset(loop_cycles=3)
+            self._command_recovery_input_tracker.reset(now)
+            self._command_recovery_last_check = 0.0
+            return False
+        if running is None:
+            try:
+                running = self.start_button["text"] == "Stop"
+            except (AttributeError, KeyError, TypeError):
+                running = True
+        if not running:
+            if getattr(self, "_command_recovery_detector_command", None) is not None:
+                self._command_recovery_detector_command = None
+                self._command_recovery_timeline.reset(loop_cycles=3)
+                self._command_recovery_input_tracker.reset(now)
+                self._command_recovery_last_check = 0.0
+            return False
+        if (getattr(self, "_commands_assist_busy", False)
+                or getattr(self, "_step_debug_session", None) is not None
+                or getattr(self, "_step_debug_pending_session", None) is not None):
+            return False
+        command = getattr(self, "cur_command", None)
+        if command is not self._command_recovery_detector_command:
+            old_paused = getattr(
+                self, "_command_recovery_paused_command", None)
+            if old_paused is not None and not getattr(old_paused, "alive", False):
+                self._command_recovery_paused_command = None
+                self._command_recovery_resume_when_safe = False
+            self._command_recovery_detector_command = command
+            self._command_recovery_timeline.reset(loop_cycles=3)
+            self._command_recovery_input_tracker.reset(now)
+            self._command_recovery_last_check = 0.0
+            if (self._command_recovery_window_exists()
+                    and getattr(self, "_command_recovery_executor", None) is None):
+                self._command_recovery_context_command = command
+                self._command_recovery_window.set_context(
+                    "実行対象Commandsが切り替わりました。",
+                    self._command_recovery_context_text(command))
+        if command is None or not getattr(command, "alive", False):
+            return False
+        if now - self._command_recovery_last_check < 0.25:
+            return False
+        self._command_recovery_last_check = now
+        state_result = self._command_recovery_timeline.add(
+            runtime_state_snapshot(command), now)
+        if state_result.get("loop_started"):
+            loop = state_result.get("loop") or {}
+            reason = "CommandsのStepループを検出しました（{}Step × 3周）。".format(
+                loop.get("period", 0))
+            self._show_command_recovery_window(
+                reason, command=command, automatic=True, pause_command=True)
+            return True
+        return False
 
     def _command_monitor_begin_session(self, command):
         self._command_monitor_command = command
@@ -16498,6 +17244,10 @@ class PokeControllerApp:
 
     def _update_command_monitor_visual_state(self, frame, now):
         """Detect only a sustained black/still failure, never a normal static menu."""
+        if PokeControllerApp._camera_feature_limited_active(self):
+            self._command_monitor_visual_detector.reset()
+            return {"sampled": False, "stall_started": False,
+                    "recovered": False, "active": None}
         result = self._command_monitor_visual_detector.add(frame, now)
         if result.get("stall_started"):
             active = result.get("active") or {}
@@ -16521,12 +17271,134 @@ class PokeControllerApp:
             self.record_monitor_status.set("画面変化が戻ったため、暗転停止の保持制限を解除しました。")
         return result
 
+    def _release_command_input_for_dark_pause(self, command):
+        """Release the controller without blocking the Tk preview callback."""
+        keys = getattr(command, "keys", None)
+        if keys is None:
+            return
+
+        def release():
+            try:
+                keys.end()
+            except Exception as error:
+                self._logger.warning(
+                    "Commands dark-screen input release failed: %s", error)
+
+        threading.Thread(
+            target=release, daemon=True,
+            name="CommandDarkScreenRelease").start()
+
+    def _update_commands_dark_safety(self, frame, now=None):
+        """Pause Commands on sustained black/still video and auto-resume."""
+        now = time.monotonic() if now is None else float(now)
+        if PokeControllerApp._camera_feature_limited_active(self):
+            self._commands_dark_safety_detector.reset()
+            self._commands_dark_safety_command = None
+            self._commands_dark_safety_paused_command = None
+            return {"sampled": False, "stall_started": False,
+                    "recovered": False, "active": None,
+                    "command_paused": False, "command_resumed": False}
+        command = getattr(self, "cur_command", None)
+        try:
+            running = self.start_button["text"] == "Stop"
+        except (AttributeError, KeyError, TypeError):
+            running = False
+        if command is not self._commands_dark_safety_command:
+            self._commands_dark_safety_detector.reset()
+            self._commands_dark_safety_command = command
+            self._commands_dark_safety_paused_command = None
+        # PythonCommand instances start with alive=True as soon as they are
+        # selected.  The Start/Stop button is the application-level source of
+        # truth for whether Commands was actually started.
+        if (not running or command is None
+                or not getattr(command, "alive", False)):
+            self._commands_dark_safety_detector.reset()
+            self._commands_dark_safety_paused_command = None
+            return {"command_paused": False, "command_resumed": False}
+
+        result = self._commands_dark_safety_detector.add(frame, now)
+        result["command_paused"] = False
+        result["command_resumed"] = False
+        if result.get("stall_started"):
+            # Do not claim a pause already owned by manual control or another
+            # safety path; otherwise recovery could cancel that user's pause.
+            if not getattr(command, "pause_requested", False):
+                if hasattr(command, "request_pause"):
+                    command.request_pause()
+                else:
+                    command.pause_requested = True
+                self._commands_dark_safety_paused_command = command
+                self._release_command_input_for_dark_pause(command)
+                result["command_paused"] = True
+                try:
+                    recovery_window_enabled = bool(
+                        self.command_recovery_auto_open.get())
+                except Exception:
+                    recovery_window_enabled = False
+                hold_seconds = int(round(getattr(
+                    self._commands_dark_safety_detector,
+                    "hold_seconds", 60.0)))
+                message = (
+                    "画面の暗転・停止が{}秒続いたためCommandsを一時停止しました。".format(
+                        hold_seconds)
+                    + ("映像復帰で自動再開するか、復旧画面から手動再開できます。"
+                       if recovery_window_enabled else
+                       "映像変化が戻ると自動再開します。"))
+                self._logger.warning(message)
+                if hasattr(self, "record_monitor_status"):
+                    self.record_monitor_status.set(message)
+                self.show_output("Analysis", text=message)
+            if hasattr(self, "_show_command_recovery_window"):
+                self._show_command_recovery_window(
+                    "画面の暗転・停止が{}秒続きました。映像復帰で自動再開するか、"
+                    "［Commandsを再開］で手動再開できます。".format(
+                        int(round(getattr(
+                            self._commands_dark_safety_detector,
+                            "hold_seconds", 60.0)))),
+                    command=command, automatic=True,
+                    # Dark-screen safety already owns this pause. Merely
+                    # showing the editor must not steal ownership, otherwise
+                    # a visible frame change cannot auto-resume Commands.
+                    pause_command=False)
+        elif result.get("recovered"):
+            paused_command = self._commands_dark_safety_paused_command
+            self._commands_dark_safety_paused_command = None
+            if paused_command is command and getattr(command, "alive", False):
+                if getattr(self, "_software_controller_override_active", False):
+                    # Let the manual controller release path resume Commands
+                    # after its final neutral packet instead of resuming now.
+                    self._software_controller_paused_command = command
+                elif hasattr(command, "resume"):
+                    command.resume()
+                else:
+                    command.pause_requested = False
+                result["command_resumed"] = True
+                message = "映像変化が戻ったためCommandsを自動再開しました。"
+                self._logger.info(message)
+                if hasattr(self, "record_monitor_status"):
+                    self.record_monitor_status.set(message)
+                self.show_output("Analysis", text=message)
+            if (getattr(self, "_command_recovery_resume_when_safe", False)
+                    and getattr(
+                        self, "_command_recovery_paused_command", None) is command
+                    and hasattr(self, "resume_command_after_recovery")):
+                result["command_resumed"] = bool(
+                    self.resume_command_after_recovery(wait_for_visual=False))
+        return result
+
     def _record_command_key_activity(self, _payload, priority=False):
         """Sender callback: update a timestamp only; never touch Tk here."""
         if priority:
             return
         tracker = getattr(self, "_command_monitor_input_tracker", None)
+        recovery_tracker = getattr(
+            self, "_command_recovery_input_tracker", None)
         command = getattr(self, "cur_command", None)
+        if (recovery_tracker is not None and command is not None
+                and command is getattr(
+                    self, "_command_recovery_detector_command", None)
+                and getattr(command, "alive", False)):
+            recovery_tracker.mark_activity(time.monotonic())
         if (tracker is not None and command is not None
                 and command is getattr(self, "_command_monitor_command", None)
                 and getattr(command, "alive", False)):
@@ -16842,17 +17714,16 @@ class PokeControllerApp:
 
     def _request_command_monitor_stop_cleanup(self, command):
         """Remember an explicit Stop without including natural command exits."""
-        enabled = (getattr(self, "record_monitor_confirm_delete_on_stop", None)
-                   is not None
-                   and self.record_monitor_confirm_delete_on_stop.get())
-        if (not enabled or getattr(self, "record_mode", None) is None
-                or self.record_mode.get() != "CommandMonitor"
-                or command is None
-                or command is not getattr(self, "_command_monitor_command", None)):
+        if command is None:
             return
         self._command_monitor_stop_cleanup_command = command
-        self._command_monitor_stop_cleanup_session_id = str(
-            getattr(self, "_command_monitor_session_id", "") or "")
+        session_id = ""
+        if command is getattr(self, "_command_monitor_command", None):
+            session_id = str(
+                getattr(self, "_command_monitor_session_id", "") or "")
+        # 自動録画が開始できなかった場合も、手動Stopを無言で終わらせない。
+        self._command_monitor_stop_cleanup_session_id = (
+            session_id or "no-recording-{}".format(time.time_ns()))
 
     def _stop_command_monitor_capture_on_request(self, command, reason):
         """Bound and stop recording immediately, even if Commands cannot exit."""
@@ -16901,6 +17772,14 @@ class PokeControllerApp:
         self._command_monitor_stop_cleanup_command = None
         self._command_monitor_stop_cleanup_session_id = ""
         return session_id
+
+    def _confirm_requested_command_monitor_stop(self, command):
+        """Show the explicit-Stop recording choice once, without waiting for exit."""
+        session_id = self._consume_command_monitor_stop_cleanup(command)
+        if not session_id:
+            return False
+        self._confirm_save_stopped_command_monitor_recordings(session_id)
+        return True
 
     def _merge_stopped_command_monitor_recordings(self, session_id, target_ids):
         target_ids = {str(value) for value in target_ids}
@@ -17006,11 +17885,24 @@ class PokeControllerApp:
         }
         if not target_ids:
             # "調整停止＋保護" already expresses a keep decision, so there is
-            # nothing to ask about saving.  Still collapse that run to one
-            # protected recording when it produced several chunks.
+            # no unprotected choice left. Still notify on every manual Stop;
+            # previously this return made the required popup disappear.
             if len(session_ids) > 1:
                 self._merge_stopped_command_monitor_recordings(
                     session_id, session_ids)
+            if session_ids:
+                tkmsg.showinfo(
+                    "Commands録画の保存",
+                    "今回のCommands録画はすでに保護済みです。\n"
+                    "削除せず保存を維持します。",
+                    parent=self.root)
+            else:
+                tkmsg.showwarning(
+                    "Commands録画の保存",
+                    "今回のCommands実行では保存確認できる録画が0本です。\n\n"
+                    "Camera・Audio・録画保存先・ディスク容量を確認してください。\n"
+                    "次回のCommands Startでは監視録画を自動開始します。",
+                    parent=self.root)
             return
         targets = [chunk for chunk in self._command_monitor_chunks
                    if str(chunk.get("id", "")) in target_ids]
@@ -17019,7 +17911,8 @@ class PokeControllerApp:
                 "今回のCommands実行で作成した録画が{}本あります。\n"
                 "問題確認用として保存しますか？\n\n"
                 "［はい］1本へ結合して保護保存　［いいえ］今回分だけ削除\n"
-                "保護した録画と過去の実行分は削除されません。".format(len(targets))):
+                "保護した録画と過去の実行分は削除されません。".format(len(targets)),
+                parent=self.root):
             saved_ids = apply_stopped_session_recording_choice(
                 self._command_monitor_chunks, session_id, save=True)
             for chunk in self._command_monitor_chunks:
@@ -17045,12 +17938,21 @@ class PokeControllerApp:
             or getattr(self._command_monitor_input_tracker, "active", None))
 
     def _process_command_monitor_frame(self, frame):
+        if PokeControllerApp._camera_feature_limited_active(self):
+            self._command_monitor_visual_detector.reset()
+            return
         if not self.record_armed:
+            return
+        # Chunk rotation drains its ordered AVI queue on a worker. Preview and
+        # Commands safety checks continue, but a second recorder must not be
+        # started until that drain has completed.
+        if self._command_monitor_stop_in_progress:
             return
         command = getattr(self, "cur_command", None)
         if command is None or not getattr(command, "alive", False):
             if self._command_monitor_current_chunk is not None:
-                self._finish_command_monitor_chunk("command_stopped")
+                self._finish_command_monitor_chunk(
+                    "command_stopped", background=True)
                 self.record_monitor_status.set(
                     "Commands停止を検出しました。録画は確認待ちで保持しています。")
             else:
@@ -17058,7 +17960,9 @@ class PokeControllerApp:
             return
         if command is not self._command_monitor_command:
             if self._command_monitor_current_chunk is not None:
-                self._finish_command_monitor_chunk("command_changed")
+                self._finish_command_monitor_chunk(
+                    "command_changed", background=True)
+                return
             self._command_monitor_begin_session(command)
         now = time.monotonic()
         if not self.recorder.active and not self._command_monitor_failure_active():
@@ -17085,7 +17989,8 @@ class PokeControllerApp:
         if evidence_started and self._command_monitor_current_chunk is not None:
             if state_result.get("loop_started"):
                 reason = "loop_evidence_bounded"
-                self._finish_command_monitor_chunk(reason)
+                self._finish_command_monitor_chunk(
+                    reason, background=True)
                 self._mark_command_monitor_prune_candidates(now)
                 bounded_for_evidence = True
             else:
@@ -17105,7 +18010,8 @@ class PokeControllerApp:
                 and now >= float(failure_until)):
             reason = "{}_evidence_60s_bounded".format(
                 self._command_monitor_failure_capture_mode or "failure")
-            self._finish_command_monitor_chunk(reason)
+            self._finish_command_monitor_chunk(
+                reason, background=True)
             self._mark_command_monitor_prune_candidates(now)
             self.record_monitor_status.set(
                 "停止開始から約{}秒の原因確認映像を保持しました。復帰するまで後続の無変化映像は破棄します。".format(
@@ -17136,8 +18042,9 @@ class PokeControllerApp:
                 and self._command_monitor_current_chunk is not None
                 and now - self._command_monitor_current_chunk["started"] >= chunk_seconds):
             self._finish_command_monitor_chunk(
-                "chunk_rotated", frame=frame, restart=True)
-        if self.recorder.active:
+                "chunk_rotated", frame=frame, restart=True,
+                background=True)
+        if self.recorder.active and not self._command_monitor_stop_in_progress:
             self._queue_recording_frame(frame)
 
     def _apply_record_output_dir(self):
@@ -17293,8 +18200,8 @@ class PokeControllerApp:
         self.record_monitor_failure_tail_seconds.set(
             data.get("monitor_failure_tail_seconds", 60.0))
         self.record_monitor_auto_arm.set(data.get("monitor_auto_arm", True))
-        self.record_monitor_confirm_delete_on_stop.set(
-            data.get("monitor_confirm_delete_on_stop", True))
+        # 手動Stop時の保存確認は必須。旧InputSetのOFF値も引き継がない。
+        self.record_monitor_confirm_delete_on_stop.set(True)
         self._select_recording_mode_page()
         self.configure_recording_rules()
         if not self.record_trigger_rules:
@@ -17496,6 +18403,8 @@ class PokeControllerApp:
                     "録画条件のROIデバッグ表示")):
             return
         self.configure_recording_rules()
+        if self.record_mode.get() != "Template":
+            self.recorder.defer_finalization = False
         if self.record_mode.get() == "CommandMonitor":
             if self.record_armed:
                 self.record_armed = False
@@ -17541,9 +18450,12 @@ class PokeControllerApp:
         if self.record_mode.get() == "Template":
             if self.record_armed:
                 self.record_armed = False
-                if self.recorder.active:
-                    self._stop_capture_recorder()
                 self.record_button.configure(text="Start recording")
+                if (self.recorder.active
+                        or self._template_recording_stop_in_progress):
+                    self._request_template_recording_stop(launch_after=True)
+                else:
+                    self._launch_deferred_template_finalizer()
                 return
             if not self.record_trigger_rules and not self.record_template_path.get():
                 tkmsg.showwarning("Recording", "Choose a template image before arming template recording.")
@@ -17559,6 +18471,7 @@ class PokeControllerApp:
                 return
             if not self._confirm_selected_audio_for_use():
                 return
+            self.recorder.defer_finalization = True
             self.record_armed = True
             self.recorder.last_check = 0.0
             self.record_button.configure(text="Stop monitoring")
@@ -18115,6 +19028,95 @@ class PokeControllerApp:
                     self._record_compose_active_session = None
                     self._record_compose_condition.notify_all()
 
+    def _template_finalize_candidates(self):
+        candidates = self.recorder.deferred_finalize_manifests()
+        return [
+            path for path in candidates
+            if path not in self._template_finalize_launched_paths
+        ]
+
+    def _launch_deferred_template_finalizer(self, wait_for_exit=False):
+        jobs = self._template_finalize_candidates()
+        if not jobs:
+            return True
+        try:
+            launch_recording_finalize_worker(
+                jobs, wait_pid=os.getpid() if wait_for_exit else 0)
+        except Exception as error:
+            self._logger.exception("Deferred MP4 worker launch failed")
+            tkmsg.showerror(
+                "MP4一括作成",
+                "別プロセスのMP4一括作成を開始できませんでした。\n"
+                "AVI/WAVと再試行ジョブは保持しています。\n\n{}".format(error),
+                parent=self.root)
+            return False
+        self._template_finalize_launched_paths.update(jobs)
+        self.show_output(
+            "Analysis",
+            text="{}本の録画を別画面のMP4一括作成へ引き継ぎました。".format(
+                len(jobs)))
+        return True
+
+    def _complete_template_recording_stop(self, error=None):
+        launch_after = self._template_finalize_after_stop
+        exit_after = self._template_exit_after_stop
+        self._template_recording_stop_in_progress = False
+        self._template_finalize_after_stop = False
+        self._template_exit_after_stop = False
+        if error is not None:
+            self.record_armed = False
+            self._preview_shutdown_mode = False
+            self._refresh_preview_priority_status()
+            message = "Template録画の停止に失敗しました: {}".format(error)
+            self._logger.error(message)
+            self.show_output("Analysis", text=message)
+            tkmsg.showerror("Recording", message, parent=self.root)
+            return False
+        if hasattr(self, "record_button"):
+            self.record_button.configure(
+                text="Stop monitoring" if self.record_armed
+                else "Start recording")
+        launched = True
+        if launch_after or exit_after:
+            launched = self._launch_deferred_template_finalizer(
+                wait_for_exit=exit_after)
+        if exit_after:
+            if launched:
+                self._exit_now(confirm=False)
+            else:
+                self._preview_shutdown_mode = False
+                self._refresh_preview_priority_status()
+        return launched
+
+    def _request_template_recording_stop(
+            self, launch_after=False, exit_after=False):
+        """Drain AVI/WAV off Tk and defer every MP4 job to another process."""
+        self._template_finalize_after_stop = bool(
+            self._template_finalize_after_stop or launch_after)
+        self._template_exit_after_stop = bool(
+            self._template_exit_after_stop or exit_after)
+        if self._template_recording_stop_in_progress:
+            return True
+        if not getattr(self.recorder, "active", False):
+            return self._complete_template_recording_stop()
+        self._template_recording_stop_in_progress = True
+        self.recorder.defer_finalization = True
+
+        def stop_recorder():
+            error = None
+            try:
+                self._stop_capture_recorder()
+            except Exception as stop_error:
+                error = stop_error
+            self._gui_action_queue.put(
+                lambda error=error: self._complete_template_recording_stop(
+                    error=error))
+
+        threading.Thread(
+            target=stop_recorder, daemon=True,
+            name="TemplateRecordingStop").start()
+        return True
+
     def _stop_capture_recorder(self, discard=False):
         """Stop after every already-presented frame reaches the AVI queue."""
         session = getattr(self.recorder, "session_dir", None)
@@ -18143,6 +19145,21 @@ class PokeControllerApp:
         return self.recorder.start(*args, **kwargs)
 
     def process_recording_frame(self, frame):
+        if (PokeControllerApp._camera_feature_limited_active(self)
+                and not getattr(self.recorder, "active", False)
+                and not getattr(self, "record_armed", False)
+                and not getattr(self.operation_recorder, "active", False)):
+            # A limited PokeCon used only for native preview must not run audio
+            # ownership sync, detection, overlay, or finalizer bookkeeping on
+            # every frame. An explicitly active recording is left untouched.
+            return
+        try:
+            self._update_commands_dark_safety(frame)
+        except Exception as error:
+            # Safety diagnostics must never become another reason for the
+            # preview timer to stop.
+            self._logger.warning(
+                "Commands dark-screen safety check failed: %s", error)
         self._sync_audio_device_usage()
         # Operation authoring is an independent clean-video pipeline.  Feed it
         # before the normal recording mode returns from this callback.
@@ -18151,7 +19168,20 @@ class PokeControllerApp:
             self._interrupt_recording_for_disk_space()
             return
         if self.record_mode.get() == "CommandMonitor":
-            self._process_command_monitor_frame(frame)
+            try:
+                self._process_command_monitor_frame(frame)
+            except Exception as error:
+                # A monitor recording is diagnostic. Disable it after a hard
+                # failure instead of letting the exception terminate the Tk
+                # preview callback while Commands keeps running invisibly.
+                self.record_armed = False
+                message = (
+                    "Commands監視録画でエラーが発生したため監視録画を停止しました。"
+                    "PokeCon画面とCommands安全監視は継続します: {}"
+                ).format(error)
+                self._logger.exception(message)
+                self.record_monitor_status.set(message)
+                self.show_output("Analysis", text=message)
             return
         if self.record_mode.get() == "Manual":
             if not self.recorder.active:
@@ -18254,6 +19284,10 @@ class PokeControllerApp:
             return
         if not self.record_armed and not self.record_debug.get():
             return
+        if self._template_recording_stop_in_progress:
+            self.update_recording_debug(frame)
+            return
+        self.recorder.defer_finalization = True
         if not self.record_trigger_rules and self.recorder.template_path != self.record_template_path.get():
             self.recorder.configure_template(self.record_template_path.get())
         result = self.recorder.process_detection(
@@ -18263,6 +19297,11 @@ class PokeControllerApp:
             audio_level_options=self._audio_level_options(),
         )
         self.update_recording_debug(frame)
+        if result == DETECTION_STOP_REQUESTED:
+            if hasattr(self, "record_button"):
+                self.record_button.configure(text="Saving AVI/WAV...")
+            self._request_template_recording_stop()
+            return
         # A detected segment must receive every camera frame, not merely the
         # low-frequency frames that are used for template matching.
         if self.recorder.active:
@@ -18942,6 +19981,11 @@ if __name__ == "__main__":
         app = PokeControllerApp(
             root, args.profile, start_maximized=args.start_maximized)
         app.run()
+        if getattr(app, "_process_exit_ready", False):
+            # A few device backends can leave native/non-daemon workers alive
+            # after their normal close calls.  End only this PokeCon process so
+            # its waiting PowerShell/Cmd launcher can close as well.
+            terminate_after_gui_shutdown(0)
     except Exception as error:
         # Do not make startup failures look like an unexplained normal exit.
         logger.exception("PokeCon startup failed")

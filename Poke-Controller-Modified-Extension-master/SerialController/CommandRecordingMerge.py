@@ -185,10 +185,12 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
             raise RuntimeError("FFmpegによる録画結合に失敗しました。" + ("\n" + detail if detail else ""))
 
         step_output = os.path.join(building, "steps.jsonl")
+        timeline_event_count = 0
         with open(step_output, "w", encoding="utf-8", newline="\n") as target:
             video_offset = 0.0
             for chunk_index, (source, chunk) in enumerate(
                     zip(source_dirs, chunks), start=1):
+                chunk_duration = _chunk_duration(chunk)
                 path = os.path.join(source, "steps.jsonl")
                 try:
                     with open(path, "r", encoding="utf-8") as stream:
@@ -199,8 +201,16 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
                                 continue
                             if not isinstance(event, dict):
                                 continue
+                            event_offset = _event_offset(event, chunk)
+                            # A delayed trace writer can finish just after the
+                            # recorder. Keep a small end-boundary tolerance,
+                            # but never carry an event from outside this saved
+                            # video chunk into the merged execution path.
+                            if event_offset > chunk_duration + 0.25:
+                                continue
+                            event_offset = min(event_offset, chunk_duration)
                             event["video_time"] = round(
-                                video_offset + _event_offset(event, chunk), 6)
+                                video_offset + event_offset, 6)
                             event["chunk_index"] = chunk_index
                             event["source_chunk_id"] = str(chunk.get("id", ""))
                             event = _copy_timeline_snapshot(
@@ -208,9 +218,10 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
                                 "{:03d}".format(chunk_index))
                             json.dump(event, target, ensure_ascii=False)
                             target.write("\n")
+                            timeline_event_count += 1
                 except OSError:
                     pass
-                video_offset += _chunk_duration(chunk)
+                video_offset += chunk_duration
 
         log_output = os.path.join(building, "commands.log")
         with open(log_output, "w", encoding="utf-8", newline="\n") as target:
@@ -273,6 +284,14 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
             "duration": duration,
             "mode": "Commands monitoring recording (merged)",
             "merged_at": timestamp.isoformat(timespec="seconds"),
+            "execution_path": {
+                "file": "steps.jsonl",
+                "scope": "retained_video_only",
+                "video_start": 0.0,
+                "video_end": duration,
+                "event_count": timeline_event_count,
+                "sample_interval_seconds": 0.1,
+            },
         })
         with open(os.path.join(building, "command_monitor.json"),
                   "w", encoding="utf-8", newline="\n") as stream:

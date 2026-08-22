@@ -98,7 +98,9 @@ def ZA_battle_missing_field_recovery(
     self.pressRep(
         Button.X, repeat=1, duration=0.15,
         wait=0.5, interval=0.1)
-    for _ in range(20):
+    help_press_count = 0
+    b_press_count = 0
+    while b_press_count < 20:
         # 復帰用XによってXメニューが開いた場合は、背後のFIELD表示で
         # 復帰済みと誤判定する前にBで閉じる。
         if self.image_check("POKEMON_ZA_X_MENU_OPEN"):
@@ -107,12 +109,24 @@ def ZA_battle_missing_field_recovery(
                 Button.B, repeat=1, duration=0.15,
                 wait=0.5, interval=0.1)
             return True
+        if self.image_check("POKEMON_ZA_HELP_MARKER"):
+            if help_press_count >= 10:
+                return True
+            # FIELD復帰ループ中のHELPは、消えるまでAで進める。
+            # HELP中には選択を変えるBを送らない。
+            self.checkIfAlive()
+            self.pressRep(
+                Button.A, repeat=1, duration=0.15,
+                wait=0.5, interval=0.1)
+            help_press_count += 1
+            continue
         if bool(self.ZA_story_Template_Field_HardGaurd()):
             break
         self.checkIfAlive()
         self.pressRep(
             Button.B, repeat=1, duration=0.15,
             wait=0.5, interval=0.1)
+        b_press_count += 1
     return True
 
 def ZA_battle_coCp_noloop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endskip=0,battle_mode=0):
