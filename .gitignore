@@ -1,3 +1,7 @@
 # PokeCon portable backup output (generated locally)
 /PokeCon_Portable_Packages/
 /Poke-Controller-Modified-Extension-master__.zip.tmp
+
+# Codex local state, temporary files, and backups
+.codex*
+_codex_tmp/

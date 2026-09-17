@@ -101,8 +101,7 @@ def detect_image(
         match_color="blue",
         no_match_color="red",
         history=None,
-        exclude_regions=None,
-        template_crop=None):
+        exclude_regions=None):
     """Return match details while remaining independent of PokeCon base APIs."""
     frame = _command_frame(command)
     resolved_template_path = str(template_path)
@@ -112,8 +111,6 @@ def detect_image(
     template = cv2.imread(resolved_template_path, cv2.IMREAD_COLOR)
     if template is None:
         raise FileNotFoundError("テンプレート画像を読み込めません: " + str(template_path))
-    template, _template_offset = _crop_region(
-        template, template_crop or [])
     region, offset = _crop_region(frame, crop or [])
     source_match = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY) if use_gray else region
     template_match = cv2.cvtColor(template, cv2.COLOR_BGR2GRAY) if use_gray else template
@@ -152,8 +149,8 @@ def detect_image(
         color = [str(match_color), "orange"] if matched else [str(no_match_color), "orange"]
         command.displayRectangle(
             absolute_location,
-            int(template_match.shape[1]),
-            int(template_match.shape[0]),
+            int(template.shape[1]),
+            int(template.shape[0]),
             str(time.perf_counter()),
             ms,
             color=color,
@@ -164,8 +161,8 @@ def detect_image(
         command.gui.ImgRect(
             absolute_location[0],
             absolute_location[1],
-            absolute_location[0] + int(template_match.shape[1]) + 1,
-            absolute_location[1] + int(template_match.shape[0]) + 1,
+            absolute_location[0] + int(template.shape[1]) + 1,
+            absolute_location[1] + int(template.shape[0]) + 1,
             outline=outline,
             tag=str(time.perf_counter()),
             ms=int(ms),

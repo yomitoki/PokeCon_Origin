@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 
 COMMAND_INPUT_SET_VARIABLES = frozenset((
@@ -17,6 +17,7 @@ COMMAND_INPUT_SET_VARIABLES = frozenset((
     "operation_capture_output_dir", "operation_capture_include_audio",
     "operation_capture_auto_controller", "operation_gamepad_profile_name",
     "operation_capture_last_session",
+    "record_focus_repair_enabled", "record_focus_repair_functions",
 ))
 
 
@@ -98,6 +99,7 @@ INPUT_SET_VARIABLES = (
     "record_monitor_loop_cycles", "record_monitor_long_seconds",
     "record_monitor_failure_tail_seconds",
     "record_monitor_auto_arm", "record_monitor_confirm_delete_on_stop",
+    "record_focus_repair_enabled", "record_focus_repair_functions",
     # Long-form PC-controller + video authoring session
     "operation_capture_output_dir", "operation_capture_include_audio",
     "operation_capture_auto_controller", "operation_gamepad_profile_name",

@@ -503,8 +503,15 @@ def _concat_line(path):
 
 
 def _run_checked(command, description):
-    completed = subprocess.run(command, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.PIPE, text=True)
+    run_options = {
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.PIPE,
+        "text": True,
+    }
+    if os.name == "nt":
+        run_options["creationflags"] = getattr(
+            subprocess, "CREATE_NO_WINDOW", 0x08000000)
+    completed = subprocess.run(command, **run_options)
     if completed.returncode != 0:
         raise RuntimeError(description + "\n" + str(completed.stderr or "")[-800:])
 

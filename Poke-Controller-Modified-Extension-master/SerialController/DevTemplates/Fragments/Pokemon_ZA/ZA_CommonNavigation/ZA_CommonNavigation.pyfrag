@@ -27,7 +27,7 @@ def ZA_Common_map_open(self,check_pic1="POKEMON_ZA_FALSE_RETURN",check_pic2="POK
     #    return "CHECK_TIME"
 
     return "COMMON_MAP_OPEN"
-def ZA_Common_goto_select1(self,position,othermap="POKEMON_ZA_FALSE_RETURN"):
+def ZA_Common_goto_select1(self,position,othermap="POKEMON_ZA_FALSE_RETURN",select_position0_direct=0):
     # position:0 すべて
     # position:1 施設
     # position:2 ポケセン
@@ -38,7 +38,36 @@ def ZA_Common_goto_select1(self,position,othermap="POKEMON_ZA_FALSE_RETURN"):
     if self.image_check("POKEMON_ZA_MAP2") or self.image_check(othermap):      
         self.wait(0.1)
         if self.image_check("POKEMON_ZA_MOVESPOT_TAB"):
-            if self.map_cursor_reset==0:
+            # position=0（すべて）はマップの種類にかかわらず、左タブの
+            # リセット移動を行わず、MINUSでフィルターを開いて現在の
+            # 0番目をそのままAで選択する。select_position0_directは
+            # 旧生成ソースとの呼出し互換のため引数として残す。
+            if position == 0:
+                # フィルターを開いた後も背景側のTAB_FILTERが一致する
+                # 場合があるため、開いた状態を先に判定する。
+                if self.image_check("POKEMON_ZA_SELECT_ALL"):
+                    print(
+                        "[COMMON_GOTO_SELECT1] position=0 "
+                        "action=A filter=SELECT_ALL")
+                    self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+                    return "COMMON_GOTO_SELECT2"
+
+                # TAB_FILTERの画像を取りこぼしても、MOVESPOT_TAB上で
+                # SELECT_ALLが未表示なら必ずMINUSを送る。直前のMINUSが
+                # 遅れて反映される場合に備え、入力直前にもう一度だけ
+                # 開いた状態を確認する。
+                self.wait(0.3)
+                if self.image_check("POKEMON_ZA_SELECT_ALL"):
+                    print(
+                        "[COMMON_GOTO_SELECT1] position=0 "
+                        "action=A filter=SELECT_ALL delayed")
+                    self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+                    return "COMMON_GOTO_SELECT2"
+                print(
+                    "[COMMON_GOTO_SELECT1] position=0 "
+                    "action=MINUS filter=SELECT_ALL_not_visible")
+                self.pressRep(Button.MINUS, repeat=1, duration=0.2, wait=0.5, interval=0.1)
+            elif self.map_cursor_reset==0:
                 if self.image_check("POKEMON_ZA_SIDE_SELECT_TOP_MAP"):
                     self.map_cursor_reset=1
                 else:
@@ -84,7 +113,10 @@ def ZA_Common_goto_select1(self,position,othermap="POKEMON_ZA_FALSE_RETURN"):
         self.wait(0.1)
         return "COMMON_GOTO_SELECT1"
     return "COMMON_GOTO_SELECT1"
-def ZA_Common_goto_select2(self,positionright,positiondown,movepoint_check,othermap="POKEMON_ZA_FALSE_RETURN"):
+def ZA_Common_goto_select2(
+        self, positionright, positiondown, movepoint_check,
+        othermap="POKEMON_ZA_FALSE_RETURN",
+        battle_recovery_mode=0):
     self.wait(0.1)#self.wait(self.SLEEPLIST[7][2])
     if self.image_check("POKEMON_ZA_MAP2") or self.image_check(othermap):        
         if self.image_check("POKEMON_ZA_MOVESPOT_TAB"):         
@@ -102,24 +134,116 @@ def ZA_Common_goto_select2(self,positionright,positiondown,movepoint_check,other
                         self.etc_sendCommand("Lbutton_up")
                         self.wait(0.1)#回数が多い場合に移動が足りない場合は必要
                 if movepoint_check == 0:
-                    ret = self.ZA_Common_goto_jump()#移動
+                    ret = self.ZA_Common_goto_jump(
+                        othermap=othermap,
+                        battle_recovery_mode=battle_recovery_mode)#移動
                     return ret
                 else:
                     return "COMMON_GOTO_JUMP"
                     
     return "COMMON_GOTO_SELECT2"
-def ZA_Common_goto_jump(self):
+def _ZA_furadari_screen_is_dark(self, log_detection=True):
+    """Return True for a sustained dark view or unavailable live input."""
+    missing_frames = 0
+    brightness = None
+    dark_ratio = None
+    for sample_index in range(3):
+        frame = self._read_camera_frame()
+        if frame is None:
+            missing_frames += 1
+        else:
+            try:
+                height, width = frame.shape[:2]
+                # HUDや黒帯の影響を避け、実際の正面視界だけを確認する。
+                region = frame[
+                    max(0, int(height * 0.10)):max(1, int(height * 0.85)),
+                    max(0, int(width * 0.10)):max(1, int(width * 0.90)),
+                ]
+                if region.size == 0:
+                    return False
+                if len(region.shape) >= 3:
+                    gray = cv2.cvtColor(region, cv2.COLOR_BGR2GRAY)
+                else:
+                    gray = region
+                brightness = float(gray.mean())
+                dark_ratio = float((gray <= 32).mean())
+            except (AttributeError, TypeError, ValueError, cv2.error):
+                return False
+            # Window側の暗転安全監視（brightness <= 28）と判定を
+            # 揃える。正面視界にはHUDが重なるため黒画素率は80%以上。
+            if brightness > 28.0 or dark_ratio < 0.80:
+                return False
+        if sample_index < 2:
+            self.wait(0.1)
+
+    if missing_frames == 3:
+        self._za_furadari_dark_detection_reason = "camera_stalled"
+        message = (
+            "[FURADARI_MAP_DARK_RECOVERY] live camera frame "
+            "unavailable for 3 checks; start bounded B/FIELD recovery")
+    else:
+        self._za_furadari_dark_detection_reason = "dark"
+        message = (
+            "[FURADARI_MAP_DARK_RECOVERY] sustained dark view detected "
+            "brightness={:.2f} dark_ratio={:.3f} missing_frames={}".format(
+                brightness, dark_ratio, missing_frames))
+    if log_detection:
+        print(message)
+        logger = getattr(self, "_logger", None)
+        log_method = getattr(logger, "warning", None)
+        if callable(log_method):
+            log_method(message)
+    return True
+
+def ZA_Common_goto_jump(
+        self, othermap="POKEMON_ZA_FALSE_RETURN",
+        battle_recovery_mode=0):
     self.wait(0.1)#self.wait(self.SLEEPLIST[7][2])
  
     self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.1, interval=0.1)
+    furadari_battle_recovery = (
+        battle_recovery_mode == 1
+        and othermap == "POKEMON_ZA_FURADARI_MAP")
+
+    def start_furadari_battle_recovery(reason, recovery_kind="battle"):
+        self.inactioncount += 1
+        self.pressRep(
+            Button.B, repeat=1, duration=0.15,
+            wait=0.1, interval=0.1)
+        self._za_furadari_map_recovery_kind = recovery_kind
+        self._za_furadari_map_b_count = 1
+        self._za_furadari_map_b_limit_logged = False
+        self._za_furadari_map_field_started = False
+        self._za_furadari_map_view_active = False
+        self._za_furadari_map_eye_seen = False
+        self._za_furadari_map_eye_acquire_count = 0
+        self._za_furadari_map_eye_miss_count = 0
+        self._za_furadari_dark_recovery_phase = "ALTERNATE_GOTO"
+        self._za_furadari_dark_map_state = "COMMON_MAP_OPEN"
+        self._za_furadari_dark_in_miss_count = 0
+        self._za_furadari_dark_entry_a_count = 0
+        print(
+            "[FURADARI_MAP_RECOVERY] "
+            "{} mode=1 kind={} -> press B up to 30 until FIELD".format(
+                reason, recovery_kind))
+        return "COMMON_FURADARI_MAP_BATTLE_RECOVERY"
+
     for i in range(1,10):
         self.wait(0.1)#self.wait(self.SLEEPLIST[10][2])
+        # バトル警告は通常の移動確認と似ているため、補助モード1では
+        # 先に判定しないと通常移動成功として次Stepへ進む場合がある。
+        if (furadari_battle_recovery
+                and self.image_check("POKEMON_ZA_MOVE_COMMENT_BATTLE")):
+            return start_furadari_battle_recovery(
+                "battle warning detected")
+
         if self.image_check("POKEMON_ZA_MOVE_COMMENT"): 
             self.pressRep(Button.A, repeat=15, duration=0.15, wait=0.1, interval=0.1)
             self.sleepcount=0
             return "COMMON_CHANGE_TIME"
         
-        elif self.image_check("POKEMON_ZA_MOVE_COMMENT_BATTLE"):
+        elif (not furadari_battle_recovery
+                and self.image_check("POKEMON_ZA_MOVE_COMMENT_BATTLE")):
             self.inactioncount+=1
             self.pressRep(Button.B, repeat=10, duration=0.15, wait=0.1, interval=0.1)
             self.battle_step_return=1
@@ -132,6 +256,16 @@ def ZA_Common_goto_jump(self):
                 return "COMMON_CHANGE_TIME"
             self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.2, interval=0.1)
     print("MOVE_COM_ELSE")
+    if furadari_battle_recovery:
+        # 実録画では両方の移動確認を取り逃がし、従来のA5回から
+        # COMMON_CHANGE_TIMEへ進んでGURI_92へ抜けていた。補助モード1
+        # のタイムアウトはFIELD復帰・戦闘経路へ必ず引き渡す。
+        if self._ZA_furadari_screen_is_dark():
+            return start_furadari_battle_recovery(
+                "dark view after move confirmation timeout",
+                recovery_kind="dark")
+        return start_furadari_battle_recovery(
+            "move confirmation timed out")
     if self.battlecheck == 1:
         self.inactioncount+=1
         self.pressRep(Button.B, repeat=20, duration=0.15, wait=0.1, interval=0.1)
@@ -140,6 +274,249 @@ def ZA_Common_goto_jump(self):
     self.sleepcount=0
     self.pressRep(Button.A, repeat=5, duration=0.15, wait=0.1, interval=0.1)
     return "COMMON_CHANGE_TIME"
+def ZA_Common_furadari_map_dark_recovery(self):
+    """Reset a dark FURADARI view through a safe alternate travel spot."""
+    recovery_state = "COMMON_FURADARI_MAP_BATTLE_RECOVERY"
+    othermap = "POKEMON_ZA_FURADARI_MAP"
+    field_picture = "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_0"
+    phase = getattr(
+        self, "_za_furadari_dark_recovery_phase", "ALTERNATE_GOTO")
+
+    if phase == "ALTERNATE_GOTO":
+        common_state = getattr(
+            self, "_za_furadari_dark_map_state", "COMMON_MAP_OPEN")
+        if common_state == "COMMON_MAP_OPEN":
+            next_state = self.ZA_Common_map_open(othermap=othermap)
+        elif common_state == "COMMON_GOTO_SELECT1":
+            # MINUSのフィルターで「すべて」から下へ1つ移動する。
+            next_state = self.ZA_Common_goto_select1(
+                1, othermap=othermap)
+        elif common_state == "COMMON_GOTO_SELECT2":
+            # 退避スポットは現在位置から右1・下1。
+            next_state = self.ZA_Common_goto_select2(
+                1, 1, 0, othermap=othermap,
+                battle_recovery_mode=0)
+        elif common_state in {
+                "COMMON_CHANGE_TIME", "COMMON_CHECK_TIME"}:
+            next_state = common_state
+        else:
+            next_state = self.STATE_COMMON_FUNCTION[common_state]()
+        self._za_furadari_dark_map_state = next_state
+        if next_state in {"COMMON_CHANGE_TIME", "COMMON_CHECK_TIME"}:
+            self._za_furadari_dark_recovery_phase = "APPROACH_ENTRY"
+            self._za_furadari_dark_map_state = "COMMON_START"
+            print(
+                "[FURADARI_MAP_DARK_RECOVERY] alternate goto complete "
+                "filter_down=1 spot_right=1 spot_down=1")
+        return recovery_state
+
+    if phase == "APPROACH_ENTRY":
+        if not self.image_check(field_picture):
+            self.wait(0.1)
+            return recovery_state
+        self.press(
+            Direction(Stick.LEFT, 90), duration=0.5, wait=0.1)
+        self._za_furadari_dark_recovery_phase = "WAIT_ENTRY_ICON"
+        self._za_furadari_dark_in_miss_count = 0
+        print(
+            "[FURADARI_MAP_DARK_RECOVERY] FIELD -> move 90deg 0.5s; "
+            "wait for IN_ICON")
+        return recovery_state
+
+    if phase == "WAIT_ENTRY_ICON":
+        if (self.image_check(field_picture)
+                and self.image_check("POKEMON_ZA_IN_ICON")):
+            self.pressRep(
+                Button.A, repeat=1, duration=0.15,
+                wait=0.5, interval=0.1)
+            self._za_furadari_dark_entry_a_count = 1
+            self._za_furadari_dark_recovery_phase = "WAIT_ENTRY_FIELD"
+            print(
+                "[FURADARI_MAP_DARK_RECOVERY] IN_ICON -> A; "
+                "wait for destination FIELD")
+            return recovery_state
+        miss_count = int(getattr(
+            self, "_za_furadari_dark_in_miss_count", 0)) + 1
+        self._za_furadari_dark_in_miss_count = miss_count
+        if miss_count >= 30:
+            # 入口を外した場合は歩き続けず、退避スポットからやり直す。
+            self._za_furadari_dark_recovery_phase = "ALTERNATE_GOTO"
+            self._za_furadari_dark_map_state = "COMMON_MAP_OPEN"
+            self._za_furadari_dark_in_miss_count = 0
+            self.map_cursor_reset = 0
+            print(
+                "[FURADARI_MAP_DARK_RECOVERY] IN_ICON not found "
+                "after 30 checks -> retry alternate goto")
+        self.wait(0.1)
+        return recovery_state
+
+    # Aがロード前に取りこぼされた場合はIN_ICONが残っている間だけ再送する。
+    if (self.image_check(field_picture)
+            and self.image_check("POKEMON_ZA_IN_ICON")):
+        entry_a_count = int(getattr(
+            self, "_za_furadari_dark_entry_a_count", 0))
+        if entry_a_count < 10:
+            self.pressRep(
+                Button.A, repeat=1, duration=0.15,
+                wait=0.5, interval=0.1)
+            self._za_furadari_dark_entry_a_count = entry_a_count + 1
+        return recovery_state
+    if not self.image_check(field_picture):
+        self.wait(0.1)
+        return recovery_state
+
+    self.press(Direction(Stick.LEFT, 90), duration=1.5, wait=0.1)
+    self._za_furadari_map_recovery_kind = ""
+    self._za_furadari_map_b_count = 0
+    self._za_furadari_map_field_started = False
+    self._za_furadari_dark_recovery_phase = "ALTERNATE_GOTO"
+    self._za_furadari_dark_map_state = "COMMON_MAP_OPEN"
+    self._za_furadari_dark_in_miss_count = 0
+    self._za_furadari_dark_entry_a_count = 0
+    self.inactioncount = 0
+    self.battlecheck = 0
+    self.battle_step_return = 0
+    self.map_cursor_reset = 0
+    print(
+        "[FURADARI_MAP_DARK_RECOVERY] destination FIELD -> "
+        "move 90deg 1.5s; retry last POKEMON_ZA_FURADARI_MAP goto")
+    return "COMMON_MAP_OPEN"
+
+def ZA_Common_furadari_map_battle_recovery(self):
+    recovery_state = "COMMON_FURADARI_MAP_BATTLE_RECOVERY"
+    self.checkIfAlive()
+
+    # 警告／マップ画面では攻撃せず、FIELDが出るまでBを送る。
+    # 1回目はZA_Common_goto_jump側で送信済み。合計30回を上限にする。
+    b_count = int(getattr(self, "_za_furadari_map_b_count", 0))
+    if not getattr(self, "_za_furadari_map_field_started", False):
+        field_picture = "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_0"
+        field_visible = self.image_check(field_picture)
+        while not field_visible and b_count < 30:
+            self.checkIfAlive()
+            self.pressRep(
+                Button.B, repeat=1, duration=0.15,
+                wait=0.1, interval=0.1)
+            b_count += 1
+            self._za_furadari_map_b_count = b_count
+            field_visible = self.image_check(field_picture)
+
+        if not field_visible:
+            if not getattr(
+                    self, "_za_furadari_map_b_limit_logged", False):
+                print(
+                    "[FURADARI_MAP_RECOVERY] "
+                    "FIELD not detected after B x30; "
+                    "wait without input")
+                self._za_furadari_map_b_limit_logged = True
+            self._za_furadari_map_eye_miss_count = 0
+            self.wait(0.1)
+            return recovery_state
+
+        self._za_furadari_map_field_started = True
+        self._za_furadari_map_b_limit_logged = False
+        self._za_furadari_map_eye_seen = False
+        self._za_furadari_map_eye_acquire_count = 0
+        self._za_furadari_map_eye_miss_count = 0
+        print(
+            "[FURADARI_MAP_RECOVERY] "
+            "FIELD restored after B count={} -> "
+            "{}".format(
+                b_count,
+                "run dark-view reset route"
+                if getattr(
+                    self, "_za_furadari_map_recovery_kind", "battle")
+                == "dark" else "rotate, lock on and attack"))
+
+    if getattr(
+            self, "_za_furadari_map_recovery_kind", "battle") == "dark":
+        return self.ZA_Common_furadari_map_dark_recovery()
+
+    # バトル中の選択位置が下へ動いている場合は、攻撃より先に上へ
+    # 戻す。生コマンドで保持入力が解除されるため、視点・ZLより前に
+    # 送り、この周期内でロックオンと保持移動を改めて設定する。
+    if self.image_check("POKEMON_ZA_FIELD_W"):
+        self.etc_sendCommand("Lbutton_up")
+        print(
+            "[FURADARI_MAP_RECOVERY] FIELD_W detected -> Lbutton_up")
+
+    # no_Cplus等の通常戦闘設定に抑止されない専用の視点回転。
+    # 右スティック180度・押し幅0.6をEYE解決まで保持する。
+    if not getattr(self, "_za_furadari_map_view_active", False):
+        if getattr(self, "Rstick_state", 0) == 1:
+            self.holdEnd(Direction(Stick.RIGHT, 180))
+            self.wait(0.1)
+        self.hold(Direction(Stick.RIGHT, 180, 0.6))
+        self.Rstick_state = 1
+        self._za_furadari_map_view_active = True
+    self.ZA_ZL_ACTION("")
+
+    eye_visible = (
+        self.image_check("POKEMON_ZA_EYE_CHECK_HIGH")
+        or self.image_check("POKEMON_ZA_EYE_CHECK"))
+    eye_seen = bool(getattr(
+        self, "_za_furadari_map_eye_seen", False))
+    if eye_visible:
+        eye_seen = True
+        self._za_furadari_map_eye_seen = True
+        self._za_furadari_map_eye_acquire_count = 0
+        self._za_furadari_map_eye_miss_count = 0
+    elif eye_seen:
+        self._za_furadari_map_eye_miss_count = int(getattr(
+            self, "_za_furadari_map_eye_miss_count", 0)) + 1
+    else:
+        self._za_furadari_map_eye_acquire_count = int(getattr(
+            self, "_za_furadari_map_eye_acquire_count", 0)) + 1
+
+    marker_direction = self.ZA_infi_target_marker_direction()
+    if marker_direction:
+        self.hold(marker_direction)
+    try:
+        # 一度見えたEYEが消えた後は追加攻撃せず、連続消失だけを確認する。
+        if ((eye_visible or not eye_seen)
+                and self.ZA_infi_attack_ready()):
+            # C+が表示中の技だけを、ロックオン側へ
+            # 移動を保持したまま順に入力する。Y回避は行わない。
+            for button in (Button.X, Button.A, Button.B):
+                self.pressRep(
+                    button, repeat=1, duration=0.04,
+                    wait=0.0, interval=0.1)
+    finally:
+        if marker_direction:
+            self.holdEnd(marker_direction)
+    self.wait(0.1)
+
+    if eye_visible:
+        return recovery_state
+    if eye_seen:
+        if self._za_furadari_map_eye_miss_count < 3:
+            return recovery_state
+        completion_reason = "eye_cleared"
+    else:
+        # FIELD復帰直後の未検知だけで終了せず、視点回転と攻撃を
+        # 10周期行っても一度もEYEが見えない場合に限り再試行する。
+        if self._za_furadari_map_eye_acquire_count < 10:
+            return recovery_state
+        completion_reason = "eye_not_acquired_after_grace"
+
+    if getattr(self, "_za_furadari_map_view_active", False):
+        self.holdEnd(Direction(Stick.RIGHT, 180))
+        self.Rstick_state = 0
+        self._za_furadari_map_view_active = False
+    self.ZA_ZL_ACTION("END")
+    self._za_furadari_map_b_count = 0
+    self._za_furadari_map_field_started = False
+    self._za_furadari_map_eye_seen = False
+    self._za_furadari_map_eye_acquire_count = 0
+    self._za_furadari_map_eye_miss_count = 0
+    self.inactioncount = 0
+    self.battlecheck = 0
+    self.battle_step_return = 0
+    self.map_cursor_reset = 0
+    print(
+        "[FURADARI_MAP_RECOVERY] {} -> retry goto "
+        "POKEMON_ZA_FURADARI_MAP".format(completion_reason))
+    return "COMMON_MAP_OPEN"
 def ZA_Common_change_time(self):
     
     #マップコメントの捕捉失敗用
@@ -239,14 +616,28 @@ def ZA_Common_event_marker_check(self,othermap="POKEMON_ZA_FALSE_RETURN",markert
     return "COMMON_FALSE_RETURN"
 def ZA_Common_false_return(self,othermap="POKEMON_ZA_FALSE_RETURN"):#dummy
     return "COMMON_FALSE_RETURN"
-def ZA_Common_goto(self,position1,position2left,position2down,movepoint_check=0,check_pic1="POKEMON_ZA_FALSE_RETURN",check_pic2="POKEMON_ZA_FALSE_RETURN",othermap="POKEMON_ZA_FALSE_RETURN"):
+def ZA_Common_goto(
+        self, position1, position2left, position2down,
+        movepoint_check=0,
+        check_pic1="POKEMON_ZA_FALSE_RETURN",
+        check_pic2="POKEMON_ZA_FALSE_RETURN",
+        othermap="POKEMON_ZA_FALSE_RETURN",
+        select1_position0_direct=0,
+        battle_recovery_mode=0):
     #type=0:ポケセンブルーにて実施(バトルゾーンに影響あり)
     if self.Common_current_state == "COMMON_MAP_OPEN":
         self.Common_current_state = self.ZA_Common_map_open(check_pic1=check_pic1,check_pic2=check_pic2,othermap=othermap)
     elif self.Common_current_state == "COMMON_GOTO_SELECT1":
-        self.Common_current_state = self.ZA_Common_goto_select1(position1,othermap=othermap)
+        self.Common_current_state = self.ZA_Common_goto_select1(
+            position1,othermap=othermap,
+            select_position0_direct=select1_position0_direct)
     elif self.Common_current_state == "COMMON_GOTO_SELECT2":
-        self.Common_current_state = self.ZA_Common_goto_select2(position2left,position2down,movepoint_check,othermap=othermap)
+        self.Common_current_state = self.ZA_Common_goto_select2(
+            position2left, position2down, movepoint_check,
+            othermap=othermap,
+            battle_recovery_mode=battle_recovery_mode)
+    elif self.Common_current_state == "COMMON_FURADARI_MAP_BATTLE_RECOVERY":
+        self.Common_current_state = self.ZA_Common_furadari_map_battle_recovery()
     else:
         self.Common_current_state = self.STATE_COMMON_FUNCTION[self.Common_current_state]()
         

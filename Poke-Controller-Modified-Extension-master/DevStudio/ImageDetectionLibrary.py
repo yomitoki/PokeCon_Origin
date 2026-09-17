@@ -11,6 +11,22 @@ import pprint
 SCHEMA_VERSION = 1
 
 
+def normalize_image_operator(value):
+    """Normalize OR/AND or an N-of-variants majority operator."""
+    operator = str(value or "OR").strip().upper()
+    if operator in ("AND", "OR"):
+        return operator
+    prefix = "AT_LEAST_"
+    if operator.startswith(prefix):
+        try:
+            count = int(operator[len(prefix):])
+        except ValueError:
+            count = 0
+        if count >= 1:
+            return prefix + str(count)
+    return "OR"
+
+
 def empty_library():
     return {"schema_version": SCHEMA_VERSION, "targets": {}, "lists": {}}
 
@@ -29,8 +45,7 @@ def load_library(path):
             continue
         result["targets"][str(name)] = {
             "description": str(item.get("description", "")),
-            "operator": str(item.get("operator", "OR")).strip().upper()
-            if str(item.get("operator", "OR")).strip().upper() in ("AND", "OR") else "OR",
+            "operator": normalize_image_operator(item.get("operator", "OR")),
             "tags": [str(tag) for tag in item.get("tags", []) if str(tag).strip()],
             "variants": [dict(variant) for variant in item.get("variants", []) if isinstance(variant, dict)],
         }
@@ -250,6 +265,12 @@ def generate_image_check(data, name, selection_type="list"):
         "    if not results:",
         "        return False",
         "    operator = self.IMAGE_DETECTION_OPERATORS.get(str(targetimage), 'OR')",
+        "    if str(operator).startswith('AT_LEAST_'):",
+        "        try:",
+        "            minimum_matches = int(str(operator).rsplit('_', 1)[1])",
+        "        except (TypeError, ValueError):",
+        "            minimum_matches = len(results) + 1",
+        "        return sum(bool(value) for value in results) >= minimum_matches",
         "    return all(results) if operator == 'AND' else any(results)",
         "",
         "def image_check(self, targetimage, nocheckflag=1):",

@@ -60,8 +60,10 @@ def _class_literal(command, name, default=None):
 
 def _description_map(command):
     result = {}
-    for name in ("COMMAND_STEP_DESCRIPTIONS", "STEP_DESCRIPTIONS",
-                 "RUN_LOCATION_DESCRIPTIONS"):
+    # The canonical DevStudio map is read last so it can intentionally
+    # override an older alias that remains in a hand-written command.
+    for name in ("STEP_DESCRIPTIONS", "RUN_LOCATION_DESCRIPTIONS",
+                 "COMMAND_STEP_DESCRIPTIONS"):
         value = _class_literal(command, name, {})
         if isinstance(value, dict):
             result.update({str(key): str(description)
@@ -69,7 +71,18 @@ def _description_map(command):
     return result
 
 
-def _state_locations(command, descriptions):
+def _label_map(command):
+    result = {}
+    for name in ("STEP_DISPLAY_NAMES", "RUN_LOCATION_LABELS",
+                 "COMMAND_STEP_LABELS"):
+        value = _class_literal(command, name, {})
+        if isinstance(value, dict):
+            result.update({str(key): str(label)
+                           for key, label in value.items()})
+    return result
+
+
+def _state_locations(command, labels, descriptions):
     methods = {node.name: node for node in command.body
                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
     result = []
@@ -94,14 +107,14 @@ def _state_locations(command, descriptions):
             result.append({
                 "id": "state:{}:{}".format(name, state),
                 "kind": "state", "mode": "state", "variable": name,
-                "value": state, "label": state,
+                "value": state, "label": labels.get(state, state),
                 "description": description,
                 "group": name, "order": order,
             })
     return result
 
 
-def _step_locations(command, descriptions):
+def _step_locations(command, display_names, descriptions):
     labels = _class_literal(command, "STEP_LABELS", [])
     keys = _class_literal(command, "STEP_KEYS", [])
     if not isinstance(labels, (list, tuple)):
@@ -110,13 +123,16 @@ def _step_locations(command, descriptions):
     for index, label in enumerate(labels):
         key = (keys[index] if isinstance(keys, (list, tuple)) and
                index < len(keys) and keys[index] not in (None, "") else index)
-        display = str(label)
+        source_label = str(label)
+        display = display_names.get(
+            str(key), display_names.get(source_label, source_label))
         result.append({
             "id": "step:{}".format(index), "kind": "step",
             "mode": "attribute", "variable": "step", "value": index,
             "label": display,
             "description": descriptions.get(str(key),
-                                                descriptions.get(display, "")),
+                descriptions.get(source_label,
+                                 descriptions.get(display, ""))),
             "group": "STEP_LABELS", "order": index,
         })
     return result
@@ -229,16 +245,18 @@ def discover_command_run_options(source, class_name=""):
 
     add_bases(command)
     descriptions = {}
+    labels = {}
     for node in chain:
         descriptions.update(_description_map(node))
+        labels.update(_label_map(node))
     locations = []
     for node in reversed(chain):
         locations.extend(_explicit_locations(node))
     if not locations:
         for node in chain:
-            locations.extend(_step_locations(node, descriptions))
+            locations.extend(_step_locations(node, labels, descriptions))
             locations.extend(_numbered_route_locations(node))
-            locations.extend(_state_locations(node, descriptions))
+            locations.extend(_state_locations(node, labels, descriptions))
     seen, unique = set(), []
     for row in locations:
         key = (row.get("mode"), row.get("variable"), row.get("value"))

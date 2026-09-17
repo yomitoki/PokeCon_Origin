@@ -39,6 +39,12 @@ def _image_check_target(self, targetimage):
     if not results:
         return False
     operator = self.IMAGE_DETECTION_OPERATORS.get(str(targetimage), 'OR')
+    if str(operator).startswith('AT_LEAST_'):
+        try:
+            minimum_matches = int(str(operator).rsplit('_', 1)[1])
+        except (TypeError, ValueError):
+            minimum_matches = len(results) + 1
+        return sum(bool(value) for value in results) >= minimum_matches
     return all(results) if operator == 'AND' else any(results)
 
 

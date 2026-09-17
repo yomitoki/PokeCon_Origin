@@ -151,8 +151,10 @@ def inspect_variant(name, index, variant, template_root, frame_size=(1280, 720))
     path = resolve_template_path(raw_path, template_root)
     metadata = None
     image_size = None
+    source_image_size = None
     crop_size = None
     crop = variant.get("crop", [0, 0, 0, 0])
+    template_crop = variant.get("template_crop", [0, 0, 0, 0])
     repairable = False
 
     if not raw_path:
@@ -172,6 +174,7 @@ def inspect_variant(name, index, variant, template_root, frame_size=(1280, 720))
         else:
             image_width, image_height, channels, has_alpha, _format = metadata
             image_size = (image_width, image_height)
+            source_image_size = image_size
             if image_width < 2 or image_height < 2:
                 errors.append("テンプレート画像が小さすぎます: {}x{}".format(image_width, image_height))
                 codes.append("tiny_image")
@@ -201,6 +204,27 @@ def inspect_variant(name, index, variant, template_root, frame_size=(1280, 720))
                     warnings.append(message)
                     codes.append(warning_code)
                     fixes.append(fix)
+
+    if image_size:
+        try:
+            template_crop = _crop_values(template_crop)
+            if min(template_crop) < 0:
+                raise ValueError("画像内範囲に負数があります。")
+            if any(template_crop):
+                tx1, ty1, tx2, ty2 = template_crop
+                if tx2 <= tx1 or ty2 <= ty1:
+                    raise ValueError(
+                        "画像内範囲の終点は開始点より右下にしてください。")
+                if tx2 > image_size[0] or ty2 > image_size[1]:
+                    raise ValueError(
+                        "画像内範囲がテンプレート画像の外へ出ています。")
+                image_size = (tx2 - tx1, ty2 - ty1)
+        except ValueError as error:
+            errors.append(str(error))
+            codes.append("invalid_template_crop")
+            fixes.append(
+                "画像内範囲をテンプレート画像内の"
+                "x1,y1,x2,y2で指定し直してください。")
 
     try:
         threshold = float(variant.get("threshold", 0.8))
@@ -252,7 +276,8 @@ def inspect_variant(name, index, variant, template_root, frame_size=(1280, 720))
         name, index, status, codes,
         details[0] if details else "画像と検知設定に問題は見つかりませんでした。",
         details, list(dict.fromkeys(fixes)), path=path, raw_path=raw_path,
-        image_size=image_size, crop=crop, crop_size=crop_size,
+        image_size=image_size, source_image_size=source_image_size,
+        crop=crop, template_crop=template_crop, crop_size=crop_size,
         frame_size=(frame_width, frame_height), repairable=repairable,
         warning_codes=warning_codes,
         ignored_warning_codes=ignored_warning_codes,

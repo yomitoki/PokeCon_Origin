@@ -80,6 +80,20 @@ def _worker_accepts_jobs(queue_dir):
                 process_is_alive(worker.get("pid", 0)))
 
 
+def active_recording_finalize_worker_pid(queue_dir=None):
+    """Return the live MP4 batch-window PID, or ``None`` when it is closed."""
+    queue_dir = os.path.abspath(
+        queue_dir or recording_finalize_queue_dir())
+    worker = _read_worker_registry(queue_dir)
+    if not bool(worker.get("accepting", True)):
+        return None
+    try:
+        pid = int(worker.get("pid", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    return pid if process_is_alive(pid) else None
+
+
 def _acquire_worker_start(queue_dir):
     marker = os.path.join(queue_dir, FINALIZE_WORKER_STARTING)
     for attempt in range(2):
@@ -161,8 +175,7 @@ def launch_recording_finalize_worker(
             options["creationflags"] = (
                 getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
                 | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
-                | getattr(
-                    subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
+                | getattr(subprocess, "IDLE_PRIORITY_CLASS", 0x00000040)
             )
         process = (popen or subprocess.Popen)(command, **options)
         process_started = True

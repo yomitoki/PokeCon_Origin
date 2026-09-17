@@ -19,6 +19,16 @@ DEFAULT_ROOT = r"D:\SSR_pic"
 ZERO_DEFECT_THRESHOLD = 0.01
 
 
+def _hidden_subprocess_options():
+    """Keep FFmpeg helpers from opening a foreground CMD on Windows."""
+    if os.name != "nt":
+        return {}
+    return {
+        "creationflags": getattr(
+            subprocess, "CREATE_NO_WINDOW", 0x08000000),
+    }
+
+
 def ffmpeg_executable():
     executable = shutil.which("ffmpeg")
     if executable:
@@ -384,7 +394,8 @@ def write_presentation_aligned_audio(source_path, timing_path,
         ]
         completed = subprocess.run(
             command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace")
+            text=True, encoding="utf-8", errors="replace",
+            **_hidden_subprocess_options())
         candidate_frames = 0
         if completed.returncode == 0 and os.path.isfile(destination_path):
             try:
@@ -466,7 +477,8 @@ def media_duration(ffmpeg, path):
     completed = subprocess.run(
         [ffmpeg, "-hide_banner", "-i", path],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-        text=True, encoding="utf-8", errors="replace")
+        text=True, encoding="utf-8", errors="replace",
+        **_hidden_subprocess_options())
     match = re.search(
         r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", completed.stderr)
     if not match:
@@ -516,7 +528,7 @@ def create_audio_advance_variants(source_mp4, offsets_ms):
         print(
             "[録画再同期] 音声を{}ms前進: {}".format(
                 milliseconds, output_mp4), flush=True)
-        completed = subprocess.run(command)
+        completed = subprocess.run(command, **_hidden_subprocess_options())
         if completed.returncode != 0 or not os.path.isfile(output_mp4):
             raise RuntimeError(
                 "{}ms比較版の作成に失敗しました。".format(milliseconds))
@@ -605,7 +617,7 @@ def rebuild_presentation_clock_session(session_dir):
     print(
         "[録画再同期] 提示時計ドリフトを区間補正（固定offsetなし）: "
         + output_mp4, flush=True)
-    completed = subprocess.run(command)
+    completed = subprocess.run(command, **_hidden_subprocess_options())
     if completed.returncode != 0 or not os.path.isfile(output_mp4):
         report["status"] = "failed"
         report["ffmpeg_returncode"] = int(completed.returncode)
@@ -717,7 +729,7 @@ def repair_session(session_dir, repair_synthetic_silence=True,
                 source_audio["exact_zero_seconds"],
                 source_audio["exact_zero_fraction"] * 100.0), flush=True)
     print("[録画再同期] MP4を作成中: " + output_mp4, flush=True)
-    completed = subprocess.run(command)
+    completed = subprocess.run(command, **_hidden_subprocess_options())
     if completed.returncode != 0 or not os.path.isfile(output_mp4):
         report["status"] = "failed"
         report["ffmpeg_returncode"] = int(completed.returncode)

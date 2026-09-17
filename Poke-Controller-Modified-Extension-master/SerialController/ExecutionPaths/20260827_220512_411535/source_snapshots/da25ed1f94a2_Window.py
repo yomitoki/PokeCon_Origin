@@ -145,7 +145,6 @@ from UiResponsiveness import (dialog_owner_attachment_allowed,
                               foreground_process_matches,
                               confirmation_audio_action,
                               keyboard_listener_should_run,
-                              preview_fps_status,
                               preview_rate_permissions)
 from VideoInputPolicy import (guard_combobox_mousewheel,
                               is_pokecon_window_title)
@@ -364,10 +363,7 @@ class PokeControllerApp:
         self._mp4_finalize_foreground = False
         self._newest_pokecon_instance = True
         self._other_main_preview_owner = False
-        self._last_preview_mode_status_value = None
-        self._last_preview_fps_header_status_value = None
-        self._last_preview_fps_header_update_at = 0.0
-        self._last_preview_fps_warning_value = None
+        self._last_active_preview_status_value = None
         self._preview_shutdown_mode = False
         self._last_focus_mark_monotonic = 0.0
         self._windows_foreground_active = False
@@ -385,9 +381,8 @@ class PokeControllerApp:
             "enabled": True, "target_percent": 90, "main_requested": False,
         }
         self.last_active_preview_full_fps = tk.BooleanVar(value=False)
-        self.preview_mode_status = tk.StringVar(value="表示状態を確認中")
-        self.preview_fps_header_status = tk.StringVar(
-            value="FPS 入力測定中 / 表示測定中")
+        self.last_active_preview_status = tk.StringVar(
+            value="メインツールは設定FPS、通常ツールは最大30fpsで表示")
         Command.app_name = f"{Constant.NAME} ver.{Constant.VERSION}"
         Command.profilename = profile
 
@@ -397,11 +392,7 @@ class PokeControllerApp:
         # build ui
         self.main_frame = ttk.Frame(master)
         self.camera_lf = ttk.Labelframe(self.main_frame)
-        # The feature-limited Switch2 UI hides only the command buttons.  FPS
-        # diagnostics live in the sibling row so they remain visible above the
-        # native preview when ``top_command_f`` is grid-removed.
-        self.main_panel_header_f = ttk.Frame(self.camera_lf)
-        self.top_command_f = ttk.Frame(self.main_panel_header_f)
+        self.top_command_f = ttk.Frame(self.camera_lf)
         self.start_top_button = ttk.Button(self.top_command_f)
         self.start_top_button.configure(text="Start")
         self.start_top_button.grid(column="0", padx="5", pady="5", row="0", sticky="ew")
@@ -442,23 +433,14 @@ class PokeControllerApp:
             command=self._resource_main_changed)
         self.keep_preview_fps_checkbox.grid(
             column="7", padx="8", pady="5", row="0", sticky="ew")
-        self.preview_status_f = ttk.Frame(self.main_panel_header_f)
-        self.preview_status_f.grid(
+        self.preview_fps_live_label = ttk.Label(
+            self.top_command_f, textvariable=self.last_active_preview_status,
+            foreground="#174a7e", anchor="w")
+        self.preview_fps_live_label.grid(
             column="0", columnspan="8", padx="5", pady=(0, 3),
             row="1", sticky="ew")
-        self.preview_mode_live_label = ttk.Label(
-            self.preview_status_f, textvariable=self.preview_mode_status,
-            foreground="#174a7e", anchor="w", width=43)
-        self.preview_mode_live_label.pack(side="left")
-        self.preview_fps_live_label = ttk.Label(
-            self.preview_status_f, textvariable=self.preview_fps_header_status,
-            foreground="#174a7e", anchor="e", width=75)
-        self.preview_fps_live_label.pack(side="right", padx=(15, 0))
-        self.top_command_f.grid(
-            column="0", columnspan="8", row="0", sticky="ew")
+        self.top_command_f.grid(column="0", row="0", sticky="w")
         self.top_command_f.grid_anchor("center")
-        self.main_panel_header_f.grid(
-            column="0", columnspan="7", row="0", sticky="ew")
         self.canvas_frame = ttk.Frame(self.camera_lf)
         self.canvas_frame.configure(height="360", relief="groove", width="640")
         self.canvas_frame.grid(column="0", columnspan="7", row="1")
@@ -561,6 +543,10 @@ class PokeControllerApp:
             variable=self.last_active_preview_full_fps,
             command=self._resource_main_changed).grid(
                 column=0, columnspan=6, row=4, padx=5, pady=(0, 5), sticky="w")
+        ttk.Label(
+            self.camera_settings_lf, textvariable=self.last_active_preview_status,
+            foreground="#174a7e", anchor="w").grid(
+                column=6, columnspan=4, row=4, padx=5, pady=(0, 5), sticky="w")
         self.camera_settings_lf.configure(text="Settings", width="420")
         self.camera_settings_lf.grid(column="0", padx="5", row="0", sticky="nw")
         self.display_settings_lf = ttk.Labelframe(self.camera_f)
@@ -1665,7 +1651,6 @@ class PokeControllerApp:
         self.execution_path_lf = ttk.Labelframe(
             self.execution_path_f, text="実行中Commandsの現在位置／10秒経路記録")
         execution_path_actions = ttk.Frame(self.execution_path_lf)
-        self.execution_path_source_only = tk.BooleanVar(value=False)
         ttk.Button(
             execution_path_actions, text="現在位置を取得",
             command=self.capture_execution_path_snapshot).pack(side="left", padx=(0, 5))
@@ -1684,11 +1669,6 @@ class PokeControllerApp:
         ttk.Button(
             execution_path_actions, text="履歴を消去",
             command=self.clear_execution_path_snapshots).pack(side="left")
-        ttk.Checkbutton(
-            execution_path_actions, text="Commandsソース内のみ",
-            variable=self.execution_path_source_only,
-            command=self.refresh_execution_path_snapshots).pack(
-                side="left", padx=(10, 0))
         execution_path_actions.pack(fill="x", padx=5, pady=(5, 2))
         self.execution_path_command = tk.StringVar(value="実行Commands: 停止中")
         self.execution_path_step = tk.StringVar(value="Step: 未取得")
@@ -1704,7 +1684,6 @@ class PokeControllerApp:
         self._execution_path_trace_last_status = 0.0
         self._execution_path_last_session = ""
         self._execution_path_stop_reason = ""
-        self._execution_path_snapshot_history = []
         ttk.Label(
             self.execution_path_lf, textvariable=self.execution_path_command,
             anchor="w").pack(fill="x", padx=5, pady=1)
@@ -8820,73 +8799,10 @@ class PokeControllerApp:
         tree = getattr(self, "execution_path_tree", None)
         if tree is None:
             return
-        self._execution_path_snapshot_history = []
         for item in tree.get_children(""):
             tree.delete(item)
         self.execution_path_status.set(
             "履歴を消去しました。［現在位置を取得］で新しい位置を取得できます。")
-
-    @staticmethod
-    def _execution_path_same_source(frame, source_file):
-        frame_file = str(frame.get("file", "") or "") \
-            if isinstance(frame, dict) else ""
-        source_file = str(source_file or "")
-        if not frame_file or not source_file:
-            return False
-        try:
-            return os.path.normcase(os.path.abspath(frame_file)) == \
-                os.path.normcase(os.path.abspath(source_file))
-        except (OSError, ValueError):
-            return False
-
-    def refresh_execution_path_snapshots(self):
-        """Rebuild snapshot rows without discarding the captured full stack."""
-        tree = getattr(self, "execution_path_tree", None)
-        if tree is None:
-            return
-        for item in tree.get_children(""):
-            tree.delete(item)
-        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        source_only = bool(self.execution_path_source_only.get())
-        for snapshot in self._execution_path_snapshot_history:
-            root_item = tree.insert(
-                "", "end",
-                text="{}  {}".format(snapshot["captured"], snapshot["step_path"]),
-                values=(snapshot["command_name"], "", ""), open=True)
-            indexed_stack = list(enumerate(snapshot["stack"]))
-            source_file = snapshot.get("source_file", "")
-            snapshot_source_only = source_only and bool(source_file)
-            if snapshot_source_only:
-                indexed_stack = [
-                    (depth, frame) for depth, frame in indexed_stack
-                    if self._execution_path_same_source(frame, source_file)]
-            if not indexed_stack:
-                tree.insert(
-                    root_item, "end", text="Commandsソース内の位置なし",
-                    values=("", "", ""))
-                continue
-            for visible_index, (depth, frame) in enumerate(indexed_stack):
-                frame_file = os.path.abspath(str(frame.get("file", "") or ""))
-                try:
-                    display_file = os.path.relpath(frame_file, project_root)
-                except (OSError, ValueError):
-                    display_file = frame_file
-                line = int(frame.get("line", 0) or 0)
-                if snapshot_source_only:
-                    row_label = "Commandsソース"
-                else:
-                    row_label = "現在" if depth == 0 else "呼出元 {}".format(depth)
-                tree.insert(
-                    root_item, "end", text=row_label,
-                    values=(
-                        str(frame.get("function", "")),
-                        "{} : {}".format(display_file, line),
-                        str(frame.get("source", ""))),
-                    tags=("current",) if visible_index == 0 else ())
-        self.execution_path_status.set(
-            "Commandsソース内の位置だけを表示しています。"
-            if source_only else
-            "共通基盤を含む取得済みの全位置を表示しています。")
 
     def capture_execution_path_snapshot(self):
         """Sample the Commands worker once; never install continuous tracing."""
@@ -8905,24 +8821,32 @@ class PokeControllerApp:
         location = snapshot.get("location") or {}
         stack = list(location.get("stack") or ([] if not location else [location]))
         captured = datetime.datetime.now().strftime("%H:%M:%S.%f")[:-3]
-        descriptor = command_source_descriptor(command)
-        source_file = str(descriptor.get("file", "") or "") \
-            if isinstance(descriptor, dict) else ""
-        self._execution_path_snapshot_history.insert(0, {
-            "captured": captured,
-            "step_path": step_path,
-            "command_name": command_name,
-            "source_file": source_file,
-            "stack": stack,
-        })
-        del self._execution_path_snapshot_history[30:]
-        self.refresh_execution_path_snapshots()
+        root_item = self.execution_path_tree.insert(
+            "", 0, text="{}  {}".format(captured, step_path),
+            values=(command_name, "", ""), open=True)
+        for depth, frame in enumerate(stack):
+            source_file = os.path.abspath(str(frame.get("file", "") or ""))
+            try:
+                display_file = os.path.relpath(source_file, project_root)
+            except (OSError, ValueError):
+                display_file = source_file
+            line = int(frame.get("line", 0) or 0)
+            self.execution_path_tree.insert(
+                root_item, "end", text="現在" if depth == 0 else "呼出元 {}".format(depth),
+                values=(
+                    str(frame.get("function", "")),
+                    "{} : {}".format(display_file, line),
+                    str(frame.get("source", ""))),
+                tags=("current",) if depth == 0 else ())
+        roots = self.execution_path_tree.get_children("")
+        for old_item in roots[30:]:
+            self.execution_path_tree.delete(old_item)
         if stack:
             current = stack[0]
             self.execution_path_status.set(
                 "取得完了: {}（{}行） / 履歴 {}件".format(
                     current.get("function", ""), current.get("line", 0),
-                    len(self._execution_path_snapshot_history)))
+                    min(30, len(roots))))
         else:
             self.execution_path_status.set(
                 "Commandsは実行中ですが、プロジェクト内の実行位置を取得できませんでした。")
@@ -9080,8 +9004,6 @@ class PokeControllerApp:
                 "source": source,
                 "source_snapshots": dict(trace.get("source_snapshots", {})),
                 "states": states,
-                "source_only_default": bool(
-                    self.execution_path_source_only.get()),
                 "collection_mode": "python_line_events",
                 "duration_limit_seconds": 10.0,
                 "event_count": len(events),
@@ -10008,18 +9930,12 @@ class PokeControllerApp:
             owners.append("{} / PID {}".format(label, entry.get("pid", "?")))
         return "、".join(owners)
 
-    def _confirm_shared_device(self, kind, key, label, parent=None,
-                               prompt=True):
+    def _confirm_shared_device(self, kind, key, label, parent=None):
         if key in self._confirmed_shared_device_keys:
             return True
         conflicts = self._device_conflicts(kind, key)
         if not conflicts:
             return True
-        # Automatic background work must never open a modal confirmation.  A
-        # dialog owned by a non-active PokeCon can remain hidden behind the
-        # active window and hold its Tk callback indefinitely.
-        if not prompt:
-            return False
         names = {"camera": "Camera", "serial": "Serial", "audio": "Audio"}
         device_name = names.get(kind, kind)
         owner = parent or self.root
@@ -10203,41 +10119,20 @@ class PokeControllerApp:
                 limit = min(5, requested)
             status = "{}：{}fps（録画fpsには影響なし）".format(label, limit)
         else:
-            limit = min(5, requested)
             status = "省負荷表示：5fps（録画fpsには影響なし）"
-        if status != self._last_preview_mode_status_value:
-            self._last_preview_mode_status_value = status
-            self.preview_mode_status.set(status)
-
-        now = time.monotonic()
-        if self._last_preview_fps_header_status_value is not None \
-                and now - self._last_preview_fps_header_update_at < 1.0:
-            return
-        self._last_preview_fps_header_update_at = now
         camera = getattr(self, "camera", None)
         preview = getattr(self, "preview", None)
         input_fps = camera.measuredFps() \
             if camera is not None and hasattr(camera, "measuredFps") else 0.0
         display_fps = preview.measuredPreviewFps() \
             if preview is not None and hasattr(preview, "measuredPreviewFps") else 0.0
-        pacing = preview.measuredPreviewPacing() \
-            if preview is not None and hasattr(preview, "measuredPreviewPacing") \
-            else {}
-        fps_status, warning = preview_fps_status(
-            requested, limit, input_fps, display_fps,
-            pacing.get("p95_gap_ms", 0.0),
-            pacing.get("sample_count", 0),
-            pacing.get("max_gap_ms", 0.0))
-        if fps_status != self._last_preview_fps_header_status_value:
-            self._last_preview_fps_header_status_value = fps_status
-            self.preview_fps_header_status.set(fps_status)
-        if warning != self._last_preview_fps_warning_value:
-            self._last_preview_fps_warning_value = warning
-            try:
-                self.preview_fps_live_label.configure(
-                    foreground="#b42318" if warning else "#174a7e")
-            except (AttributeError, tk.TclError):
-                pass
+        measured = "入力{} / 表示{}fps".format(
+            "{:.1f}".format(input_fps) if input_fps > 0.0 else "測定中",
+            "{:.1f}".format(display_fps) if display_fps > 0.0 else "測定中")
+        status = status + " / " + measured
+        if status != self._last_active_preview_status_value:
+            self._last_active_preview_status_value = status
+            self.last_active_preview_status.set(status)
 
     def createControllerWindow(self):
         if self.controller is not None:
@@ -11249,26 +11144,6 @@ class PokeControllerApp:
         self.pause_button["text"] = "Pause"
         self.pause_button["command"] = self.pausePlay
 
-    def _set_command_running_ui(self):
-        """Expose Stop before optional recording setup can delay Start."""
-        self.start_button.configure(
-            state="normal", text="Stop", command=self.stopPlay)
-        self.start_top_button.configure(
-            state="normal", text="Stop", command=self.stopPlay)
-        self.reload_command_button["state"] = "disabled"
-        for number in range(1, 11):
-            getattr(self, "shortcut_button_{}".format(number))[
-                "state"] = "disabled"
-        self.pause_button["state"] = "normal"
-        self.force_stop_button["state"] = "normal"
-        # Paint the new label without dispatching nested button callbacks.
-        # The current Start callback returns immediately after the remaining
-        # short setup, at which point a queued Stop click is handled normally.
-        try:
-            self.root.update_idletasks()
-        except tk.TclError:
-            pass
-
     def startPlay(self, *event):
         if not self._commands_loaded:
             self.show_output("Analysis", text="Commandsをバックグラウンドで読み込み中です。")
@@ -11292,11 +11167,28 @@ class PokeControllerApp:
         if not self._install_function_replacement_mappings(self.cur_command):
             return
         self._install_step_debug_wrappers(self.cur_command)
-        self._set_command_running_ui()
         self._suspend_pc_gamepad_for_command()
         self._auto_arm_command_monitor_recording()
         self.cur_command.start(self.ser, lambda: self.stopPlayPost(started_command))
         self._start_command_start_monitor(self.cur_command)
+
+        self.start_button["text"] = "Stop"
+        self.start_top_button["text"] = "Stop"
+        self.start_button["command"] = self.stopPlay
+        self.start_top_button["command"] = self.stopPlay
+        self.reload_command_button["state"] = "disabled"
+        self.shortcut_button_1["state"] = "disabled"
+        self.shortcut_button_2["state"] = "disabled"
+        self.shortcut_button_3["state"] = "disabled"
+        self.shortcut_button_4["state"] = "disabled"
+        self.shortcut_button_5["state"] = "disabled"
+        self.shortcut_button_6["state"] = "disabled"
+        self.shortcut_button_7["state"] = "disabled"
+        self.shortcut_button_8["state"] = "disabled"
+        self.shortcut_button_9["state"] = "disabled"
+        self.shortcut_button_10["state"] = "disabled"
+        self.pause_button["state"] = "normal"
+        self.force_stop_button["state"] = "normal"
 
     def startShortcutPlay(self, *event, num=0):
         if not self._commands_loaded:
@@ -11321,11 +11213,30 @@ class PokeControllerApp:
             if not self._install_function_replacement_mappings(self.cur_command):
                 return
             self._install_step_debug_wrappers(self.cur_command)
-            self._set_command_running_ui()
             self._suspend_pc_gamepad_for_command()
             self._auto_arm_command_monitor_recording()
             self.cur_command.start(self.ser, lambda: self.stopPlayPost(started_command))
             self._start_command_start_monitor(self.cur_command)
+
+            self.start_button["text"] = "Stop"
+            self.start_top_button["text"] = "Stop"
+            self.start_button["command"] = self.stopPlay
+            self.start_top_button["command"] = self.stopPlay
+            self.start_button["state"] = "normal"
+            self.start_top_button["state"] = "normal"
+            self.reload_command_button["state"] = "disabled"
+            self.shortcut_button_1["state"] = "disabled"
+            self.shortcut_button_2["state"] = "disabled"
+            self.shortcut_button_3["state"] = "disabled"
+            self.shortcut_button_4["state"] = "disabled"
+            self.shortcut_button_5["state"] = "disabled"
+            self.shortcut_button_6["state"] = "disabled"
+            self.shortcut_button_7["state"] = "disabled"
+            self.shortcut_button_8["state"] = "disabled"
+            self.shortcut_button_9["state"] = "disabled"
+            self.shortcut_button_10["state"] = "disabled"
+            self.pause_button["state"] = "normal"
+            self.force_stop_button["state"] = "normal"
         else:
             pass
 
@@ -15012,11 +14923,10 @@ class PokeControllerApp:
         else:
             self.audio_input.set("")
 
-    def _confirm_selected_audio_for_use(self, show_popup=True):
+    def _confirm_selected_audio_for_use(self):
         selected = self._selected_audio_device_name()
         return (not selected or self._confirm_shared_device(
-            "audio", canonical_device_key("audio", selected), selected,
-            prompt=show_popup))
+            "audio", canonical_device_key("audio", selected), selected))
 
     def _audio_output_stream_active(self):
         stream = getattr(self.audio_monitor, "output_stream", None)
@@ -16745,10 +16655,8 @@ class PokeControllerApp:
             self.record_monitor_status.set("開始できません：カメラ映像がありません。")
             return False
         if not self._recording_disk_space_ok(show_popup=show_popup, force=True):
-            self.record_monitor_status.set(
-                "開始できません：録画保存先の容量制限です。")
             return False
-        if not self._confirm_selected_audio_for_use(show_popup=show_popup):
+        if not self._confirm_selected_audio_for_use():
             self.record_monitor_status.set("使用中のAudioを反映しなかったため監視を開始していません。")
             return False
         self.record_armed = True
@@ -16780,12 +16688,7 @@ class PokeControllerApp:
             self.record_mode.set("CommandMonitor")
             self._select_recording_mode_page()
         if not self.record_armed:
-            # Commands Start is also used on non-active PokeCons.  A modal
-            # disk/audio warning here can be hidden behind another window and
-            # prevent both the command worker and Stop button from becoming
-            # usable.  Report the failure in the Recording/Analysis status and
-            # continue Commands without monitoring instead.
-            if not self._arm_command_monitor_recording(show_popup=False):
+            if not self._arm_command_monitor_recording(show_popup=True):
                 self.show_output(
                     "Analysis", text="Commands監視録画を自動開始できませんでした。Commandsは継続します。")
         if (self.record_armed
@@ -17224,18 +17127,6 @@ class PokeControllerApp:
             self.record_monitor_status.set(message)
             self.show_output("Analysis", text=message)
             return False
-        # The completed file is no longer held by the recorder.  Re-evaluate
-        # retention here so an unchanged Step can release its middle chunks
-        # immediately instead of waiting for another state transition/frame
-        # maintenance pass.
-        prune = getattr(self, "_mark_command_monitor_prune_candidates", None)
-        if callable(prune):
-            try:
-                prune(time.monotonic())
-            except Exception as prune_error:
-                self._logger.warning(
-                    "Command monitor post-finalize cleanup failed: %s",
-                    prune_error)
         command = getattr(self, "cur_command", None)
         if (restart and frame is not None and self.record_armed
                 and command is self._command_monitor_command

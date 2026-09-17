@@ -135,6 +135,73 @@ def resize_safe_preview_intervals(capture_interval, render_interval,
     return capture_interval, max(render_interval, 1.0 / 15.0)
 
 
+def preview_fps_status(requested_fps, display_target_fps,
+                       input_fps=0.0, display_fps=0.0,
+                       p95_gap_ms=0.0, pacing_samples=0,
+                       max_gap_ms=0.0):
+    """Format fixed-header FPS diagnostics and flag visible instability.
+
+    A frame counter alone can still look healthy when draws arrive in bursts.
+    The 95th-percentile draw interval therefore accompanies the input/display
+    rates whenever enough recent samples are available.
+    """
+    try:
+        requested = max(1, int(requested_fps))
+    except (TypeError, ValueError):
+        requested = 30
+    try:
+        display_target = max(1, int(display_target_fps))
+    except (TypeError, ValueError):
+        display_target = min(30, requested)
+
+    def measured_text(value):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            value = 0.0
+        return "{:.1f}".format(value) if value > 0.0 else "測定中"
+
+    try:
+        input_value = max(0.0, float(input_fps))
+    except (TypeError, ValueError):
+        input_value = 0.0
+    try:
+        display_value = max(0.0, float(display_fps))
+    except (TypeError, ValueError):
+        display_value = 0.0
+    try:
+        gap_value = max(0.0, float(p95_gap_ms))
+        max_gap_value = max(gap_value, float(max_gap_ms))
+        sample_count = max(0, int(pacing_samples))
+    except (TypeError, ValueError):
+        gap_value, max_gap_value, sample_count = 0.0, 0.0, 0
+
+    text = "FPS 入力{} / 表示{}（目標{}）".format(
+        measured_text(input_value), measured_text(display_value),
+        display_target)
+    if sample_count >= 5 and gap_value > 0.0:
+        text += " / 描画間隔95% {:.0f}ms・最大{:.0f}ms".format(
+            gap_value, max_gap_value)
+
+    input_low = input_value > 0.0 and input_value < requested * 0.90
+    display_low = display_value > 0.0 \
+        and display_value < display_target * 0.90
+    pacing_unstable = sample_count >= 5 and gap_value > 0.0 \
+        and (gap_value > (1000.0 / display_target) * 1.80
+             or max_gap_value > (1000.0 / display_target) * 4.0)
+    if input_low and (display_low or pacing_unstable):
+        warning = "入力低下・表示不安定"
+    elif input_low:
+        warning = "入力低下"
+    elif display_low or pacing_unstable:
+        warning = "表示不安定"
+    else:
+        warning = ""
+    if warning:
+        text += " / ⚠{}".format(warning)
+    return text, warning
+
+
 def keyboard_listener_should_run(enabled=False, input_owner=False):
     """Run global keyboard input only in the retained active PokeCon."""
     return bool(enabled and input_owner)

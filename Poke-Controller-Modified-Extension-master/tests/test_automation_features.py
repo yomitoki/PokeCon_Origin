@@ -1,5 +1,6 @@
 import datetime
 import ast
+import copy
 import inspect
 import math
 import os
@@ -17,8 +18,17 @@ import wave
 import cv2
 import numpy
 from PIL import Image
-from collections import namedtuple
+from collections import deque, namedtuple
 from unittest import mock
+
+
+def normalized_function_ast_dump(function_node):
+    """Compare class and top-level sample functions without docstring indent."""
+    normalized = copy.deepcopy(function_node)
+    docstring = ast.get_docstring(normalized, clean=True)
+    if docstring is not None:
+        normalized.body[0].value.value = docstring
+    return ast.dump(normalized, include_attributes=False)
 
 
 SERIAL_CONTROLLER = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "SerialController"))
@@ -90,6 +100,8 @@ from SourceDependencyTools import (analyze_source_dependencies,
                                    suggest_state_dictionary)
 from SampleLibrary import compose_preview, save_library
 from PokeConDevStudio import find_match_index, pack_scrollable_widget
+from CommandBuilder import template_source
+from StepMetadata import read_step_metadata, update_step_metadata
 from SampleOriginSync import (apply_sample_list_to_origins,
                               compare_sample_list_origins,
                               restore_origin_sync_backup)
@@ -106,6 +118,9 @@ from InputSetData import (INPUT_SET_VARIABLES, SCHEMA_VERSION,
                           sync_quick_actions,
                           sync_step_debug_rules)
 from SoftwareControllerState import SoftwareControllerState
+from SwitchUpdatePrompt import (START_WITHOUT_UPDATE,
+                                UPDATE_SELECTED,
+                                detect_switch_update_prompt_selection)
 from InputSetRuntimeRegistry import (ActiveInputSetRegistry,
                                      canonical_device_key,
                                      default_window_activity_registry_path,
@@ -116,7 +131,8 @@ from InputSetRuntimeRegistry import (ActiveInputSetRegistry,
 from PokeConRecovery import (PokeConRecoveryError, discover_running_pokecon,
                              force_terminate, request_normal_close,
                              validate_recovery_target)
-from ProcessShutdown import (launch_recording_finalize_worker,
+from ProcessShutdown import (active_recording_finalize_worker_pid,
+                             launch_recording_finalize_worker,
                              terminate_after_gui_shutdown)
 from ResourceControl import (clamp_cpu_target, resource_throttle_level,
                              throttle_multiplier)
@@ -159,7 +175,8 @@ from WindowsAudioIdentity import (enrich_saved_audio_identity,
                                   resolve_saved_audio,
                                   upgrade_input_set_audio_identities,
                                   usb_connection_token)
-from GuiAssets import (CaptureArea, hold_last_preview_on_missing_frame,
+from GuiAssets import (CaptureArea, gui_resource_pressure,
+                       hold_last_preview_on_missing_frame,
                        prepare_disabled_preview_image,
                        prepare_preview_image)
 from PokeConShowInfo import (installed_distribution_version,
@@ -179,6 +196,7 @@ from UiResponsiveness import (compensated_after_delay,
                               foreground_process_matches,
                               keyboard_listener_should_run,
                               preview_capture_interval, preview_priority,
+                              preview_fps_status,
                               preview_rate_permissions,
                               preview_render_due, preview_render_interval,
                               resize_safe_preview_intervals)
@@ -189,6 +207,7 @@ from CommandMonitorRecording import (CommandInputActivityTracker,
                                      CommandStateTimeline, DarkStillFrameDetector,
                                      apply_stopped_session_recording_choice,
                                      command_source_descriptor,
+                                     ensure_stopped_session_recording_candidate,
                                      failure_evidence_end,
                                      runtime_execution_location,
                                      runtime_execution_snapshot,
@@ -196,7 +215,8 @@ from CommandMonitorRecording import (CommandInputActivityTracker,
                                      relevant_state_path,
                                      runtime_state_snapshot,
                                      temporary_chunk_ids_for_session)
-from CommandRecordingMerge import merge_command_recording_chunks
+from CommandRecordingMerge import (_validated_chunk_media,
+                                   merge_command_recording_chunks)
 from CommandRecoveryScripts import (CommandRecoveryExecutor,
                                     delete_recovery_favorite,
                                     normalize_recovery_favorites,
@@ -231,9 +251,20 @@ from OperationDebugCommand import (create_debug_command_package,
                                    debug_output_paths, deploy_debug_command,
                                    intermediate_revisions,
                                    save_intermediate_revision)
-from CommandRecordingModel import (filtered_timeline, load_command_timeline,
+from CommandRecordingModel import (command_source_file, event_is_in_source,
+                                   filtered_timeline, load_command_timeline,
                                    observed_source_lines,
                                    source_function_block, timeline_page)
+from CommandFocusRepair import (build_focus_segments,
+                                matching_focus_functions,
+                                parse_focus_function_targets)
+from CommandFocusRepairModel import (build_focus_prompt, build_focus_report,
+                                     export_focus_bundle,
+                                     load_focus_request,
+                                     save_focus_request)
+from CommandRunComparison import (align_step_visits, apply_function_restore,
+                                  load_visit_frame, prepare_function_restore,
+                                  step_visits)
 from CommandDevelopmentTools import (analyze_command_source,
                                      analyze_recording_events,
                                      build_regression_case,
@@ -387,6 +418,7 @@ class CommandRunOptionsTests(unittest.TestCase):
 
         command = types.SimpleNamespace(
             COMMAND_RUN_SETTINGS=True,
+            COMMAND_STEP_LABELS={"START": "最初から"},
             COMMAND_STEP_DESCRIPTIONS={"START": "開始地点"},
             STATE_MAIN_FUNCTION={"START": object(), "END": object()},
             STATE_1_STORY_FUNCTION={"STEP_A": object()},
@@ -403,9 +435,24 @@ class CommandRunOptionsTests(unittest.TestCase):
              ("STATE_MAIN_FUNCTION", "END"),
              ("STATE_1_STORY_FUNCTION", "STEP_A")])
         self.assertEqual(result["locations"][0]["description"], "開始地点")
+        self.assertEqual(result["locations"][0]["label"], "最初から")
         self.assertEqual(
             [item["attribute"] for item in result["debug_options"]],
             ["TESTADDCODE"])
+
+        generated = types.SimpleNamespace(
+            COMMAND_RUN_SETTINGS=True,
+            COMMAND_STEP_LABELS={"READY": "開始準備"},
+            COMMAND_STEP_DESCRIPTIONS={"READY": "準備画面から開始"},
+            STEP_LABELS=["準備", "実行"],
+            STEP_KEYS=["READY", "RUN"],
+        )
+        generated_result = namespace["_runtime_command_run_options"](
+            generated)
+        self.assertEqual(
+            [(item["label"], item["description"])
+             for item in generated_result["locations"]],
+            [("開始準備", "準備画面から開始"), ("実行", "")])
 
     def test_required_start_selector_uses_runtime_fallback_instead_of_skipping(self):
         source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
@@ -547,6 +594,22 @@ class Story(StoryBase):
                          "最初の町から開始")
         self.assertEqual(result["debug_options"][0]["attribute"], "DEBUG")
 
+    def test_state_display_names_and_descriptions_are_discovered_together(self):
+        result = discover_command_run_options('''
+class Story:
+    COMMAND_RUN_SETTINGS = True
+    COMMAND_STEP_LABELS = {"STEP_A": "ホテルを出る"}
+    COMMAND_STEP_DESCRIPTIONS = {"STEP_A": "正面玄関から広場へ移動します。"}
+    def __init__(self):
+        self.STATE_MAIN_FUNCTION = {"STEP_A": self.step_a}
+    def step_a(self): return "STEP_A"
+''')
+        self.assertEqual(result["locations"][0]["value"], "STEP_A")
+        self.assertEqual(result["locations"][0]["label"], "ホテルを出る")
+        self.assertEqual(
+            result["locations"][0]["description"],
+            "正面玄関から広場へ移動します。")
+
     def test_applies_step_debug_user_and_legacy_dialogue_values(self):
         class Demo:
             step = 0
@@ -631,6 +694,65 @@ class Story(StoryBase):
         self.assertFalse(perform_failure_save_recovery(command, RuntimeError()))
 
 
+class StepMetadataTests(unittest.TestCase):
+    def test_updates_step_metadata_without_reformatting_command_body(self):
+        source = '''class Demo:
+    NAME = "Demo"
+    COMMAND_RUN_SETTINGS = True
+    COMMAND_STEP_DESCRIPTIONS = {"OLD": "old description"}
+
+    def do(self):
+        return "KEEP_BODY"
+'''
+        updated = update_step_metadata(
+            source,
+            labels={"STEP_A": "準備", "STEP_B": "STEP_B"},
+            descriptions={
+                "STEP_A": "最初の準備を行います。",
+                "STEP_B": "2行目も保持\n詳しい説明",
+            })
+        metadata = read_step_metadata(updated)
+        self.assertEqual(metadata["labels"], {"STEP_A": "準備"})
+        self.assertEqual(metadata["descriptions"], {
+            "STEP_A": "最初の準備を行います。",
+            "STEP_B": "2行目も保持\n詳しい説明",
+        })
+        self.assertIn('return "KEEP_BODY"', updated)
+        self.assertNotIn("OLD", updated)
+        compile(updated, "Demo.py", "exec")
+
+    def test_canonical_metadata_overrides_legacy_aliases(self):
+        metadata = read_step_metadata('''
+class Demo:
+    STEP_DISPLAY_NAMES = {"A": "old label"}
+    COMMAND_STEP_LABELS = {"A": "new label"}
+    STEP_DESCRIPTIONS = {"A": "old description"}
+    COMMAND_STEP_DESCRIPTIONS = {"A": "new description"}
+''')
+        self.assertEqual(metadata["labels"]["A"], "new label")
+        self.assertEqual(
+            metadata["descriptions"]["A"], "new description")
+
+    def test_generated_step_command_exposes_descriptions_at_start(self):
+        source = template_source(
+            "Step (state transition / 状態遷移)",
+            "DemoSteps", "Demo steps", ["Example"], [{
+                "key": "READY", "label": "準備",
+                "description": "開始前の準備を行います。",
+            }, {
+                "key": "RUN", "label": "実行",
+                "description": "メイン処理を開始します。",
+            }])
+        options = discover_command_run_options(source, "DemoSteps")
+        self.assertTrue(options["enabled"])
+        self.assertEqual(
+            [(row["label"], row["description"])
+             for row in options["locations"]],
+            [("準備", "開始前の準備を行います。"),
+             ("実行", "メイン処理を開始します。")])
+        compile(source, "DemoSteps.py", "exec")
+
+
 class ForceStopTests(unittest.TestCase):
     def test_normal_stop_request_never_waits_on_pause_checkpoint(self):
         class Connection:
@@ -708,6 +830,43 @@ class CommandModuleLoadingTests(unittest.TestCase):
         self.assertEqual(modules, [loaded])
         self.assertEqual(errors[0]["module"], "Commands.PythonCommands.broken")
         self.assertIn("mixed indentation", errors[0]["error"])
+
+    def test_embedded_ssr3_imports_from_command_namespace_and_standalone(self):
+        builder_dir = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "SSR",
+            "SSR_Building")
+        ssr3_dir = os.path.join(builder_dir, "ssr3")
+        for root, _directories, filenames in os.walk(ssr3_dir):
+            for filename in filenames:
+                if not filename.endswith(".py"):
+                    continue
+                path = os.path.join(root, filename)
+                with open(path, "r", encoding="utf-8-sig") as stream:
+                    tree = ast.parse(stream.read())
+                absolute_ssr3_imports = [
+                    node for node in ast.walk(tree)
+                    if isinstance(node, ast.ImportFrom)
+                    and node.level == 0
+                    and (node.module == "ssr3"
+                         or str(node.module).startswith("ssr3."))
+                ]
+                self.assertEqual(absolute_ssr3_imports, [], path)
+
+        package_prefix = (
+            "Commands.PythonCommands.SSR.SSR_Building")
+        for module_name in (
+                package_prefix + ".ssr3.tabs",
+                package_prefix + ".ssr3.app",
+                package_prefix + ".main"):
+            with self.subTest(module=module_name):
+                module = command_utility.importlib.import_module(module_name)
+                self.assertIsNotNone(module)
+
+        with open(os.path.join(builder_dir, "main.py"),
+                  "r", encoding="utf-8-sig") as stream:
+            main_source = stream.read()
+        self.assertIn("if __package__:", main_source)
+        self.assertIn("from ssr3.app import SSR3Application", main_source)
 
 
 class StepDebugAssistTests(unittest.TestCase):
@@ -1052,6 +1211,473 @@ class InputSetRuntimeRegistryTests(unittest.TestCase):
             self.assertEqual([item["pid"] for item in conflicts], [701])
             first.close()
             self.assertTrue(second.set_resource_state(main_requested=True))
+
+
+class SwitchUpdatePromptTests(unittest.TestCase):
+    @staticmethod
+    def _prompt_frame(selection):
+        frame = numpy.full((720, 1280, 3), 75, dtype=numpy.uint8)
+        cv2.rectangle(frame, (250, 173), (1033, 549),
+                      (245, 245, 245), thickness=-1)
+        color = (200, 200, 40)
+        if selection == START_WITHOUT_UPDATE:
+            cv2.rectangle(frame, (253, 395), (1028, 466),
+                          color, thickness=5)
+        elif selection == UPDATE_SELECTED:
+            cv2.rectangle(frame, (636, 467), (1033, 549),
+                          color, thickness=5)
+        return frame
+
+    def test_detects_only_the_selected_safe_update_prompt_option(self):
+        self.assertEqual(detect_switch_update_prompt_selection(
+            self._prompt_frame(START_WITHOUT_UPDATE)), START_WITHOUT_UPDATE)
+        self.assertEqual(detect_switch_update_prompt_selection(
+            self._prompt_frame(UPDATE_SELECTED)), UPDATE_SELECTED)
+        self.assertIsNone(detect_switch_update_prompt_selection(
+            numpy.zeros((720, 1280, 3), dtype=numpy.uint8)))
+
+    def test_update_selection_gets_at_most_ten_up_inputs_and_no_a(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with tokenize.open(source_path) as stream:
+            tree = ast.parse(stream.read())
+        method = next(
+            item for node in tree.body if isinstance(node, ast.ClassDef)
+            for item in node.body if isinstance(item, ast.FunctionDef)
+            and item.name == "_reset_handle_switch_update_prompt")
+        function = copy.deepcopy(method)
+        function.decorator_list = []
+        function_module = ast.Module(body=[function], type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {
+            "Button": types.SimpleNamespace(A="A"),
+            "Hat": types.SimpleNamespace(TOP="TOP"),
+            "START_WITHOUT_UPDATE": START_WITHOUT_UPDATE,
+            "UPDATE_SELECTED": UPDATE_SELECTED,
+            "time": time,
+        }
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        pressed = []
+        states = []
+        command = types.SimpleNamespace(
+            _reset_update_prompt_up_count=0,
+            _reset_update_prompt_last_confirm=0.0,
+            _reset_switch_update_prompt_selection=(
+                lambda: UPDATE_SELECTED),
+            press=lambda button, **_kwargs: pressed.append(button),
+            wait=lambda _seconds: None,
+        )
+        handler = namespace["_reset_handle_switch_update_prompt"]
+        for _ in range(12):
+            self.assertTrue(handler(command, states.append))
+        self.assertEqual(pressed, ["TOP"] * 10)
+        self.assertNotIn("A", pressed)
+        self.assertEqual(states[-1], "WAIT_START_WITHOUT_UPDATE")
+
+        command._reset_switch_update_prompt_selection = (
+            lambda: START_WITHOUT_UPDATE)
+        self.assertTrue(handler(command, states.append))
+        self.assertEqual(pressed[-1], "A")
+        self.assertEqual(states[-1], "CONFIRM_START_WITHOUT_UPDATE")
+
+
+class ZaMapping52RecoveryTests(unittest.TestCase):
+    @staticmethod
+    def _load_methods():
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with tokenize.open(source_path) as stream:
+            tree = ast.parse(stream.read())
+        method_names = {
+            "_2_story_mapping_37",
+            "_2_story_mapping_39",
+            "_2_story_mapping_52",
+            "_2_story_mapping_54",
+        }
+        methods = {
+            item.name: copy.deepcopy(item)
+            for node in tree.body if isinstance(node, ast.ClassDef)
+            for item in node.body if isinstance(item, ast.FunctionDef)
+            and item.name in method_names
+        }
+        module = ast.fix_missing_locations(ast.Module(
+            body=[methods[name] for name in sorted(method_names)],
+            type_ignores=[]))
+        namespace = {
+            "Button": types.SimpleNamespace(B="B"),
+        }
+        exec(compile(module, source_path, "exec"), namespace)
+        return namespace
+
+    @staticmethod
+    def _command(namespace, goto_result="WAIT", mappic_result=True):
+        class Command:
+            _2_story_mapping_37 = namespace["_2_story_mapping_37"]
+            _2_story_mapping_39 = namespace["_2_story_mapping_39"]
+            _2_story_mapping_52 = namespace["_2_story_mapping_52"]
+            _2_story_mapping_54 = namespace["_2_story_mapping_54"]
+
+            def __init__(self):
+                self.check_picture = 0
+                self.goto_result = goto_result
+                self.goto_calls = []
+                self.jump_count = 0
+                self._2_story_mapping_52_54_loop_count = 0
+                self._2_story_mapping_52_recovery_active = False
+
+            def ZA_Common_goto(self, *args, **kwargs):
+                self.goto_calls.append((args, kwargs))
+                return self.goto_result
+
+            def ZA_Common_mappic_check(self, **_kwargs):
+                return mappic_result
+
+            def ZA_Common_goto_jump(self):
+                self.jump_count += 1
+
+            def image_check(self, _name):
+                return False
+
+            def pressRep(self, *_args, **_kwargs):
+                pass
+
+            def wait(self, _seconds):
+                pass
+
+        return Command()
+
+    def test_mapping37_uses_position2_only_when_returning_from_mapping52(self):
+        namespace = self._load_methods()
+        recovery = self._command(namespace, goto_result="START")
+        recovery._2_story_mapping_52_recovery_active = True
+
+        self.assertEqual(
+            recovery._2_story_mapping_37(),
+            "2_STORY_MAPPING_38")
+        self.assertEqual(recovery.goto_calls, [((3, 0, 2), {})])
+
+        normal = self._command(namespace, goto_result="START")
+        self.assertEqual(
+            normal._2_story_mapping_37(),
+            "2_STORY_MAPPING_38")
+        self.assertEqual(normal.goto_calls, [((3, 0, 1), {})])
+
+    def test_mapping52_self_retry_never_starts_mapping37_recovery(self):
+        namespace = self._load_methods()
+        command = self._command(namespace)
+
+        results = [command._2_story_mapping_52() for _ in range(10)]
+
+        self.assertEqual(results, ["2_STORY_MAPPING_52"] * 10)
+        self.assertEqual(command._2_story_mapping_52_54_loop_count, 0)
+        self.assertFalse(command._2_story_mapping_52_recovery_active)
+        self.assertEqual(
+            command.goto_calls,
+            [((4, 0, 1), {})] * 10)
+
+    def test_fifth_mapping54_return_schedules_recovery_from_mapping52(self):
+        namespace = self._load_methods()
+        command = self._command(
+            namespace, goto_result="MOVEPOINT_PIC", mappic_result=False)
+
+        results = [command._2_story_mapping_54() for _ in range(5)]
+
+        self.assertEqual(results, ["2_STORY_MAPPING_52"] * 5)
+        self.assertEqual(command._2_story_mapping_52_54_loop_count, 0)
+        self.assertTrue(command._2_story_mapping_52_recovery_active)
+        goto_count = len(command.goto_calls)
+        self.assertEqual(
+            command._2_story_mapping_52(),
+            "2_STORY_MAPPING_37")
+        self.assertEqual(len(command.goto_calls), goto_count)
+
+    def test_mapping39_success_returns_to_mapping52_only_during_recovery(self):
+        namespace = self._load_methods()
+        recovery = self._command(namespace, goto_result="MOVEPOINT_PIC")
+        recovery._2_story_mapping_52_recovery_active = True
+
+        self.assertEqual(
+            recovery._2_story_mapping_39(),
+            "2_STORY_MAPPING_52")
+        self.assertFalse(recovery._2_story_mapping_52_recovery_active)
+        self.assertEqual(recovery.jump_count, 1)
+
+        normal = self._command(namespace, goto_result="MOVEPOINT_PIC")
+        self.assertEqual(
+            normal._2_story_mapping_39(),
+            "2_STORY_MAPPING_40")
+        self.assertEqual(normal.jump_count, 1)
+
+    def test_mapping54_success_clears_loop_state(self):
+        namespace = self._load_methods()
+        command = self._command(namespace, goto_result="MOVEPOINT_PIC")
+        command._2_story_mapping_52_54_loop_count = 4
+
+        self.assertEqual(
+            command._2_story_mapping_54(),
+            "2_STORY_MAPPING_55")
+        self.assertEqual(command._2_story_mapping_52_54_loop_count, 0)
+        self.assertFalse(command._2_story_mapping_52_recovery_active)
+
+
+class ZaOutHotelZ17To22BlackRecoveryTests(unittest.TestCase):
+    @staticmethod
+    def _load_helper(fake_time):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with tokenize.open(source_path) as stream:
+            tree = ast.parse(stream.read())
+        source_class = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ZA_story_Base")
+        functions = {
+            node.name: node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        helper_name = (
+            "_1_story_out_hotel_z_17_22_black_comment_recovery")
+        namespace = {"time": fake_time}
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[functions[helper_name]], type_ignores=[])),
+            source_path, "exec"), namespace)
+        return source_class, functions, namespace[helper_name]
+
+    def test_all_z17_to_z22_steps_use_black_comment_recovery(self):
+        _, functions, _ = self._load_helper(
+            types.SimpleNamespace(monotonic=lambda: 0.0))
+        helper_name = (
+            "_1_story_out_hotel_z_17_22_black_comment_recovery")
+        expected_steps = {
+            "_1_story_out_hotel_z_17": "1_STORY_OUT_HOTEL_Z_17",
+            "_1_story_out_hotel_z_18": "1_STORY_OUT_HOTEL_Z_18",
+            "_1_story_out_hotel_z_18_1": "1_STORY_OUT_HOTEL_Z_18_1",
+            "_1_story_out_hotel_z_18_2": "1_STORY_OUT_HOTEL_Z_18_2",
+            "_1_story_out_hotel_z_19": "1_STORY_OUT_HOTEL_Z_19",
+            "_1_story_out_hotel_z_19_1": "1_STORY_OUT_HOTEL_Z_19_1",
+            "_1_story_out_hotel_z_20": "1_STORY_OUT_HOTEL_Z_20",
+            "_1_story_out_hotel_z_20_1": "1_STORY_OUT_HOTEL_Z_20_1",
+            "_1_story_out_hotel_z_21": "1_STORY_OUT_HOTEL_Z_21",
+            "_1_story_out_hotel_z_22": "1_STORY_OUT_HOTEL_Z_22",
+        }
+        for function_name, state_name in expected_steps.items():
+            calls = [
+                node for node in ast.walk(functions[function_name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == helper_name
+            ]
+            self.assertGreaterEqual(len(calls), 1, function_name)
+            self.assertEqual(ast.literal_eval(calls[0].args[0]), state_name)
+
+    def test_sustained_black_restarts_and_resumes_by_caught_icons(self):
+        clock = types.SimpleNamespace(now=0.0)
+        _, _, helper = self._load_helper(
+            types.SimpleNamespace(monotonic=lambda: clock.now))
+
+        class Command:
+            ZA_OUT_HOTEL_Z_17_22_BLACK_RESTART_SECONDS = 5.0
+            ZA_OUT_HOTEL_Z_17_22_BLACK_GAP_SECONDS = 2.0
+
+            def __init__(self, caught=()):
+                self.black_visible = True
+                self.caught = set(caught)
+                self.waits = []
+                self.reset_count = 0
+
+            def image_check(self, target):
+                if target == "POKEMON_ZA_TEXT_BLACK_COMMENT":
+                    return self.black_visible
+                return target in self.caught
+
+            def wait(self, seconds):
+                self.waits.append(seconds)
+
+            def ZA_gamereset(self):
+                self.reset_count += 1
+
+        cases = (
+            ({"POKEMON_ZA_MERIP_ICON_GET5",
+              "POKEMON_ZA_KOHUKI_ICON_GET4"},
+             "1_STORY_OUT_HOTEL_Z_20_1"),
+            ({"POKEMON_ZA_KOHUKI_ICON_GET4"},
+             "1_STORY_OUT_HOTEL_Z_19"),
+            (set(), "1_STORY_OUT_HOTEL_Z_17"),
+        )
+        for caught, expected_state in cases:
+            with self.subTest(expected_state=expected_state):
+                clock.now = 0.0
+                command = Command(caught)
+                self.assertEqual(
+                    helper(command, "1_STORY_OUT_HOTEL_Z_21"),
+                    "1_STORY_OUT_HOTEL_Z_21")
+                for current_time in (1.0, 2.0, 3.0, 4.0, 4.9):
+                    clock.now = current_time
+                    self.assertEqual(
+                        helper(command, "1_STORY_OUT_HOTEL_Z_21"),
+                        "1_STORY_OUT_HOTEL_Z_21")
+                self.assertEqual(command.reset_count, 0)
+                clock.now = 5.0
+                self.assertEqual(
+                    helper(command, "1_STORY_OUT_HOTEL_Z_21"),
+                    expected_state)
+                self.assertEqual(command.reset_count, 1)
+                self.assertIsNone(
+                    command._1_story_out_hotel_z_17_22_black_started_at)
+                self.assertIsNone(
+                    command._1_story_out_hotel_z_17_22_black_last_seen_at)
+
+    def test_short_black_or_long_detection_gap_does_not_restart(self):
+        clock = types.SimpleNamespace(now=0.0)
+        _, _, helper = self._load_helper(
+            types.SimpleNamespace(monotonic=lambda: clock.now))
+
+        class Command:
+            ZA_OUT_HOTEL_Z_17_22_BLACK_RESTART_SECONDS = 5.0
+            ZA_OUT_HOTEL_Z_17_22_BLACK_GAP_SECONDS = 2.0
+
+            def __init__(self):
+                self.black_visible = True
+                self.reset_count = 0
+
+            def image_check(self, target):
+                return (
+                    target == "POKEMON_ZA_TEXT_BLACK_COMMENT"
+                    and self.black_visible)
+
+            @staticmethod
+            def wait(_seconds):
+                return None
+
+            def ZA_gamereset(self):
+                self.reset_count += 1
+
+        command = Command()
+        self.assertEqual(
+            helper(command, "1_STORY_OUT_HOTEL_Z_18"),
+            "1_STORY_OUT_HOTEL_Z_18")
+        command.black_visible = False
+        clock.now = 1.0
+        self.assertEqual(
+            helper(command, "1_STORY_OUT_HOTEL_Z_18"),
+            "1_STORY_OUT_HOTEL_Z_18")
+        clock.now = 2.1
+        self.assertIsNone(
+            helper(command, "1_STORY_OUT_HOTEL_Z_18"))
+        self.assertEqual(command.reset_count, 0)
+
+
+class ZaOutHotelZ40RecoveryTests(unittest.TestCase):
+    @staticmethod
+    def _load_methods(fake_time):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with tokenize.open(source_path) as stream:
+            tree = ast.parse(stream.read())
+        methods = {
+            item.name: copy.deepcopy(item)
+            for node in tree.body if isinstance(node, ast.ClassDef)
+            for item in node.body if isinstance(item, ast.FunctionDef)
+            and item.name in {
+                "_1_story_out_hotel_z_40_restart",
+                "_1_story_out_hotel_z_40",
+            }
+        }
+        module = ast.fix_missing_locations(ast.Module(
+            body=[
+                methods["_1_story_out_hotel_z_40_restart"],
+                methods["_1_story_out_hotel_z_40"],
+            ],
+            type_ignores=[]))
+        namespace = {
+            "Button": types.SimpleNamespace(A="A"),
+            "Direction": lambda stick, angle: (stick, angle),
+            "Stick": types.SimpleNamespace(LEFT="LEFT"),
+            "time": fake_time,
+        }
+        exec(compile(module, source_path, "exec"), namespace)
+        return namespace
+
+    @staticmethod
+    def _command(namespace, image_check):
+        class Command:
+            ZA_OUT_HOTEL_Z_40_STALL_TIMEOUT_SECONDS = 120.0
+            _1_story_out_hotel_z_40_restart = namespace[
+                "_1_story_out_hotel_z_40_restart"]
+            _1_story_out_hotel_z_40 = namespace[
+                "_1_story_out_hotel_z_40"]
+
+            def __init__(self):
+                self.image_check = image_check
+                self.pressed = []
+                self.repeated = []
+                self.waited = []
+                self.reset_count = 0
+
+            def press(self, key, **kwargs):
+                self.pressed.append((key, kwargs))
+
+            def pressRep(self, key, **kwargs):
+                self.repeated.append((key, kwargs))
+
+            def wait(self, seconds):
+                self.waited.append(seconds)
+
+            def ZA_gamereset(self):
+                self.reset_count += 1
+
+        return Command()
+
+    def test_green_comment_restarts_and_returns_to_skill_change3(self):
+        fake_time = types.SimpleNamespace(monotonic=lambda: 10.0)
+        namespace = self._load_methods(fake_time)
+        command = self._command(
+            namespace,
+            lambda name: name == "POKEMON_ZA_TEXT_GREEN_COMMENT")
+
+        self.assertEqual(
+            command._1_story_out_hotel_z_40(),
+            "1_STORY_WANINOKO_SKILL_CHANGE3")
+        self.assertEqual(command.reset_count, 1)
+        self.assertEqual(command.pressed, [])
+
+    def test_failed_out_search_restarts_instead_of_repeating_z40(self):
+        fake_time = types.SimpleNamespace(monotonic=lambda: 10.0)
+        namespace = self._load_methods(fake_time)
+        checks = []
+
+        def image_check(name):
+            checks.append(name)
+            return name == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"
+
+        command = self._command(namespace, image_check)
+        self.assertEqual(
+            command._1_story_out_hotel_z_40(),
+            "1_STORY_WANINOKO_SKILL_CHANGE3")
+        self.assertEqual(command.reset_count, 1)
+        self.assertEqual(checks.count("POKEMON_ZA_OUT_MARKER"), 20)
+
+    def test_missing_field_restarts_only_after_two_minutes(self):
+        clock = types.SimpleNamespace(now=10.0)
+        fake_time = types.SimpleNamespace(monotonic=lambda: clock.now)
+        namespace = self._load_methods(fake_time)
+        command = self._command(namespace, lambda _name: False)
+
+        self.assertEqual(
+            command._1_story_out_hotel_z_40(),
+            "1_STORY_OUT_HOTEL_Z_40")
+        self.assertEqual(command.reset_count, 0)
+
+        clock.now = 130.1
+        self.assertEqual(
+            command._1_story_out_hotel_z_40(),
+            "1_STORY_WANINOKO_SKILL_CHANGE3")
+        self.assertEqual(command.reset_count, 1)
 
 
 class PokeConRecoveryTests(unittest.TestCase):
@@ -1602,6 +2228,419 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             source_targets["POKEMON_ZA_TEXT_WHITE_COMMENT"], variants)
         self.assertNotIn("def image_check_confirmation", source)
 
+    def test_restaurant_loop_closes_x_menu_before_other_actions(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+        source_tree = ast.parse(source)
+        function = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_2_story_restaurant_dohutsu_loop")
+        module = ast.fix_missing_locations(ast.Module(
+            body=[function], type_ignores=[]))
+        namespace = {"Button": Button}
+        exec(compile(module, source_path, "exec"), namespace)
+
+        calls = []
+        command = types.SimpleNamespace(
+            _2_story_restaurant_dohutsu_black_check=3,
+            image_check=lambda target: calls.append(
+                ("image_check", target)) or target == "POKEMON_ZA_X_MENU_OPEN",
+            pressRep=lambda button, **kwargs: calls.append(
+                ("pressRep", button, kwargs)),
+        )
+        result = namespace["_2_story_restaurant_dohutsu_loop"](command)
+
+        self.assertEqual(result, "2_STORY_RESTAURANT_DOHUTSU_LOOP")
+        self.assertEqual(command._2_story_restaurant_dohutsu_black_check, 0)
+        self.assertEqual(calls[0], (
+            "image_check", "POKEMON_ZA_X_MENU_OPEN"))
+        self.assertEqual(calls[1][0:2], ("pressRep", Button.B))
+        self.assertEqual(calls[1][2], {
+            "repeat": 1, "duration": 0.15,
+            "wait": 0.5, "interval": 0.1,
+        })
+        self.assertEqual(len(calls), 2)
+
+    def test_yubiwa_check_redirects_tower55_and_restores_start_boundary(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        source_class = next(
+            node for node in source_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ZA_story_Base")
+        functions = {
+            node.name: node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        selected = [
+            functions["_2_story_yubiwa_checked_for_start"],
+            functions["_2_story_tower_55_or_61"],
+            functions["main_state_init"],
+            functions["_2_story_tower_59"],
+        ]
+        module = ast.fix_missing_locations(ast.Module(
+            body=selected, type_ignores=[]))
+        namespace = {"Button": Button}
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            STATE_2_STORY_FUNCTION = {
+                "2_STORY_TOWER_54": None,
+                "2_STORY_TOWER_55": None,
+                "2_STORY_TOWER_56": None,
+                "2_STORY_TOWER_61": None,
+                "2_STORY_AME1": None,
+            }
+            _2_story_yubiwa_checked_for_start = namespace[
+                "_2_story_yubiwa_checked_for_start"]
+            _2_story_tower_55_or_61 = namespace[
+                "_2_story_tower_55_or_61"]
+            main_state_init = namespace["main_state_init"]
+            _2_story_tower_59 = namespace["_2_story_tower_59"]
+
+            def __init__(self, start="2_STORY_TOWER_55"):
+                self.main_current_state_init = "MAIN_2_Y_V_LANK"
+                self._2_story_current_state_init = start
+                self._2_story_current_state = "2_STORY_START_CHECK"
+                self._2_story_yubiwa_checked = False
+                self.renda_results = []
+
+            @staticmethod
+            def etc_sendCommand(_command):
+                return None
+
+            def image_check(self, target):
+                return target in {
+                    "POKEMON_ZA_TEXT_BLACK_COMMENT",
+                    "POKEMON_ZA_YUBIWA",
+                }
+
+            def ZA_renda_button(self, **_kwargs):
+                return self.renda_results.pop(0)
+
+            @staticmethod
+            def press(*_args, **_kwargs):
+                return None
+
+            @staticmethod
+            def pressRep(*_args, **_kwargs):
+                return None
+
+        for start in ("2_STORY_TOWER_54", "2_STORY_TOWER_55"):
+            command = Command(start)
+            self.assertEqual(command.main_state_init(), "MAIN_2_Y_V_LANK")
+            self.assertFalse(command._2_story_yubiwa_checked)
+            self.assertEqual(
+                command._2_story_tower_55_or_61(), "2_STORY_TOWER_55")
+        for start in ("2_STORY_TOWER_56", "2_STORY_TOWER_61",
+                      "2_STORY_AME1"):
+            command = Command(start)
+            self.assertEqual(command.main_state_init(), "MAIN_2_Y_V_LANK")
+            self.assertTrue(command._2_story_yubiwa_checked)
+            self.assertEqual(
+                command._2_story_tower_55_or_61(), "2_STORY_TOWER_61")
+
+        command = Command()
+        command.renda_results = [True, False]
+        self.assertEqual(command._2_story_tower_59(), "2_STORY_TOWER_59")
+        self.assertTrue(command._2_story_yubiwa_checked)
+        self.assertEqual(
+            command._2_story_tower_55_or_61(), "2_STORY_TOWER_61")
+
+        for name in ("_2_story_tower_54", "_2_story_tower_55",
+                     "_2_story_tower_58", "_2_story_tower_59",
+                     "_2_story_tower_78"):
+            direct_tower55 = [
+                node for node in ast.walk(functions[name])
+                if isinstance(node, ast.Return)
+                and isinstance(node.value, ast.Constant)
+                and node.value.value == "2_STORY_TOWER_55"
+            ]
+            self.assertEqual(direct_tower55, [], name)
+
+    def test_tower38_resets_after_30_consecutive_else_results(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        source_class = next(
+            node for node in source_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ZA_story_Base")
+        functions = {
+            node.name: node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        reset_limit = next(
+            ast.literal_eval(node.value)
+            for node in source_class.body
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "ZA_STORY_TOWER_38_ELSE_RESET_COUNT"
+                    for target in node.targets))
+        self.assertEqual(reset_limit, 30)
+
+        namespace = {"Button": Button}
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[functions["_2_story_tower_38"]], type_ignores=[])),
+            source_path, "exec"), namespace)
+        tower38 = namespace["_2_story_tower_38"]
+
+        class Command:
+            ZA_STORY_TOWER_38_ELSE_RESET_COUNT = reset_limit
+
+            def __init__(self, recovery_results, move_comment=False):
+                self.recovery_results = list(recovery_results)
+                self.move_comment = move_comment
+                self.reset_calls = 0
+                self.buttons = []
+
+            def image_check(self, target):
+                return (
+                    self.move_comment
+                    and target == "POKEMON_ZA_MOVE_COMMENT_BATTLE2")
+
+            def ZA_Common_pokemon_recovery(self):
+                return self.recovery_results.pop(0)
+
+            @staticmethod
+            def _2_story_tower_34_38_black_comment_recovery(_state):
+                return None
+
+            def pressRep(self, button, **kwargs):
+                self.buttons.append((button, kwargs))
+
+            def ZA_gamereset(self):
+                self.reset_calls += 1
+
+        stalled = Command([False] * 30)
+        for _ in range(29):
+            self.assertEqual(tower38(stalled), "2_STORY_TOWER_38")
+        self.assertEqual(stalled._2_story_tower_38_else_count, 29)
+        self.assertEqual(stalled.reset_calls, 0)
+        self.assertEqual(tower38(stalled), "2_STORY_TOWER_31")
+        self.assertEqual(stalled._2_story_tower_38_else_count, 0)
+        self.assertEqual(stalled.reset_calls, 1)
+
+        # 成功分岐を1回でも通れば、次のelseは1回目から数え直す。
+        interrupted = Command([False, True] + [False] * 29)
+        self.assertEqual(tower38(interrupted), "2_STORY_TOWER_38")
+        self.assertEqual(tower38(interrupted), "2_STORY_TOWER_39")
+        for _ in range(29):
+            self.assertEqual(tower38(interrupted), "2_STORY_TOWER_38")
+        self.assertEqual(interrupted._2_story_tower_38_else_count, 29)
+        self.assertEqual(interrupted.reset_calls, 0)
+
+        # 移動不可Comment分岐でも連続else回数を破棄する。
+        move_comment = Command([], move_comment=True)
+        move_comment._2_story_tower_38_else_count = 29
+        self.assertEqual(tower38(move_comment), "2_STORY_TOWER_37")
+        self.assertEqual(move_comment._2_story_tower_38_else_count, 0)
+        self.assertEqual(move_comment.reset_calls, 0)
+
+    def test_tower32_skip_and_tower34_38_persistent_black_recovery(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        selected = [
+            functions["_2_story_tower_32"],
+            functions["_2_story_tower_34_38_black_comment_recovery"],
+            functions["_2_story_tower_36"],
+        ]
+        module = ast.fix_missing_locations(ast.Module(
+            body=selected, type_ignores=[]))
+        clock = types.SimpleNamespace(now=100.0)
+        namespace = {
+            "Button": Button,
+            "time": types.SimpleNamespace(monotonic=lambda: clock.now),
+        }
+        exec(compile(module, source_path, "exec"), namespace)
+
+        goto_calls = []
+        pika = types.SimpleNamespace(
+            image_check=lambda target: (
+                target == "POKEMON_ZA_PIKA_ICON_GET6"),
+            ZA_Common_goto=lambda *args: goto_calls.append(args) or "START",
+        )
+        self.assertEqual(
+            namespace["_2_story_tower_32"](pika),
+            "2_STORY_TOWER_39")
+        self.assertEqual(goto_calls, [])
+
+        no_pika = types.SimpleNamespace(
+            image_check=lambda _target: False,
+            ZA_Common_goto=lambda *args: goto_calls.append(args) or "START",
+        )
+        self.assertEqual(
+            namespace["_2_story_tower_32"](no_pika),
+            "2_STORY_TOWER_33")
+        self.assertEqual(goto_calls, [(2, 0, 1)])
+
+        expected_steps = {
+            "_2_story_tower_34": "2_STORY_TOWER_34",
+            "_2_story_tower_34_1": "2_STORY_TOWER_34_1",
+            "_2_story_tower_34_2": "2_STORY_TOWER_34_2",
+            "_2_story_tower_35": "2_STORY_TOWER_35",
+            "_2_story_tower_36": "2_STORY_TOWER_36",
+            "_2_story_tower_37": "2_STORY_TOWER_37",
+            "_2_story_tower_38": "2_STORY_TOWER_38",
+        }
+        for function_name, step_name in expected_steps.items():
+            calls = [
+                node for node in ast.walk(functions[function_name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == (
+                    "_2_story_tower_34_38_black_comment_recovery")
+            ]
+            self.assertEqual(len(calls), 1, function_name)
+            self.assertEqual(ast.literal_eval(calls[0].args[0]), step_name)
+
+        # 32で移動し直す手前の33と、捕獲後の39は監視範囲外。
+        for function_name in ("_2_story_tower_33", "_2_story_tower_39"):
+            calls = [
+                node for node in ast.walk(functions[function_name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == (
+                    "_2_story_tower_34_38_black_comment_recovery")
+            ]
+            self.assertEqual(calls, [], function_name)
+
+        recovery_calls = []
+        black_comment = types.SimpleNamespace(
+            ZA_STORY_TOWER_34_38_BLACK_RECOVERY_SECONDS=5.0,
+            ZA_STORY_TOWER_34_38_BLACK_GAP_SECONDS=2.0,
+            image_check=lambda target: (
+                target == "POKEMON_ZA_TEXT_BLACK_COMMENT"),
+            ZA_renda_button=lambda **kwargs: (
+                recovery_calls.append(kwargs) or True),
+            wait=lambda _seconds: None,
+        )
+        black_comment._2_story_tower_34_38_black_comment_recovery = (
+            types.MethodType(
+                namespace[
+                    "_2_story_tower_34_38_black_comment_recovery"],
+                black_comment))
+        self.assertEqual(
+            namespace["_2_story_tower_36"](black_comment),
+            "2_STORY_TOWER_36")
+        self.assertEqual(recovery_calls, [])
+
+        for current_time in (101.0, 102.0, 103.0, 104.0, 104.9):
+            clock.now = current_time
+            self.assertEqual(
+                namespace["_2_story_tower_36"](black_comment),
+                "2_STORY_TOWER_36")
+        self.assertEqual(recovery_calls, [])
+
+        clock.now = 105.0
+        self.assertEqual(
+            namespace["_2_story_tower_36"](black_comment),
+            "2_STORY_TOWER_32")
+        self.assertEqual(recovery_calls, [{
+            "rendabutton": "B",
+            "endpicture": "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+            "sleeptime": 0.5,
+        }])
+
+    def test_tower71_74_persistent_black_recovers_to_69_with_b_limit(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        helper_name = "_2_story_tower_71_74_black_comment_recovery"
+        module = ast.fix_missing_locations(ast.Module(
+            body=[functions[helper_name]], type_ignores=[]))
+        clock = types.SimpleNamespace(now=100.0)
+        namespace = {
+            "Button": Button,
+            "time": types.SimpleNamespace(monotonic=lambda: clock.now),
+        }
+        exec(compile(module, source_path, "exec"), namespace)
+
+        for step_number in range(71, 75):
+            function_name = f"_2_story_tower_{step_number}"
+            calls = [
+                node for node in ast.walk(functions[function_name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == helper_name
+            ]
+            self.assertEqual(len(calls), 1, function_name)
+            self.assertEqual(
+                ast.literal_eval(calls[0].args[0]),
+                f"2_STORY_TOWER_{step_number}")
+
+        state = {"field_checks": 0, "b_presses": 0}
+
+        def image_check(target):
+            if target == "POKEMON_ZA_TEXT_BLACK_COMMENT":
+                return True
+            if target == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK":
+                state["field_checks"] += 1
+                return state["field_checks"] >= 6
+            return False
+
+        recovery = types.SimpleNamespace(
+            ZA_STORY_TOWER_71_74_BLACK_RECOVERY_SECONDS=5.0,
+            ZA_STORY_TOWER_71_74_BLACK_GAP_SECONDS=2.0,
+            ZA_STORY_TOWER_71_74_BLACK_RECOVERY_MAX_B=50,
+            image_check=image_check,
+            checkIfAlive=lambda: None,
+            pressRep=lambda *_args, **_kwargs: state.__setitem__(
+                "b_presses", state["b_presses"] + 1),
+        )
+        helper = types.MethodType(namespace[helper_name], recovery)
+        self.assertEqual(helper("2_STORY_TOWER_71"), "2_STORY_TOWER_71")
+        for current_time in (101.0, 102.0, 103.0, 104.0, 104.9):
+            clock.now = current_time
+            self.assertEqual(
+                helper("2_STORY_TOWER_71"), "2_STORY_TOWER_71")
+
+        clock.now = 105.0
+        self.assertEqual(helper("2_STORY_TOWER_71"), "2_STORY_TOWER_69")
+        self.assertEqual(state["b_presses"], 3)
+
+        exhausted_state = {"b_presses": 0}
+        exhausted = types.SimpleNamespace(
+            ZA_STORY_TOWER_71_74_BLACK_RECOVERY_SECONDS=0.0,
+            ZA_STORY_TOWER_71_74_BLACK_GAP_SECONDS=2.0,
+            ZA_STORY_TOWER_71_74_BLACK_RECOVERY_MAX_B=50,
+            image_check=lambda target: (
+                target == "POKEMON_ZA_TEXT_BLACK_COMMENT"),
+            checkIfAlive=lambda: None,
+            pressRep=lambda *_args, **_kwargs: exhausted_state.__setitem__(
+                "b_presses", exhausted_state["b_presses"] + 1),
+        )
+        exhausted_helper = types.MethodType(namespace[helper_name], exhausted)
+        self.assertEqual(
+            exhausted_helper("2_STORY_TOWER_74"), "2_STORY_TOWER_74")
+        self.assertEqual(exhausted_state["b_presses"], 50)
+        clock.now = 106.0
+        self.assertEqual(
+            exhausted_helper("2_STORY_TOWER_74"), "2_STORY_TOWER_74")
+        self.assertEqual(exhausted_state["b_presses"], 50)
+
     def test_za_marker_positions_are_registered_and_steer_toward_center(self):
         profile_path = os.path.join(
             SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
@@ -1728,6 +2767,20 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             and node.func.value.id == "IMAGE_DETECTION_TARGETS"
             and node.func.attr == "update")
         managed_targets = ast.literal_eval(managed_update.args[0])
+        field_white_name = (
+            "POKEMON_ZA_OUT_HOTEL_Z23_FIELD_WHITE_COMMENT")
+        field_white_target = library["targets"][field_white_name]
+        self.assertEqual(field_white_target["operator"], "OR")
+        self.assertEqual(
+            field_white_target["variants"][0]["template_path"],
+            "Template/ZA_Story/_1_z_lank/"
+            "out_hotel_z23_field_white_comment.png")
+        self.assertEqual(
+            field_white_target["variants"][0]["crop"],
+            [350, 100, 950, 350])
+        self.assertEqual(
+            field_white_target["variants"][0]["threshold"], 0.8)
+        self.assertIn(field_white_name, managed_targets)
         for marker in marker_settings:
             for suffix in regions:
                 name = "POKEMON_ZA_{}_{}".format(marker, suffix)
@@ -1769,7 +2822,53 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             "detect_image",
             {node.id for node in ast.walk(fragment_function)
              if isinstance(node, ast.Name)})
+        self.assertEqual(
+            [argument.arg for argument in runtime_function.args.args[:4]],
+            ["self", "type", "search_mode", "nofiled"])
 
+        mode_functions = set()
+        for function in (
+                node for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.FunctionDef)):
+            for call in ast.walk(function):
+                if (isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and call.func.attr == "ZA_markerdir"
+                        and len(call.args) > 1
+                        and isinstance(call.args[1], ast.Constant)
+                        and call.args[1].value == 1):
+                    mode_functions.add(function.name)
+        self.assertEqual(mode_functions, {
+            "ZA_story_Template_battle_function",
+            "ZA_story_Template_battle_before_active_level",
+            "ZA_story_Template_battle_before_renda_route",
+            "_2_story_tower_2",
+            "_2_story_tower_25",
+            "_4_story_shiro_55",
+            "_5_story_karasuba_30",
+            "_5_story_karasuba_62",
+            "_5_story_karasuba_121",
+            "_6_story_yukari_21",
+            "_6_story_yukari_22",
+            "_7_story_guri_12",
+            "_8_story_story_last_53",
+            "_8_story_story_last_56",
+            "_8_story_story_last_60",
+        })
+        mode2_functions = set()
+        for function in (
+                node for node in ast.walk(ast.parse(source))
+                if isinstance(node, ast.FunctionDef)):
+            for call in ast.walk(function):
+                if (isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and call.func.attr == "ZA_markerdir"
+                        and len(call.args) > 1
+                        and isinstance(call.args[1], ast.Constant)
+                        and call.args[1].value == 2):
+                    mode2_functions.add(function.name)
+        self.assertEqual(
+            mode2_functions, {"_1_story_out_hotel_z_23"})
         marker_temp = tempfile.TemporaryDirectory()
         self.addCleanup(marker_temp.cleanup)
         marker_path = os.path.join(marker_temp.name, "marker.png")
@@ -1808,13 +2907,18 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                     self.command.fresh_frame_timeouts.append(timeout)
                     frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
                     position = self.command.position
+                    if isinstance(position, list):
+                        position = position.pop(0) if position else None
                     if position is not None:
                         x, y = position
                         frame[y:y + 10, x:x + 10] = marker_image
                     return frame
 
-            def __init__(self, position=None):
+            def __init__(self, position=None, field=False,
+                         field_white_comment=False):
                 self.position = position
+                self.field = field
+                self.field_white_comment = field_white_comment
                 self.template_size = (10, 10)
                 self.IMAGE_DETECTION_TARGETS = marker_targets
                 self.pressed = []
@@ -1826,6 +2930,11 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 self.camera = self.Camera(self)
 
             def image_check(self, name):
+                if name == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK":
+                    return self.field
+                if name == (
+                        "POKEMON_ZA_OUT_HOTEL_Z23_FIELD_WHITE_COMMENT"):
+                    return self.field_white_comment
                 return False
 
             def get_filespec(self, path, mode="t"):
@@ -1879,13 +2988,139 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             command.position = None
             press_count = len(command.pressed)
             self.assertFalse(markerdir(command, marker_type, nofiled=True))
-            self.assertEqual(len(command.pressed), press_count + 1)
-            self.assertEqual(command.pressed[-1].angle_for_show, 0)
-            self.assertEqual(command.pressed[-1].mag, 1.0)
-            self.assertEqual(command.press_durations[-1], 0.03)
+            expected_attempts = 10 if marker_type == "EVENT" else 1
+            self.assertEqual(
+                len(command.pressed), press_count + expected_attempts)
+            if marker_type == "EVENT":
+                event_search = command.pressed[press_count:]
+                self.assertEqual(
+                    [direction.angle_for_show for direction in event_search],
+                    [0, 180] * 5)
+                self.assertEqual(
+                    command.press_durations[press_count:],
+                    [0.03] + [0.06] * 9)
+                self.assertTrue(all(
+                    direction.stick == Stick.RIGHT
+                    for direction in event_search))
+
+                # search_mode=1では途中の未検知だけで視点を動かさず、
+                # 30回以内にEVENTが見えれば中央一致として終了する。
+                delayed_event = MarkerCommand(
+                    [None, None, None, (645, 300)])
+                self.assertTrue(markerdir(
+                    delayed_event, marker_type, 1, nofiled=True))
+                self.assertEqual(delayed_event.pressed, [])
+                self.assertEqual(
+                    len(delayed_event.fresh_frame_timeouts), 4)
+
+                # 30回すべて未検知になった時だけ左スティックで1回移動し、
+                # 次の30回も未検知なら反対側へ移動する。
+                delayed_missing = MarkerCommand()
+
+                def missing_fresh_frame(timeout=0.75):
+                    delayed_missing.fresh_frame_timeouts.append(timeout)
+                    return None
+
+                delayed_missing.camera.readFreshFrame = missing_fresh_frame
+                self.assertFalse(markerdir(
+                    delayed_missing, marker_type, 1, nofiled=True))
+                self.assertEqual(
+                    len(delayed_missing.fresh_frame_timeouts), 300)
+                self.assertEqual(
+                    [direction.angle_for_show
+                     for direction in delayed_missing.pressed],
+                    [0, 180] * 5)
+                self.assertTrue(all(
+                    direction.mag == 1.0
+                    for direction in delayed_missing.pressed))
+                self.assertTrue(all(
+                    direction.stick == Stick.LEFT
+                    for direction in delayed_missing.pressed))
+                self.assertEqual(
+                    delayed_missing.press_durations, [0.3] * 10)
+
+                # EVENTが見えていても同じStepで接近成功が10回続いたら、
+                # 次の接近前に右、その次の10回後は左へ移動する。
+                stalled_approach = MarkerCommand((645, 300))
+                stalled_approach.main_current_state = "MAIN_1_Z_LANK"
+                stalled_approach._1_story_current_state = (
+                    "1_STORY_OUT_HOTEL_Z_23")
+                for _ in range(10):
+                    self.assertTrue(markerdir(
+                        stalled_approach, marker_type, 1,
+                        nofiled=True))
+                self.assertEqual(stalled_approach.pressed, [])
+                self.assertEqual(
+                    stalled_approach._za_markerdir_event_approach_count,
+                    10)
+
+                self.assertTrue(markerdir(
+                    stalled_approach, marker_type, 1,
+                    nofiled=True))
+                self.assertEqual(
+                    stalled_approach.pressed[-1].stick, Stick.LEFT)
+                self.assertEqual(
+                    stalled_approach.pressed[-1].angle_for_show, 0)
+                self.assertEqual(
+                    stalled_approach.press_durations[-1], 0.3)
+                for _ in range(9):
+                    self.assertTrue(markerdir(
+                        stalled_approach, marker_type, 1,
+                        nofiled=True))
+                self.assertEqual(len(stalled_approach.pressed), 1)
+                self.assertTrue(markerdir(
+                    stalled_approach, marker_type, 1,
+                    nofiled=True))
+                self.assertEqual(
+                    [direction.angle_for_show
+                     for direction in stalled_approach.pressed],
+                    [0, 180])
+
+                # 現在Stepが変われば、接近回数と左右順を新しく始める。
+                stalled_approach._1_story_current_state = (
+                    "1_STORY_OUT_HOTEL_Z_24")
+                self.assertTrue(markerdir(
+                    stalled_approach, marker_type, 1,
+                    nofiled=True))
+                self.assertEqual(len(stalled_approach.pressed), 2)
+                self.assertEqual(
+                    stalled_approach._za_markerdir_event_approach_count,
+                    1)
+                self.assertEqual(
+                    stalled_approach._za_markerdir_event_approach_side_index,
+                    0)
+
+                # search_mode=2ではSwitch_No3から取得したFIELD上の白い
+                # NPC吹き出しを検知した時だけ、横へ外れてからEVENTを
+                # 中央へ合わせる。同じ吹き出しの継続中は横移動を重ねない。
+                field_white = MarkerCommand(
+                    (645, 300), field=True, field_white_comment=True)
+                self.assertTrue(markerdir(field_white, marker_type, 2))
+                self.assertEqual(len(field_white.pressed), 1)
+                self.assertEqual(
+                    field_white.pressed[-1].stick, Stick.LEFT)
+                self.assertEqual(
+                    field_white.pressed[-1].angle_for_show, 0)
+                self.assertEqual(field_white.press_durations[-1], 0.5)
+
+                self.assertTrue(markerdir(field_white, marker_type, 2))
+                self.assertEqual(len(field_white.pressed), 1)
+                field_white.field_white_comment = False
+                self.assertTrue(markerdir(field_white, marker_type, 2))
+                field_white.field_white_comment = True
+                self.assertTrue(markerdir(field_white, marker_type, 2))
+                self.assertEqual(
+                    [direction.angle_for_show
+                     for direction in field_white.pressed],
+                    [0, 180])
+            else:
+                self.assertEqual(command.pressed[-1].angle_for_show, 0)
+                self.assertEqual(command.pressed[-1].mag, 1.0)
+                self.assertEqual(command.press_durations[-1], 0.03)
 
             command.position = (500, 40)
             self.assertFalse(markerdir(command, marker_type, nofiled=True))
+            self.assertEqual(command.pressed[-1].stick, Stick.RIGHT)
             self.assertEqual(command.pressed[-1].angle_for_show, 180)
             self.assertEqual(command.pressed[-1].mag, 0.2)
             self.assertEqual(command.press_durations[-1], 0.0)
@@ -1893,8 +3128,12 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             command.position = None
             self.assertFalse(markerdir(command, marker_type, nofiled=True))
             self.assertEqual(command.pressed[-1].angle_for_show, 180)
-            self.assertEqual(command.pressed[-1].mag, 0.2)
-            self.assertEqual(command.press_durations[-1], 0.0)
+            if marker_type == "EVENT":
+                self.assertEqual(command.pressed[-1].mag, 1.0)
+                self.assertEqual(command.press_durations[-1], 0.06)
+            else:
+                self.assertEqual(command.pressed[-1].mag, 0.2)
+                self.assertEqual(command.press_durations[-1], 0.0)
 
             command.position = (645, 300)
             self.assertTrue(markerdir(command, marker_type, nofiled=True))
@@ -1902,7 +3141,9 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             self.assertFalse(markerdir(command, marker_type, nofiled=True))
             self.assertEqual(command.pressed[-1].angle_for_show, 180)
             self.assertEqual(command.pressed[-1].mag, 1.0)
-            self.assertEqual(command.press_durations[-1], 0.0)
+            self.assertEqual(
+                command.press_durations[-1],
+                0.06 if marker_type == "EVENT" else 0.0)
 
         near_movement_cases = (
             ((500, 600), 180),
@@ -1915,8 +3156,20 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 command = MarkerCommand(position)
                 self.assertFalse(markerdir(command, marker_type, nofiled=True))
                 self.assertEqual(command.pressed[-1].angle_for_show, angle)
-                self.assertEqual(command.pressed[-1].mag, 0.2)
-                self.assertEqual(command.press_durations[-1], 0.0)
+            self.assertEqual(command.pressed[-1].mag, 0.2)
+            self.assertEqual(command.press_durations[-1], 0.0)
+
+        command = MarkerCommand([
+            (300, 300), (500, 300), (610, 300), (645, 300)])
+        self.assertTrue(markerdir(command, "EVENT", nofiled=True))
+        self.assertEqual(len(command.pressed), 3)
+        self.assertEqual(len(command.fresh_frame_timeouts), 4)
+        self.assertEqual(command.wait_durations, [0.1, 0.1, 0.1])
+
+        command = MarkerCommand((300, 300))
+        self.assertFalse(markerdir(command, "EVENT", nofiled=True))
+        self.assertEqual(len(command.pressed), 10)
+        self.assertEqual(len(command.fresh_frame_timeouts), 10)
 
         for position, angle, magnitude, duration in (
                 ((610, 300), 180, 0.2, 0.0),
@@ -1933,6 +3186,1514 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertFalse(markerdir(map_command, "EVENT", nofiled=True))
         self.assertFalse(map_command.last_image_detection["matched"])
         self.assertEqual(map_command.pressed[-1].angle_for_show, 180)
+
+    def test_za_reword_recovery_uses_registered_target_and_mashes_b(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        profile_path = os.path.join(
+            SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(profile_path, "r", encoding="utf-8") as stream:
+            library = json.load(stream)
+
+        functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        reword_recovery = functions["ZA_battle_reword_recovery"]
+        missing_field_recovery = functions[
+            "ZA_battle_missing_field_recovery"]
+        recovery_calls = [
+            node for node in ast.walk(missing_field_recovery)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ZA_battle_reword_recovery"
+        ]
+        self.assertEqual(len(recovery_calls), 2)
+
+        module = ast.Module(body=[reword_recovery], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {"Button": Button}
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class RewordCommand:
+            def __init__(self):
+                self.remaining = 3
+                self.buttons = []
+                self.alive_checks = 0
+
+            def image_check(self, name):
+                return name == "POKEMON_ZA_REWORD" and self.remaining > 0
+
+            def checkIfAlive(self):
+                self.alive_checks += 1
+
+            def pressRep(self, button, repeat=1, **_kwargs):
+                self.buttons.extend([button] * repeat)
+                if button == Button.B:
+                    self.remaining = max(0, self.remaining - repeat)
+
+        command = RewordCommand()
+        self.assertTrue(namespace["ZA_battle_reword_recovery"](command))
+        self.assertEqual(command.buttons, [Button.B] * 3)
+        self.assertEqual(command.alive_checks, 3)
+        self.assertFalse(namespace["ZA_battle_reword_recovery"](command))
+
+        runtime_targets = {}
+        runtime_operators = {}
+        for node in ast.walk(source_tree):
+            if (not isinstance(node, ast.Call)
+                    or not isinstance(node.func, ast.Attribute)
+                    or node.func.attr != "update"
+                    or not isinstance(node.func.value, ast.Name)
+                    or not node.args):
+                continue
+            try:
+                value = ast.literal_eval(node.args[0])
+            except (TypeError, ValueError):
+                continue
+            if node.func.value.id == "IMAGE_DETECTION_TARGETS":
+                runtime_targets.update(value)
+            elif node.func.value.id == "IMAGE_DETECTION_OPERATORS":
+                runtime_operators.update(value)
+        profile = library["targets"]["POKEMON_ZA_REWORD"]
+        self.assertEqual(
+            runtime_targets["POKEMON_ZA_REWORD"], profile["variants"])
+        self.assertEqual(
+            runtime_operators["POKEMON_ZA_REWORD"], profile["operator"])
+        self.assertEqual(profile["variants"][0]["threshold"], 0.8)
+        self.assertTrue(os.path.isfile(os.path.join(
+            SERIAL_CONTROLLER, "Template", "ZA_Story", "Common", "X_menu",
+            "POKEMON_ZA_REWORD.png")))
+
+    def test_za_yukari_mega_before_comment_timeout_returns_to_time_reset(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+        source_tree = ast.parse(source)
+        source_class = next(
+            node for node in source_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ZA_story_Base")
+        functions = {
+            node.name: node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        assignments = {
+            node.targets[0].id: ast.literal_eval(node.value)
+            for node in source_class.body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id
+            == "ZA_STORY_MEGA_BEFORE_COMMENT_RECOVERY_TARGETS"
+        }
+        self.assertEqual(
+            assignments["ZA_STORY_MEGA_BEFORE_COMMENT_RECOVERY_TARGETS"],
+            {
+                "6_STORY_YUKARI_39": "6_STORY_YUKARI_35",
+                "6_STORY_YUKARI_52": "6_STORY_YUKARI_42",
+            })
+
+        for function_name, success_state in (
+                ("_6_story_yukari_39", "6_STORY_YUKARI_40"),
+                ("_6_story_yukari_52", "6_STORY_YUKARI_53")):
+            function_source = ast.get_source_segment(
+                source, functions[function_name])
+            self.assertIn("POKEMON_ZA_TEXT_WHITE_COMMENT", function_source)
+            self.assertIn("POKEMON_ZA_TEXT_GREEN_COMMENT", function_source)
+            if function_name == "_6_story_yukari_39":
+                self.assertNotIn(
+                    "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+                    function_source)
+            else:
+                self.assertIn(
+                    "POKEMON_ZA_TEXT_BLACK_COMMENT", function_source)
+                self.assertIn(
+                    "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+                    function_source)
+            self.assertIn('return "{}"'.format(success_state), function_source)
+
+        compiled_functions = [
+            functions[name] for name in (
+                "ZA_story_event_entry_recovery_step",
+                "_ZA_story_event_entry_recovery_timeout",
+                "_6_story_yukari_39",
+                "_6_story_yukari_52",
+            )
+        ]
+        module = ast.fix_missing_locations(ast.Module(
+            body=compiled_functions, type_ignores=[]))
+        now = [0.0]
+        namespace = {
+            "time": types.SimpleNamespace(monotonic=lambda: now[0]),
+        }
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS = 30.0
+            ZA_STORY_BATTLE_RETURN_RECOVERY_COUNT = 3
+            ZA_STORY_WHITE_COMMENT_RECOVERY_TARGETS = {}
+            ZA_STORY_MEGA_BEFORE_COMMENT_RECOVERY_TARGETS = {
+                "6_STORY_YUKARI_39": "6_STORY_YUKARI_35",
+                "6_STORY_YUKARI_52": "6_STORY_YUKARI_42",
+            }
+            ZA_STORY_BATTLE_BEFORE_RECOVERY_TARGETS = {}
+            ZA_story_event_entry_recovery_step = namespace[
+                "ZA_story_event_entry_recovery_step"]
+            _ZA_story_event_entry_recovery_timeout = namespace[
+                "_ZA_story_event_entry_recovery_timeout"]
+            _6_story_yukari_39 = namespace["_6_story_yukari_39"]
+            _6_story_yukari_52 = namespace["_6_story_yukari_52"]
+
+            def __init__(self, matched=()):
+                self.matched = set(matched)
+
+            def image_check(self, target):
+                return target in self.matched
+
+            @staticmethod
+            def ZA_story_Template_Comment_Out():
+                return True
+
+        cases = (
+            ("6_STORY_YUKARI_39", "_6_story_yukari_39",
+             "6_STORY_YUKARI_40", "6_STORY_YUKARI_35"),
+            ("6_STORY_YUKARI_52", "_6_story_yukari_52",
+             "6_STORY_YUKARI_53", "6_STORY_YUKARI_42"),
+        )
+        for state, function_name, success_state, recovery_state in cases:
+            with self.subTest(state=state, condition="timeout"):
+                command = Command({
+                    "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"})
+                state_functions = {state: getattr(command, function_name)}
+                now[0] = 0.0
+                self.assertEqual(command.ZA_story_event_entry_recovery_step(
+                    state, state_functions), state)
+                now[0] = 29.0
+                self.assertEqual(command.ZA_story_event_entry_recovery_step(
+                    state, state_functions), state)
+                now[0] = 31.0
+                self.assertEqual(command.ZA_story_event_entry_recovery_step(
+                    state, state_functions), recovery_state)
+
+            for comment_target in (
+                    "POKEMON_ZA_TEXT_WHITE_COMMENT",
+                    "POKEMON_ZA_TEXT_GREEN_COMMENT"):
+                with self.subTest(
+                        state=state, condition=comment_target):
+                    command = Command({comment_target})
+                    command._za_markerdir_event_approach_step = (
+                        "MAIN_6_C_LANK", state)
+                    command._za_markerdir_event_approach_count = 10
+                    command._za_markerdir_event_approach_side_index = 1
+                    now[0] = 100.0
+                    self.assertEqual(
+                        command.ZA_story_event_entry_recovery_step(
+                            state, {state: getattr(command, function_name)}),
+                        success_state)
+                    self.assertNotIn(
+                        state,
+                        getattr(command,
+                                "_za_story_event_entry_recovery_started", {}))
+                    self.assertIsNone(
+                        command._za_markerdir_event_approach_step)
+                    self.assertEqual(
+                        command._za_markerdir_event_approach_count, 0)
+                    self.assertEqual(
+                        command._za_markerdir_event_approach_side_index, 0)
+
+    def test_za_yukari_52_black_comment_runs_bounded_recovery_plan(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+        source_tree = ast.parse(source)
+        source_class = next(
+            node for node in source_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ZA_story_Base")
+        functions = {
+            node.name: node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        function_names = (
+            "_6_story_yukari_48", "_6_story_yukari_49",
+            "_6_story_yukari_50", "_6_story_yukari_52",
+            "_6_story_yukari_52_recovery",
+        )
+        module = ast.fix_missing_locations(ast.Module(
+            body=[functions[name] for name in function_names],
+            type_ignores=[]))
+        namespace = {
+            "Button": Button,
+            "Direction": Direction,
+            "Stick": Stick,
+            "time": time,
+        }
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            _6_story_yukari_48 = namespace["_6_story_yukari_48"]
+            _6_story_yukari_49 = namespace["_6_story_yukari_49"]
+            _6_story_yukari_50 = namespace["_6_story_yukari_50"]
+            _6_story_yukari_52 = namespace["_6_story_yukari_52"]
+            _6_story_yukari_52_recovery = namespace[
+                "_6_story_yukari_52_recovery"]
+
+            def __init__(self, matched=(), field_after_b=None):
+                self.matched = set(matched)
+                self.field_after_b = field_after_b
+                self.b_count = 0
+                self.button_inputs = []
+                self.move_inputs = []
+                self.waits = []
+                self.alive_checks = 0
+                self._6_story_yukari_52_recovery_waiting_field = False
+                self._6_story_yukari_52_recovery_plan_active = False
+
+            def image_check(self, target):
+                if target == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK":
+                    return (self.field_after_b is not None
+                            and self.b_count >= self.field_after_b)
+                return target in self.matched
+
+            def pressRep(self, button, **kwargs):
+                self.button_inputs.append((button, kwargs))
+                if button == Button.B:
+                    self.b_count += int(kwargs.get("repeat", 1))
+
+            def press(self, direction, **kwargs):
+                self.move_inputs.append((direction, kwargs))
+
+            def wait(self, duration):
+                self.waits.append(duration)
+
+            def checkIfAlive(self):
+                self.alive_checks += 1
+
+            @staticmethod
+            def ZA_story_Template_Comment_Out(**_kwargs):
+                return True
+
+        recovery = Command(
+            {"POKEMON_ZA_TEXT_BLACK_COMMENT"}, field_after_b=3)
+        self.assertEqual(
+            recovery._6_story_yukari_52(),
+            "6_STORY_YUKARI_52_RECOVERY")
+        self.assertEqual(recovery.b_count, 3)
+        self.assertFalse(
+            recovery._6_story_yukari_52_recovery_waiting_field)
+        self.assertFalse(
+            recovery._6_story_yukari_52_recovery_plan_active)
+        self.assertEqual(
+            recovery._6_story_yukari_52_recovery(),
+            "6_STORY_YUKARI_42")
+        self.assertTrue(
+            recovery._6_story_yukari_52_recovery_plan_active)
+
+        expected_states = (
+            "6_STORY_YUKARI_49",
+            "6_STORY_YUKARI_50",
+            "6_STORY_YUKARI_51",
+        )
+        for function_name, expected_state in zip(
+                function_names[:3], expected_states):
+            self.assertEqual(
+                getattr(recovery, function_name)(), expected_state)
+        self.assertEqual(len(recovery.move_inputs), 3)
+        for direction, kwargs in recovery.move_inputs:
+            self.assertEqual(direction.stick, Stick.LEFT)
+            self.assertEqual(direction.angle_for_show, 210)
+            self.assertEqual(kwargs["duration"], 0.5)
+        self.assertFalse(
+            recovery._6_story_yukari_52_recovery_plan_active)
+
+        bounded = Command(
+            {"POKEMON_ZA_TEXT_BLACK_COMMENT"}, field_after_b=None)
+        self.assertEqual(
+            bounded._6_story_yukari_52(), "6_STORY_YUKARI_52")
+        self.assertEqual(bounded.b_count, 40)
+        self.assertTrue(
+            bounded._6_story_yukari_52_recovery_waiting_field)
+        bounded.field_after_b = 40
+        self.assertEqual(
+            bounded._6_story_yukari_52(),
+            "6_STORY_YUKARI_52_RECOVERY")
+        self.assertEqual(bounded.b_count, 40)
+        self.assertEqual(
+            bounded._6_story_yukari_52_recovery(),
+            "6_STORY_YUKARI_42")
+        self.assertTrue(
+            bounded._6_story_yukari_52_recovery_plan_active)
+
+        normal = Command({
+            "POKEMON_ZA_ITEM_WINDOW", "POKEMON_ZA_WATER_ICON"})
+        self.assertEqual(
+            normal._6_story_yukari_48(), "6_STORY_YUKARI_49")
+        self.assertEqual(normal.move_inputs, [])
+        self.assertEqual(normal.button_inputs[0][0], Button.A)
+        self.assertEqual(normal.button_inputs[0][1]["repeat"], 3)
+
+        options = discover_command_run_options(source, "ZA_story")
+        recovery_locations = [
+            row for row in options["locations"]
+            if row.get("value") == "6_STORY_YUKARI_52_RECOVERY"
+        ]
+        self.assertEqual(len(recovery_locations), 1)
+        self.assertEqual(
+            recovery_locations[0]["variable"],
+            "STATE_6_STORY_FUNCTION")
+
+    def test_za_furadari_comment_steps_advance_after_timeout(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        source_class = next(
+            node for node in source_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ZA_story_Base")
+        functions = {
+            node.name: node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        furadari_comment_targets = {
+            "7_STORY_GURI_88": "7_STORY_GURI_89",
+            "7_STORY_GURI_96": "7_STORY_GURI_97",
+            "7_STORY_GURI_103": "7_STORY_GURI_104",
+            "7_STORY_GURI_107": "7_STORY_GURI_108",
+            "7_STORY_GURI_112": "7_STORY_GURI_113",
+            "7_STORY_GURI_120": "7_STORY_GURI_121",
+            "7_STORY_GURI_122": "7_STORY_GURI_123",
+            "7_STORY_GURI_128": "7_STORY_GURI_129",
+        }
+        step_function_names = [
+            "_" + state.lower() for state in furadari_comment_targets
+        ]
+        module = ast.fix_missing_locations(ast.Module(body=[
+            functions["ZA_story_event_entry_recovery_step"],
+            functions["_ZA_story_event_entry_recovery_timeout"],
+            functions["_ZA_story_furadari_allow_comment_retry"],
+            *(functions[name] for name in step_function_names),
+        ], type_ignores=[]))
+        now = [0.0]
+        namespace = {
+            "time": types.SimpleNamespace(monotonic=lambda: now[0]),
+        }
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS = 30.0
+            ZA_STORY_BATTLE_RETURN_RECOVERY_COUNT = 3
+            ZA_STORY_WHITE_COMMENT_RECOVERY_TARGETS = (
+                furadari_comment_targets)
+            ZA_STORY_FURADARI_COMMENT_SKIP_TARGETS = (
+                furadari_comment_targets)
+            ZA_STORY_MEGA_BEFORE_COMMENT_RECOVERY_TARGETS = {}
+            ZA_STORY_BATTLE_BEFORE_RECOVERY_TARGETS = {}
+            ZA_story_event_entry_recovery_step = namespace[
+                "ZA_story_event_entry_recovery_step"]
+            _ZA_story_event_entry_recovery_timeout = namespace[
+                "_ZA_story_event_entry_recovery_timeout"]
+            _ZA_story_furadari_allow_comment_retry = namespace[
+                "_ZA_story_furadari_allow_comment_retry"]
+
+            def __init__(self):
+                self.comment_visible = False
+                self.comment_out_calls = 0
+
+            def image_check(self, target):
+                return (
+                    target == "POKEMON_ZA_TEXT_WHITE_COMMENT"
+                    and self.comment_visible)
+
+            def ZA_story_Template_Comment_Out(self, **_kwargs):
+                self.comment_out_calls += 1
+                return self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT")
+
+        for function_name in step_function_names:
+            setattr(Command, function_name, namespace[function_name])
+
+        for state, next_state in furadari_comment_targets.items():
+            with self.subTest(state=state):
+                now[0] = 0.0
+                command = Command()
+                state_function = getattr(command, "_" + state.lower())
+                state_functions = {state: state_function}
+                self.assertEqual(
+                    command.ZA_story_event_entry_recovery_step(
+                        state, state_functions),
+                    state)
+                now[0] = 29.0
+                self.assertEqual(
+                    command.ZA_story_event_entry_recovery_step(
+                        state, state_functions),
+                    state)
+                now[0] = 31.0
+                self.assertEqual(
+                    command.ZA_story_event_entry_recovery_step(
+                        state, state_functions),
+                    next_state)
+                calls_after_timeout = command.comment_out_calls
+
+                # 通常経路で同じStepを再訪しても、Comment_Outと30秒待機を
+                # 繰り返さず前回と同じ次Stepへ直ちに進む。
+                now[0] = 32.0
+                self.assertEqual(
+                    command.ZA_story_event_entry_recovery_step(
+                        state, state_functions),
+                    next_state)
+                self.assertEqual(
+                    command.comment_out_calls, calls_after_timeout)
+
+                # 明示的なFURADARI復帰で前へ戻した場合だけ履歴を解除し、
+                # Comment_Outを改めて試行できる。
+                command._ZA_story_furadari_allow_comment_retry(
+                    "7_STORY_GURI_0", state)
+                now[0] = 33.0
+                self.assertEqual(
+                    command.ZA_story_event_entry_recovery_step(
+                        state, state_functions),
+                    state)
+                self.assertEqual(
+                    command.comment_out_calls, calls_after_timeout + 1)
+
+                # Comment_Out成功時はタイムアウトを待たず通常どおり進む。
+                command.comment_visible = True
+                now[0] = 100.0
+                self.assertEqual(
+                    command.ZA_story_event_entry_recovery_step(
+                        state, state_functions),
+                    next_state)
+
+    def test_za_event_entry_recovery_catalog_and_battle_return_exemption(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+        source_tree = ast.parse(source)
+        source_class = next(
+            node for node in source_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ZA_story_Base")
+        functions = {
+            node.name: node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+        }
+
+        assignments = {}
+        for node in source_class.body:
+            if (isinstance(node, ast.Assign)
+                    and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)):
+                assignments[node.targets[0].id] = node.value
+        white_targets = ast.literal_eval(assignments[
+            "ZA_STORY_WHITE_COMMENT_RECOVERY_TARGETS"])
+        mega_before_comment_targets = ast.literal_eval(assignments[
+            "ZA_STORY_MEGA_BEFORE_COMMENT_RECOVERY_TARGETS"])
+        battle_targets = ast.literal_eval(assignments[
+            "ZA_STORY_BATTLE_BEFORE_RECOVERY_TARGETS"])
+        self.assertEqual(len(white_targets), 97)
+        self.assertEqual(mega_before_comment_targets, {
+            "6_STORY_YUKARI_39": "6_STORY_YUKARI_35",
+            "6_STORY_YUKARI_52": "6_STORY_YUKARI_42",
+        })
+        self.assertEqual(len(battle_targets), 55)
+        self.assertEqual(
+            white_targets["5_STORY_KARASUBA_46"],
+            "5_STORY_KARASUBA_46_RECOVERY")
+        self.assertEqual(
+            {key: value for key, value in white_targets.items()
+             if key != value},
+            {
+                "2_STORY_TOWER_58": "2_STORY_TOWER_69",
+                "2_STORY_TOWER_72": "2_STORY_TOWER_74",
+                "3_STORY_CANARI_16": "3_STORY_CANARI_14",
+                "4_STORY_SHIRO_15": "4_STORY_SHIRO_13",
+                "4_STORY_SHIRO_17": "4_STORY_SHIRO_16",
+                "4_STORY_SHIRO_44": "4_STORY_SHIRO_43",
+                "5_STORY_KARASUBA_46":
+                    "5_STORY_KARASUBA_46_RECOVERY",
+                "7_STORY_GURI_88": "7_STORY_GURI_89",
+                "7_STORY_GURI_96": "7_STORY_GURI_97",
+                "7_STORY_GURI_103": "7_STORY_GURI_104",
+                "7_STORY_GURI_107": "7_STORY_GURI_108",
+                "7_STORY_GURI_112": "7_STORY_GURI_113",
+                "7_STORY_GURI_120": "7_STORY_GURI_121",
+                "7_STORY_GURI_122": "7_STORY_GURI_123",
+                "7_STORY_GURI_128": "7_STORY_GURI_129",
+            })
+        self.assertEqual(
+            battle_targets["2_STORY_Y_LANK_MOVE3"][0],
+            "2_STORY_Y_LANK_MOVE3")
+
+        method_states = {}
+        for node in ast.walk(functions["__init__"]):
+            if (not isinstance(node, ast.Assign)
+                    or len(node.targets) != 1
+                    or not isinstance(node.targets[0], ast.Attribute)
+                    or not node.targets[0].attr.startswith("STATE_")
+                    or not node.targets[0].attr.endswith("_STORY_FUNCTION")
+                    or not isinstance(node.value, ast.Dict)):
+                continue
+            for key, value in zip(node.value.keys, node.value.values):
+                if (isinstance(key, ast.Constant)
+                        and isinstance(value, ast.Attribute)):
+                    method_states[value.attr] = key.value
+        expected_white = set()
+        expected_battle = {}
+        for name, function in functions.items():
+            state = method_states.get(name)
+            if state is None:
+                continue
+            body = function.body
+            if (len(body) == 2
+                    and isinstance(body[0], ast.If)
+                    and not body[0].orelse
+                    and isinstance(body[0].test, ast.Call)
+                    and isinstance(body[0].test.func, ast.Attribute)
+                    and body[0].test.func.attr == "image_check"
+                    and body[0].test.args
+                    and isinstance(body[0].test.args[0], ast.Constant)
+                    and body[0].test.args[0].value
+                    == "POKEMON_ZA_TEXT_WHITE_COMMENT"
+                    and isinstance(body[1], ast.Return)):
+                expected_white.add(state)
+            if (body
+                    and isinstance(body[0], ast.Return)
+                    and isinstance(body[0].value, ast.Call)
+                    and isinstance(body[0].value.func, ast.Attribute)
+                    and body[0].value.func.attr
+                    == "ZA_story_Template_battle_before_renda_route"):
+                keywords = {
+                    keyword.arg: ast.literal_eval(keyword.value)
+                    for keyword in body[0].value.keywords
+                }
+                expected_battle[state] = keywords["prg_ret"]
+        expected_white.update({
+            "2_STORY_TOWER_58",
+            "2_STORY_TOWER_68",
+            "2_STORY_TOWER_72",
+            "2_STORY_ABSOL_MOVE22",
+            # KARASUBA_46は白または緑Commentを受ける明示的な復帰対象。
+            "5_STORY_KARASUBA_46",
+            # FURADARI_MAP区間はComment_Out内の白Comment未検知を監視する。
+            "7_STORY_GURI_88",
+            "7_STORY_GURI_96",
+            "7_STORY_GURI_103",
+            "7_STORY_GURI_107",
+            "7_STORY_GURI_112",
+            "7_STORY_GURI_120",
+            "7_STORY_GURI_122",
+            "7_STORY_GURI_128",
+        })
+        self.assertEqual(set(white_targets), expected_white)
+        self.assertEqual(set(battle_targets), set(expected_battle))
+        self.assertEqual(
+            {state: value[1] for state, value in battle_targets.items()},
+            expected_battle)
+
+        self.assertIn("TODO_EVENT_ENTRY_RECOVERY[未対応]", source)
+        self.assertIn("TODO_EVENT_ENTRY_RECOVERY[確認中]", source)
+        self.assertIn("EVENT_ENTRY_RECOVERY[完了]", source)
+
+        for function_name, success_state in (
+                ("_6_story_yukari_39", "6_STORY_YUKARI_40"),
+                ("_6_story_yukari_52", "6_STORY_YUKARI_53")):
+            function_source = ast.get_source_segment(
+                source, functions[function_name])
+            self.assertIn(
+                'image_check("POKEMON_ZA_TEXT_WHITE_COMMENT")',
+                function_source)
+            self.assertIn(
+                'image_check("POKEMON_ZA_TEXT_GREEN_COMMENT")',
+                function_source)
+            self.assertNotIn(
+                "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+                function_source)
+            self.assertIn(
+                "ZA_story_Template_Comment_Out", function_source)
+            self.assertIn('return "{}"'.format(success_state), function_source)
+
+        module = ast.Module(body=[
+            functions["ZA_story_event_entry_recovery_step"],
+            functions["_ZA_story_event_entry_recovery_timeout"],
+        ], type_ignores=[])
+        ast.fix_missing_locations(module)
+        now = [0.0]
+        namespace = {
+            "time": types.SimpleNamespace(monotonic=lambda: now[0]),
+        }
+        exec(compile(module, source_path, "exec"), namespace)
+        event_step = namespace["ZA_story_event_entry_recovery_step"]
+        event_timeout = namespace[
+            "_ZA_story_event_entry_recovery_timeout"]
+
+        class EventCommand:
+            ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS = 30.0
+            ZA_STORY_BATTLE_RETURN_RECOVERY_COUNT = 3
+            ZA_STORY_WHITE_COMMENT_RECOVERY_TARGETS = {
+                "WHITE": "WHITE_RECOVERY",
+            }
+            ZA_STORY_MEGA_BEFORE_COMMENT_RECOVERY_TARGETS = {
+                "MEGA_COMMENT": "MEGA_COMMENT_RECOVERY",
+            }
+            ZA_STORY_BATTLE_BEFORE_RECOVERY_TARGETS = {
+                "BEFORE": ("BEFORE_RECOVERY", "SUCCESS"),
+            }
+
+            def ZA_story_event_entry_recovery_step(
+                    self, current_state, state_functions):
+                return event_step(self, current_state, state_functions)
+
+            def _ZA_story_event_entry_recovery_timeout(self, *args):
+                return event_timeout(self, *args)
+
+            white_comment = False
+            green_comment = False
+            battle_image_visible = False
+
+            def image_check(self, name):
+                return (
+                    (name == "POKEMON_ZA_TEXT_WHITE_COMMENT"
+                     and self.white_comment)
+                    or (name == "POKEMON_ZA_TEXT_GREEN_COMMENT"
+                        and self.green_comment)
+                    or (name == "POKEMON_ZA_BATTLE_BALL_CHECK"
+                        and self.battle_image_visible))
+
+            def white_wait(self):
+                self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT")
+                return "WHITE"
+
+            def mega_comment_wait(self):
+                if (self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT")
+                        or self.image_check(
+                            "POKEMON_ZA_TEXT_GREEN_COMMENT")):
+                    return "MEGA_COMMENT_NEXT"
+                return "MEGA_COMMENT"
+
+            @staticmethod
+            def before_wait():
+                return "RETRY"
+
+            @staticmethod
+            def before_success():
+                return "SUCCESS"
+
+            def ZA_story_Template_battle_function(self):
+                return None
+
+            def battle_function_step(self):
+                # co_namesへ共通battle_functionを残し、実際の戻り元を再現する。
+                callback = self.ZA_story_Template_battle_function
+                self.last_callback = callback
+                return "BEFORE"
+
+            def battle_active_step(self):
+                # BATTLE_BALL／ESCAPE検知中のnoprg_ret継続を再現する。
+                callback = self.ZA_story_Template_battle_function
+                self.last_callback = callback
+                self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK")
+                return "BATTLE"
+
+        command = EventCommand()
+        self.assertEqual(command.ZA_story_event_entry_recovery_step(
+            "WHITE", {"WHITE": command.white_wait}), "WHITE")
+        now[0] = 31.0
+        self.assertEqual(command.ZA_story_event_entry_recovery_step(
+            "WHITE", {"WHITE": command.white_wait}), "WHITE_RECOVERY")
+        command.white_comment = True
+        now[0] = 100.0
+        self.assertEqual(command.ZA_story_event_entry_recovery_step(
+            "WHITE", {"WHITE": command.white_wait}), "WHITE")
+        self.assertNotIn(
+            "WHITE", command._za_story_event_entry_recovery_started)
+
+        mega_comment = EventCommand()
+        now[0] = 0.0
+        self.assertEqual(mega_comment.ZA_story_event_entry_recovery_step(
+            "MEGA_COMMENT",
+            {"MEGA_COMMENT": mega_comment.mega_comment_wait}),
+            "MEGA_COMMENT")
+        now[0] = 31.0
+        self.assertEqual(mega_comment.ZA_story_event_entry_recovery_step(
+            "MEGA_COMMENT",
+            {"MEGA_COMMENT": mega_comment.mega_comment_wait}),
+            "MEGA_COMMENT_RECOVERY")
+
+        mega_comment.green_comment = True
+        now[0] = 100.0
+        self.assertEqual(mega_comment.ZA_story_event_entry_recovery_step(
+            "MEGA_COMMENT",
+            {"MEGA_COMMENT": mega_comment.mega_comment_wait}),
+            "MEGA_COMMENT_NEXT")
+        self.assertNotIn(
+            "MEGA_COMMENT",
+            mega_comment._za_story_event_entry_recovery_started)
+
+        mega_comment.green_comment = False
+        mega_comment.white_comment = True
+        now[0] = 200.0
+        self.assertEqual(mega_comment.ZA_story_event_entry_recovery_step(
+            "MEGA_COMMENT",
+            {"MEGA_COMMENT": mega_comment.mega_comment_wait}),
+            "MEGA_COMMENT_NEXT")
+        self.assertNotIn(
+            "MEGA_COMMENT",
+            mega_comment._za_story_event_entry_recovery_started)
+
+        direct = EventCommand()
+        now[0] = 0.0
+        self.assertEqual(direct.ZA_story_event_entry_recovery_step(
+            "BEFORE", {"BEFORE": direct.before_wait}), "RETRY")
+        now[0] = 31.0
+        self.assertEqual(direct.ZA_story_event_entry_recovery_step(
+            "BEFORE", {"BEFORE": direct.before_wait}), "BEFORE_RECOVERY")
+
+        from_battle = EventCommand()
+        now[0] = 0.0
+        self.assertEqual(from_battle.ZA_story_event_entry_recovery_step(
+            "BATTLE", {"BATTLE": from_battle.battle_function_step}),
+            "BEFORE")
+        now[0] = 300.0
+        self.assertEqual(from_battle.ZA_story_event_entry_recovery_step(
+            "BEFORE", {"BEFORE": from_battle.before_wait}), "RETRY")
+        self.assertNotIn(
+            "BEFORE", getattr(
+                from_battle, "_za_story_event_entry_recovery_started", {}))
+        self.assertEqual(from_battle.ZA_story_event_entry_recovery_step(
+            "BEFORE", {"BEFORE": from_battle.before_success}), "SUCCESS")
+        self.assertNotIn(
+            "BEFORE", from_battle._za_story_battle_before_recovery_exempt)
+
+        rapid_return = EventCommand()
+        for index in range(2):
+            now[0] = float(index)
+            self.assertEqual(rapid_return.ZA_story_event_entry_recovery_step(
+                "BATTLE", {"BATTLE": rapid_return.battle_function_step}),
+                "BEFORE")
+        now[0] = 20.0
+        self.assertEqual(rapid_return.ZA_story_event_entry_recovery_step(
+            "BATTLE", {"BATTLE": rapid_return.battle_function_step}),
+            "BEFORE_RECOVERY")
+        self.assertNotIn(
+            "BEFORE", rapid_return._za_story_battle_return_counts)
+
+        active_battle = EventCommand()
+        active_battle.battle_image_visible = True
+        self.assertEqual(active_battle.ZA_story_event_entry_recovery_step(
+            "BATTLE", {"BATTLE": active_battle.battle_active_step}),
+            "BATTLE")
+        active_battle.battle_image_visible = False
+        for index in range(5):
+            now[0] = float(index)
+            self.assertEqual(active_battle.ZA_story_event_entry_recovery_step(
+                "BATTLE", {"BATTLE": active_battle.battle_function_step}),
+                "BEFORE")
+        self.assertEqual(
+            getattr(active_battle, "_za_story_battle_return_counts", {}), {})
+
+        spaced_return = EventCommand()
+        for returned_at in (0.0, 11.0):
+            now[0] = returned_at
+            self.assertEqual(spaced_return.ZA_story_event_entry_recovery_step(
+                "BATTLE", {"BATTLE": spaced_return.battle_function_step}),
+                "BEFORE")
+        now[0] = 22.0
+        self.assertEqual(spaced_return.ZA_story_event_entry_recovery_step(
+            "BATTLE", {"BATTLE": spaced_return.battle_function_step}),
+            "BEFORE_RECOVERY")
+
+        for chapter in range(1, 9):
+            main_name = {
+                1: "main_1_z_lank", 2: "main_2_y_v_lank",
+                3: "main_3_f_lank", 4: "main_4_e_lank",
+                5: "main_5_d_lank", 6: "main_6_c_lank",
+                7: "main_7_b_lank", 8: "main_8_story_last",
+            }[chapter]
+            calls = [
+                node for node in ast.walk(functions[main_name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "ZA_story_event_entry_recovery_step"
+            ]
+            self.assertEqual(len(calls), 1, main_name)
+
+    def test_za_shiro_17_missing_white_comment_resets_and_retries_move16(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+        source_tree = ast.parse(source)
+        source_class = next(
+            node for node in source_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ZA_story_Base")
+        functions = {
+            node.name: node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        assignments = {
+            node.targets[0].id: ast.literal_eval(node.value)
+            for node in source_class.body
+            if (isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id in {
+                    "ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS_BY_STATE",
+                    "ZA_STORY_WHITE_COMMENT_RECOVERY_TARGETS",
+                })
+        }
+        self.assertEqual(
+            assignments["ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS_BY_STATE"][
+                "4_STORY_SHIRO_17"],
+            30.0)
+        self.assertEqual(
+            assignments["ZA_STORY_WHITE_COMMENT_RECOVERY_TARGETS"][
+                "4_STORY_SHIRO_17"],
+            "4_STORY_SHIRO_16")
+
+        module = ast.fix_missing_locations(ast.Module(body=[
+            functions["ZA_story_event_entry_recovery_step"],
+            functions["_ZA_story_event_entry_recovery_timeout"],
+            functions["_4_story_shiro_17"],
+        ], type_ignores=[]))
+        now = [0.0]
+        namespace = {
+            "time": types.SimpleNamespace(monotonic=lambda: now[0]),
+        }
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS = 30.0
+            ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS_BY_STATE = {
+                "4_STORY_SHIRO_17": 30.0,
+            }
+            ZA_STORY_BATTLE_RETURN_RECOVERY_COUNT = 3
+            ZA_STORY_WHITE_COMMENT_RECOVERY_TARGETS = {
+                "4_STORY_SHIRO_17": "4_STORY_SHIRO_16",
+            }
+            ZA_STORY_MEGA_BEFORE_COMMENT_RECOVERY_TARGETS = {}
+            ZA_STORY_BATTLE_BEFORE_RECOVERY_TARGETS = {}
+            ZA_story_event_entry_recovery_step = namespace[
+                "ZA_story_event_entry_recovery_step"]
+            _ZA_story_event_entry_recovery_timeout = namespace[
+                "_ZA_story_event_entry_recovery_timeout"]
+            _4_story_shiro_17 = namespace["_4_story_shiro_17"]
+
+            def __init__(self):
+                self.white_visible = False
+                self.reset_calls = 0
+                self.renda_calls = 0
+
+            def image_check(self, target):
+                return (
+                    target == "POKEMON_ZA_TEXT_WHITE_COMMENT"
+                    and self.white_visible)
+
+            def ZA_gamereset(self):
+                self.reset_calls += 1
+                return True
+
+            def ZA_renda_button(self, **_kwargs):
+                self.renda_calls += 1
+                return True
+
+        command = Command()
+        state_functions = {
+            "4_STORY_SHIRO_17": command._4_story_shiro_17,
+        }
+        now[0] = 0.0
+        self.assertEqual(
+            command.ZA_story_event_entry_recovery_step(
+                "4_STORY_SHIRO_17", state_functions),
+            "4_STORY_SHIRO_17")
+        now[0] = 29.0
+        self.assertEqual(
+            command.ZA_story_event_entry_recovery_step(
+                "4_STORY_SHIRO_17", state_functions),
+            "4_STORY_SHIRO_17")
+        self.assertEqual(command.reset_calls, 0)
+
+        now[0] = 31.0
+        self.assertEqual(
+            command.ZA_story_event_entry_recovery_step(
+                "4_STORY_SHIRO_17", state_functions),
+            "4_STORY_SHIRO_16")
+        self.assertEqual(command.reset_calls, 1)
+        self.assertNotIn(
+            "4_STORY_SHIRO_17",
+            command._za_story_event_entry_recovery_started)
+
+        # SHIRO_16から戻った後は古い計時を引き継がない。
+        now[0] = 100.0
+        self.assertEqual(
+            command.ZA_story_event_entry_recovery_step(
+                "4_STORY_SHIRO_17", state_functions),
+            "4_STORY_SHIRO_17")
+        self.assertEqual(command.reset_calls, 1)
+
+        # 白Commentが見えた場合はリセットせず通常進行する。
+        command.white_visible = True
+        now[0] = 101.0
+        self.assertEqual(
+            command.ZA_story_event_entry_recovery_step(
+                "4_STORY_SHIRO_17", state_functions),
+            "4_STORY_SHIRO_18")
+        self.assertEqual(command.reset_calls, 1)
+        self.assertEqual(command.renda_calls, 1)
+
+    def test_za_shiro_44_missing_white_comment_retries_move43(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+        source_tree = ast.parse(source)
+        source_class = next(
+            node for node in source_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ZA_story_Base")
+        functions = {
+            node.name: node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        assignments = {
+            node.targets[0].id: ast.literal_eval(node.value)
+            for node in source_class.body
+            if (isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id in {
+                    "ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS_BY_STATE",
+                    "ZA_STORY_WHITE_COMMENT_RECOVERY_TARGETS",
+                })
+        }
+        self.assertEqual(
+            assignments["ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS_BY_STATE"][
+                "4_STORY_SHIRO_44"],
+            30.0)
+        self.assertEqual(
+            assignments["ZA_STORY_WHITE_COMMENT_RECOVERY_TARGETS"][
+                "4_STORY_SHIRO_44"],
+            "4_STORY_SHIRO_43")
+
+        module = ast.fix_missing_locations(ast.Module(body=[
+            functions["ZA_story_event_entry_recovery_step"],
+            functions["_ZA_story_event_entry_recovery_timeout"],
+            functions["_4_story_shiro_44"],
+        ], type_ignores=[]))
+        now = [0.0]
+        namespace = {
+            "time": types.SimpleNamespace(monotonic=lambda: now[0]),
+        }
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS = 30.0
+            ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS_BY_STATE = {
+                "4_STORY_SHIRO_44": 30.0,
+            }
+            ZA_STORY_BATTLE_RETURN_RECOVERY_COUNT = 3
+            ZA_STORY_WHITE_COMMENT_RECOVERY_TARGETS = {
+                "4_STORY_SHIRO_44": "4_STORY_SHIRO_43",
+            }
+            ZA_STORY_MEGA_BEFORE_COMMENT_RECOVERY_TARGETS = {}
+            ZA_STORY_BATTLE_BEFORE_RECOVERY_TARGETS = {}
+            ZA_story_event_entry_recovery_step = namespace[
+                "ZA_story_event_entry_recovery_step"]
+            _ZA_story_event_entry_recovery_timeout = namespace[
+                "_ZA_story_event_entry_recovery_timeout"]
+            _4_story_shiro_44 = namespace["_4_story_shiro_44"]
+
+            def __init__(self):
+                self.white_visible = False
+                self.reset_calls = 0
+                self.renda_calls = 0
+
+            def image_check(self, target):
+                return (
+                    target == "POKEMON_ZA_TEXT_WHITE_COMMENT"
+                    and self.white_visible)
+
+            def ZA_gamereset(self):
+                self.reset_calls += 1
+                return True
+
+            def ZA_renda_button(self, **_kwargs):
+                self.renda_calls += 1
+                return True
+
+        command = Command()
+        state_functions = {
+            "4_STORY_SHIRO_44": command._4_story_shiro_44,
+        }
+        now[0] = 0.0
+        self.assertEqual(
+            command.ZA_story_event_entry_recovery_step(
+                "4_STORY_SHIRO_44", state_functions),
+            "4_STORY_SHIRO_44")
+        now[0] = 29.0
+        self.assertEqual(
+            command.ZA_story_event_entry_recovery_step(
+                "4_STORY_SHIRO_44", state_functions),
+            "4_STORY_SHIRO_44")
+        self.assertEqual(command.reset_calls, 0)
+
+        now[0] = 31.0
+        self.assertEqual(
+            command.ZA_story_event_entry_recovery_step(
+                "4_STORY_SHIRO_44", state_functions),
+            "4_STORY_SHIRO_43")
+        self.assertEqual(command.reset_calls, 0)
+        self.assertNotIn(
+            "4_STORY_SHIRO_44",
+            command._za_story_event_entry_recovery_started)
+
+        # SHIRO_43から戻った後は30秒を最初から計る。
+        now[0] = 100.0
+        self.assertEqual(
+            command.ZA_story_event_entry_recovery_step(
+                "4_STORY_SHIRO_44", state_functions),
+            "4_STORY_SHIRO_44")
+        self.assertEqual(command.reset_calls, 0)
+
+        # 白Commentを検知した場合は従来どおり45へ進む。
+        command.white_visible = True
+        now[0] = 101.0
+        self.assertEqual(
+            command.ZA_story_event_entry_recovery_step(
+                "4_STORY_SHIRO_44", state_functions),
+            "4_STORY_SHIRO_45")
+        self.assertEqual(command.reset_calls, 0)
+        self.assertEqual(command.renda_calls, 1)
+
+    def test_za_lank_battle_zone_resets_ticket_only_on_step_entry(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        source_class = next(
+            node for node in source_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ZA_story_Base")
+        event_step_node = next(
+            node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_story_event_entry_recovery_step")
+        story_main_node = next(
+            node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_story_main")
+        infi_main_node = next(
+            node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_battle_infi_main")
+        entry_guard_assignments = [
+            node for node in ast.walk(story_main_node)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Attribute)
+                    and target.attr == "_za_story_active_lank_battle_zone"
+                    for target in node.targets)
+        ]
+        self.assertEqual(len(entry_guard_assignments), 1)
+        self.assertFalse(any(
+            isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Attribute)
+                    and target.attr == "_za_story_active_lank_battle_zone"
+                    for target in node.targets)
+            for node in ast.walk(infi_main_node)))
+        module = ast.Module(body=[event_step_node], type_ignores=[])
+        ast.fix_missing_locations(module)
+        namespace = {"time": types.SimpleNamespace(monotonic=lambda: 0.0)}
+        exec(compile(module, source_path, "exec"), namespace)
+        event_step = namespace["ZA_story_event_entry_recovery_step"]
+
+        class LankBattleZoneCommand:
+            ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS = 30.0
+            ZA_STORY_BATTLE_RETURN_RECOVERY_COUNT = 3
+            ZA_STORY_WHITE_COMMENT_RECOVERY_TARGETS = {}
+            ZA_STORY_BATTLE_BEFORE_RECOVERY_TARGETS = {}
+
+            def __init__(self):
+                self.chicketmaxflag = 2
+                self.observed_flags = []
+                self.lank_calls = 0
+
+            @staticmethod
+            def image_check(_name):
+                return False
+
+            def lank_battle_zone_step(self):
+                self.observed_flags.append(self.chicketmaxflag)
+                self.lank_calls += 1
+                if self.lank_calls == 1:
+                    # 同じStep内で満杯になった値は、次周へ保持される。
+                    self.chicketmaxflag = 2
+                    return "2_STORY_X_LANK_BATTLE_ZONE"
+                return "NEXT_STEP"
+
+        lank_zone = LankBattleZoneCommand()
+        lank_state = "2_STORY_X_LANK_BATTLE_ZONE"
+        lank_functions = {lank_state: lank_zone.lank_battle_zone_step}
+        self.assertEqual(
+            event_step(lank_zone, lank_state, lank_functions), lank_state)
+        self.assertEqual(lank_zone.observed_flags, [0])
+        self.assertEqual(
+            event_step(lank_zone, lank_state, lank_functions), "NEXT_STEP")
+        self.assertEqual(lank_zone.observed_flags, [0, 2])
+
+        # Stepを抜けた後に同じLANK_BATTLE_ZONEへ入り直した場合は再初期化する。
+        lank_zone.chicketmaxflag = 2
+        lank_zone.lank_calls = 0
+        self.assertEqual(
+            event_step(lank_zone, lank_state, lank_functions), lank_state)
+        self.assertEqual(lank_zone.observed_flags, [0, 2, 0])
+
+        # StoryのLANK_BATTLE_ZONE以外では、既存のZA_INFI用フラグに触れない。
+        standalone = LankBattleZoneCommand()
+        standalone_state = "ZA_INFI_MAIN_BENCH"
+        self.assertEqual(event_step(
+            standalone, standalone_state,
+            {standalone_state: lambda: standalone_state}), standalone_state)
+        self.assertEqual(standalone.chicketmaxflag, 2)
+
+    def test_za_battle_return_recovery_requires_three_never_active_returns(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        source_class = next(
+            node for node in source_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ZA_story_Base")
+        class_values = {
+            target.id: ast.literal_eval(statement.value)
+            for statement in source_class.body
+            if isinstance(statement, ast.Assign)
+            for target in statement.targets
+            if isinstance(target, ast.Name)
+            and target.id in {
+                "ZA_STORY_BATTLE_RETURN_RECOVERY_COUNT",
+                "ZA_STORY_SHIRO_WHITE_COMMENT_RECOVERY_COUNT",
+                "ZA_STORY_BATTLE_BEFORE_RECOVERY_TARGETS"}
+        }
+        self.assertEqual(
+            class_values["ZA_STORY_BATTLE_RETURN_RECOVERY_COUNT"], 3)
+        self.assertEqual(
+            class_values["ZA_STORY_SHIRO_WHITE_COMMENT_RECOVERY_COUNT"], 3)
+        self.assertEqual(
+            class_values["ZA_STORY_BATTLE_BEFORE_RECOVERY_TARGETS"][
+                "2_STORY_ABSOL_MOVE17"],
+            ("2_STORY_ABSOL_MOVE14", "2_STORY_ABSOL_MOVE18"))
+        self.assertEqual(
+            class_values["ZA_STORY_BATTLE_BEFORE_RECOVERY_TARGETS"][
+                "4_STORY_SHIRO_5"],
+            ("4_STORY_SHIRO_5", "4_STORY_SHIRO_6"))
+        recovery_step = next(
+            node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_story_event_entry_recovery_step")
+        reset_absol_infi = next(
+            node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_ZA_story_reset_absol_infi_reentry")
+        reset_shiro_infi = next(
+            node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_ZA_story_reset_shiro_infi_entry")
+        recovery_timeout = next(
+            node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_ZA_story_event_entry_recovery_timeout")
+        shiro_1 = next(
+            node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_4_story_shiro_1")
+        shiro_5 = next(
+            node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_4_story_shiro_5")
+        module = ast.Module(
+            body=[
+                reset_absol_infi,
+                reset_shiro_infi,
+                recovery_timeout,
+                recovery_step,
+                shiro_1,
+                shiro_5,
+            ], type_ignores=[])
+        ast.fix_missing_locations(module)
+        now = [0.0]
+        namespace = {
+            "time": types.SimpleNamespace(monotonic=lambda: now[0]),
+        }
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            ZA_STORY_BATTLE_RETURN_RECOVERY_COUNT = 3
+            ZA_STORY_WHITE_COMMENT_RECOVERY_TARGETS = {}
+            ZA_STORY_BATTLE_BEFORE_RECOVERY_TARGETS = {
+                "BEFORE": ("RECOVERY", "BATTLE"),
+            }
+
+            def __init__(self, next_state):
+                self.next_state = next_state
+                self.battle_image_visible = False
+
+            def image_check(self, name):
+                return (
+                    self.battle_image_visible
+                    and name == "POKEMON_ZA_BATTLE_BALL_CHECK")
+
+            def ZA_story_Template_battle_function(self):
+                return None
+
+            def battle_step(self):
+                callback = self.ZA_story_Template_battle_function
+                self.last_callback = callback
+                self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK")
+                return self.next_state
+
+            @staticmethod
+            def before_success():
+                return "BATTLE"
+
+        event_step = namespace["ZA_story_event_entry_recovery_step"]
+        non_battle = Command("BEFORE")
+        for index in range(2):
+            now[0] = float(index)
+            self.assertEqual(event_step(
+                non_battle, "BATTLE", {"BATTLE": non_battle.battle_step}),
+                "BEFORE")
+            self.assertEqual(event_step(
+                non_battle, "BEFORE",
+                {"BEFORE": non_battle.before_success}), "BATTLE")
+        # 周回間隔ではなく、実バトル未検知の連続戻り回数で判定する。
+        now[0] = 20.0
+        self.assertEqual(event_step(
+            non_battle, "BATTLE", {"BATTLE": non_battle.battle_step}),
+            "RECOVERY")
+
+        active_battle = Command("BATTLE")
+        active_battle.battle_image_visible = True
+        self.assertEqual(event_step(
+            active_battle, "BATTLE",
+            {"BATTLE": active_battle.battle_step}), "BATTLE")
+        active_battle.battle_image_visible = False
+        active_battle.next_state = "BEFORE"
+        for index in range(5):
+            now[0] = float(index)
+            self.assertEqual(event_step(
+                active_battle, "BATTLE",
+                {"BATTLE": active_battle.battle_step}), "BEFORE")
+            self.assertEqual(event_step(
+                active_battle, "BEFORE",
+                {"BEFORE": active_battle.before_success}), "BATTLE")
+        self.assertEqual(
+            getattr(active_battle, "_za_story_battle_return_counts", {}), {})
+
+        # ABSOLの白Comment等でbattle_beforeへ3回戻った場合は、
+        # MOVE14のZA_INFIへ戻す直前に古いチケット満杯状態を破棄する。
+        class AbsolCommand(Command):
+            ZA_STORY_BATTLE_BEFORE_RECOVERY_TARGETS = {
+                "2_STORY_ABSOL_MOVE17": (
+                    "2_STORY_ABSOL_MOVE14", "2_STORY_ABSOL_MOVE18"),
+            }
+            _ZA_story_reset_absol_infi_reentry = namespace[
+                "_ZA_story_reset_absol_infi_reentry"]
+
+            def __init__(self):
+                super().__init__("2_STORY_ABSOL_MOVE17")
+                self.chicketmaxflag = 2
+                self.za_infi_main_current_state = "ZA_INFI_MAIN_BENCH"
+                self.bench_current_state = "BENCH_CHECK_TIME"
+                self.battle_current_state = "BATTLE_MOVE"
+
+            @staticmethod
+            def before_step():
+                return "2_STORY_ABSOL_MOVE18"
+
+        absol = AbsolCommand()
+        for index in range(3):
+            next_state = event_step(
+                absol, "2_STORY_ABSOL_MOVE18",
+                {"2_STORY_ABSOL_MOVE18": absol.battle_step})
+            if index < 2:
+                self.assertEqual(next_state, "2_STORY_ABSOL_MOVE17")
+                self.assertEqual(event_step(
+                    absol, "2_STORY_ABSOL_MOVE17",
+                    {"2_STORY_ABSOL_MOVE17": absol.before_step}),
+                    "2_STORY_ABSOL_MOVE18")
+        self.assertEqual(next_state, "2_STORY_ABSOL_MOVE14")
+        self.assertEqual(absol.chicketmaxflag, 0)
+        self.assertEqual(
+            absol.za_infi_main_current_state, "ZA_INFI_MAIN_START")
+        self.assertEqual(absol.bench_current_state, "BENCH_START")
+        self.assertEqual(absol.battle_current_state, "BATTLE_START")
+
+        # SHIRO_5は30秒停滞ではなく、実際に白Commentを
+        # Bで閉じた回数が3回に達した場合だけSHIRO_1へ戻す。
+        class ShiroCommand:
+            ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS = 30.0
+            ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS_BY_STATE = {}
+            ZA_STORY_BATTLE_RETURN_RECOVERY_COUNT = 3
+            ZA_STORY_SHIRO_WHITE_COMMENT_RECOVERY_COUNT = 3
+            ZA_STORY_WHITE_COMMENT_RECOVERY_TARGETS = {}
+            ZA_STORY_BATTLE_BEFORE_RECOVERY_TARGETS = {
+                "4_STORY_SHIRO_5": (
+                    "4_STORY_SHIRO_5", "4_STORY_SHIRO_6"),
+            }
+            _ZA_story_reset_shiro_infi_entry = namespace[
+                "_ZA_story_reset_shiro_infi_entry"]
+            _ZA_story_event_entry_recovery_timeout = namespace[
+                "_ZA_story_event_entry_recovery_timeout"]
+            _4_story_shiro_5 = namespace["_4_story_shiro_5"]
+
+            def __init__(self):
+                self.chicketmaxflag = 2
+                self.za_infi_main_current_state = "ZA_INFI_MAIN_BENCH"
+                self.bench_current_state = "BENCH_CHECK_TIME"
+                self.battle_current_state = "BATTLE_MOVE"
+                self.quasar_current_state = "QUASAR_BATTLE_LOOP"
+                self.flow_resets = []
+                self.white_comment_visible = False
+                self.template_next_state = "4_STORY_SHIRO_5"
+
+            def _ZA_story_battle_flow_reset(self, key, reason):
+                self.flow_resets.append((key, reason))
+
+            def image_check(self, picture):
+                return (
+                    picture == "POKEMON_ZA_TEXT_WHITE_COMMENT"
+                    and self.white_comment_visible)
+
+            def ZA_story_Template_battle_before_renda_route(self, **_kwargs):
+                return self.template_next_state
+
+        shiro = ShiroCommand()
+        # 白CommentでないFIELD待ちが長く続いても回数は増えない。
+        for index in range(100):
+            now[0] = float(index)
+            self.assertEqual(event_step(
+                shiro, "4_STORY_SHIRO_5",
+                {"4_STORY_SHIRO_5": shiro._4_story_shiro_5}),
+                "4_STORY_SHIRO_5")
+        self.assertEqual(
+            getattr(shiro, "_4_story_shiro_white_comment_count", 0), 0)
+        self.assertNotIn(
+            "4_STORY_SHIRO_5",
+            getattr(shiro, "_za_story_event_entry_recovery_started", {}))
+
+        # CommentとCommentの間にFIELD周回が入っても、白Commentの
+        # 累積回数だけを保持する。SHIRO_5は30秒タイマーが
+        # 発動せず、3回目の明示的なSHIRO_1遷移だけを使う。
+        for comment_index in range(3):
+            shiro.white_comment_visible = True
+            now[0] += 31.0
+            next_state = event_step(
+                shiro, "4_STORY_SHIRO_5",
+                {"4_STORY_SHIRO_5": shiro._4_story_shiro_5})
+            if comment_index < 2:
+                self.assertEqual(next_state, "4_STORY_SHIRO_5")
+                # B取りこぼしで同じ白Commentが残っても、
+                # 消失を挟むまでは同じ1回として扱う。
+                now[0] += 31.0
+                self.assertEqual(event_step(
+                    shiro, "4_STORY_SHIRO_5",
+                    {"4_STORY_SHIRO_5": shiro._4_story_shiro_5}),
+                    "4_STORY_SHIRO_5")
+                self.assertEqual(
+                    shiro._4_story_shiro_white_comment_count,
+                    comment_index + 1)
+                shiro.white_comment_visible = False
+                now[0] += 31.0
+                self.assertEqual(event_step(
+                    shiro, "4_STORY_SHIRO_5",
+                    {"4_STORY_SHIRO_5": shiro._4_story_shiro_5}),
+                    "4_STORY_SHIRO_5")
+        self.assertEqual(next_state, "4_STORY_SHIRO_1")
+        self.assertEqual(shiro.chicketmaxflag, 0)
+        self.assertEqual(
+            shiro.za_infi_main_current_state, "ZA_INFI_MAIN_START")
+        self.assertEqual(shiro.bench_current_state, "BENCH_START")
+        self.assertEqual(shiro.battle_current_state, "BATTLE_START")
+        self.assertEqual(shiro.quasar_current_state, "QUASAR_START")
+        self.assertTrue(shiro._4_story_shiro_infi_initialized)
+        self.assertEqual(shiro.flow_resets[0][0], "4_STORY_SHIRO_6")
+
+        # 初回の白Commentでも、テンプレートが正常に
+        # SHIRO_6へ進めた場合は復旧回数を即座に破棄する。
+        shiro_success = ShiroCommand()
+        shiro_success.white_comment_visible = True
+        shiro_success.template_next_state = "4_STORY_SHIRO_6"
+        self.assertEqual(
+            shiro_success._4_story_shiro_5(), "4_STORY_SHIRO_6")
+        self.assertEqual(shiro_success._4_story_shiro_white_comment_count, 0)
+
+        # 通常のSHIRO_1初回進入でも一度だけ初期化し、
+        # chicketmaxflag=2持越しによるバトルゾーンの即スキップを防ぐ。
+        class ShiroStartCommand:
+            _ZA_story_reset_shiro_infi_entry = namespace[
+                "_ZA_story_reset_shiro_infi_entry"]
+            _4_story_shiro_1 = namespace["_4_story_shiro_1"]
+
+            def __init__(self):
+                self.chicketmaxflag = 2
+                self.za_infi_main_current_state = "ZA_INFI_MAIN_BENCH"
+                self.bench_current_state = "BENCH_CHECK_TIME"
+                self.battle_current_state = "BATTLE_MOVE"
+                self.quasar_current_state = "QUASAR_BATTLE_LOOP"
+                self.SLEEPLIST = {9: ["test", True, 0.0]}
+                self.flow_resets = []
+                self.start_observations = []
+                self.STATE_ZA_INFI_MAIN_FUNCTION = {
+                    "ZA_INFI_MAIN_START": self.start_step,
+                    "ZA_INFI_MAIN_BENCH": self.finish_step,
+                }
+
+            def _ZA_story_battle_flow_reset(self, key, reason):
+                self.flow_resets.append((key, reason))
+
+            def start_step(self):
+                self.start_observations.append((
+                    self.chicketmaxflag,
+                    self.bench_current_state,
+                    self.battle_current_state,
+                    self.quasar_current_state,
+                ))
+                return "ZA_INFI_MAIN_BENCH"
+
+            @staticmethod
+            def finish_step():
+                return "ZA_INFI_QUASAR_LOOP"
+
+            @staticmethod
+            def wait(_seconds):
+                return None
+
+        shiro_start = ShiroStartCommand()
+        self.assertEqual(
+            shiro_start._4_story_shiro_1(), "4_STORY_SHIRO_1")
+        self.assertEqual(shiro_start.start_observations, [(
+            0, "BENCH_START", "BATTLE_START", "QUASAR_START")])
+        self.assertEqual(len(shiro_start.flow_resets), 1)
+        self.assertEqual(
+            shiro_start._4_story_shiro_1(), "4_STORY_SHIRO_2")
+        self.assertFalse(shiro_start._4_story_shiro_infi_initialized)
+        self.assertEqual(len(shiro_start.flow_resets), 1)
 
     def test_za_battle_missing_field_recovers_after_ten_consecutive_checks(self):
         source_path = os.path.join(
@@ -1953,6 +4714,10 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             node for node in ast.walk(runtime_tree)
             if isinstance(node, ast.FunctionDef)
             and node.name == "ZA_battle_missing_field_recovery")
+        runtime_reword_recovery = next(
+            node for node in ast.walk(runtime_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_battle_reword_recovery")
         fragment_function = next(
             node for node in fragment_tree.body
             if isinstance(node, ast.FunctionDef)
@@ -1961,25 +4726,42 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             node for node in fragment_tree.body
             if isinstance(node, ast.FunctionDef)
             and node.name == "ZA_battle_missing_field_recovery")
+        fragment_reword_recovery = next(
+            node for node in fragment_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_battle_reword_recovery")
         self.assertEqual(
             ast.dump(runtime_function, include_attributes=False),
             ast.dump(fragment_function, include_attributes=False))
         self.assertEqual(
             ast.dump(runtime_recovery, include_attributes=False),
             ast.dump(fragment_recovery, include_attributes=False))
+        self.assertEqual(
+            ast.dump(runtime_reword_recovery, include_attributes=False),
+            ast.dump(fragment_reword_recovery, include_attributes=False))
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            recovery_text = ast.get_source_segment(
+                stream.read(), runtime_recovery)
+        self.assertIn("POKEMON_ZA_BATTLE_ACTIVE_LEVEL", recovery_text)
+        self.assertNotIn("POKEMON_ZA_BATTLE_BALL_CHECK", recovery_text)
+        self.assertNotIn("POKEMON_ZA_ESCAPE", recovery_text)
 
         function_module = ast.Module(
-            body=[fragment_recovery, fragment_function], type_ignores=[])
+            body=[fragment_reword_recovery, fragment_recovery,
+                  fragment_function], type_ignores=[])
         ast.fix_missing_locations(function_module)
         namespace = {"Button": Button}
         exec(compile(function_module, fragment_path, "exec"), namespace)
         battle_once = namespace["ZA_battle_coCp_noloop"]
         recover = namespace["ZA_battle_missing_field_recovery"]
+        recover_reword = namespace["ZA_battle_reword_recovery"]
 
         class RecoveryCommand:
             def __init__(self, field_after_b=3, x_menu_open=False,
                          menu_after_x=False, help_after_x=False,
-                         help_clear_after_a=1):
+                         help_clear_after_a=1, reword_open=False,
+                         reword_after_x=False, reword_clear_after_b=1,
+                         battle_level_visible=False):
                 self.stuck = True
                 self.field_after_b = field_after_b
                 self.x_menu_open = x_menu_open
@@ -1987,14 +4769,22 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 self.help_marker = False
                 self.help_after_x = help_after_x
                 self.help_clear_after_a = help_clear_after_a
+                self.reword_open = reword_open
+                self.reword_after_x = reword_after_x
+                self.reword_clear_after_b = reword_clear_after_b
                 self.b_count = 0
                 self.a_count = 0
                 self.press_events = []
                 self.alive_checks = 0
+                self.battle_level_visible = battle_level_visible
 
             def image_check(self, name):
                 if name == "POKEMON_ZA_HELP_MARKER":
                     return self.help_marker
+                if name == "POKEMON_ZA_REWORD":
+                    return self.reword_open
+                if name == "POKEMON_ZA_BATTLE_ACTIVE_LEVEL":
+                    return self.battle_level_visible
                 return (
                     name == "POKEMON_ZA_X_MENU_OPEN"
                     and self.x_menu_open)
@@ -2010,6 +4800,9 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             def ZA_battle_missing_field_recovery(self, *args, **kwargs):
                 return recover(self, *args, **kwargs)
 
+            def ZA_battle_reword_recovery(self, *args, **kwargs):
+                return recover_reword(self, *args, **kwargs)
+
             def checkIfAlive(self):
                 self.alive_checks += 1
 
@@ -2021,6 +4814,8 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                     self.stuck = False
                 if button == Button.X and self.help_after_x:
                     self.help_marker = True
+                if button == Button.X and self.reword_after_x:
+                    self.reword_open = True
                 if button == Button.A:
                     self.a_count += repeat
                     if self.a_count >= self.help_clear_after_a:
@@ -2028,6 +4823,8 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 if button == Button.B:
                     self.x_menu_open = False
                     self.b_count += repeat
+                    if self.b_count >= self.reword_clear_after_b:
+                        self.reword_open = False
                     if self.b_count >= self.field_after_b:
                         self.stuck = False
 
@@ -2037,6 +4834,28 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             def wait(self, _duration):
                 pass
 
+        open_reword_command = RecoveryCommand(
+            field_after_b=999, reword_open=True,
+            reword_clear_after_b=3)
+        self.assertTrue(recover(
+            open_reword_command, "reword", enabled=False,
+            attack_ready=True))
+        self.assertEqual(
+            open_reword_command.press_events, [(Button.B, 1)] * 3)
+        self.assertFalse(open_reword_command.reword_open)
+        self.assertEqual(
+            open_reword_command._za_battle_missing_field_count_reword, 0)
+
+        recovery_reword_command = RecoveryCommand(
+            field_after_b=999, reword_after_x=True,
+            reword_clear_after_b=3)
+        for _ in range(10):
+            battle_once(recovery_reword_command)
+        self.assertEqual(
+            recovery_reword_command.press_events,
+            [(Button.X, 1)] + [(Button.B, 1)] * 3)
+        self.assertFalse(recovery_reword_command.reword_open)
+
         menu_command = RecoveryCommand(x_menu_open=True)
         menu_command.stuck = False
         self.assertTrue(recover(
@@ -2044,6 +4863,14 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(menu_command.press_events, [(Button.B, 1)])
         self.assertEqual(
             menu_command._za_battle_missing_field_count_menu, 0)
+
+        active_battle_command = RecoveryCommand(
+            battle_level_visible=True)
+        for _ in range(12):
+            battle_once(active_battle_command)
+        self.assertEqual(active_battle_command.press_events, [])
+        self.assertEqual(
+            active_battle_command._za_battle_missing_field_count_cocp, 0)
 
         recovery_menu_command = RecoveryCommand(
             field_after_b=999, menu_after_x=True)
@@ -2118,6 +4945,121 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(
             capped_command._za_battle_missing_field_count_cocp, 1)
 
+    def test_za_cp_loop_view_lockon_mode_rotates_before_zl(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+        namespace = {"Button": Button}
+        exec(compile(
+            records["ZA_battle_Cp_loop"], source_path, "exec"), namespace)
+        battle = namespace["ZA_battle_Cp_loop"]
+
+        class Command:
+            def __init__(self):
+                self.events = []
+
+            def checkIfAlive(self):
+                return None
+
+            def image_check(self, _target):
+                return False
+
+            def ZA_battle_missing_field_recovery(self, *_args, **_kwargs):
+                return False
+
+            def ZA_MOVE_SEE(self, action="RELOAD", in_see_r=0.0):
+                self.events.append(("see", action, in_see_r))
+
+            def ZA_ZL_ACTION(self, action="RELOAD"):
+                self.events.append(("zl", action))
+
+            def wait(self, duration):
+                self.events.append(("wait", duration))
+
+        enabled = Command()
+        self.assertTrue(battle(
+            enabled, mode=1, battle_mode=1, view_lockon_mode=1))
+        self.assertEqual(enabled.events, [
+            ("see", "", 0.6),
+            ("zl", ""),
+            ("see", "END", 0.6),
+            ("zl", "END"),
+        ])
+
+        disabled = Command()
+        self.assertTrue(battle(disabled, mode=1, battle_mode=1))
+        self.assertEqual(disabled.events, [
+            ("zl", ""),
+            ("see", "END", 0.6),
+            ("zl", "END"),
+        ])
+
+        class AttackSent(Exception):
+            pass
+
+        class LowCplusCommand(Command):
+            def __init__(self):
+                super().__init__()
+                self.checked = []
+
+            def image_check(self, target):
+                self.checked.append(target)
+                return target == "POKEMON_ZA_C+_LOW"
+
+            def pressRep(self, button, **_kwargs):
+                self.events.append(("attack", button))
+                raise AttackSent()
+
+        low_cplus = LowCplusCommand()
+        with self.assertRaises(AttackSent):
+            battle(low_cplus, Xaction=1)
+        self.assertIn("POKEMON_ZA_C+", low_cplus.checked)
+        self.assertIn("POKEMON_ZA_C+_LOW", low_cplus.checked)
+        self.assertIn(("attack", Button.X), low_cplus.events)
+
+        class DelayedLowCplusCommand(Command):
+            def __init__(self):
+                super().__init__()
+                self.lockon_active = False
+                self.lockon_low_checks = 0
+
+            def ZA_ZL_ACTION(self, action="RELOAD"):
+                super().ZA_ZL_ACTION(action)
+                self.lockon_active = action != "END"
+
+            def image_check(self, target):
+                if (target == "POKEMON_ZA_C+_LOW"
+                        and self.lockon_active):
+                    self.lockon_low_checks += 1
+                    return self.lockon_low_checks >= 3
+                return False
+
+            def pressRep(self, button, **_kwargs):
+                self.events.append(("attack", button))
+                raise AttackSent()
+
+        delayed_cplus = DelayedLowCplusCommand()
+        with self.assertRaises(AttackSent):
+            battle(
+                delayed_cplus, Xaction=1,
+                lockon_attack_wait=0.3,
+                lockon_attack_checks=3)
+        self.assertEqual(delayed_cplus.lockon_low_checks, 3)
+        self.assertEqual(
+            [event for event in delayed_cplus.events
+             if event[0] == "wait"],
+            [("wait", 0.15), ("wait", 0.15)])
+        self.assertLess(
+            delayed_cplus.events.index(("zl", "")),
+            delayed_cplus.events.index(("attack", Button.X)))
+        self.assertIn(
+            "view_lockon_mode=1", records["_5_story_karasuba_59"])
+
     def test_za_infi_uses_low_cplus_and_faces_marker_before_relock(self):
         source_path = os.path.join(
             SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
@@ -2148,10 +5090,13 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             if isinstance(node, ast.FunctionDef)
         }
         synchronized = (
+            "ZA_battle_reword_recovery",
             "ZA_battle_missing_field_recovery",
             "ZA_battle_Cp_loop",
             "ZA_battle_Cp_loop_move",
             "ZA_infi_attack_ready",
+            "ZA_infi_guarded_ladder_climb",
+            "ZA_infi_stalled_ladder_recovery",
             "ZA_infi_target_marker_direction",
             "ZA_infi_relock_toward_marker",
             "ZA_battle_move_test",
@@ -2179,6 +5124,25 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 and isinstance(node.func, ast.Attribute)
             }
             self.assertIn("ZA_battle_missing_field_recovery", calls, name)
+        battle_move_calls = {
+            node.func.attr
+            for node in ast.walk(source_functions["ZA_battle_move_test"])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+        }
+        self.assertIn("ZA_infi_guarded_ladder_climb", battle_move_calls)
+        uninterrupted_ladder_inputs = [
+            node for node in ast.walk(source_functions["ZA_battle_move_test"])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "press"
+            and any(
+                keyword.arg == "duration"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value == 10.0
+                for keyword in node.keywords)
+        ]
+        self.assertEqual(uninterrupted_ladder_inputs, [])
         mega_calls = {
             node.func.attr
             for node in ast.walk(source_functions["ZA_mega_evolution_battle"])
@@ -2226,6 +5190,98 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(
             low_attack.checks,
             ["POKEMON_ZA_C+", "POKEMON_ZA_C+_LOW"])
+
+        ladder_climb_function = battle_functions[
+            "ZA_infi_guarded_ladder_climb"]
+        ladder_function = battle_functions[
+            "ZA_infi_stalled_ladder_recovery"]
+        ladder_namespace = {
+            "cv2": cv2,
+            "Direction": Direction,
+            "Stick": Stick,
+            "time": time,
+        }
+        exec(compile(ast.Module(
+            body=[ladder_climb_function, ladder_function], type_ignores=[]),
+            battle_fragment_path, "exec"), ladder_namespace)
+
+        class LadderCommand:
+            def __init__(self):
+                self.battle_current_state = "BATTLE_MOVE"
+                self.battle_step = 0
+                self.attack_ready = False
+                self.escape_visible = False
+                self.stop_after_moves = None
+                self.events = []
+
+            def image_check(self, name):
+                if name == "POKEMON_ZA_ESCAPE":
+                    return self.escape_visible
+                return False
+
+            def ZA_infi_attack_ready(self):
+                return self.attack_ready
+
+            def ZA_MOVE_SEE(self, action=""):
+                self.events.append(("see", action))
+
+            def ZA_ZL_ACTION(self, action=""):
+                self.events.append(("zl", action))
+
+            def press(self, direction, duration=0.0, wait=0.0):
+                self.events.append(("move", direction, duration, wait))
+                move_count = sum(
+                    event[0] == "move" for event in self.events)
+                if (self.stop_after_moves is not None
+                        and move_count >= self.stop_after_moves):
+                    self.attack_ready = True
+
+        LadderCommand.ZA_infi_guarded_ladder_climb = (
+            ladder_namespace["ZA_infi_guarded_ladder_climb"])
+
+        recover_ladder = ladder_namespace[
+            "ZA_infi_stalled_ladder_recovery"]
+        static_frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        ladder_command = LadderCommand()
+        self.assertFalse(recover_ladder(
+            ladder_command, now=10.0, frame=static_frame))
+        self.assertFalse(recover_ladder(
+            ladder_command, now=12.9, frame=static_frame))
+        self.assertTrue(recover_ladder(
+            ladder_command, now=13.1, frame=static_frame))
+        ladder_moves = [
+            event for event in ladder_command.events
+            if event[0] == "move"]
+        self.assertEqual(len(ladder_moves), 20)
+        self.assertTrue(all(event[2:] == (0.5, 0.0)
+                            for event in ladder_moves))
+
+        interrupted_ladder = LadderCommand()
+        interrupted_ladder.stop_after_moves = 2
+        moved, completed = ladder_namespace[
+            "ZA_infi_guarded_ladder_climb"](interrupted_ladder)
+        self.assertTrue(moved)
+        self.assertFalse(completed)
+        self.assertEqual(len([
+            event for event in interrupted_ladder.events
+            if event[0] == "move"]), 2)
+
+        attack_command = LadderCommand()
+        self.assertFalse(recover_ladder(
+            attack_command, now=20.0, frame=static_frame))
+        attack_command.attack_ready = True
+        self.assertFalse(recover_ladder(
+            attack_command, now=23.1, frame=static_frame))
+        self.assertEqual(attack_command.events, [])
+
+        moving_command = LadderCommand()
+        moving_frame = numpy.full(
+            (720, 1280, 3), 255, dtype=numpy.uint8)
+        self.assertFalse(recover_ladder(
+            moving_command, now=30.0, frame=static_frame))
+        self.assertFalse(recover_ladder(
+            moving_command, now=34.0, frame=moving_frame))
+        self.assertEqual(moving_command.events, [])
 
         target_function = battle_functions[
             "ZA_infi_target_marker_direction"]
@@ -2315,6 +5371,147 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(relock_command.events[3][0:2], ("press", Button.L))
         self.assertEqual(relock_command.events[4], ("zl", ""))
 
+    def test_za_infi_rotates_area_and_recovers_from_failures(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_BattleAndRoyale", "ZA_BattleAndRoyale.pyfrag")
+        support_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_InfiMainDependencies", "ZA_battle_infi_main__support",
+            "ZA_battle_infi_main__support.pokesample.json")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        source_functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        fragment_functions = {
+            node.name: node for node in fragment_tree.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        guarded_functions = (
+            "ZA_battle_start",
+            "ZA_battle_goto_battle_zone2",
+            "ZA_battle_move",
+        )
+        for name in guarded_functions:
+            self.assertEqual(
+                ast.dump(source_functions[name], include_attributes=False),
+                ast.dump(fragment_functions[name], include_attributes=False),
+                name)
+        with open(support_path, "r", encoding="utf-8") as stream:
+            support_initializer = json.load(stream)["initializer"]
+        self.assertIn("self.infi_previous_targetzone = None",
+                      support_initializer)
+        self.assertIn("self.infi_area_failure_limit = 3",
+                      support_initializer)
+
+        namespace = {"Button": Button}
+        function_module = ast.Module(
+            body=[fragment_functions[name] for name in guarded_functions],
+            type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        exec(compile(function_module, fragment_path, "exec"), namespace)
+
+        class MapCommand:
+            def __init__(self):
+                self.SLEEPLIST = [[None, None, 0.0] for _ in range(11)]
+                self.battlecount = 2
+                self.battle_zone_loop_num = 3
+                self.infi_previous_targetzone = 5
+                self.testcode = 0
+                self.testtarget = 0
+                self.ZONELIST = [
+                    [None, "unused", True]
+                ] + [[None, f"zone{zone}", True] for zone in range(1, 13)]
+                self.zonemisscount = [0] * 12
+                self.sleepcount = 0
+                self.battle_step_return = 0
+                self.battlecheck = 0
+                self.inactioncount = 0
+                self.detected_zones = iter((5, 6))
+                self.events = []
+
+            def wait(self, _seconds):
+                pass
+
+            def image_check(self, name):
+                return name in {
+                    "POKEMON_ZA_MAP2",
+                    "POKEMON_ZA_MOVESPOT_TAB",
+                    "POKEMON_ZA_TAB_FILTER",
+                    "POKEMON_ZA_MOVE_COMMENT",
+                }
+
+            def ZA_zone_check(self):
+                return next(self.detected_zones)
+
+            def etc_sendCommand(self, command):
+                self.events.append(("command", command))
+
+            def pressRep(self, button, **kwargs):
+                self.events.append(("press", button, kwargs))
+
+        map_command = MapCommand()
+        self.assertEqual(
+            namespace["ZA_battle_goto_battle_zone2"](map_command),
+            "BATTLE_START")
+        self.assertEqual(map_command.battlecount, 3)
+        self.assertEqual(map_command.targetzone, 6)
+        self.assertEqual(map_command.infi_previous_targetzone, 6)
+        self.assertIn(("press", Button.A, {
+            "repeat": 1, "duration": 0.15, "wait": 0.1,
+            "interval": 0.1}), map_command.events)
+
+        class MoveCommand:
+            def __init__(self, reward=False, advance_inside=False):
+                self.battle_step_return = 0
+                self.battle_step = 0
+                self.battlecount = 0
+                self.battle_zone_loop_num = 99
+                self.infi_area_failure_limit = 3
+                self.reward = reward
+                self.advance_inside = advance_inside
+
+            def image_check(self, name):
+                return name in {
+                    "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+                    "POKEMON_ZA_FIELD",
+                }
+
+            def ZA_battle_move_test(self, *_args):
+                if self.advance_inside:
+                    self.battlecount += 1
+                if self.reward:
+                    self._za_infi_area_end_reason = "reward"
+                    self.battlecount += 1
+                return "BATTLE_MAP_OPEN"
+
+        move = namespace["ZA_battle_move"]
+        failed_command = MoveCommand()
+        self.assertEqual(move(failed_command), "BATTLE_MAP_OPEN")
+        self.assertEqual((failed_command.battlecount,
+                          failed_command.infi_area_failure_count), (1, 1))
+        self.assertEqual(move(failed_command), "BATTLE_MAP_OPEN")
+        self.assertEqual((failed_command.battlecount,
+                          failed_command.infi_area_failure_count), (2, 2))
+        self.assertEqual(move(failed_command), "BATTLE_START")
+        self.assertEqual((failed_command.battlecount,
+                          failed_command.infi_area_failure_count), (3, 3))
+
+        pre_counted_command = MoveCommand(advance_inside=True)
+        self.assertEqual(move(pre_counted_command), "BATTLE_MAP_OPEN")
+        self.assertEqual(pre_counted_command.battlecount, 1)
+        reward_command = MoveCommand(reward=True)
+        reward_command.infi_area_failure_count = 2
+        self.assertEqual(move(reward_command), "BATTLE_MAP_OPEN")
+        self.assertEqual(reward_command.infi_area_failure_count, 0)
+
     def test_za_infi_escape_confirmation_allows_for_party_switching(self):
         source_path = os.path.join(
             SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
@@ -2346,6 +5543,4194 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertIn("self.ZA_escapecheckrange = 149", battle_sample)
         # outer condition + range(1, value) + final condition = value + 1
         self.assertEqual(149 + 1, 150)
+
+    def test_za_red_edge_helpers_and_mode5_green_priority(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        source_functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        fragment_functions = {
+            node.name: node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+
+        helper_names = (
+            "ZA_mega_red_screen_edge_check",
+            "ZA_mega_red_edge_y_renda",
+            "ZA_mega_red_edge_dodge_if_needed",
+        )
+        for name in helper_names:
+            self.assertEqual(
+                ast.dump(source_functions[name], include_attributes=False),
+                ast.dump(fragment_functions[name], include_attributes=False),
+                name)
+
+        for functions in (source_functions, fragment_functions):
+            mode_select = functions[
+                "ZA_mega_evolution_battle_mode_select"]
+            self.assertEqual(
+                mode_select.args.args[-2].arg,
+                "red_edge_y_renda_seconds")
+            self.assertEqual(
+                ast.literal_eval(mode_select.args.defaults[-2]), 0.0)
+            self.assertEqual(
+                mode_select.args.args[-1].arg,
+                "attack_unavailable_y_dodge")
+            self.assertEqual(
+                ast.literal_eval(mode_select.args.defaults[-1]), 1)
+            mega_calls = [
+                node for node in ast.walk(mode_select)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "ZA_mega_evolution_battle"
+            ]
+            self.assertTrue(mega_calls)
+            self.assertTrue(all(
+                any(keyword.arg == "red_edge_y_renda_seconds"
+                    for keyword in call.keywords)
+                for call in mega_calls))
+
+        for functions in (source_functions, fragment_functions):
+            battle_function = functions["ZA_mega_evolution_battle"]
+            default_arguments = battle_function.args.args[-len(
+                battle_function.args.defaults):]
+            defaults_by_name = {
+                argument.arg: ast.literal_eval(default)
+                for argument, default in zip(
+                    default_arguments, battle_function.args.defaults)
+            }
+            self.assertEqual(
+                defaults_by_name["red_edge_y_renda_seconds"], 0.0)
+            self.assertEqual(
+                defaults_by_name["red_edge_y_repeat"], 0)
+            battle_calls = [
+                node.func.attr for node in ast.walk(battle_function)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr in {
+                    "ZA_mega_red_edge_dodge_if_needed",
+                }
+            ]
+            self.assertEqual(
+                battle_calls.count(
+                    "ZA_mega_red_edge_dodge_if_needed"), 3)
+
+        class FakeTime:
+            now = 0.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+        module = ast.fix_missing_locations(ast.Module(
+            body=[source_functions[name] for name in helper_names],
+            type_ignores=[]))
+        namespace = {"Button": Button, "cv2": cv2, "time": FakeTime}
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            def __init__(self, matched=(), guard=False):
+                self.matched = set(matched)
+                self.guard = guard
+                self.buttons = []
+                self.alive_checks = 0
+
+            def image_check(self, name):
+                return name in self.matched
+
+            def ZA_mega_choice_input_guard(self):
+                return self.guard
+
+            def checkIfAlive(self):
+                self.alive_checks += 1
+
+            def pressRep(self, button, **_kwargs):
+                self.buttons.append(button)
+
+            @staticmethod
+            def wait(duration):
+                FakeTime.now += duration
+
+        red_edge_check = namespace["ZA_mega_red_screen_edge_check"]
+        frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        edge_y = int(frame.shape[0] * 0.08)
+        edge_x = int(frame.shape[1] * 0.08)
+        frame[:edge_y, :] = (0, 0, 220)
+        frame[-edge_y:, :] = (0, 0, 220)
+        frame[:, :edge_x] = (0, 0, 220)
+        frame[:, -edge_x:] = (0, 0, 220)
+        self.assertTrue(red_edge_check(Command(), frame=frame))
+
+        center_red = numpy.zeros_like(frame)
+        center_red[200:520, 400:880] = (0, 0, 220)
+        self.assertFalse(red_edge_check(Command(), frame=center_red))
+        one_red_edge = numpy.zeros_like(frame)
+        one_red_edge[-edge_y:, :] = (0, 0, 220)
+        self.assertFalse(red_edge_check(Command(), frame=one_red_edge))
+
+        FakeTime.now = 0.0
+        rolling = Command()
+        self.assertEqual(namespace["ZA_mega_red_edge_y_renda"](
+            rolling, 5.0), "complete")
+        self.assertGreaterEqual(len(rolling.buttons), 49)
+        self.assertTrue(all(button == Button.Y for button in rolling.buttons))
+        self.assertEqual(rolling.alive_checks, len(rolling.buttons))
+
+        FakeTime.now = 0.0
+        rolling_four = Command()
+        self.assertEqual(namespace["ZA_mega_red_edge_y_renda"](
+            rolling_four, 0.2, repeat_count=4), "complete")
+        self.assertEqual(rolling_four.buttons, [Button.Y] * 4)
+        self.assertEqual(rolling_four.alive_checks, 4)
+
+        FakeTime.now = 0.0
+        ended = Command({"END"})
+        self.assertEqual(namespace["ZA_mega_red_edge_y_renda"](
+            ended, 5.0, endpicture="END"), "endpicture")
+        self.assertEqual(ended.buttons, [])
+
+        class DodgeCommand:
+            def __init__(self):
+                self._za_mega_red_edge_latched = False
+                self.actions = []
+
+            def ZA_mega_red_screen_edge_check(self):
+                self.actions.append("red_check")
+                return True
+
+            def ZA_ZL_ACTION(self, action):
+                self.actions.append("zl:" + action)
+
+            def ZA_MOVE_SEE(self, action, **_kwargs):
+                self.actions.append("see:" + action)
+
+            def ZA_mega_red_edge_y_renda(self, *_args, **_kwargs):
+                self.actions.append("y_renda")
+                return "complete"
+
+            def ZA_mega_keep_left_moving(self, *_args):
+                self.actions.append("left_resume")
+
+        dodge = DodgeCommand()
+        self.assertEqual(
+            namespace["ZA_mega_red_edge_dodge_if_needed"](
+                dodge, 5.0, 20, 340, 40, 300, 0.24),
+            "complete")
+        self.assertEqual(dodge.actions, [
+            "red_check",
+            "zl:END",
+            "see:END",
+            "y_renda",
+            "zl:",
+            "left_resume",
+            "see:",
+        ])
+        self.assertLess(
+            dodge.actions.index("zl:END"),
+            dodge.actions.index("y_renda"))
+        self.assertGreater(
+            dodge.actions.index("zl:"),
+            dodge.actions.index("y_renda"))
+
+        class GreenPriorityDodgeCommand(DodgeCommand):
+            def __init__(self):
+                super().__init__()
+                self._za_mega_last_battle_mode = True
+                self._za_mega_z_guard_enabled = True
+
+            def ZA_mega_z_guard_update(self, *_args):
+                self.actions.append("green_check")
+                return True
+
+            def ZA_mega_mode5_trace(self, phase, detail):
+                self.actions.append("trace:{}:{}".format(phase, detail))
+
+        green_priority = GreenPriorityDodgeCommand()
+        self.assertEqual(
+            namespace["ZA_mega_red_edge_dodge_if_needed"](
+                green_priority, 0.2, 20, 90, 40, 90, 0.24),
+            "green_priority")
+        self.assertEqual(green_priority.actions[:2], [
+            "red_check", "green_check"])
+        self.assertTrue(green_priority.actions[2].startswith(
+            "trace:RED_DAMAGE_AND_GREEN_FLOOR:"))
+        self.assertNotIn("zl:END", green_priority.actions)
+        self.assertNotIn("y_renda", green_priority.actions)
+        self.assertFalse(green_priority._za_mega_red_edge_latched)
+
+        red_edge_calls = {}
+        for name, function in source_functions.items():
+            calls = [
+                call for call in ast.walk(function)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "ZA_mega_evolution_battle_mode_select"
+                and any(keyword.arg == "red_edge_y_renda_seconds"
+                        for keyword in call.keywords)
+            ]
+            if calls:
+                red_edge_calls[name] = calls
+        self.assertEqual(red_edge_calls, {})
+
+    def test_za_mode5_charge_warning_prefers_near_green_then_y_dodge(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        profile_path = os.path.join(
+            SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        with open(profile_path, "r", encoding="utf-8") as stream:
+            library = json.load(stream)
+
+        names = (
+            "ZA_mega_last_battle_charge_dodge",
+            "ZA_mega_mode5_testmode1_warning_cycle_update",
+            "ZA_mega_last_battle_charge_update",
+        )
+        source_functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)}
+        fragment_functions = {
+            node.name: node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef)}
+        for name in names:
+            self.assertEqual(
+                normalized_function_ast_dump(source_functions[name]),
+                normalized_function_ast_dump(fragment_functions[name]))
+
+        battle_calls = [
+            node for node in ast.walk(
+                source_functions["ZA_mega_evolution_battle"])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ZA_mega_last_battle_charge_update"]
+        self.assertEqual(len(battle_calls), 3)
+
+        target_names = (
+            "POKEMON_ZA_LAST_BATTLE_CHARGE",
+            "POKEMON_ZA_LAST_BATTLE_STRONG_LIGHT",
+        )
+        source_targets = ast.literal_eval(next(
+            node.value for node in ast.walk(source_tree)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "IMAGE_DETECTION_TARGETS"
+                    for target in node.targets)))
+        common_members = {
+            member["id"] for member in library["lists"][
+                "POKEMON_ZA_FOLDER_COMMON"]["members"]
+            if member.get("type") == "target"}
+        for target_name in target_names:
+            target = library["targets"][target_name]
+            variant = target["variants"][0]
+            self.assertEqual(variant["threshold"], 0.78)
+            self.assertEqual(variant["crop"], [840, 170, 1275, 360])
+            self.assertIn(target_name, common_members)
+            self.assertEqual(source_targets[target_name], target["variants"])
+            template_path = os.path.join(
+                SERIAL_CONTROLLER,
+                variant["template_path"].replace("/", os.sep))
+            template = cv2.imread(template_path)
+            self.assertIsNotNone(template, template_path)
+            self.assertGreater(template.size, 0)
+
+        class FakeTime:
+            now = 0.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+        namespace = {
+            "Button": Button, "Direction": Direction, "Stick": Stick,
+            "time": FakeTime,
+        }
+        module = ast.fix_missing_locations(ast.Module(
+            body=[source_functions[name] for name in names],
+            type_ignores=[]))
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class ChargeCommand:
+            def __init__(self, move_seconds=0.0, direction=None):
+                self._za_mega_last_battle_mode = True
+                self._za_mega_z_guard_enabled = True
+                self._za_mega_last_charge_state = "IDLE"
+                self._za_mega_last_charge_check_retry_at = 0.0
+                self._za_mega_last_charge_search_deadline = 0.0
+                self._za_mega_last_charge_cooldown_until = 0.0
+                self._za_mega_last_charge_skip_count = 0
+                self._za_mega_last_charge_attack_suspended = False
+                self._za_mega_testmode1_existing_charge_latched = False
+                self._za_mega_testmode1_enabled = False
+                self._za_mega_testmode1_red_premove_block_until = 0.0
+                self._za_mega_testmode1_red_premove_waiting_strong_light = False
+                self._za_mega_testmode1_warning_cycle_active = False
+                self._za_mega_testmode1_warning_cycle_saw_strong = False
+                self._za_mega_testmode1_warning_interval_active = False
+                self._za_mega_testmode1_warning_interval_blue_seen = False
+                self._za_mega_testmode1_warning_red_pending = False
+                self.charge_warning_skip_count = 2
+                self._za_mega_z_guard_holding = False
+                self._za_mega_marker_search_direction = 180.0
+                self._za_mega_marker_search_strength = 0.24
+                self._za_mega_green_floor_move_seconds = move_seconds
+                self._za_mega_green_floor_distance_ratio = 0.0
+                self.direction = direction
+                self.on_green = False
+                self.green_active = False
+                self.matched = set()
+                self.events = []
+
+            def image_check(self, name):
+                self.events.append("check:" + name)
+                return name in self.matched
+
+            def ZA_mega_green_safe_floor_direction(self):
+                return self.on_green, self.direction, 0.0
+
+            def ZA_mega_z_guard_update(self, *_args, **_kwargs):
+                self.events.append("green_update")
+                return self.green_active
+
+            def ZA_mega_last_battle_charge_dodge(self, *args, **kwargs):
+                return namespace["ZA_mega_last_battle_charge_dodge"](
+                    self, *args, **kwargs)
+
+            def ZA_mega_mode5_testmode1_warning_cycle_update(self, event):
+                return namespace[
+                    "ZA_mega_mode5_testmode1_warning_cycle_update"](
+                        self, event)
+
+            def ZA_mega_red_edge_y_renda(self, seconds, **_kwargs):
+                self.events.append("y:{:.1f}".format(seconds))
+                FakeTime.now += seconds
+                return "complete"
+
+            def ZA_mega_mode5_marker_search_view_stop(self, relock=False):
+                self.events.append("view_stop:" + str(relock))
+
+            def ZA_MOVE_LStick(self, *_args):
+                self.events.append("left_stop")
+
+            def ZA_MOVE_SEE(self, action, **_kwargs):
+                self.events.append("see:" + action)
+
+            def ZA_ZL_ACTION(self, action):
+                self.events.append("zl:" + action)
+
+            def ZA_mega_mode5_trace(self, phase, detail, **_kwargs):
+                self.events.append("trace:" + phase + ":" + detail)
+
+            def ZA_mega_mode5_transition(self, phase, detail):
+                self.events.append("transition:" + phase + ":" + detail)
+
+            def ZA_mega_mode5_testmode1_settings(self):
+                return {
+                    "CHARGE_WARNING_SKIP_COUNT":
+                        self.charge_warning_skip_count,
+                    "WARNING_BLUE_FALLBACK_ENABLED": True,
+                    "RED_ATTACK_PREMOVE_BLOCK_SECONDS": 7.0,
+                }
+
+            def press(self, direction, **_kwargs):
+                self.events.append("right:{:.0f}:{:.3f}".format(
+                    direction.angle_for_show, direction.mag))
+
+        update = namespace["ZA_mega_last_battle_charge_update"]
+        near = ChargeCommand(
+            move_seconds=1.0, direction=Direction(Stick.LEFT, 45, 1.0))
+        near.green_active = True
+        near.matched.add("POKEMON_ZA_LAST_BATTLE_CHARGE")
+        self.assertEqual(update(near, 20, 90, 40, 90, 0.24), "green")
+        self.assertEqual(near._za_mega_last_charge_state, "GREEN")
+        self.assertIn("green_update", near.events)
+        self.assertNotIn("y:3.0", near.events)
+
+        FakeTime.now = 0.0
+        far = ChargeCommand(
+            move_seconds=1.8, direction=Direction(Stick.LEFT, 45, 1.0))
+        far.matched.add("POKEMON_ZA_LAST_BATTLE_CHARGE")
+        self.assertEqual(update(far, 20, 90, 40, 90, 0.24), "dodge")
+        self.assertIn("y:7.0", far.events)
+        self.assertLess(far.events.index("zl:END"), far.events.index("y:7.0"))
+        self.assertGreater(far.events.index("zl:"), far.events.index("y:7.0"))
+        self.assertEqual(far._za_mega_last_charge_state, "COOLDOWN")
+
+        FakeTime.now = 0.0
+        missing = ChargeCommand()
+        missing.matched.add("POKEMON_ZA_LAST_BATTLE_CHARGE")
+        self.assertEqual(update(missing, 20, 90, 40, 90, 0.24), "search")
+        self.assertIn("right:180:0.576", missing.events)
+        missing.matched = {"POKEMON_ZA_LAST_BATTLE_STRONG_LIGHT"}
+        self.assertEqual(update(missing, 20, 90, 40, 90, 0.24), "dodge")
+        self.assertIn("y:3.0", missing.events)
+
+        # TESTMODE1では同じ表示を重複計上せず、予兆イベントを2回だけ
+        # 無視する。3回目を受理した後は再開まで攻撃入力へ戻らない。
+        FakeTime.now = 0.0
+        skipped = ChargeCommand(
+            move_seconds=1.0, direction=Direction(Stick.LEFT, 45, 1.0))
+        skipped._za_mega_testmode1_enabled = True
+        skipped.green_active = True
+        skipped.matched = {"POKEMON_ZA_LAST_BATTLE_CHARGE"}
+        self.assertEqual(
+            update(skipped, 20, 90, 40, 90, 0.24), "skip")
+        self.assertEqual(skipped._za_mega_last_charge_skip_count, 1)
+        self.assertEqual(skipped._za_mega_last_charge_state, "SKIP_WAIT_CLEAR")
+        self.assertFalse(skipped._za_mega_last_charge_attack_suspended)
+        self.assertFalse(skipped._za_mega_testmode1_existing_charge_latched)
+        FakeTime.now = 0.6
+        self.assertEqual(
+            update(skipped, 20, 90, 40, 90, 0.24), "skip")
+        self.assertEqual(skipped._za_mega_last_charge_skip_count, 1)
+        skipped.matched.clear()
+        FakeTime.now = 1.2
+        self.assertEqual(
+            update(skipped, 20, 90, 40, 90, 0.24), "none")
+        skipped.matched = {"POKEMON_ZA_LAST_BATTLE_STRONG_LIGHT"}
+        FakeTime.now = 1.8
+        self.assertEqual(
+            update(skipped, 20, 90, 40, 90, 0.24), "skip")
+        self.assertEqual(skipped._za_mega_last_charge_skip_count, 2)
+        skipped.matched.clear()
+        FakeTime.now = 2.4
+        self.assertEqual(
+            update(skipped, 20, 90, 40, 90, 0.24), "none")
+        skipped.matched = {"POKEMON_ZA_LAST_BATTLE_CHARGE"}
+        FakeTime.now = 3.0
+        self.assertEqual(
+            update(skipped, 20, 90, 40, 90, 0.24), "green")
+        self.assertTrue(skipped._za_mega_last_charge_attack_suspended)
+        self.assertTrue(skipped._za_mega_testmode1_existing_charge_latched)
+        self.assertEqual(skipped._za_mega_testmode1_phase, "EXISTING_CHARGE")
+        self.assertIn("left_stop", skipped.events)
+        skipped._za_mega_last_charge_state = "COOLDOWN"
+        self.assertEqual(
+            update(skipped, 20, 90, 40, 90, 0.24), "guard")
+
+        # -1では予兆を何回検知してもTESTMODE1を終了せず、赤のみ確認の
+        # LEGACY_COMBAT移行を待つ。移行後は既存の予兆処理を使用する。
+        FakeTime.now = 0.0
+        red_only_wait = ChargeCommand(
+            move_seconds=1.0, direction=Direction(Stick.LEFT, 45, 1.0))
+        red_only_wait._za_mega_testmode1_enabled = True
+        red_only_wait._za_mega_testmode1_phase = "COVER_ATTACK"
+        red_only_wait.charge_warning_skip_count = -1
+        red_only_wait.green_active = True
+        red_only_wait.matched = {"POKEMON_ZA_LAST_BATTLE_CHARGE"}
+        self.assertEqual(
+            update(red_only_wait, 20, 90, 40, 90, 0.24), "skip")
+        self.assertEqual(red_only_wait._za_mega_last_charge_skip_count, 0)
+        self.assertFalse(red_only_wait._za_mega_last_charge_attack_suspended)
+        self.assertFalse(
+            red_only_wait._za_mega_testmode1_existing_charge_latched)
+        self.assertTrue(
+            red_only_wait._za_mega_testmode1_red_premove_waiting_strong_light)
+
+        # 1組目の「力をためた→強い光」が終わってから次の予兆までに
+        # 青を一度も確認できない場合は、赤色が取れなくても青撃破とする。
+        # 次の強い光が消えるまでは危険な赤側固定移動を開始しない。
+        warning_fallback = ChargeCommand()
+        warning_fallback._za_mega_testmode1_enabled = True
+        warning_fallback._za_mega_testmode1_phase = "COVER_ATTACK"
+        warning_fallback.charge_warning_skip_count = -1
+        FakeTime.now = 20.0
+        warning_fallback.matched = {
+            "POKEMON_ZA_LAST_BATTLE_CHARGE"}
+        self.assertEqual(
+            update(warning_fallback, 20, 90, 40, 90, 0.24), "skip")
+        FakeTime.now = 20.6
+        warning_fallback.matched = {
+            "POKEMON_ZA_LAST_BATTLE_STRONG_LIGHT"}
+        self.assertEqual(
+            update(warning_fallback, 20, 90, 40, 90, 0.24), "skip")
+        FakeTime.now = 21.2
+        warning_fallback.matched.clear()
+        self.assertEqual(
+            update(warning_fallback, 20, 90, 40, 90, 0.24), "none")
+        self.assertTrue(
+            warning_fallback._za_mega_testmode1_warning_interval_active)
+
+        FakeTime.now = 21.8
+        warning_fallback.matched = {
+            "POKEMON_ZA_LAST_BATTLE_CHARGE"}
+        self.assertEqual(
+            update(warning_fallback, 20, 90, 40, 90, 0.24), "skip")
+        self.assertEqual(
+            warning_fallback._za_mega_testmode1_phase, "COVER_ATTACK")
+        self.assertTrue(
+            warning_fallback._za_mega_testmode1_warning_red_pending)
+        FakeTime.now = 22.4
+        warning_fallback.matched.clear()
+        self.assertEqual(
+            update(warning_fallback, 20, 90, 40, 90, 0.24), "none")
+        self.assertEqual(
+            warning_fallback._za_mega_testmode1_phase, "COVER_ATTACK")
+        FakeTime.now = 23.0
+        warning_fallback.matched = {
+            "POKEMON_ZA_LAST_BATTLE_STRONG_LIGHT"}
+        self.assertEqual(
+            update(warning_fallback, 20, 90, 40, 90, 0.24), "skip")
+        FakeTime.now = 23.6
+        warning_fallback.matched.clear()
+        self.assertEqual(
+            update(warning_fallback, 20, 90, 40, 90, 0.24), "none")
+        self.assertEqual(
+            warning_fallback._za_mega_testmode1_phase,
+            "WAIT_RED_COVER_DELAY")
+        self.assertAlmostEqual(
+            warning_fallback._za_mega_testmode1_red_cover_move_not_before,
+            28.6)
+        self.assertTrue(any(
+            event.startswith("trace:TESTMODE1_WARNING_RED_COVER_DELAY:")
+            for event in warning_fallback.events))
+
+        # 青／赤側障害物中は「力をためた」で270度の攻撃前移動を止め、
+        # 「強い光」の最終検知から7秒後まで止め続ける。
+        FakeTime.now = 10.0
+        red_cover_warning = ChargeCommand()
+        red_cover_warning._za_mega_testmode1_enabled = True
+        red_cover_warning._za_mega_testmode1_phase = "RED_COVER_ATTACK"
+        red_cover_warning.charge_warning_skip_count = -1
+        red_cover_warning.matched = {
+            "POKEMON_ZA_LAST_BATTLE_CHARGE"}
+        self.assertEqual(
+            update(red_cover_warning, 20, 90, 40, 90, 0.24), "skip")
+        self.assertEqual(
+            red_cover_warning._za_mega_testmode1_red_premove_block_until, 0.0)
+        self.assertTrue(
+            red_cover_warning._za_mega_testmode1_red_premove_waiting_strong_light)
+        FakeTime.now = 10.6
+        self.assertEqual(
+            update(red_cover_warning, 20, 90, 40, 90, 0.24), "skip")
+        self.assertTrue(
+            red_cover_warning._za_mega_testmode1_red_premove_waiting_strong_light)
+        red_cover_warning.matched = {
+            "POKEMON_ZA_LAST_BATTLE_STRONG_LIGHT"}
+        FakeTime.now = 12.0
+        self.assertEqual(
+            update(red_cover_warning, 20, 90, 40, 90, 0.24), "skip")
+        self.assertFalse(
+            red_cover_warning._za_mega_testmode1_red_premove_waiting_strong_light)
+        self.assertEqual(
+            red_cover_warning._za_mega_testmode1_red_premove_block_until,
+            19.0)
+        FakeTime.now = 12.6
+        self.assertEqual(
+            update(red_cover_warning, 20, 90, 40, 90, 0.24), "skip")
+        self.assertEqual(
+            red_cover_warning._za_mega_testmode1_red_premove_block_until,
+            19.6)
+        red_cover_warning.matched.clear()
+        FakeTime.now = 13.2
+        self.assertEqual(
+            update(red_cover_warning, 20, 90, 40, 90, 0.24), "none")
+        self.assertTrue(any(
+            event.startswith("trace:CHARGE_WARNING_RED_ONLY_WAIT:")
+            for event in red_only_wait.events))
+        red_only_wait.matched.clear()
+        FakeTime.now = 0.6
+        self.assertEqual(
+            update(red_only_wait, 20, 90, 40, 90, 0.24), "none")
+        red_only_wait._za_mega_testmode1_red_premove_waiting_strong_light = False
+        red_only_wait._za_mega_testmode1_phase = "LEGACY_COMBAT"
+        red_only_wait._za_mega_testmode1_legacy_until_reset = True
+        red_only_wait.matched = {"POKEMON_ZA_LAST_BATTLE_CHARGE"}
+        FakeTime.now = 1.2
+        self.assertEqual(
+            update(red_only_wait, 20, 90, 40, 90, 0.24), "green")
+        self.assertTrue(red_only_wait._za_mega_last_charge_attack_suspended)
+        self.assertEqual(
+            red_only_wait._za_mega_testmode1_phase, "LEGACY_COMBAT")
+        self.assertFalse(
+            red_only_wait._za_mega_testmode1_existing_charge_latched)
+
+    def test_za_mega_mode3_moves_forward_for_four_seconds_on_entry(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        source_functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        fragment_functions = {
+            node.name: node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        mode_select_name = "ZA_mega_evolution_battle_mode_select"
+        mode5_name = "ZA_mega_evolution_battle_mode5"
+        self.assertEqual(
+            ast.dump(
+                source_functions[mode_select_name],
+                include_attributes=False),
+            ast.dump(
+                fragment_functions[mode_select_name],
+                include_attributes=False))
+        self.assertEqual(
+            normalized_function_ast_dump(source_functions[mode5_name]),
+            normalized_function_ast_dump(fragment_functions[mode5_name]))
+
+        module = ast.fix_missing_locations(ast.Module(
+            body=[source_functions[mode_select_name],
+                  source_functions[mode5_name]], type_ignores=[]))
+        namespace = {}
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            def __init__(self):
+                self.calls = []
+
+            def ZA_mega_evolution_battle(self, **kwargs):
+                self.calls.append(kwargs)
+                return True
+
+            def ZA_mega_evolution_battle_mode5(self, **kwargs):
+                return namespace[mode5_name](self, **kwargs)
+
+        command = Command()
+        self.assertTrue(namespace[mode_select_name](command, mode=3))
+        self.assertEqual(len(command.calls), 1)
+        mode3_options = command.calls[0]
+        self.assertEqual(mode3_options["dir4"], 0)
+        self.assertEqual(mode3_options["dir5"], 90)
+        self.assertEqual(
+            mode3_options["field_resume_dir5_seconds"], 4.0)
+        self.assertEqual(mode3_options["escape_flag"], 0)
+        self.assertEqual(
+            mode3_options["attack_unavailable_y_dodge"], 1)
+
+        disabled = Command()
+        self.assertTrue(namespace[mode_select_name](
+            disabled, mode=3, attack_unavailable_y_dodge=0))
+        self.assertEqual(
+            disabled.calls[0]["attack_unavailable_y_dodge"], 0)
+        mode2 = Command()
+        self.assertTrue(namespace[mode_select_name](mode2, mode=2))
+        self.assertEqual(
+            mode2.calls[0]["attack_unavailable_y_dodge"], 0)
+        mode4 = Command()
+        self.assertTrue(namespace[mode_select_name](mode4, mode=4))
+        mode4_options = mode4.calls[0]
+        self.assertEqual(mode4_options["dir5"], 90)
+        self.assertEqual(mode4_options["field_resume_dir5_seconds"], 2.0)
+        self.assertEqual(mode4_options["mode4_view_nudge"], 1)
+        self.assertEqual(
+            mode4_options["attack_unavailable_y_dodge"], 1)
+
+        mode5_guard = Command()
+        self.assertTrue(namespace[mode_select_name](
+            mode5_guard, mode=5, movemode=1, Z_Gaurd=1,
+            red_edge_y_renda_seconds=5.0,
+            attack_unavailable_y_dodge=1))
+        self.assertEqual(
+            mode5_guard.calls[0]["field_resume_dir5_seconds"], 3.0)
+        self.assertEqual(mode5_guard.calls[0]["dir2"], 90)
+        self.assertEqual(mode5_guard.calls[0]["dir4"], 90)
+        # mode 5はAを常用し、C+画像を確認できた時だけB/X/Yも技として使う。
+        self.assertEqual(mode5_guard.calls[0]["Xaction"], 1)
+        self.assertEqual(mode5_guard.calls[0]["Aaction"], 1)
+        self.assertEqual(mode5_guard.calls[0]["Yaction"], 1)
+        self.assertEqual(mode5_guard.calls[0]["Baction"], 1)
+        self.assertEqual(
+            mode5_guard.calls[0]["attack_unavailable_y_dodge"], 0)
+        self.assertEqual(
+            mode5_guard.calls[0]["red_edge_y_renda_seconds"], 0.2)
+        self.assertEqual(mode5_guard.calls[0]["red_edge_y_repeat"], 6)
+        self.assertEqual(mode5_guard.calls[0]["testmode1"], 0)
+        mode5_trial = Command()
+        self.assertTrue(namespace[mode_select_name](
+            mode5_trial, mode=5, movemode=1, Z_Gaurd=1,
+            testmode1=1))
+        self.assertEqual(mode5_trial.calls[0]["testmode1"], 1)
+        mode5_without_guard = Command()
+        self.assertTrue(namespace[mode_select_name](
+            mode5_without_guard, mode=5, movemode=1, Z_Gaurd=0))
+        self.assertEqual(
+            mode5_without_guard.calls[0]["field_resume_dir5_seconds"], 3.0)
+
+        nudge_name = "ZA_mega_mode4_view_nudge"
+        nudge_namespace = {"Direction": Direction, "Stick": Stick}
+        exec(compile(ast.Module(
+            body=[source_functions[nudge_name]], type_ignores=[]),
+            source_path, "exec"), nudge_namespace)
+
+        class ViewNudgeCommand:
+            def __init__(self):
+                self.inputs = []
+
+            def press(self, direction, **kwargs):
+                self.inputs.append((direction, kwargs))
+
+        view_command = ViewNudgeCommand()
+        nudge_namespace[nudge_name](view_command)
+        self.assertEqual(len(view_command.inputs), 1)
+        view_direction, view_options = view_command.inputs[0]
+        self.assertEqual(view_direction.stick, Stick.RIGHT)
+        self.assertEqual(view_direction.angle_for_show, 90)
+        self.assertEqual(view_options["duration"], 0.1)
+        self.assertEqual(view_options["wait"], 0.0)
+
+        battle_function = source_functions["ZA_mega_evolution_battle"]
+        battle_nudge_calls = [
+            node for node in ast.walk(battle_function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ZA_mega_mode4_view_nudge"
+        ]
+        self.assertEqual(len(battle_nudge_calls), 1)
+        dodge_call = next(
+            node for node in ast.walk(battle_function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ZA_mega_attack_unavailable_y_dodge")
+        post_l_keyword = next(
+            keyword for keyword in dodge_call.keywords
+            if keyword.arg == "post_l_view_nudge")
+        self.assertIsInstance(post_l_keyword.value, ast.Name)
+        self.assertEqual(post_l_keyword.value.id, "mode4_view_nudge")
+        upper_keyword = next(
+            keyword for keyword in dodge_call.keywords
+            if keyword.arg == "include_upper_marker")
+        self.assertIsInstance(upper_keyword.value, ast.Name)
+        self.assertEqual(upper_keyword.value.id, "mode4_view_nudge")
+        direct_upper_calls = [
+            node for node in ast.walk(battle_function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ZA_mega_target_marker_direction"
+            and any(keyword.arg == "include_upper"
+                    for keyword in node.keywords)
+        ]
+        self.assertEqual(len(direct_upper_calls), 1)
+        relock_upper_calls = [
+            node for node in ast.walk(battle_function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ZA_mega_relock_toward_marker"
+            and any(keyword.arg == "include_upper_marker"
+                    for keyword in node.keywords)
+        ]
+        self.assertEqual(len(relock_upper_calls), 1)
+        field_resume_assignments = [
+            node for node in ast.walk(battle_function)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Attribute)
+                    and target.attr == "_za_mega_field_dir5_until"
+                    for target in node.targets)
+            and any(isinstance(child, ast.Name)
+                    and child.id == "field_resume_dir5_seconds"
+                    for child in ast.walk(node.value))
+        ]
+        # mode 5の早期復帰経路と、mode 0～4の従来位置に分離して保持する。
+        self.assertEqual(len(field_resume_assignments), 2)
+        battle_source = ast.unparse(battle_function)
+        self.assertIn(
+            "field_resume_detected and last_battle_mode", battle_source)
+        self.assertIn(
+            "field_resume_detected and (not last_battle_mode)",
+            battle_source)
+        nofield_retry_assignments = [
+            node for node in ast.walk(battle_function)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "nofiled"
+                    for target in node.targets)
+            and isinstance(node.value, ast.Constant)
+            and node.value.value == 1
+        ]
+        # 初期値に加えて戦闘終了／選択後にも1へ戻り、同じ再入場処理を通る。
+        self.assertGreaterEqual(len(nofield_retry_assignments), 2)
+
+    def test_za_mega_attack_unavailable_dodge_unlocks_before_y_and_relocks(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        helper_name = "ZA_mega_attack_unavailable_y_dodge"
+        source_helper = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef) and node.name == helper_name)
+        fragment_helper = next(
+            node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef) and node.name == helper_name)
+        self.assertEqual(
+            ast.dump(source_helper, include_attributes=False),
+            ast.dump(fragment_helper, include_attributes=False))
+
+        class FakeTime:
+            now = 10.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+        namespace = {
+            "Button": Button,
+            "Direction": Direction,
+            "Stick": Stick,
+            "time": FakeTime,
+        }
+        exec(compile(ast.Module(
+            body=[source_helper], type_ignores=[]),
+            source_path, "exec"), namespace)
+
+        class Command:
+            def __init__(self, resume_dirnum=3):
+                self._za_mega_attack_unavailable_y_dodge_retry_at = 0.0
+                self._za_mega_relock_retry_at = 0.0
+                self._za_mega_dir5 = 90
+                self.resume_dirnum = resume_dirnum
+                self.actions = []
+                self.button_times = []
+
+            def ZA_mega_choice_input_guard(self):
+                return False
+
+            def ZA_mega_target_marker_direction(self, **_kwargs):
+                self.actions.append((
+                    "marker", _kwargs.get("include_upper", False)))
+                return "marker_direction"
+
+            def ZA_mega_keep_left_moving(self, *_args):
+                self.actions.append(("keep",))
+                return self.resume_dirnum
+
+            def ZA_ZL_ACTION(self, action):
+                self.actions.append(("zl", action))
+
+            def ZA_MOVE_SEE(self, action, **_kwargs):
+                self.actions.append((
+                    "see", action, _kwargs.get("in_see_r")))
+
+            def ZA_MOVE_LStick(self, *_args, **kwargs):
+                self.actions.append((
+                    "move", _args[-2], _args[-1],
+                    kwargs.get("force_direction", False)))
+
+            def ZA_mega_mode4_view_nudge(self):
+                self.actions.append(("mode4_view_nudge",))
+
+            def pressRep(self, button, **kwargs):
+                self.actions.append(("button", button, kwargs.get("repeat")))
+                self.button_times.append((button, FakeTime.now))
+
+            def wait(self, duration):
+                self.actions.append(("wait", duration))
+                FakeTime.now += duration
+
+        command = Command()
+        helper = namespace[helper_name]
+        self.assertTrue(helper(
+            command, 20, 0, 40, 0, 0.24,
+            post_l_view_nudge=1,
+            include_upper_marker=1))
+        self.assertIn(("marker", True), command.actions)
+        self.assertIn(("button", Button.Y, 2), command.actions)
+        self.assertIn(("button", Button.L, 1), command.actions)
+        unlock_index = command.actions.index(("zl", "END"))
+        y_index = command.actions.index(("button", Button.Y, 2))
+        relock_index = command.actions.index(("zl", ""))
+        self.assertLess(unlock_index, y_index)
+        self.assertLess(y_index, relock_index)
+        self.assertIn(("see", "", 0.48),
+                      command.actions[unlock_index:y_index])
+        l_index = command.actions.index(("button", Button.L, 1))
+        nudge_index = command.actions.index(("mode4_view_nudge",))
+        self.assertLess(relock_index, l_index)
+        self.assertLess(l_index, nudge_index)
+        self.assertIn(("see", "END", 0.48),
+                      command.actions[y_index:l_index])
+        roll_moves = [
+            action for action in command.actions[unlock_index:y_index]
+            if action[0] == "move" and action[3]
+        ]
+        self.assertEqual(len(roll_moves), 1)
+        self.assertIsInstance(roll_moves[0][1], Direction)
+        self.assertEqual(roll_moves[0][1].stick, Stick.LEFT)
+        self.assertEqual(roll_moves[0][1].angle_for_show, 60.0)
+        # Lは従来どおり1秒後だが、ZLはY直後に再保持する。
+        self.assertNotIn(
+            ("wait", 1.1), command.actions[y_index:relock_index])
+        self.assertIn(("wait", 1.1), command.actions[relock_index:l_index])
+        y_time = next(value for button, value in command.button_times
+                      if button == Button.Y)
+        l_time = next(value for button, value in command.button_times
+                      if button == Button.L)
+        self.assertGreaterEqual(l_time - y_time, 1.0)
+        action_count = len(command.actions)
+        self.assertFalse(helper(command, 20, 0, 40, 0, 0.24))
+        self.assertEqual(len(command.actions), action_count)
+
+        FakeTime.now = 20.0
+        dir5_command = Command(resume_dirnum=5)
+        self.assertTrue(helper(dir5_command, 20, 0, 40, 0, 0.24))
+        dir5_roll = next(
+            action for action in dir5_command.actions
+            if action[0] == "move" and action[3])
+        self.assertEqual(dir5_roll[1].angle_for_show, 110.0)
+
+    def test_za_mega_mode5_uses_safe_a_fallback_and_guards_skill_attacks(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        expected = (
+            "mode == 5 and self.ZA_mega_evolution_battle_mode5(")
+        for path in (source_path, fragment_path):
+            with open(path, "r", encoding="utf-8-sig") as stream:
+                self.assertIn(expected, stream.read())
+
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        helper_names = (
+            "ZA_mega_mode5_lockon_ready",
+            "ZA_mega_mode5_a_attack_ready",
+            "ZA_mega_attack_ready",
+            "ZA_mega_a_attack_ready",
+            "ZA_mega_mode5_y_attack_ready",
+            "ZA_mega_mode5_skill_attack_ready",
+        )
+        source_helpers = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in helper_names
+        }
+        fragment_helpers = {
+            node.name: node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in helper_names
+        }
+        for helper_name in helper_names:
+            self.assertEqual(
+                ast.dump(source_helpers[helper_name], include_attributes=False),
+                ast.dump(fragment_helpers[helper_name], include_attributes=False))
+
+        class FakeTime:
+            now = 10.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+        namespace = {
+            "Direction": Direction,
+            "Stick": Stick,
+            "time": FakeTime,
+        }
+        exec(compile(ast.Module(
+            body=[source_helpers[name] for name in helper_names],
+            type_ignores=[]), source_path, "exec"), namespace)
+
+        class Command:
+            def __init__(self, matched=(), marker=0, mode5=True, zl=1,
+                         marker_from_color=False):
+                self.matched = set(matched)
+                self.marker = marker
+                self._za_mega_last_battle_mode = mode5
+                self.ZL_state = zl
+                self._za_mega_mode5_lockon_confirmed_until = 0.0
+                self._za_mega_mode5_attack_fallback_logged = False
+                self._za_mega_mode5_y_skip_logged = False
+                self._za_mega_mode5_a_block_logged = False
+                self._za_mega_mode5_battle_active = False
+                self._za_mega_mode5_state_lockon_logged = False
+                self._za_mega_mode5_start_flag = 4
+                self._za_mega_mode5_skill_ready_until = 0.0
+                self._za_mega_marker_search_view_holding = False
+                self._za_mega_target_from_color = marker_from_color
+                self.checked = []
+
+            def image_check(self, name):
+                self.checked.append(name)
+                return name in self.matched
+
+            def ZA_mega_target_marker_direction(self):
+                return self.marker
+
+            def ZA_mega_mode5_lockon_ready(self, refresh=False):
+                return namespace["ZA_mega_mode5_lockon_ready"](
+                    self, refresh=refresh)
+
+            def ZA_mega_mode5_a_attack_ready(self, **kwargs):
+                return namespace["ZA_mega_mode5_a_attack_ready"](
+                    self, **kwargs)
+
+            def ZA_mega_attack_ready(self):
+                return namespace["ZA_mega_attack_ready"](self)
+
+            def ZA_mega_choice_input_guard(self):
+                return False
+
+            def ZA_mega_mode5_trace(self, *_args, **_kwargs):
+                return True
+
+        attack_ready = namespace["ZA_mega_attack_ready"]
+        a_attack_ready = namespace["ZA_mega_a_attack_ready"]
+        a_ready = namespace["ZA_mega_mode5_a_attack_ready"]
+        y_ready = namespace["ZA_mega_mode5_y_attack_ready"]
+        skill_ready = namespace["ZA_mega_mode5_skill_attack_ready"]
+
+        normal = Command(mode5=False)
+        self.assertFalse(attack_ready(normal))
+        normal_field = Command(
+            matched={"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"},
+            mode5=False)
+        self.assertTrue(a_attack_ready(
+            normal_field, choice_guard_checked=True))
+
+        eye = Command(matched={"POKEMON_ZA_EYE_CHECK"})
+        self.assertTrue(attack_ready(eye))
+        self.assertTrue(y_ready(eye))
+        self.assertEqual(
+            eye._za_mega_mode5_lockon_confirmed_until, 10.8)
+
+        no_zl = Command(
+            matched={"POKEMON_ZA_EYE_CHECK"}, zl=0)
+        self.assertFalse(attack_ready(no_zl))
+        self.assertFalse(y_ready(no_zl))
+
+        # C+が見えても、Yだけはロックオンを実確認できなければ送らない。
+        cplus_only = Command(matched={"POKEMON_ZA_C+"})
+        self.assertTrue(attack_ready(cplus_only))
+        self.assertFalse(y_ready(cplus_only))
+
+        # 最終戦のFIELD復帰後は、画像が白背景・演出で外れても
+        # ZL保持かつ視点探索停止中なら攻撃とY技を継続する。
+        active_battle = Command()
+        active_battle._za_mega_mode5_battle_active = True
+        self.assertTrue(attack_ready(active_battle))
+        self.assertTrue(y_ready(active_battle))
+        self.assertEqual(active_battle.checked, [])
+        searching = Command()
+        searching._za_mega_mode5_battle_active = True
+        searching._za_mega_marker_search_view_holding = True
+        self.assertFalse(attack_ready(searching))
+        self.assertFalse(y_ready(searching))
+
+        real_marker = Command(marker=Direction(Stick.LEFT, 90, 0.5))
+        self.assertTrue(attack_ready(real_marker))
+        color_only = Command(
+            marker=Direction(Stick.LEFT, 90, 0.5),
+            marker_from_color=True)
+        self.assertFalse(attack_ready(color_only))
+
+        # Aだけはロックオン画像／ZLなしでも、現在のFIELDを確認できれば送る。
+        active_field = Command(
+            matched={"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"}, zl=0)
+        active_field._za_mega_mode5_battle_active = True
+        self.assertTrue(a_ready(active_field))
+        # FIELD画像を外しても、実戦闘BATTLEが見えていればAを継続する。
+        active_battle_picture = Command(
+            matched={"POKEMON_ZA_BATTLE"}, zl=0)
+        active_battle_picture._za_mega_mode5_battle_active = True
+        self.assertTrue(a_ready(active_battle_picture))
+        # 直前に選択肢／黒Commentを確認済みの攻撃ループでは、白／緑と
+        # BATTLEだけを確認して重い再判定を繰り返さない。
+        fast_battle_picture = Command(
+            matched={"POKEMON_ZA_BATTLE"}, zl=0)
+        fast_battle_picture._za_mega_mode5_battle_active = True
+        self.assertTrue(a_ready(
+            fast_battle_picture, choice_guard_checked=True))
+        self.assertEqual(fast_battle_picture.checked, [
+            "POKEMON_ZA_TEXT_WHITE_COMMENT",
+            "POKEMON_ZA_TEXT_GREEN_COMMENT",
+            "POKEMON_ZA_BATTLE",
+        ])
+        for blocker in (
+                "POKEMON_ZA_TEXT_WHITE_COMMENT",
+                "POKEMON_ZA_TEXT_GREEN_COMMENT",
+                "POKEMON_ZA_TEXT_BLACK_COMMENT",
+                "POKEMON_ZA_3_SELECT_TUTORIAL",
+                "POKEMON_ZA_3_SELECT",
+                "POKEMON_ZA_4_SELECT"):
+            blocked = Command(matched={
+                "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK", blocker})
+            blocked._za_mega_mode5_battle_active = True
+            self.assertFalse(a_ready(blocked), blocker)
+        dark = Command()
+        dark._za_mega_mode5_battle_active = True
+        self.assertFalse(a_ready(dark))
+        skill = Command(matched={"POKEMON_ZA_C+"})
+        skill._za_mega_mode5_battle_active = True
+        self.assertTrue(skill_ready(skill))
+        no_skill = Command()
+        no_skill._za_mega_mode5_battle_active = True
+        self.assertFalse(skill_ready(no_skill))
+        skill._za_mega_mode5_start_flag = 3
+        skill._za_mega_mode5_skill_ready_until = 0.0
+        self.assertFalse(skill_ready(skill))
+
+    def test_za_mega_mode5_event_attack_uses_switch_no2_move_ui_without_cplus(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        profile_path = os.path.join(
+            SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        with open(profile_path, "r", encoding="utf-8") as stream:
+            image_library = json.load(stream)
+
+        helper_names = (
+            "ZA_mega_mode5_event_attack_blocked",
+            "ZA_mega_mode5_event_attack_picture",
+            "ZA_mega_mode5_event_attack_axby",
+            "ZA_mega_mode5_detect_screen_state",
+        )
+        source_helpers = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in helper_names
+        }
+        fragment_helpers = {
+            node.name: node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in helper_names
+        }
+        for helper_name in helper_names:
+            self.assertEqual(
+                normalized_function_ast_dump(source_helpers[helper_name]),
+                normalized_function_ast_dump(fragment_helpers[helper_name]))
+
+        target_name = "POKEMON_ZA_LAST_BATTLE_MOVE_UI"
+        target = image_library["targets"][target_name]
+        self.assertEqual(target["operator"], "OR")
+        self.assertEqual(len(target["variants"]), 4)
+        for variant in target["variants"]:
+            self.assertEqual(variant["threshold"], 0.8)
+            self.assertTrue(variant["use_gray"])
+            template_path = os.path.join(
+                SERIAL_CONTROLLER,
+                variant["template_path"].replace("/", os.sep))
+            template = cv2.imread(template_path, cv2.IMREAD_COLOR)
+            self.assertIsNotNone(template, template_path)
+            self.assertGreater(template.shape[0], 10)
+            self.assertGreater(template.shape[1], 100)
+
+        source_targets = ast.literal_eval(next(
+            node.value for node in ast.walk(source_tree)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(name, ast.Name)
+                    and name.id == "IMAGE_DETECTION_TARGETS"
+                    for name in node.targets)))
+        for node in ast.walk(source_tree):
+            if (not isinstance(node, ast.Call)
+                    or not isinstance(node.func, ast.Attribute)
+                    or node.func.attr != "update"
+                    or not isinstance(node.func.value, ast.Name)
+                    or node.func.value.id != "IMAGE_DETECTION_TARGETS"
+                    or not node.args):
+                continue
+            source_targets.update(ast.literal_eval(node.args[0]))
+        self.assertEqual(source_targets[target_name], target["variants"])
+
+        namespace = {
+            "Button": Button, "Direction": Direction, "time": time}
+        exec(compile(ast.Module(
+            body=[source_helpers[name] for name in helper_names],
+            type_ignores=[]), source_path, "exec"), namespace)
+
+        class EventAttackCommand:
+            def __init__(self, matched=(), mode5=True):
+                self.matched = set(matched)
+                self._za_mega_last_battle_mode = mode5
+                self._za_mega_mode5_start_flag = 4
+                self._za_mega_mode5_battle_active = True
+                self._za_mega_z_guard_enabled = False
+                self.events = []
+                self.clear_after_first_attack = False
+
+            def image_check(self, name):
+                if (self.clear_after_first_attack
+                        and name == target_name
+                        and any(event[0] == "attack"
+                                for event in self.events)):
+                    return False
+                return name in self.matched
+
+            def ZA_mega_mode5_event_attack_blocked(self):
+                return namespace[
+                    "ZA_mega_mode5_event_attack_blocked"](self)
+
+            def ZA_mega_mode5_event_attack_picture(self, **kwargs):
+                return namespace[
+                    "ZA_mega_mode5_event_attack_picture"](self, **kwargs)
+
+            def ZA_mega_choice_input_guard(self):
+                return False
+
+            def ZA_mega_mode5_marker_search_view_stop(self, relock=False):
+                self.events.append(("view_stop", relock))
+
+            def ZA_MOVE_SEE(self, **kwargs):
+                self.events.append(("see", kwargs))
+
+            def ZA_ZL_ACTION(self, action=""):
+                self.events.append(("zl", action))
+
+            def wait(self, seconds):
+                self.events.append(("wait", seconds))
+
+            def ZA_mega_mode5_trace(self, *args, **kwargs):
+                self.events.append(("trace", args, kwargs))
+
+            def checkIfAlive(self):
+                self.events.append(("alive",))
+
+            def pressRep(self, button, **kwargs):
+                self.events.append(("attack", button, kwargs))
+
+        attack = EventAttackCommand({target_name})
+        self.assertEqual(
+            attack.ZA_mega_mode5_event_attack_picture(), target_name)
+        screen = namespace["ZA_mega_mode5_detect_screen_state"](
+            attack, nofiled=1)
+        self.assertTrue(screen["battle_screen"])
+        self.assertTrue(screen["resume_screen"])
+        self.assertEqual(screen["event_attack_picture"], target_name)
+        self.assertEqual(screen["resume_reason"], "event-attack-ui")
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_event_attack_axby"](attack))
+        self.assertEqual(
+            [event[1] for event in attack.events
+             if event[0] == "attack"],
+            [Button.A, Button.X, Button.B, Button.Y])
+        self.assertLess(
+            attack.events.index(("zl", "")),
+            next(index for index, event in enumerate(attack.events)
+                 if event[0] == "attack"))
+        self.assertNotIn(Button.PLUS, [
+            event[1] for event in attack.events
+            if event[0] == "attack"])
+
+        blocked = EventAttackCommand({
+            target_name, "POKEMON_ZA_TEXT_WHITE_COMMENT"})
+        self.assertEqual(
+            blocked.ZA_mega_mode5_event_attack_picture(), "")
+        self.assertFalse(namespace[
+            "ZA_mega_mode5_event_attack_axby"](blocked))
+
+        cleared = EventAttackCommand({target_name})
+        cleared.clear_after_first_attack = True
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_event_attack_axby"](cleared))
+        self.assertEqual(
+            [event[1] for event in cleared.events
+             if event[0] == "attack"], [Button.A])
+
+        normal_mode = EventAttackCommand({target_name}, mode5=False)
+        self.assertEqual(
+            normal_mode.ZA_mega_mode5_event_attack_picture(), "")
+        self.assertFalse(namespace[
+            "ZA_mega_mode5_event_attack_axby"](normal_mode))
+
+    def test_za_mega_mode5_start_flag_trace_clamps_and_reports_state(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        names = ("ZA_mega_mode5_trace", "ZA_mega_mode5_set_start_flag")
+        source_functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef) and node.name in names}
+        fragment_functions = {
+            node.name: node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef) and node.name in names}
+        for name in names:
+            self.assertEqual(
+                normalized_function_ast_dump(source_functions[name]),
+                normalized_function_ast_dump(fragment_functions[name]))
+        namespace = {"time": time}
+        exec(compile(ast.Module(
+            body=[source_functions[name] for name in names],
+            type_ignores=[]), source_path, "exec"), namespace)
+
+        class Command:
+            _za_mega_last_battle_mode = True
+            _za_mega_mode5_phase = "WAIT_RESUME"
+            _za_mega_mode5_start_flag = 0
+            _za_mega_mode5_trace_key = None
+            _za_mega_mode5_trace_retry_at = 0.0
+            _za_mega_testmode1_enabled = True
+            _za_mega_testmode1_resume_hp = "HP75"
+            _za_mega_testmode1_hp_color = "GREEN"
+            _za_mega_testmode1_hp_fill_ratio = 0.665
+            _za_mega_testmode1_phase = "HP75_EXISTING"
+
+            def __init__(self):
+                self.status_events = []
+
+            def ZA_mega_mode5_trace(self, *args, **kwargs):
+                return namespace["ZA_mega_mode5_trace"](
+                    self, *args, **kwargs)
+
+            def ZA_story_status_text(self):
+                return "STATE STATUS TESTMODE1=1 RESUME_HP=HP75"
+
+            def print_tb(self, mode):
+                self.status_events.append(("clear", mode))
+
+            def print_t(self, value):
+                self.status_events.append(("status", value))
+
+        command = Command()
+        with mock.patch("builtins.print") as print_mock:
+            self.assertEqual(namespace["ZA_mega_mode5_set_start_flag"](
+                command, 2, "GREEN_FLOOR", "move"), 2)
+            self.assertEqual(command._za_mega_mode5_start_flag, 2)
+            self.assertEqual(namespace["ZA_mega_mode5_set_start_flag"](
+                command, 9, "BATTLE", "attack"), 4)
+        output = "\n".join(
+            str(call.args[0]) for call in print_mock.call_args_list)
+        self.assertIn("[STATE_MAIN_FUNCTION][MEGA_MODE5]", output)
+        self.assertIn("TESTMODE1=1", output)
+        self.assertIn("RESUME_HP=HP75", output)
+        self.assertIn("HP_COLOR=GREEN", output)
+        self.assertIn("HP_RATIO=0.665", output)
+        self.assertIn("TEST_PHASE=HP75_EXISTING", output)
+        self.assertIn("START_FLAG=2", output)
+        self.assertIn("DETECT=GREEN_FLOOR", output)
+        self.assertIn("START_FLAG=4", output)
+        self.assertIn(("clear", "d"), command.status_events)
+        self.assertIn(
+            ("status", "STATE STATUS TESTMODE1=1 RESUME_HP=HP75"),
+            command.status_events)
+
+    def test_za_mega_mode5_initial_sequence_moves_waits_then_requests_field(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        names = (
+            "ZA_mega_mode5_transition", "ZA_mega_mode5_trace",
+            "ZA_mega_mode5_set_start_flag", "ZA_mega_mode5_begin_resume",
+             "ZA_mega_mode5_low_yellow_hp",
+             "ZA_mega_mode5_begin_post_move_wait",
+             "ZA_mega_mode5_testmode1_settings",
+             "ZA_mega_mode5_testmode1_reset_for_selection",
+             "ZA_mega_mode5_testmode1_resume_update",
+             "ZA_mega_mode5_testmode1_finish_hp75_initial",
+             "ZA_mega_mode5_green_and_initial_update")
+        source_functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef) and node.name in names}
+        fragment_functions = {
+            node.name: node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef) and node.name in names}
+        for name in names:
+            self.assertEqual(
+                normalized_function_ast_dump(source_functions[name]),
+                normalized_function_ast_dump(fragment_functions[name]))
+
+        class FakeTime:
+            now = 0.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+        namespace = {
+            "cv2": cv2, "time": FakeTime,
+            "Direction": Direction, "Stick": Stick}
+        exec(compile(ast.Module(
+            body=[source_functions[name] for name in names],
+            type_ignores=[]), source_path, "exec"), namespace)
+
+        class Command:
+            def __init__(self):
+                self._za_mega_last_battle_mode = True
+                self._za_mega_mode5_phase = "WAIT_RESUME"
+                self._za_mega_mode5_start_flag = 0
+                self._za_mega_mode5_trace_key = None
+                self._za_mega_mode5_trace_retry_at = 0.0
+                self._za_mega_z_guard_enabled = False
+                self._za_mega_dir5 = 90
+                self.events = []
+
+            def ZA_mega_mode5_transition(self, *args):
+                return namespace["ZA_mega_mode5_transition"](self, *args)
+
+            def ZA_mega_mode5_trace(self, *args, **kwargs):
+                return namespace["ZA_mega_mode5_trace"](
+                    self, *args, **kwargs)
+
+            def ZA_mega_mode5_set_start_flag(self, *args):
+                return namespace["ZA_mega_mode5_set_start_flag"](
+                    self, *args)
+
+            def ZA_mega_mode5_low_yellow_hp(self, *args, **kwargs):
+                return namespace["ZA_mega_mode5_low_yellow_hp"](
+                    self, *args, **kwargs)
+
+            def ZA_mega_mode5_begin_post_move_wait(self, *args, **kwargs):
+                return namespace["ZA_mega_mode5_begin_post_move_wait"](
+                    self, *args, **kwargs)
+
+            def ZA_mega_mode5_testmode1_settings(self):
+                return namespace[
+                    "ZA_mega_mode5_testmode1_settings"](self)
+
+            def ZA_mega_mode5_testmode1_reset_for_selection(self, reason):
+                return namespace[
+                    "ZA_mega_mode5_testmode1_reset_for_selection"](
+                        self, reason)
+
+            def ZA_mega_mode5_testmode1_resume_update(
+                    self, *args, **kwargs):
+                return namespace["ZA_mega_mode5_testmode1_resume_update"](
+                    self, *args, **kwargs)
+
+            def ZA_mega_mode5_testmode1_finish_hp75_initial(
+                    self, *args, **kwargs):
+                return namespace[
+                    "ZA_mega_mode5_testmode1_finish_hp75_initial"](
+                        self, *args, **kwargs)
+
+            def ZA_mega_mode5_marker_search_view_stop(self, relock=False):
+                self.events.append(("view_stop", relock))
+
+            def ZA_mega_mode5_marker_search_view(self):
+                self.events.append(("view_search",))
+
+            def ZA_MOVE_SEE(self, action="", **_kwargs):
+                self.events.append(("move_see", action))
+
+            def ZA_MOVE_LStick(self, *args, **kwargs):
+                self.events.append(("move_left", args, kwargs))
+
+            def ZA_ZL_ACTION(self, action=""):
+                self.events.append(("zl", action))
+
+            def press(self, direction, duration=0.0, **_kwargs):
+                self.events.append(("press", direction, duration))
+                FakeTime.now += duration
+
+            def wait(self, duration):
+                FakeTime.now += duration
+
+        command = Command()
+        command._za_mega_last_charge_skip_count = 2
+        command._za_mega_last_charge_attack_suspended = True
+        command._za_mega_testmode1_enemy_check_retry_at = 99.0
+        command._za_mega_testmode1_red_only_since = 90.0
+        command._za_mega_testmode1_red_only_last_seen = 98.0
+        command._za_mega_testmode1_red_only_confirmations = 8
+        command._za_mega_testmode1_existing_charge_latched = True
+        namespace["ZA_mega_mode5_begin_resume"](
+            command, False, 1.0, 0.24, "field")
+        self.assertEqual(command._za_mega_last_charge_skip_count, 0)
+        self.assertFalse(command._za_mega_last_charge_attack_suspended)
+        self.assertEqual(command._za_mega_testmode1_enemy_check_retry_at, 0.0)
+        self.assertEqual(command._za_mega_testmode1_red_only_since, 0.0)
+        self.assertEqual(command._za_mega_testmode1_red_only_last_seen, 0.0)
+        self.assertEqual(
+            command._za_mega_testmode1_red_only_confirmations, 0)
+        self.assertFalse(command._za_mega_testmode1_existing_charge_latched)
+        self.assertEqual(command._za_mega_mode5_start_flag, 2)
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_green_and_initial_update"](
+                command, 20, 90, 40, 90, 0.24, 1.0))
+        initial_press = next(
+            event for event in reversed(command.events)
+            if event[0] == "press")
+        self.assertEqual(initial_press[1].angle_for_show, 90)
+        self.assertIn(("zl", "END"), command.events)
+        self.assertEqual(command._za_mega_mode5_start_flag, 2)
+        self.assertGreater(command._za_mega_mode5_post_move_wait_until,
+                           FakeTime.now)
+
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_green_and_initial_update"](
+                command, 20, 90, 40, 90, 0.24, 1.0))
+        self.assertIn(("view_search",), command.events)
+        FakeTime.now = command._za_mega_mode5_post_move_wait_until + 0.01
+        self.assertFalse(namespace[
+            "ZA_mega_mode5_green_and_initial_update"](
+                command, 20, 90, 40, 90, 0.24, 1.0))
+        self.assertEqual(command._za_mega_mode5_start_flag, 3)
+        self.assertEqual(command._za_mega_mode5_phase, "FIELD_W_INPUT")
+
+        # TESTMODE1のHP75はFIELD判定後の緑床確認を0回とし、直ちに
+        # 90度・3秒の初期移動へ入る。完了後は青側障害物へ合流する。
+        FakeTime.now = 0.0
+        hp75_command = Command()
+        hp75_command._za_mega_testmode1_enabled = True
+        hp75_command.ZA_mega_mode5_hp_resume_mode = lambda: "HP75"
+        # 前回の赤のみフォールバック状態は敵が復活するFIELD再開で破棄する。
+        hp75_command._za_mega_testmode1_phase = "LEGACY_COMBAT"
+        hp75_command._za_mega_testmode1_red_only_since = 90.0
+        hp75_command._za_mega_testmode1_red_only_last_seen = 98.0
+        hp75_command._za_mega_testmode1_red_only_confirmations = 8
+        hp75_command.green_checks = 0
+
+        def hp75_green_update(*_args, **_kwargs):
+            hp75_command.green_checks += 1
+            return False
+
+        hp75_command.ZA_mega_z_guard_update = hp75_green_update
+        namespace["ZA_mega_mode5_begin_resume"](
+            hp75_command, True, 1.0, 0.24, "field")
+        self.assertEqual(
+            hp75_command._za_mega_testmode1_phase, "HP75_EXISTING")
+        self.assertEqual(hp75_command._za_mega_testmode1_red_only_since, 0.0)
+        self.assertEqual(
+            hp75_command._za_mega_testmode1_red_only_confirmations, 0)
+        self.assertEqual(
+            hp75_command._za_mega_mode5_green_priority_checks_remaining,
+            0)
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_green_and_initial_update"](
+                hp75_command, 20, 90, 40, 90, 0.24, 1.0))
+        self.assertEqual(hp75_command.green_checks, 0)
+        hp75_initial_press = next(
+            event for event in reversed(hp75_command.events)
+            if event[0] == "press")
+        self.assertEqual(hp75_initial_press[1].angle_for_show, 90.0)
+        self.assertEqual(hp75_initial_press[2], 3.0)
+        hp75_command.events.clear()
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_green_and_initial_update"](
+                hp75_command, 20, 90, 40, 90, 0.24, 1.0))
+        self.assertFalse(any(
+            event[0] == "view_search" for event in hp75_command.events))
+        self.assertTrue(any(
+            event[0] == "view_stop" for event in hp75_command.events))
+        FakeTime.now = (
+            hp75_command._za_mega_mode5_post_move_wait_until + 0.01)
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_green_and_initial_update"](
+                hp75_command, 20, 90, 40, 90, 0.24, 1.0))
+        self.assertEqual(
+            hp75_command._za_mega_testmode1_phase, "MOVE_TO_COVER")
+        # 現在の手動設定4.5秒待機完了後、次の周回で固定障害物移動する。
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_green_and_initial_update"](
+                hp75_command, 20, 90, 40, 90, 0.24, 1.0))
+        self.assertEqual(
+            hp75_command._za_mega_testmode1_phase, "FACE_BLUE")
+        self.assertEqual(hp75_command._za_mega_mode5_start_flag, 3)
+        self.assertEqual(
+            hp75_command._za_mega_mode5_phase, "BLUE_COVER_SEARCH")
+
+        # HP75以外はFIELD判定から直接、障害物用の固定移動へ入る。
+        # HP75用の90度・3秒初期移動と緑床確認は経由しない。
+        FakeTime.now = 0.0
+        other_command = Command()
+        other_command._za_mega_testmode1_enabled = True
+        other_command.ZA_mega_mode5_hp_resume_mode = lambda: "OTHER"
+        other_command.green_checks = 0
+
+        def other_green_update(*_args, **_kwargs):
+            other_command.green_checks += 1
+            return False
+
+        other_command.ZA_mega_z_guard_update = other_green_update
+        namespace["ZA_mega_mode5_begin_resume"](
+            other_command, True, 1.0, 0.24, "field")
+        self.assertEqual(other_command._za_mega_mode5_phase,
+                         "BLUE_COVER_SEARCH")
+        self.assertEqual(
+            other_command._za_mega_mode5_green_priority_checks_remaining,
+            0)
+        self.assertFalse(
+            other_command._za_mega_mode5_initial_phase_active)
+        self.assertTrue(
+            other_command._za_mega_mode5_initial_approach_started)
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_green_and_initial_update"](
+                other_command, 20, 90, 40, 90, 0.24, 1.0))
+        self.assertEqual(other_command.green_checks, 0)
+        other_presses = [
+            event for event in other_command.events if event[0] == "press"]
+        self.assertEqual(len(other_presses), 1)
+        self.assertEqual(other_presses[0][1].angle_for_show, 150.0)
+        self.assertEqual(other_presses[0][2], 5.7)
+        self.assertEqual(other_command._za_mega_testmode1_phase, "FACE_BLUE")
+
+        # 緑床成立後の通常mode5固定は、FIELD再開だけで
+        # TESTMODE1の固定障害物移動を再実行しない。
+        legacy_command = Command()
+        legacy_command._za_mega_testmode1_enabled = True
+        legacy_command._za_mega_testmode1_legacy_until_reset = True
+        legacy_command._za_mega_testmode1_reinitialize_pending = False
+        legacy_command._za_mega_testmode1_phase = "LEGACY_COMBAT"
+        namespace["ZA_mega_mode5_begin_resume"](
+            legacy_command, True, 1.0, 0.24, "field")
+        self.assertEqual(
+            legacy_command._za_mega_testmode1_phase, "LEGACY_COMBAT")
+        self.assertEqual(legacy_command._za_mega_mode5_start_flag, 3)
+        self.assertFalse(any(
+            event[0] == "press" for event in legacy_command.events))
+
+        # BLACK_COMMENT／SELECT検知のみで固定を解除し、
+        # 次のFIELDでTESTMODE1のHP別開始を再初期化する。
+        legacy_command.ZA_mega_mode5_testmode1_reset_for_selection(
+            "BLACK_COMMENT_OR_SELECT")
+        self.assertFalse(
+            legacy_command._za_mega_testmode1_legacy_until_reset)
+        self.assertTrue(
+            legacy_command._za_mega_testmode1_reinitialize_pending)
+        legacy_command.ZA_mega_mode5_hp_resume_mode = lambda: "OTHER"
+        namespace["ZA_mega_mode5_begin_resume"](
+            legacy_command, True, 1.0, 0.24, "field")
+        self.assertFalse(
+            legacy_command._za_mega_testmode1_reinitialize_pending)
+        self.assertEqual(
+            legacy_command._za_mega_testmode1_phase, "MOVE_TO_COVER")
+        self.assertEqual(legacy_command._za_mega_mode5_start_flag, 2)
+
+        # TESTMODE1以外で緑床確認を有効にした場合は、画像判定が重くても
+        # 8回を一括実行せず、実時間1秒で打ち切って初期移動へ進む。
+        class SlowGreenCheckCommand(Command):
+            def __init__(self):
+                super().__init__()
+                self._za_mega_z_guard_enabled = True
+                self.green_checks = 0
+
+            def ZA_mega_z_guard_update(self, *_args, **_kwargs):
+                self.green_checks += 1
+                FakeTime.now += 0.55
+                return False
+
+        slow_green = SlowGreenCheckCommand()
+        FakeTime.now = 0.0
+        namespace["ZA_mega_mode5_begin_resume"](
+            slow_green, True, 1.0, 0.24, "field")
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_green_and_initial_update"](
+                slow_green, 20, 90, 40, 90, 0.24, 1.0))
+        self.assertEqual(slow_green.green_checks, 2)
+        self.assertEqual(
+            slow_green._za_mega_mode5_green_priority_checks_remaining, 0)
+        slow_initial_press = next(
+            event for event in reversed(slow_green.events)
+            if event[0] == "press")
+        self.assertEqual(slow_initial_press[1].angle_for_show, 90)
+
+        # 再開検知の瞬間だけHPバーが隠れていても、初期移動後の
+        # 待機中に再判定し、黄色低HPの距離維持を有効にする。
+        class DelayedYellowCommand(Command):
+            def __init__(self):
+                super().__init__()
+                self.yellow_checks = 0
+
+            def ZA_mega_mode5_low_yellow_hp(self, *_args, **_kwargs):
+                self.yellow_checks += 1
+                if self.yellow_checks >= 2:
+                    self._za_mega_mode5_yellow_hp_fill_ratio = 0.355
+                    return True
+                return False
+
+        delayed_yellow = DelayedYellowCommand()
+        FakeTime.now = 0.0
+        namespace["ZA_mega_mode5_begin_resume"](
+            delayed_yellow, False, 1.0, 0.24, "field")
+        self.assertFalse(delayed_yellow._za_mega_mode5_low_yellow_hp_active)
+        self.assertEqual(delayed_yellow.yellow_checks, 1)
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_green_and_initial_update"](
+                delayed_yellow, 20, 90, 40, 90, 0.24, 1.0))
+        self.assertFalse(delayed_yellow._za_mega_mode5_low_yellow_hp_active)
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_green_and_initial_update"](
+                delayed_yellow, 20, 90, 40, 90, 0.24, 1.0))
+        self.assertTrue(delayed_yellow._za_mega_mode5_low_yellow_hp_active)
+        self.assertEqual(delayed_yellow.yellow_checks, 2)
+        self.assertEqual(
+            delayed_yellow._za_mega_mode5_low_yellow_hp_checks_remaining,
+            0)
+        self.assertFalse(
+            delayed_yellow._za_mega_mode5_low_yellow_hp_lock_seen)
+
+        # Switch No2実録画と同じ位置・幅の黄色い低HPバーでも、初期移動は
+        # 通常90度のままにし、ロックオン後の距離維持フラグだけを有効にする。
+        yellow_low_frame = numpy.zeros(
+            (720, 1280, 3), dtype=numpy.uint8)
+        yellow_low_frame[82:105, 423:579] = (0, 255, 255)
+        yellow = Command()
+        yellow.camera = types.SimpleNamespace(
+            readFreshFrame=lambda timeout=0.75: yellow_low_frame)
+        yellow._za_mega_mode5_low_yellow_hp_lock_seen = True
+        yellow._za_mega_mode5_lockon_retreating = True
+        self.assertTrue(namespace["ZA_mega_mode5_low_yellow_hp"](
+            yellow, yellow_low_frame))
+        namespace["ZA_mega_mode5_begin_resume"](
+            yellow, False, 1.0, 0.24, "field")
+        self.assertTrue(yellow._za_mega_mode5_low_yellow_hp_active)
+        self.assertFalse(yellow._za_mega_mode5_low_yellow_hp_lock_seen)
+        self.assertFalse(yellow._za_mega_mode5_lockon_retreating)
+        self.assertEqual(yellow._za_mega_mode5_initial_approach_angle, 90)
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_green_and_initial_update"](
+                yellow, 20, 90, 40, 90, 0.24, 1.0))
+        yellow_press = next(
+            event for event in reversed(yellow.events)
+            if event[0] == "press")
+        self.assertEqual(yellow_press[1].angle_for_show, 90)
+        self.assertEqual(yellow_press[2], 1.0)
+
+        # HPが半分以上残る長い黄色バーや、別位置の黄色UIは対象外。
+        yellow_high_frame = numpy.zeros(
+            (720, 1280, 3), dtype=numpy.uint8)
+        yellow_high_frame[82:105, 423:760] = (0, 255, 255)
+        self.assertFalse(namespace["ZA_mega_mode5_low_yellow_hp"](
+            yellow, yellow_high_frame))
+        shifted_yellow_frame = numpy.zeros(
+            (720, 1280, 3), dtype=numpy.uint8)
+        shifted_yellow_frame[82:105, 700:856] = (0, 255, 255)
+        self.assertFalse(namespace["ZA_mega_mode5_low_yellow_hp"](
+            yellow, shifted_yellow_frame))
+
+    def test_za_mega_green_floor_uses_uneroded_foot_mask(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        helper_name = "ZA_mega_green_safe_floor_direction"
+        source_helper = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef) and node.name == helper_name)
+        fragment_helper = next(
+            node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef) and node.name == helper_name)
+        self.assertEqual(
+            ast.dump(source_helper, include_attributes=False),
+            ast.dump(fragment_helper, include_attributes=False))
+        self.assertIn(
+            "distance = math.hypot(delta_x, delta_y)",
+            ast.unparse(source_helper))
+
+        namespace = {
+            "cv2": cv2,
+            "math": math,
+            "Direction": Direction,
+            "Stick": Stick,
+        }
+        exec(compile(ast.Module(
+            body=[source_helper], type_ignores=[]),
+            source_path, "exec"), namespace)
+        detect = namespace[helper_name]
+
+        class Command:
+            pass
+
+        # 足元領域の約12%を連続した緑床が占めれば到達候補になる。
+        reached_frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        reached_frame[590:620, 560:740] = (0, 255, 0)
+        on_green, direction, ratio = detect(Command(), reached_frame)
+        self.assertTrue(on_green)
+        self.assertIsNone(direction)
+        self.assertGreaterEqual(ratio, 0.10)
+
+        # 画面内の小さな緑要素は足元到達にしない。
+        small_green_frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        small_green_frame[600:608, 560:740] = (0, 255, 0)
+        on_green, direction, ratio = detect(Command(), small_green_frame)
+        self.assertFalse(on_green)
+        self.assertIsNone(direction)
+        self.assertLess(ratio, 0.08)
+
+        # 合計量が多くても、点在する緑線は床上判定にしない。
+        fragmented_green_frame = numpy.zeros(
+            (720, 1280, 3), dtype=numpy.uint8)
+        for y in range(550, 640, 3):
+            fragmented_green_frame[y:y + 1, 560:740] = (0, 255, 0)
+        on_green, direction, ratio = detect(
+            Command(), fragmented_green_frame)
+        self.assertFalse(on_green)
+        self.assertIsNone(direction)
+        self.assertGreaterEqual(ratio, 0.10)
+
+        # 遠方で画面上寄りに横長表示された緑床も移動候補にする。
+        distant_floor = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        distant_floor[180:260, 80:800] = (0, 255, 0)
+        distant_command = Command()
+        on_green, direction, _ = detect(distant_command, distant_floor)
+        self.assertFalse(on_green)
+        self.assertIsInstance(direction, Direction)
+        self.assertEqual(direction.mag, 1.0)
+        distant_seconds = distant_command._za_mega_green_floor_move_seconds
+        self.assertGreater(distant_seconds, 0.18)
+        self.assertLessEqual(distant_seconds, 3.0)
+
+        # 画面下側へ近づいた床は、遠方より短い1回分の移動時間になる。
+        nearby_floor = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        nearby_floor[360:500, 300:980] = (0, 255, 0)
+        nearby_command = Command()
+        on_green, direction, _ = detect(nearby_command, nearby_floor)
+        self.assertFalse(on_green)
+        self.assertIsInstance(direction, Direction)
+        self.assertEqual(direction.mag, 1.0)
+        # 現行録画では旧係数の約1.3秒で床の手前に止まったため、
+        # この距離は約2秒の移動予算を確保する。
+        self.assertGreaterEqual(
+            nearby_command._za_mega_green_floor_move_seconds, 1.8)
+        self.assertLess(
+            nearby_command._za_mega_green_floor_move_seconds,
+            distant_seconds)
+
+        # 縦長の緑攻撃エフェクトは安全床候補にしない。
+        vertical_effect = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        vertical_effect[170:500, 300:400] = (0, 255, 0)
+        on_green, direction, _ = detect(Command(), vertical_effect)
+        self.assertFalse(on_green)
+        self.assertIsNone(direction)
+
+        # 左下へ近づいた大きな緑床は、手持ちHP表示として除外しない。
+        lower_left_floor = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        lower_left_floor[400:690, 100:550] = (0, 255, 0)
+        on_green, direction, _ = detect(Command(), lower_left_floor)
+        self.assertFalse(on_green)
+        self.assertIsInstance(direction, Direction)
+
+        # 左下の薄い小領域は従来どおりUI候補として除外する。
+        lower_left_ui = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        lower_left_ui[560:600, 100:300] = (0, 255, 0)
+        on_green, direction, _ = detect(Command(), lower_left_ui)
+        self.assertFalse(on_green)
+        self.assertIsNone(direction)
+
+    def test_za_mega_z_guard_holds_until_green_floor_disappears(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        helper_name = "ZA_mega_z_guard_update"
+        source_helper = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef) and node.name == helper_name)
+        fragment_helper = next(
+            node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef) and node.name == helper_name)
+        self.assertEqual(
+            ast.dump(source_helper, include_attributes=False),
+            ast.dump(fragment_helper, include_attributes=False))
+
+        class FakeTime:
+            now = 0.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+        namespace = {
+            "Direction": Direction,
+            "Stick": Stick,
+            "time": FakeTime,
+        }
+        exec(compile(ast.Module(
+            body=[source_helper], type_ignores=[]),
+            source_path, "exec"), namespace)
+
+        class Command:
+            def __init__(self):
+                self._za_mega_z_guard_enabled = True
+                self._za_mega_field_dir5_until = 0.0
+                self._za_mega_z_guard_active = False
+                self._za_mega_z_guard_holding = False
+                self._za_mega_z_guard_last_seen = 0.0
+                self._za_mega_z_guard_skip_current_floor = False
+                self._za_mega_z_guard_skip_last_seen = 0.0
+                self._za_mega_z_guard_direction = None
+                self._za_mega_z_guard_direction_until = 0.0
+                self._za_mega_movemode_direction = Direction(
+                    Stick.LEFT, 0, 1.0)
+                self._za_mega_movemode_direction_until = 10.0
+                self._za_mega_movemode_orbit_until = 10.0
+                self.floor_result = (False, None, 0.0)
+                self.floor_results = []
+                self.moves = []
+                self.presses = []
+                self.view_actions = []
+                self.events = []
+                self.waits = []
+                self.ZL_state = 1
+                self.zl_actions = []
+                self._za_mega_green_floor_move_seconds = 0.6
+
+            def ZA_mega_green_safe_floor_direction(self):
+                if self.floor_results:
+                    return self.floor_results.pop(0)
+                return self.floor_result
+
+            def ZA_MOVE_LStick(self, *_args, **_kwargs):
+                self.moves.append((_args[-2], _args[-1]))
+                if isinstance(_args[-2], Direction):
+                    self.events.append("floor_move")
+
+            def press(self, direction, **kwargs):
+                self.presses.append((direction, kwargs))
+                self.events.append("floor_move")
+
+            def ZA_MOVE_SEE(self, action="RELOAD", **_kwargs):
+                self.view_actions.append(action)
+                self.events.append("view_{}".format(action))
+
+            def ZA_mega_mode5_marker_search_view_stop(
+                    self, relock=False):
+                self.events.append("view_hold_stop")
+                return True
+
+            def ZA_mega_mode5_marker_search_view(self):
+                self.events.append("view_search")
+
+            def ZA_mega_mode5_testmode1_settings(self):
+                return {"HP75_INITIAL_GREEN_MOVE_ANGLE": 90.0}
+
+            def ZA_mega_mode5_testmode1_enter_legacy(self, reason):
+                if not getattr(self, "_za_mega_testmode1_enabled", False):
+                    return False
+                self._za_mega_testmode1_legacy_until_reset = True
+                self._za_mega_testmode1_phase = "LEGACY_COMBAT"
+                self.events.append("legacy:" + reason)
+                return True
+
+            def wait(self, seconds):
+                self.waits.append(seconds)
+
+            def ZA_ZL_ACTION(self, action="RELOAD"):
+                self.zl_actions.append(action)
+                self.ZL_state = 0 if action == "END" else 1
+
+        update = namespace[helper_name]
+        command = Command()
+        command.floor_result = (True, None, 0.5)
+        self.assertTrue(update(command, 20, 0, 40, 0))
+        self.assertFalse(command._za_mega_z_guard_holding)
+        self.assertEqual(command.moves[-1], (1, "END"))
+        self.assertIsNone(command._za_mega_z_guard_direction)
+        self.assertEqual(command._za_mega_z_guard_direction_until, 0.0)
+        FakeTime.now = 0.1
+        self.assertTrue(update(command, 20, 0, 40, 0))
+        self.assertTrue(command._za_mega_z_guard_holding)
+        self.assertEqual(command.moves[-1], (1, "END"))
+        self.assertIsNone(command._za_mega_movemode_direction)
+        self.assertEqual(command._za_mega_movemode_direction_until, 0.0)
+        self.assertEqual(command._za_mega_movemode_orbit_until, 0.0)
+
+        # TESTMODE1中に緑床移動／床上待機が成立した時点で
+        # 通常mode5固定を立て、障害物Yへ戻らない。
+        testmode_green = Command()
+        testmode_green._za_mega_testmode1_enabled = True
+        testmode_green._za_mega_testmode1_phase = "COVER_ATTACK"
+        testmode_green.floor_result = (True, None, 0.5)
+        FakeTime.now = 0.1
+        self.assertTrue(update(testmode_green, 20, 0, 40, 0))
+        FakeTime.now = 0.2
+        self.assertTrue(update(testmode_green, 20, 0, 40, 0))
+        self.assertTrue(
+            testmode_green._za_mega_testmode1_legacy_until_reset)
+        self.assertEqual(
+            testmode_green._za_mega_testmode1_phase, "LEGACY_COMBAT")
+        self.assertIn("legacy:GREEN_FLOOR", testmode_green.events)
+
+        # 通常の緑床は表示の有無にかかわらず2.5秒停止後に
+        # 戦闘へ戻り、同じ床は消えるまで再取得しない。
+        command.floor_result = (False, None, 0.0)
+        FakeTime.now = 0.4
+        self.assertTrue(update(command, 20, 0, 40, 0))
+        FakeTime.now = 0.8
+        self.assertTrue(update(command, 20, 0, 40, 0))
+        FakeTime.now = 2.7
+        self.assertFalse(update(command, 20, 0, 40, 0))
+        self.assertFalse(command._za_mega_z_guard_holding)
+        self.assertEqual(command._za_mega_z_guard_on_green_count, 0)
+        self.assertTrue(command._za_mega_z_guard_normal_hold_completed)
+        self.assertTrue(command._za_mega_z_guard_skip_current_floor)
+        FakeTime.now = 3.4
+        self.assertFalse(update(command, 20, 0, 40, 0))
+        self.assertFalse(command._za_mega_z_guard_normal_hold_completed)
+        self.assertFalse(command._za_mega_z_guard_skip_current_floor)
+
+        # 強い光の予兆用だけは、緑床が0.6秒連続で
+        # 消えるまで従来どおり停止する。
+        hazard = Command()
+        hazard.floor_result = (True, None, 0.5)
+        FakeTime.now = 3.5
+        self.assertTrue(update(
+            hazard, 20, 0, 40, 0, hold_until_disappears=True))
+        FakeTime.now = 3.6
+        self.assertTrue(update(
+            hazard, 20, 0, 40, 0, hold_until_disappears=True))
+        hazard.floor_result = (False, None, 0.0)
+        FakeTime.now = 3.9
+        self.assertTrue(update(
+            hazard, 20, 0, 40, 0, hold_until_disappears=True))
+        FakeTime.now = 4.3
+        self.assertFalse(update(
+            hazard, 20, 0, 40, 0, hold_until_disappears=True))
+        self.assertFalse(hazard._za_mega_z_guard_holding)
+
+        command.floor_results = [
+            (False, Direction(Stick.LEFT, 135, 1.0), 0.0),
+            (False, Direction(Stick.LEFT, 125, 1.0), 0.0),
+            (True, None, 0.42),
+        ]
+        FakeTime.now = 4.4
+        self.assertTrue(update(command, 20, 0, 40, 0))
+        self.assertTrue(command._za_mega_z_guard_holding)
+        self.assertEqual(command.moves[-1], (1, "END"))
+        direction_moves = [
+            item[0] for item in command.moves
+            if isinstance(item[0], Direction)]
+        self.assertEqual(len(direction_moves), 1)
+        # 回転停止後に再取得した125度を、強度1.0で解除せず保持する。
+        self.assertEqual(direction_moves[0].angle_for_show, 125.0)
+        self.assertEqual(direction_moves[0].mag, 1.0)
+        self.assertEqual(command.presses, [])
+        self.assertIn("END", command.view_actions)
+        self.assertLess(
+            command.events.index("view_END"),
+            command.events.index("floor_move"))
+        events_before_move = command.events[
+            :command.events.index("floor_move")]
+        self.assertGreaterEqual(events_before_move.count("view_hold_stop"), 2)
+        self.assertGreaterEqual(events_before_move.count("view_END"), 2)
+        # 緑床へ通常速度で移動する場合だけはZLを解除する。
+        self.assertEqual(command.zl_actions, ["END"])
+        self.assertEqual(command.ZL_state, 0)
+        self.assertIsNone(command._za_mega_z_guard_direction)
+        self.assertEqual(command._za_mega_z_guard_direction_until, 0.0)
+
+        # 距離予算の終端で床上判定を取りこぼしても、
+        # 移動後の2.5秒停止を必ず入れる。
+        missed = Command()
+        missed.floor_results = [
+            (False, Direction(Stick.LEFT, 45, 1.0), 0.0),
+            (False, Direction(Stick.LEFT, 40, 1.0), 0.0),
+            (False, Direction(Stick.LEFT, 30, 1.0), 0.0),
+            (False, None, 0.0),
+        ]
+        FakeTime.now = 5.0
+        self.assertTrue(update(missed, 20, 0, 40, 0))
+        self.assertTrue(missed._za_mega_z_guard_holding)
+        self.assertFalse(missed._za_mega_z_guard_skip_current_floor)
+        missed_moves = [
+            item[0] for item in missed.moves
+            if isinstance(item[0], Direction)]
+        self.assertEqual(len(missed_moves), 6)
+        self.assertEqual(
+            [item.angle_for_show for item in missed_moves],
+            [40.0, 30.0, 30.0, 30.0, 30.0, 30.0])
+        FakeTime.now = 6.0
+        self.assertTrue(update(missed, 20, 0, 40, 0))
+        FakeTime.now = 7.6
+        self.assertFalse(update(missed, 20, 0, 40, 0))
+        self.assertTrue(missed._za_mega_z_guard_normal_hold_completed)
+        missed.floor_result = (
+            False, Direction(Stick.LEFT, 30, 1.0), 0.0)
+        FakeTime.now = 7.8
+        self.assertFalse(update(missed, 20, 0, 40, 0))
+        ignored_floor_moves = [
+            item[0] for item in missed.moves
+            if isinstance(item[0], Direction)]
+        self.assertEqual(len(ignored_floor_moves), 6)
+        self.assertTrue(missed._za_mega_z_guard_skip_current_floor)
+
+        # 実録画では移動予算の途中で緑床が2フレーム欠落し、1.4秒で
+        # 打ち切られていた。短い欠落中も最後の有効方向で移動を続ける。
+        transient = Command()
+        transient._za_mega_green_floor_move_seconds = 1.4
+        transient.floor_results = [
+            (False, Direction(Stick.LEFT, 70, 1.0), 0.0),
+            (False, Direction(Stick.LEFT, 65, 1.0), 0.0),
+            (False, None, 0.0),
+            (False, None, 0.0),
+            (False, Direction(Stick.LEFT, 60, 1.0), 0.0),
+            (True, None, 0.35),
+        ]
+        FakeTime.now = 1.75
+        self.assertTrue(update(transient, 20, 0, 40, 0))
+        self.assertTrue(transient._za_mega_z_guard_holding)
+        transient_moves = [
+            item[0] for item in transient.moves
+            if isinstance(item[0], Direction)]
+        self.assertEqual(len(transient_moves), 4)
+        self.assertEqual(
+            [item.angle_for_show for item in transient_moves],
+            [65.0, 65.0, 65.0, 60.0])
+
+        # mode 5では2.2秒を超える遠方床だけを追わず、攻撃と敵追従を
+        # 継続する。破棄する場合も視点を先に止め、床が足元へ来たら待機する。
+        distant = Command()
+        distant._za_mega_last_battle_mode = True
+        distant._za_mega_green_floor_move_seconds = 2.3
+        distant.floor_result = (
+            False, Direction(Stick.LEFT, 90, 1.0), 0.0)
+        FakeTime.now = 1.8
+        self.assertFalse(update(distant, 20, 0, 40, 0))
+        self.assertTrue(distant._za_mega_z_guard_skip_current_floor)
+        self.assertEqual(distant.presses, [])
+        self.assertEqual(distant.view_actions, ["END"])
+        self.assertEqual(distant.events[:2], ["view_hold_stop", "view_END"])
+        distant.floor_result = (True, None, 0.5)
+        FakeTime.now = 1.9
+        self.assertTrue(update(distant, 20, 0, 40, 0))
+        self.assertFalse(distant._za_mega_z_guard_skip_current_floor)
+        FakeTime.now = 2.0
+        self.assertTrue(update(distant, 20, 0, 40, 0))
+        self.assertTrue(distant._za_mega_z_guard_holding)
+
+        # 同じ遠方床でも開始直後は破棄せず、緑床への一回移動を優先する。
+        initial_distant = Command()
+        initial_distant._za_mega_last_battle_mode = True
+        initial_distant._za_mega_mode5_initial_phase_active = True
+        initial_distant._za_mega_green_floor_move_seconds = 2.3
+        initial_distant.floor_results = [
+            (False, Direction(Stick.LEFT, 95, 1.0), 0.0),
+            (False, Direction(Stick.LEFT, 90, 1.0), 0.0),
+            (True, None, 0.4),
+        ]
+        FakeTime.now = 2.1
+        self.assertTrue(update(initial_distant, 20, 0, 40, 0))
+        self.assertFalse(initial_distant._za_mega_z_guard_skip_current_floor)
+        initial_distant_moves = [
+            item[0] for item in initial_distant.moves
+            if isinstance(item[0], Direction)]
+        self.assertEqual(len(initial_distant_moves), 1)
+        self.assertEqual(initial_distant_moves[0].angle_for_show, 90.0)
+        self.assertEqual(initial_distant_moves[0].mag, 1.0)
+
+        # 開始直後の90度移動時間内でも、緑床があればそちらを優先する。
+        initial_move = Command()
+        initial_move._za_mega_field_dir5_until = 10.0
+        initial_move.floor_results = [
+            (False, Direction(Stick.LEFT, 150, 1.0), 0.0),
+            (False, Direction(Stick.LEFT, 145, 1.0), 0.0),
+            (True, None, 0.35),
+        ]
+        FakeTime.now = 2.0
+        self.assertTrue(update(initial_move, 20, 0, 40, 0))
+        initial_move_directions = [
+            item[0] for item in initial_move.moves
+            if isinstance(item[0], Direction)]
+        self.assertEqual(initial_move_directions[-1].angle_for_show, 145.0)
+        self.assertEqual(initial_move_directions[-1].mag, 1.0)
+        self.assertTrue(initial_move._za_mega_z_guard_holding)
+
+        # TESTMODE1のHP75再開直後だけは、床の検知角度を追従せず、
+        # 視点を止めたまま設定値90度で床まで移動する。
+        hp75_initial = Command()
+        hp75_initial._za_mega_last_battle_mode = True
+        hp75_initial._za_mega_testmode1_enabled = True
+        hp75_initial._za_mega_testmode1_resume_hp = "HP75"
+        hp75_initial._za_mega_testmode1_phase = "HP75_EXISTING"
+        hp75_initial._za_mega_mode5_initial_phase_active = True
+        hp75_initial.floor_results = [
+            (False, Direction(Stick.LEFT, 160, 1.0), 0.0),
+            (False, Direction(Stick.LEFT, 145, 1.0), 0.0),
+            (False, Direction(Stick.LEFT, 120, 1.0), 0.0),
+            (True, None, 0.40),
+        ]
+        FakeTime.now = 3.0
+        self.assertTrue(update(hp75_initial, 20, 0, 40, 0))
+        hp75_moves = [
+            item[0] for item in hp75_initial.moves
+            if isinstance(item[0], Direction)]
+        self.assertGreaterEqual(len(hp75_moves), 2)
+        self.assertEqual(
+            [item.angle_for_show for item in hp75_moves],
+            [90.0] * len(hp75_moves))
+        self.assertTrue(all(
+            action == "END" for action in hp75_initial.view_actions))
+        hp75_initial.floor_result = (True, None, 0.45)
+        self.assertTrue(update(hp75_initial, 20, 0, 40, 0))
+        self.assertNotIn("view_search", hp75_initial.events)
+
+    def test_za_mega_mode5_testmode1_classifies_resume_and_holds_cover_view(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        names = (
+            "ZA_MOVE_SEE",
+            "ZA_MOVE_LStick",
+            "ZA_mega_red_edge_dodge_if_needed",
+            "ZA_mega_mode5_hp_resume_mode",
+            "ZA_mega_mode5_testmode1_settings",
+            "ZA_mega_mode5_testmode1_enter_legacy",
+            "ZA_mega_mode5_testmode1_reset_for_selection",
+            "ZA_mega_mode5_testmode1_controls_cover",
+            "ZA_mega_mode5_testmode1_warning_cycle_update",
+            "ZA_mega_mode5_testmode1_red_only_fallback_update",
+            "ZA_mega_mode5_testmode1_blue_return_update",
+            "ZA_mega_mode5_testmode1_resume_update",
+            "ZA_mega_mode5_testmode1_combat_update",
+            "ZA_mega_mode5_testmode1_finish_hp75_initial",
+            "ZA_mega_mode5_begin_resume",
+            "ZA_mega_mode5_begin_post_move_wait",
+            "ZA_mega_mode5_green_and_initial_update",
+            "ZA_mega_evolution_battle",
+        )
+        source_functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef) and node.name in names}
+        fragment_functions = {
+            node.name: node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef) and node.name in names}
+        for name in names:
+            self.assertEqual(
+                normalized_function_ast_dump(source_functions[name]),
+                normalized_function_ast_dump(fragment_functions[name]))
+
+        class FakeTime:
+            now = 10.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+        namespace = {
+            "cv2": cv2, "time": FakeTime, "Button": Button,
+            "Direction": Direction, "Stick": Stick,
+        }
+        runnable_names = (
+            "ZA_MOVE_SEE",
+            "ZA_MOVE_LStick",
+            "ZA_mega_mode5_hp_resume_mode",
+            "ZA_mega_mode5_testmode1_settings",
+            "ZA_mega_mode5_testmode1_enter_legacy",
+            "ZA_mega_mode5_testmode1_reset_for_selection",
+            "ZA_mega_mode5_testmode1_controls_cover",
+            "ZA_mega_mode5_testmode1_warning_cycle_update",
+            "ZA_mega_mode5_testmode1_red_only_fallback_update",
+            "ZA_mega_mode5_testmode1_blue_return_update",
+            "ZA_mega_mode5_testmode1_resume_update",
+            "ZA_mega_mode5_testmode1_combat_update",
+            "ZA_mega_mode5_testmode1_finish_hp75_initial",
+        )
+        exec(compile(ast.Module(
+            body=[source_functions[name] for name in runnable_names],
+            type_ignores=[]), source_path, "exec"), namespace)
+
+        hp_detect = namespace["ZA_mega_mode5_hp_resume_mode"]
+        hp_command = types.SimpleNamespace(
+            _za_mega_last_battle_mode=True,
+            last_image_detection={})
+        hp75_frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        hp75_frame[82:104, 423:717] = (0, 255, 0)
+        self.assertEqual(hp_detect(hp_command, hp75_frame), "HP75")
+        self.assertEqual(hp_command._za_mega_testmode1_hp_color, "GREEN")
+        self.assertAlmostEqual(
+            hp_command._za_mega_testmode1_hp_fill_ratio, 0.665, places=2)
+        full_frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        full_frame[82:104, 423:850] = (0, 255, 0)
+        self.assertEqual(hp_detect(hp_command, full_frame), "OTHER")
+        yellow_frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        yellow_frame[82:104, 423:580] = (0, 255, 255)
+        self.assertEqual(hp_detect(hp_command, yellow_frame), "OTHER")
+        self.assertEqual(hp_detect(
+            hp_command, numpy.zeros(
+                (720, 1280, 3), dtype=numpy.uint8)),
+            "UNKNOWN")
+
+        class Command:
+            def __init__(self):
+                self._za_mega_last_battle_mode = True
+                self._za_mega_testmode1_enabled = True
+                self._za_mega_testmode1_resume_hp = "OTHER"
+                self._za_mega_testmode1_phase = "MOVE_TO_COVER"
+                self._za_mega_testmode1_blue_scan_attempts = 0
+                self._za_mega_testmode1_face_attempts = 0
+                self._za_mega_testmode1_face_angle = 90.0
+                self._za_mega_testmode1_next_dodge_at = 0.0
+                self._za_mega_testmode1_legacy_until_reset = False
+                self._za_mega_testmode1_reinitialize_pending = False
+                self._za_mega_testmode1_blue_return_since = 0.0
+                self._za_mega_testmode1_blue_return_last_seen = 0.0
+                self._za_mega_testmode1_blue_return_confirmations = 0
+                self._za_mega_testmode1_red_cover_no_enemy_since = 0.0
+                self._za_mega_testmode1_red_cover_no_enemy_confirmations = 0
+                self._za_mega_testmode1_blue_last_seen_at = 0.0
+                self._za_mega_testmode1_red_premove_block_until = 0.0
+                self._za_mega_testmode1_red_premove_waiting_strong_light = False
+                self._za_mega_testmode1_red_cover_move_not_before = 0.0
+                self._za_mega_marker_search_direction = 180.0
+                self._za_mega_marker_search_strength = 0.24
+                self._za_mega_z_guard_enabled = True
+                self._za_mega_mode5_initial_phase_active = True
+                self._za_mega_mode5_green_priority_checks_remaining = 8
+                self.ZL_state = 1
+                self.colored_results = [
+                    Direction(Stick.LEFT, 110, 0.5), 0]
+                self.matched = set()
+                self.serial_commands = []
+                self.events = []
+                self.z_guard_calls = 0
+
+            def ZA_mega_mode5_testmode1_controls_cover(self):
+                return namespace[
+                    "ZA_mega_mode5_testmode1_controls_cover"](self)
+
+            def ZA_mega_mode5_testmode1_red_only_fallback_update(self):
+                return namespace[
+                    "ZA_mega_mode5_testmode1_red_only_fallback_update"](self)
+
+            def ZA_mega_mode5_testmode1_warning_cycle_update(self, event):
+                return namespace[
+                    "ZA_mega_mode5_testmode1_warning_cycle_update"](
+                        self, event)
+
+            def ZA_mega_mode5_testmode1_blue_return_update(self):
+                return namespace[
+                    "ZA_mega_mode5_testmode1_blue_return_update"](self)
+
+            def ZA_mega_mode5_testmode1_enter_legacy(self, reason):
+                return namespace[
+                    "ZA_mega_mode5_testmode1_enter_legacy"](self, reason)
+
+            def ZA_mega_mode5_testmode1_reset_for_selection(self, reason):
+                return namespace[
+                    "ZA_mega_mode5_testmode1_reset_for_selection"](
+                        self, reason)
+
+            def ZA_mega_mode5_testmode1_settings(self):
+                return namespace[
+                    "ZA_mega_mode5_testmode1_settings"](self)
+
+            def ZA_mega_mode5_colored_enemy_direction(self, **kwargs):
+                self.events.append(("color", kwargs))
+                result=(self.colored_results.pop(0)
+                        if self.colored_results else 0)
+                if (isinstance(result, tuple) and len(result) == 3):
+                    observed, stable, result = result
+                    self._za_mega_colored_enemy_observed_color = observed
+                    self._za_mega_colored_enemy_color = stable
+                elif (isinstance(result, tuple) and len(result) == 2):
+                    color, result = result
+                    self._za_mega_colored_enemy_observed_color = color
+                    self._za_mega_colored_enemy_color = color
+                else:
+                    self._za_mega_colored_enemy_observed_color = None
+                    self._za_mega_colored_enemy_color = None
+                return result
+
+            def image_check(self, name):
+                self.events.append(("image", name))
+                return name in self.matched
+
+            def etc_sendCommand(self, command, **kwargs):
+                self.serial_commands.append(command)
+                self.events.append(("serial", command, kwargs))
+
+            def ZA_MOVE_LStick(self, *args, **kwargs):
+                self.events.append(("left", args[-2], args[-1], kwargs))
+
+            def ZA_MOVE_SEE(self, action="", **kwargs):
+                self.events.append(("view", action, kwargs))
+
+            def ZA_mega_mode5_marker_search_view_stop(self, relock=False):
+                self.events.append(("view_stop", relock))
+
+            def ZA_ZL_ACTION(self, action=""):
+                self.events.append(("zl", action))
+                self.ZL_state = 0 if action == "END" else 1
+
+            def ZA_mega_mode5_trace(self, detection, action, **kwargs):
+                self.events.append(("trace", detection, action, kwargs))
+
+            def ZA_mega_mode5_set_start_flag(
+                    self, flag, detection, action):
+                self._za_mega_mode5_start_flag = flag
+                self.events.append(("flag", flag, detection, action))
+
+            def ZA_mega_z_guard_update(self, *_args, **_kwargs):
+                self.z_guard_calls += 1
+                return False
+
+            def ZA_mega_mode5_transition(self, phase, reason):
+                self.events.append(("transition", phase, reason))
+
+            def press(self, direction, **kwargs):
+                self.events.append(("press", direction, kwargs))
+
+            def pressRep(self, button, **kwargs):
+                self.events.append(("button", button, kwargs))
+
+            def wait(self, duration):
+                FakeTime.now += duration
+
+        resume_update = namespace["ZA_mega_mode5_testmode1_resume_update"]
+        combat_update = namespace["ZA_mega_mode5_testmode1_combat_update"]
+        finish_hp75 = namespace[
+            "ZA_mega_mode5_testmode1_finish_hp75_initial"]
+        command = Command()
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "CHARGE_WARNING_SKIP_COUNT"],
+            -1)
+        self.assertTrue(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "WARNING_BLUE_FALLBACK_ENABLED"])
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "WARNING_RED_COVER_DELAY_SECONDS"],
+            5.0)
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "BLUE_ABSENCE_FALLBACK_SECONDS"],
+            60.0)
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "RED_ONLY_GAP_TOLERANCE_SECONDS"],
+            10.0)
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "BLUE_BURROW_GRACE_SECONDS"],
+            12.0)
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "RED_COVER_MOVE_SECONDS"],
+            6.5)
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "BLUE_TO_RED_ANCHOR_DODGE_REPEAT"],
+            3)
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "BLUE_ATTACK_PREMOVE_ANGLE"],
+            270.0)
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "BLUE_ATTACK_PREMOVE_ANGLE_SECONDS"],
+            0.5)
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "RED_ATTACK_PREMOVE_ANGLE"],
+            270.0)
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "RED_ATTACK_PREMOVE_ANGLE_SECONDS"],
+            0.5)
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "RED_ATTACK_PREMOVE_BLOCK_SECONDS"],
+            7.0)
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "BLUE_RETURN_SECONDS"],
+            1.0)
+        self.assertTrue(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "BLUE_RETURN_TO_LEGACY_ENABLED"])
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "RED_COVER_NO_ENEMY_RETURN_SECONDS"],
+            20.0)
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "RED_COVER_NO_ENEMY_MIN_CONFIRMATIONS"],
+            5)
+        self.assertTrue(resume_update(command, 20, 90, 40, 90, 0.24))
+        self.assertEqual(command._za_mega_testmode1_phase, "FACE_BLUE")
+        self.assertEqual(command._za_mega_mode5_start_flag, 3)
+        cover_press = next(
+            event for event in command.events
+            if event[0] == "press" and event[1].stick == Stick.LEFT)
+        self.assertEqual(cover_press[1].angle_for_show, 150.0)
+        self.assertEqual(cover_press[2]["duration"], 5.7)
+        self.assertFalse(any(
+            event[0] == "color" for event in command.events))
+        self.assertTrue(any(
+            event[0] == "flag"
+            and event[2] == "OTHER_BLUE_COVER_FIXED"
+            for event in command.events))
+
+        command.events.clear()
+        self.assertEqual(
+            combat_update(command, 20, 90, 40, 90, 0.24), "handled")
+        self.assertEqual(command._za_mega_testmode1_phase, "COVER_ATTACK")
+        self.assertTrue(any(
+            event[0] == "button" and event[1] == Button.L
+            for event in command.events))
+        fixed_face_move = next(
+            event for event in command.events
+            if event[0] == "left" and isinstance(event[1], Direction))
+        self.assertEqual(fixed_face_move[1].angle_for_show, 30.0)
+        self.assertFalse(any(
+            event[0] == "press" and event[1].stick == Stick.RIGHT
+            for event in command.events))
+        self.assertEqual(command.z_guard_calls, 0)
+
+        # 青側障害物の内側でロックオンを取り直せるよう、
+        # 攻撃へ返す前に赤側と同じ270度へ0.5秒移動する。
+        # 赤青の存在確認は遮蔽中ではなく、この移動後のfresh frameで行う。
+        command.events.clear()
+        command.colored_results = [0]
+        command._za_mega_testmode1_next_dodge_at = 100.0
+        FakeTime.now = 12.0
+        self.assertEqual(
+            combat_update(command, 20, 90, 40, 90, 0.24), "attack")
+        blue_premove = next(
+            event for event in command.events
+            if event[0] == "press" and isinstance(event[1], Direction))
+        self.assertEqual(blue_premove[1].angle_for_show, 270.0)
+        self.assertEqual(blue_premove[2]["duration"], 0.5)
+        self.assertEqual(blue_premove[2]["wait"], 0.5)
+        blue_color_check = next(
+            event for event in command.events if event[0] == "color")
+        self.assertLess(
+            command.events.index(blue_premove),
+            command.events.index(blue_color_check))
+        self.assertTrue(blue_color_check[1]["refresh_frame"])
+        self.assertTrue(any(
+            event[0] == "trace"
+            and event[1] == "TESTMODE1_ENEMY_OCCLUDED"
+            for event in command.events))
+        self.assertTrue(any(
+            event[0] == "trace"
+            and event[1] == "TESTMODE1_BLUE_ATTACK_PREMOVE"
+            for event in command.events))
+
+        # 「力をためた」後は青側でも270度の攻撃前移動を止める。
+        command.events.clear()
+        command._za_mega_testmode1_red_premove_waiting_strong_light = True
+        command._za_mega_testmode1_next_dodge_at = 100.0
+        FakeTime.now = 13.0
+        self.assertEqual(
+            combat_update(command, 20, 90, 40, 90, 0.24), "attack")
+        self.assertFalse(any(
+            event[0] == "press" and isinstance(event[1], Direction)
+            for event in command.events))
+        self.assertTrue(any(
+            event[0] == "trace"
+            and event[1] == "TESTMODE1_BLUE_ATTACK_PREMOVE_SKIP"
+            for event in command.events))
+
+        # 攻撃前移動停止待ち中も、青側障害物の定期Yローリング2回は
+        # 止めない。
+        command.events.clear()
+        command._za_mega_testmode1_red_premove_waiting_strong_light = True
+        command._za_mega_testmode1_next_dodge_at = 0.0
+        self.assertEqual(
+            combat_update(command, 20, 90, 40, 90, 0.24), "handled")
+        blue_warning_dodge = next(
+            event for event in command.events
+            if event[0] == "button" and event[1] == Button.Y)
+        self.assertEqual(blue_warning_dodge[2]["repeat"], 2)
+
+        # 予兆を正式受理した後は、phaseが誤ってCOVER_ATTACKへ戻っても
+        # FIELD再開まで障害物用の定期Yローリングを再開しない。
+        charge_latched = Command()
+        charge_latched._za_mega_testmode1_phase = "COVER_ATTACK"
+        charge_latched._za_mega_testmode1_existing_charge_latched = True
+        charge_latched._za_mega_testmode1_next_dodge_at = 0.0
+        charge_latched.events.clear()
+        FakeTime.now = 15.0
+        self.assertEqual(
+            combat_update(charge_latched, 20, 90, 40, 90, 0.24),
+            "none")
+        self.assertFalse(
+            charge_latched.ZA_mega_mode5_testmode1_controls_cover())
+        self.assertFalse(any(
+            event[0] == "button" and event[1] == Button.Y
+            for event in charge_latched.events))
+
+        # 緑床移動が成立した後は通常mode5を固定し、
+        # BLACK_COMMENT／SELECT検知でだけTESTMODE1を再準備する。
+        green_legacy = Command()
+        self.assertTrue(green_legacy.ZA_mega_mode5_testmode1_enter_legacy(
+            "GREEN_FLOOR"))
+        self.assertTrue(green_legacy._za_mega_testmode1_legacy_until_reset)
+        self.assertEqual(
+            green_legacy._za_mega_testmode1_phase, "LEGACY_COMBAT")
+        self.assertFalse(
+            green_legacy.ZA_mega_mode5_testmode1_controls_cover())
+        self.assertTrue(
+            green_legacy.ZA_mega_mode5_testmode1_reset_for_selection(
+                "BLACK_COMMENT_OR_SELECT"))
+        self.assertFalse(green_legacy._za_mega_testmode1_legacy_until_reset)
+        self.assertTrue(green_legacy._za_mega_testmode1_reinitialize_pending)
+        self.assertEqual(
+            green_legacy._za_mega_testmode1_phase, "WAIT_RESUME")
+
+        # 2組目の強い光が消えた後は5秒青側で待ち、
+        # 上下入力を追加せず赤側障害物へ移動する。
+        warning_delay = Command()
+        warning_delay._za_mega_testmode1_phase = "WAIT_RED_COVER_DELAY"
+        warning_delay._za_mega_testmode1_red_cover_move_not_before = 105.0
+        FakeTime.now = 100.0
+        self.assertEqual(
+            combat_update(warning_delay, 20, 90, 40, 90, 0.24),
+            "handled")
+        self.assertEqual(
+            warning_delay._za_mega_testmode1_phase,
+            "WAIT_RED_COVER_DELAY")
+        self.assertEqual(warning_delay.serial_commands, [])
+
+        warning_delay.events.clear()
+        FakeTime.now = 105.0
+        self.assertEqual(
+            combat_update(warning_delay, 20, 90, 40, 90, 0.24),
+            "handled")
+        self.assertEqual(warning_delay.serial_commands, [])
+        self.assertEqual(
+            warning_delay._za_mega_testmode1_phase, "FACE_RED")
+        self.assertTrue(any(
+            event[0] == "trace"
+            and event[1] == "TESTMODE1_WARNING_RED_COVER_READY"
+            for event in warning_delay.events))
+        self.assertFalse(any(
+            event[0] == "serial"
+            and event[1] in {"Lbutton_down", "Lbutton_up"}
+            for event in warning_delay.events))
+
+        # HP区分にかかわらず、赤だけを3秒間継続確認したら
+        # 青側から赤側障害物へ固定移動し、赤へ向いてL入力する。
+        for resume_hp in ("HP75", "OTHER"):
+            fallback = Command()
+            fallback._za_mega_testmode1_resume_hp = resume_hp
+            fallback._za_mega_testmode1_phase = "COVER_ATTACK"
+            fallback._za_mega_testmode1_next_dodge_at = 100.0
+            fallback._za_mega_testmode1_blue_last_seen_at = 5.0
+            fallback.colored_results = [
+                ("red", Direction(Stick.LEFT, 180, 0.5))] * 9
+            for index in range(8):
+                FakeTime.now = 20.0 + index * 0.4
+                self.assertEqual(
+                    combat_update(
+                        fallback, 20, 90, 40, 90, 0.24),
+                    "attack")
+            FakeTime.now = 23.2
+            self.assertEqual(
+                combat_update(fallback, 20, 90, 40, 90, 0.24),
+                "handled")
+            self.assertEqual(
+                fallback._za_mega_testmode1_phase, "MOVE_TO_RED_COVER")
+            self.assertTrue(
+                fallback.ZA_mega_mode5_testmode1_controls_cover())
+
+            fallback.events.clear()
+            FakeTime.now = 23.3
+            self.assertEqual(
+                combat_update(fallback, 20, 90, 40, 90, 0.24),
+                "handled")
+            self.assertEqual(
+                fallback._za_mega_testmode1_phase, "FACE_RED")
+            red_cover_move = next(
+                event for event in fallback.events
+                if event[0] == "press" and event[1].stick == Stick.LEFT)
+            self.assertEqual(red_cover_move[1].angle_for_show, 30.0)
+            self.assertEqual(red_cover_move[2]["duration"], 6.5)
+            anchor_dodge = next(
+                event for event in fallback.events
+                if event[0] == "button" and event[1] == Button.Y)
+            self.assertEqual(anchor_dodge[2]["repeat"], 3)
+            anchor_move = next(
+                event for event in fallback.events
+                if event[0] == "left" and isinstance(event[1], Direction))
+            self.assertEqual(anchor_move[1].angle_for_show, 90.0)
+            self.assertLess(
+                fallback.events.index(anchor_dodge),
+                fallback.events.index(red_cover_move))
+            self.assertTrue(any(
+                event[0] == "trace"
+                and event[1] == "TESTMODE1_BLUE_COVER_ANCHOR"
+                for event in fallback.events))
+
+            fallback.events.clear()
+            FakeTime.now = 23.4
+            self.assertEqual(
+                combat_update(fallback, 20, 90, 40, 90, 0.24),
+                "handled")
+            self.assertEqual(
+                fallback._za_mega_testmode1_phase, "RED_COVER_ATTACK")
+            red_face_move = next(
+                event for event in fallback.events
+                if event[0] == "left" and isinstance(event[1], Direction))
+            self.assertEqual(red_face_move[1].angle_for_show, 140.0)
+            self.assertTrue(any(
+                event[0] == "button" and event[1] == Button.L
+                for event in fallback.events))
+            self.assertTrue(any(
+                event[0] == "trace"
+                and event[1] == "RED_FIXED_FACE"
+                for event in fallback.events))
+            self.assertTrue(all(
+                event[1].get("refresh_frame") is True
+                for event in fallback.events if event[0] == "color"))
+
+            # 赤側では攻撃へ返す直前に270度を0.5秒入力する。
+            # 予兆停止中は入力せず、期限後の攻撃から再開する。
+            fallback.events.clear()
+            fallback._za_mega_testmode1_next_dodge_at = 100.0
+            FakeTime.now = 25.0
+            self.assertEqual(
+                combat_update(fallback, 20, 90, 40, 90, 0.24),
+                "attack")
+            red_premove = next(
+                event for event in fallback.events
+                if event[0] == "press" and isinstance(event[1], Direction))
+            self.assertEqual(red_premove[1].angle_for_show, 270.0)
+            self.assertEqual(red_premove[2]["duration"], 0.5)
+            self.assertEqual(red_premove[2]["wait"], 0.5)
+
+            fallback.events.clear()
+            fallback._za_mega_testmode1_red_premove_waiting_strong_light = True
+            fallback._za_mega_testmode1_red_premove_block_until = 0.0
+            FakeTime.now = 26.0
+            self.assertEqual(
+                combat_update(fallback, 20, 90, 40, 90, 0.24),
+                "attack")
+            self.assertFalse(any(
+                event[0] == "press" and isinstance(event[1], Direction)
+                for event in fallback.events))
+
+            fallback.events.clear()
+            fallback._za_mega_testmode1_red_premove_waiting_strong_light = False
+            fallback._za_mega_testmode1_red_premove_block_until = 30.0
+            FakeTime.now = 26.0
+            self.assertEqual(
+                combat_update(fallback, 20, 90, 40, 90, 0.24),
+                "attack")
+            self.assertFalse(any(
+                event[0] == "press" and isinstance(event[1], Direction)
+                for event in fallback.events))
+            self.assertTrue(any(
+                event[0] == "left" and event[1] == 1
+                and event[2] == "END"
+                for event in fallback.events))
+
+            fallback.events.clear()
+            FakeTime.now = 30.1
+            self.assertEqual(
+                combat_update(fallback, 20, 90, 40, 90, 0.24),
+                "attack")
+            resumed_premove = next(
+                event for event in fallback.events
+                if event[0] == "press" and isinstance(event[1], Direction))
+            self.assertEqual(resumed_premove[1].angle_for_show, 270.0)
+            self.assertEqual(resumed_premove[2]["duration"], 0.5)
+            self.assertEqual(resumed_premove[2]["wait"], 0.5)
+
+            # 赤側で確定青を複数回確認したら通常mode5へ戻す。
+            # 赤と青は同時に存在し得るので、途中の確定赤では青確認を
+            # 取り消さない。
+            fallback.colored_results = [
+                ("blue", Direction(Stick.LEFT, 0, 0.5)),
+                ("red", Direction(Stick.LEFT, 180, 0.5)),
+                ("blue", Direction(Stick.LEFT, 0, 0.5)),
+                ("blue", Direction(Stick.LEFT, 0, 0.5)),
+            ]
+            fallback._za_mega_testmode1_enemy_check_retry_at = 0.0
+            fallback._za_mega_testmode1_blue_return_since = 0.0
+            fallback._za_mega_testmode1_blue_return_last_seen = 0.0
+            fallback._za_mega_testmode1_blue_return_confirmations = 0
+            fallback._za_mega_testmode1_next_dodge_at = 100.0
+            for current_time in (30.0, 30.4, 30.8):
+                FakeTime.now = current_time
+                self.assertEqual(
+                    combat_update(fallback, 20, 90, 40, 90, 0.24),
+                    "attack")
+            FakeTime.now = 31.2
+            self.assertEqual(
+                combat_update(fallback, 20, 90, 40, 90, 0.24),
+                "fallback")
+            self.assertEqual(
+                fallback._za_mega_testmode1_phase, "LEGACY_COMBAT")
+            self.assertTrue(
+                fallback._za_mega_testmode1_legacy_until_reset)
+            self.assertFalse(
+                fallback.ZA_mega_mode5_testmode1_controls_cover())
+
+        # 赤側で赤青とも20秒間見えない場合だけ通常mode5へ戻し、
+        # BLACK_COMMENT／SELECT後のTESTMODE1再試行へつなぐ。
+        no_enemy = Command()
+        no_enemy._za_mega_testmode1_phase = "RED_COVER_ATTACK"
+        no_enemy._za_mega_testmode1_next_dodge_at = 999.0
+        no_enemy.colored_results = [0] * 5
+        for current_time in (100.0, 105.0, 110.0, 115.0):
+            FakeTime.now = current_time
+            self.assertEqual(
+                combat_update(no_enemy, 20, 90, 40, 90, 0.24),
+                "attack")
+        FakeTime.now = 120.0
+        self.assertEqual(
+            combat_update(no_enemy, 20, 90, 40, 90, 0.24),
+            "fallback")
+        self.assertEqual(
+            no_enemy._za_mega_testmode1_phase, "LEGACY_COMBAT")
+        self.assertTrue(any(
+            event[0] == "trace"
+            and event[1] == "TESTMODE1_RED_COVER_NO_ENEMY_LEGACY"
+            for event in no_enemy.events))
+
+        # 生の赤候補だけでは青撃破扱いにせず、赤側障害物へ移らない。
+        raw_red = Command()
+        raw_red._za_mega_testmode1_phase = "COVER_ATTACK"
+        raw_red._za_mega_testmode1_next_dodge_at = 100.0
+        raw_red._za_mega_testmode1_blue_last_seen_at = 30.0
+        raw_red.colored_results = [("red", None, 0)] * 9
+        for index in range(9):
+            FakeTime.now = 50.0 + index * 0.5
+            self.assertEqual(
+                combat_update(raw_red, 20, 90, 40, 90, 0.24),
+                "attack")
+        self.assertEqual(raw_red._za_mega_testmode1_phase, "COVER_ATTACK")
+
+        # 実機では他の画像検知を含むCommands周回が2～7秒になる。
+        # 0.8秒で赤計測を捨てず、数秒間隔の3回確認でも移行する。
+        slow_cadence = Command()
+        slow_cadence._za_mega_testmode1_phase = "COVER_ATTACK"
+        slow_cadence._za_mega_testmode1_next_dodge_at = 100.0
+        slow_cadence._za_mega_testmode1_blue_last_seen_at = 20.0
+        slow_cadence.colored_results = [
+            ("red", Direction(Stick.LEFT, 180, 0.5))] * 3
+        for current_time in (40.0, 45.0):
+            FakeTime.now = current_time
+            self.assertEqual(
+                combat_update(
+                    slow_cadence, 20, 90, 40, 90, 0.24),
+                "attack")
+        FakeTime.now = 50.0
+        self.assertEqual(
+            combat_update(
+                slow_cadence, 20, 90, 40, 90, 0.24),
+            "handled")
+        self.assertEqual(
+            slow_cadence._za_mega_testmode1_phase, "MOVE_TO_RED_COVER")
+
+        # 青を確認した場合は赤のみの継続時間を破棄する。
+        blue_reset = Command()
+        blue_reset._za_mega_testmode1_phase = "COVER_ATTACK"
+        blue_reset._za_mega_testmode1_next_dodge_at = 100.0
+        blue_reset._za_mega_testmode1_blue_last_seen_at = 20.0
+        blue_reset._za_mega_testmode1_warning_interval_active = True
+        blue_reset.colored_results = [
+            ("red", Direction(Stick.LEFT, 180, 0.5)),
+            ("red", Direction(Stick.LEFT, 180, 0.5)),
+            ("blue", 0),
+            ("red", Direction(Stick.LEFT, 180, 0.5)),
+        ]
+        for current_time in (30.0, 30.4, 30.8, 31.2):
+            FakeTime.now = current_time
+            self.assertEqual(
+                combat_update(blue_reset, 20, 90, 40, 90, 0.24),
+                "attack")
+        self.assertEqual(
+            blue_reset._za_mega_testmode1_red_only_since, 0.0)
+        self.assertEqual(
+            blue_reset._za_mega_testmode1_red_only_confirmations, 0)
+        self.assertTrue(
+            blue_reset._za_mega_testmode1_warning_interval_blue_seen)
+
+        # 青が潜行して12秒以内だけ見えなくなっても、確定赤を
+        # 青撃破扱いにせず青側障害物で攻撃を続ける。
+        burrow = Command()
+        burrow._za_mega_testmode1_phase = "COVER_ATTACK"
+        burrow._za_mega_testmode1_next_dodge_at = 100.0
+        burrow._za_mega_testmode1_blue_last_seen_at = 60.0
+        burrow.colored_results = [
+            ("red", Direction(Stick.LEFT, 180, 0.5))] * 6
+        for current_time in (61.0, 64.0, 67.0, 70.0):
+            FakeTime.now = current_time
+            self.assertEqual(
+                combat_update(burrow, 20, 90, 40, 90, 0.24),
+                "attack")
+        self.assertEqual(burrow._za_mega_testmode1_phase, "COVER_ATTACK")
+        self.assertEqual(
+            burrow._za_mega_testmode1_red_only_confirmations, 0)
+
+        # 予兆セット判定・確定赤判定がどちらも成立しない場合も、
+        # 青側開始時または最後の青検知から60秒青が見えなければ赤側へ移る。
+        blue_absence = Command()
+        blue_absence._za_mega_testmode1_phase = "COVER_ATTACK"
+        blue_absence._za_mega_testmode1_next_dodge_at = 200.0
+        blue_absence._za_mega_testmode1_blue_last_seen_at = 10.0
+        blue_absence.colored_results = [0, 0]
+        FakeTime.now = 69.9
+        self.assertEqual(
+            combat_update(blue_absence, 20, 90, 40, 90, 0.24),
+            "attack")
+        self.assertEqual(
+            blue_absence._za_mega_testmode1_phase, "COVER_ATTACK")
+        FakeTime.now = 70.3
+        self.assertEqual(
+            combat_update(blue_absence, 20, 90, 40, 90, 0.24),
+            "handled")
+        self.assertEqual(
+            blue_absence._za_mega_testmode1_phase, "MOVE_TO_RED_COVER")
+        self.assertTrue(any(
+            event[0] == "trace"
+            and event[1] == "TESTMODE1_BLUE_ABSENCE_TIMEOUT"
+            for event in blue_absence.events))
+
+        # 青が現在画角にない場合も待機せず、同じ固定経路へ進む。
+        missing_blue = Command()
+        missing_blue.colored_results = [0] * 10
+        self.assertTrue(
+            resume_update(missing_blue, 20, 90, 40, 90, 0.24))
+        missing_cover_press = next(
+            event for event in missing_blue.events
+            if event[0] == "press" and event[1].stick == Stick.LEFT)
+        self.assertEqual(missing_cover_press[1].angle_for_show, 150.0)
+        self.assertEqual(missing_cover_press[2]["duration"], 5.7)
+        self.assertFalse(any(
+            event[0] == "color" for event in missing_blue.events))
+        self.assertFalse(any(
+            event[0] == "press" and event[1].stick == Stick.RIGHT
+            for event in missing_blue.events))
+
+        # HP75は90度初期移動を終えた後、手動設定の
+        # 固定経路で青側障害物へ入る。障害物内の抑止は共通。
+        hp75_cover = Command()
+        hp75_cover._za_mega_testmode1_resume_hp = "HP75"
+        hp75_cover._za_mega_testmode1_phase = "HP75_EXISTING"
+        hp75_cover._za_mega_mode5_post_move_wait_until = 12.0
+        self.assertTrue(finish_hp75(
+            hp75_cover, "HP75_POST_MOVE_WAIT_COMPLETE"))
+        self.assertEqual(
+            hp75_cover._za_mega_testmode1_phase, "MOVE_TO_COVER")
+        self.assertEqual(hp75_cover._za_mega_mode5_post_move_wait_until, 0.0)
+        self.assertTrue(any(
+            event[:2] == ("transition", "BLUE_COVER_SEARCH")
+            for event in hp75_cover.events))
+        hp75_cover.events.clear()
+        self.assertTrue(
+            resume_update(hp75_cover, 20, 90, 40, 90, 0.24))
+        self.assertEqual(hp75_cover._za_mega_testmode1_phase, "FACE_BLUE")
+        self.assertEqual(hp75_cover._za_mega_mode5_start_flag, 3)
+        hp75_cover_press = next(
+            event for event in hp75_cover.events
+            if event[0] == "press" and event[1].stick == Stick.LEFT)
+        self.assertEqual(hp75_cover_press[1].angle_for_show, 185.0)
+        self.assertEqual(hp75_cover_press[2]["duration"], 5.0)
+        self.assertEqual(hp75_cover._za_mega_testmode1_face_angle, 30.0)
+        self.assertTrue(any(
+            event[0] == "flag"
+            and event[2] == "HP75_BLUE_COVER_FIXED"
+            for event in hp75_cover.events))
+        self.assertFalse(any(
+            event[0] == "color" for event in hp75_cover.events))
+        hp75_cover.events.clear()
+        self.assertEqual(
+            combat_update(hp75_cover, 20, 90, 40, 90, 0.24), "handled")
+        hp75_face_move = next(
+            event for event in hp75_cover.events
+            if event[0] == "left" and isinstance(event[1], Direction))
+        self.assertEqual(hp75_face_move[1].angle_for_show, 30.0)
+        self.assertTrue(any(
+            event[0] == "button" and event[1] == Button.L
+            for event in hp75_cover.events))
+        self.assertFalse(any(
+            event[0] == "color" for event in hp75_cover.events))
+        self.assertTrue(
+            hp75_cover.ZA_mega_mode5_testmode1_controls_cover())
+
+        class GuardedKeys:
+            def __init__(self):
+                self.holdButton = []
+                self.inputs = 0
+
+            def input(self, _buttons):
+                self.inputs += 1
+
+        class GuardedCommand:
+            def __init__(self):
+                self.see_r = 0.24
+                self.no_Cplus = 0
+                self.quasar_current_state = ""
+                self.Rstick_state = 1
+                self.keys = GuardedKeys()
+                self.events = []
+
+            def ZA_mega_mode5_testmode1_controls_cover(self):
+                return True
+
+            def image_check(self, _name):
+                return False
+
+            def hold(self, direction):
+                self.events.append(("hold", direction))
+
+            def holdEnd(self, direction):
+                self.events.append(("hold_end", direction))
+
+            def ZA_mega_mode5_marker_search_view_stop(self, relock=False):
+                self.events.append(("view_stop", relock))
+
+        guarded = GuardedCommand()
+        namespace["ZA_MOVE_LStick"](
+            guarded, 20, 90, 40, 90, 1, "RELOAD")
+        self.assertEqual(guarded.keys.inputs, 0)
+        namespace["ZA_MOVE_SEE"](guarded, "RELOAD", 0.24)
+        self.assertEqual(guarded.Rstick_state, 0)
+        self.assertFalse(any(event[0] == "hold" for event in guarded.events))
+        self.assertTrue(any(
+            event[0] == "hold_end" for event in guarded.events))
+
+        command.events.clear()
+        FakeTime.now = command._za_mega_testmode1_next_dodge_at + 0.01
+        self.assertEqual(
+            combat_update(command, 20, 90, 40, 90, 0.24), "handled")
+        dodge = next(
+            event for event in command.events
+            if event[0] == "button" and event[1] == Button.Y)
+        self.assertEqual(dodge[2]["repeat"], 2)
+        dodge_move = next(
+            event for event in command.events
+            if event[0] == "left" and isinstance(event[1], Direction))
+        self.assertEqual(dodge_move[1].angle_for_show, 90.0)
+        self.assertFalse(any(
+            event[0] == "press" and event[1].stick == Stick.RIGHT
+            for event in command.events))
+        self.assertEqual(command.z_guard_calls, 0)
+
+        battle_source = ast.unparse(
+            source_functions["ZA_mega_evolution_battle"])
+        self.assertIn("_za_mega_testmode1_phase = 'EXISTING_CHARGE'",
+                      battle_source)
+        self.assertIn("_za_mega_testmode1_resume_hp = 'PENDING'",
+                      battle_source)
+        self.assertGreaterEqual(
+            battle_source.count(
+                "not self.ZA_mega_mode5_testmode1_controls_cover()"), 2)
+        initial_source = ast.unparse(
+            source_functions["ZA_mega_mode5_green_and_initial_update"])
+        self.assertGreaterEqual(
+            initial_source.count(
+                "ZA_mega_mode5_testmode1_finish_hp75_initial"), 2)
+        self.assertIn("testmode1_hp75", initial_source)
+        step_function = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_8_story_story_last_48")
+        step_call = next(
+            node for node in ast.walk(step_function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ZA_mega_evolution_battle_mode_select")
+        testmode_keyword = next(
+            keyword for keyword in step_call.keywords
+            if keyword.arg == "testmode1")
+        self.assertEqual(testmode_keyword.value.value, 1)
+
+    def test_za_mega_mode5_marker_search_keeps_last_side(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        helper_names = (
+            "ZA_mega_mode5_marker_search_view_stop",
+            "ZA_mega_mode5_marker_search_view",
+        )
+        source_helpers = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in helper_names
+        }
+        fragment_helpers = {
+            node.name: node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in helper_names
+        }
+        for helper_name in helper_names:
+            self.assertEqual(
+                ast.dump(source_helpers[helper_name], include_attributes=False),
+                ast.dump(fragment_helpers[helper_name], include_attributes=False))
+
+        class FakeTime:
+            now = 0.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+        namespace = {
+            "Direction": Direction,
+            "Stick": Stick,
+            "time": FakeTime,
+        }
+        exec(compile(ast.Module(
+            body=[source_helpers[name] for name in helper_names], type_ignores=[]),
+            source_path, "exec"), namespace)
+
+        class Command:
+            def __init__(self):
+                self._za_mega_movemode = 1
+                self._za_mega_last_battle_mode = True
+                self._za_mega_marker_search_direction = 180.0
+                self._za_mega_marker_search_retry_at = 0.0
+                self._za_mega_marker_search_strength = 0.24
+                self._za_mega_marker_search_view_holding = False
+                self._za_mega_marker_search_view_angle = 180.0
+                self._za_mega_marker_search_lock_until = 0.0
+                self._za_mega_mode5_view_search_block_until = 0.0
+                self._za_mega_mode5_view_search_block_logged = False
+                self.ZL_state = 1
+                self.held = []
+                self.released = []
+                self.zl_actions = []
+
+            def hold(self, direction, **kwargs):
+                self.held.append((direction, kwargs))
+
+            def holdEnd(self, direction):
+                self.released.append(direction)
+
+            def ZA_ZL_ACTION(self, action="RELOAD"):
+                self.zl_actions.append(action)
+                self.ZL_state = 0 if action == "END" else 1
+
+            def ZA_mega_mode5_marker_search_view_stop(self, relock=False):
+                return namespace[
+                    "ZA_mega_mode5_marker_search_view_stop"](
+                        self, relock=relock)
+
+        search = namespace["ZA_mega_mode5_marker_search_view"]
+        stop = namespace["ZA_mega_mode5_marker_search_view_stop"]
+        command = Command()
+        self.assertTrue(search(command))
+        self.assertEqual(command.held[-1][0].stick, Stick.RIGHT)
+        self.assertEqual(command.held[-1][0].angle_for_show, 180.0)
+        self.assertAlmostEqual(command.held[-1][0].mag, 0.48)
+        self.assertEqual(
+            command.held[-1][1], {"wait": 0.0})
+        self.assertTrue(command._za_mega_marker_search_view_holding)
+        # 探索開始時も既存のZL保持を外さない。
+        self.assertEqual(command.zl_actions, [])
+
+        # 0.7秒は中立に戻さず、右スティックを連続保持する。
+        FakeTime.now = 0.5
+        self.assertTrue(search(command))
+        self.assertEqual(len(command.held), 1)
+        self.assertEqual(command.released, [])
+
+        # 連続回転後は一度止め、ZL_state=1でも実ロックが外れている
+        # 場合を考慮して解除→再保持を1回行う。
+        FakeTime.now = 0.71
+        self.assertTrue(search(command))
+        self.assertFalse(command._za_mega_marker_search_view_holding)
+        self.assertEqual(command.released[-1].angle_for_show, 180.0)
+        self.assertEqual(command.zl_actions, [""])
+        FakeTime.now = 1.0
+        self.assertTrue(search(command))
+        self.assertEqual(len(command.held), 1)
+
+        FakeTime.now = 1.17
+        self.assertTrue(search(command))
+        self.assertEqual(len(command.held), 2)
+        self.assertEqual(command.held[-1][0].angle_for_show, 180.0)
+        self.assertEqual(command.zl_actions, [""])
+
+        # 時間では反転せず、再検知による保存方向の更新だけを使用する。
+        stop(command)
+        command._za_mega_marker_search_direction = 0.0
+        FakeTime.now = 2.0
+        self.assertTrue(search(command))
+        self.assertEqual(command.held[-1][0].angle_for_show, 0.0)
+
+        # 時間停止が切れていても、再開後の緑床確認回数が残る間は
+        # 右スティック探索を開始しない。
+        stop(command)
+        command._za_mega_mode5_view_search_block_until = 0.0
+        command._za_mega_mode5_green_priority_checks_remaining = 2
+        held_count = len(command.held)
+        FakeTime.now = 3.0
+        self.assertTrue(search(command))
+        self.assertEqual(len(command.held), held_count)
+        command._za_mega_mode5_green_priority_checks_remaining = 0
+        FakeTime.now = 3.1
+        self.assertTrue(search(command))
+        self.assertEqual(len(command.held), held_count + 1)
+
+        # 緑床へ到達済みなら左移動は止めたまま、残り確認回数に関係なく
+        # 右スティックだけで敵を探せる。
+        stop(command)
+        command._za_mega_z_guard_holding = True
+        command._za_mega_mode5_green_priority_checks_remaining = 2
+        held_count = len(command.held)
+        FakeTime.now = 4.0
+        self.assertTrue(search(command))
+        self.assertEqual(len(command.held), held_count + 1)
+        self.assertEqual(command.held[-1][0].stick, Stick.RIGHT)
+
+        # TESTMODE1はHP分類・初期回避・障害物攻撃中の視点探索を止め、
+        # 力をためた／強い光のcharge処理へ入った後だけ再許可する。
+        testmode = Command()
+        testmode._za_mega_testmode1_enabled = True
+        testmode._za_mega_testmode1_phase = "HP75_EXISTING"
+        FakeTime.now = 5.0
+        self.assertFalse(search(testmode))
+        self.assertEqual(testmode.held, [])
+        testmode._za_mega_testmode1_phase = "EXISTING_CHARGE"
+        self.assertTrue(search(testmode))
+        self.assertEqual(testmode.held[-1][0].stick, Stick.RIGHT)
+        # 赤だけ残ったため既存mode5へ戻した区間も通常視点探索を許可する。
+        stop(testmode)
+        testmode._za_mega_testmode1_phase = "LEGACY_COMBAT"
+        self.assertTrue(search(testmode))
+        self.assertEqual(testmode.held[-1][0].stick, Stick.RIGHT)
+
+        # 各ターゲット開始直後は右スティックを止め、正面と緑床を優先する。
+        blocked = Command()
+        blocked._za_mega_mode5_view_search_block_until = 12.0
+        FakeTime.now = 10.0
+        self.assertTrue(search(blocked))
+        self.assertEqual(blocked.held, [])
+        self.assertEqual(blocked.zl_actions, [])
+        FakeTime.now = 12.0
+        self.assertTrue(search(blocked))
+        self.assertEqual(blocked.held[-1][0].stick, Stick.RIGHT)
+
+    def test_za_mega_mode5_uses_red_blue_enemy_as_marker_fallback(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        helper_name = "ZA_mega_mode5_colored_enemy_direction"
+        source_helper = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef) and node.name == helper_name)
+        fragment_helper = next(
+            node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef) and node.name == helper_name)
+        self.assertEqual(
+            ast.dump(source_helper, include_attributes=False),
+            ast.dump(fragment_helper, include_attributes=False))
+        namespace = {
+            "cv2": cv2,
+            "math": math,
+            "time": time,
+            "Direction": Direction,
+            "Stick": Stick,
+        }
+        exec(compile(ast.Module(
+            body=[source_helper], type_ignores=[]),
+            source_path, "exec"), namespace)
+        detect = namespace[helper_name]
+
+        class Command:
+            def __init__(self, mode=1, last_battle_mode=True):
+                self._za_mega_movemode = mode
+                self._za_mega_last_battle_mode = last_battle_mode
+                self._za_mega_mode5_start_flag = 4
+                self._za_mega_mode5_battle_active = True
+                self._za_mega_mode5_color_field_until = (
+                    time.monotonic() + 30.0)
+                self.ZL_state = 0
+                self._za_mega_marker_search_direction = 0.0
+                self._za_mega_colored_enemy_log_key = None
+                self.rectangles = []
+
+            def displayRectangle(self, *args, **kwargs):
+                self.rectangles.append((args, kwargs))
+
+        red_frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        red_patch_hsv = numpy.zeros((180, 160, 3), dtype=numpy.uint8)
+        red_patch_hsv[:, :, 0] = 168
+        red_patch_hsv[:, :, 1] = 230
+        red_patch_hsv[:, :, 2] = 220
+        red_frame[250:430, 170:330] = cv2.cvtColor(
+            red_patch_hsv, cv2.COLOR_HSV2BGR)
+        red_command = Command()
+        self.assertEqual(detect(red_command, red_frame), 0)
+        self.assertEqual(
+            red_command._za_mega_colored_enemy_observed_color, "red")
+        self.assertIsNone(red_command._za_mega_colored_enemy_color)
+        self.assertEqual(detect(red_command, red_frame), 0)
+        red_direction = detect(red_command, red_frame)
+        self.assertIsInstance(red_direction, Direction)
+        self.assertEqual(red_command._za_mega_colored_enemy_color, "red")
+        self.assertEqual(red_command._za_mega_marker_search_direction, 0.0)
+        self.assertEqual(red_command._za_mega_marker_last_side, 180.0)
+        self.assertEqual(red_direction.stick, Stick.LEFT)
+        self.assertEqual(red_direction.mag, 0.5)
+        self.assertTrue(red_command._za_mega_target_from_color)
+        self.assertEqual(len(red_command.rectangles), 1)
+        self.assertEqual(
+            red_command.rectangles[0][1]["color"][0], "#ff1744")
+        self.assertEqual(
+            red_command.last_image_detection["candidate_hits"], 3)
+
+        blue_frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        blue_patch_hsv = numpy.zeros((190, 180, 3), dtype=numpy.uint8)
+        blue_patch_hsv[:, :, 0] = 108
+        blue_patch_hsv[:, :, 1] = 230
+        blue_patch_hsv[:, :, 2] = 220
+        blue_frame[260:450, 850:1030] = cv2.cvtColor(
+            blue_patch_hsv, cv2.COLOR_HSV2BGR)
+        blue_command = Command()
+        self.assertEqual(detect(blue_command, blue_frame), 0)
+        self.assertEqual(detect(blue_command, blue_frame), 0)
+        blue_direction = detect(blue_command, blue_frame)
+        self.assertIsInstance(blue_direction, Direction)
+        self.assertEqual(blue_command._za_mega_colored_enemy_color, "blue")
+        self.assertEqual(blue_command._za_mega_marker_search_direction, 0.0)
+        self.assertEqual(blue_command._za_mega_marker_last_side, 0.0)
+        self.assertEqual(
+            blue_command.rectangles[0][1]["color"][0], "#00b0ff")
+        self.assertFalse(blue_command._za_mega_colored_enemy_near)
+
+        # 実録画では生存中の青敵が画面左端で欠けていた。ROI左境界に
+        # 接しても中段の十分大きな青領域なら青敵として維持する。
+        left_edge_blue = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        left_edge_blue_hsv = numpy.zeros((200, 190, 3), dtype=numpy.uint8)
+        left_edge_blue_hsv[:, :, 0] = 108
+        left_edge_blue_hsv[:, :, 1] = 230
+        left_edge_blue_hsv[:, :, 2] = 220
+        left_edge_blue[150:350, 0:190] = cv2.cvtColor(
+            left_edge_blue_hsv, cv2.COLOR_HSV2BGR)
+        left_edge_command = Command()
+        self.assertEqual(detect(left_edge_command, left_edge_blue), 0)
+        self.assertEqual(detect(left_edge_command, left_edge_blue), 0)
+        self.assertIsInstance(
+            detect(left_edge_command, left_edge_blue), Direction)
+        self.assertEqual(
+            left_edge_command._za_mega_colored_enemy_color, "blue")
+
+        # 赤がより大きく見えても、有効な青候補を同時に確認できる場合は
+        # mode 5の撃破順として青を優先する。
+        both_frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        large_red_hsv = numpy.zeros((260, 260, 3), dtype=numpy.uint8)
+        large_red_hsv[:, :, 0] = 168
+        large_red_hsv[:, :, 1] = 230
+        large_red_hsv[:, :, 2] = 220
+        both_frame[190:450, 150:410] = cv2.cvtColor(
+            large_red_hsv, cv2.COLOR_HSV2BGR)
+        both_frame[260:450, 850:1030] = cv2.cvtColor(
+            blue_patch_hsv, cv2.COLOR_HSV2BGR)
+        blue_priority = Command()
+        self.assertEqual(detect(blue_priority, both_frame), 0)
+        self.assertEqual(detect(blue_priority, both_frame), 0)
+        self.assertIsInstance(detect(blue_priority, both_frame), Direction)
+        self.assertEqual(
+            blue_priority._za_mega_colored_enemy_color, "blue")
+
+        # 実マーカー／C+／EYEでロックオン確認中なら色候補を即確定する。
+        visual_locked = Command()
+        visual_locked.ZL_state = 1
+        visual_locked._za_mega_mode5_visual_lockon_until = (
+            time.monotonic() + 30.0)
+        self.assertIsInstance(
+            detect(visual_locked, red_frame), Direction)
+        self.assertTrue(
+            visual_locked.last_image_detection["visual_lockon"])
+
+        # mode 5以外では色判定を使わない。
+        self.assertEqual(detect(Command(mode=0), red_frame), 0)
+        self.assertEqual(
+            detect(Command(mode=1, last_battle_mode=False), red_frame), 0)
+
+        # 画面中央の赤い主人公の髪は敵として追従しない。
+        hair_frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        hair_patch_hsv = numpy.zeros((210, 120, 3), dtype=numpy.uint8)
+        hair_patch_hsv[:, :, 0] = 174
+        hair_patch_hsv[:, :, 1] = 170
+        hair_patch_hsv[:, :, 2] = 210
+        hair_frame[170:380, 580:700] = cv2.cvtColor(
+            hair_patch_hsv, cv2.COLOR_HSV2BGR)
+        self.assertEqual(detect(Command(), hair_frame), 0)
+
+        lower_left_ui = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        lower_left_ui[500:590, 120:360] = cv2.cvtColor(
+            numpy.tile(red_patch_hsv[:90, :1], (1, 240, 1)),
+            cv2.COLOR_HSV2BGR)
+        self.assertEqual(detect(Command(), lower_left_ui), 0)
+
+        # 面積の大きな別部位が突然現れても、直近位置にある同色部位を
+        # 優先し、色中心を反対側へ飛ばさない。
+        tracked = Command()
+        self.assertEqual(detect(tracked, red_frame), 0)
+        self.assertEqual(detect(tracked, red_frame), 0)
+        self.assertIsInstance(detect(tracked, red_frame), Direction)
+        tracked_frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        tracked_frame[260:440, 200:360] = cv2.cvtColor(
+            red_patch_hsv, cv2.COLOR_HSV2BGR)
+        far_patch_hsv = numpy.zeros((240, 220, 3), dtype=numpy.uint8)
+        far_patch_hsv[:, :, 0] = 168
+        far_patch_hsv[:, :, 1] = 230
+        far_patch_hsv[:, :, 2] = 220
+        tracked_frame[220:460, 900:1120] = cv2.cvtColor(
+            far_patch_hsv, cv2.COLOR_HSV2BGR)
+        self.assertIsInstance(detect(tracked, tracked_frame), Direction)
+        self.assertLess(tracked._za_mega_colored_enemy_position[0], 500.0)
+
+        # 紫の壁、上部HPバー、画面端の被弾赤は除外する。
+        excluded_frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        excluded_frame[220:460, 350:650] = (255, 0, 255)
+        excluded_frame[250:470, 700:1000] = (255, 0, 0)
+        excluded_frame[70:92, 300:980] = (0, 0, 255)
+        excluded_frame[80:600, 75:95] = (0, 0, 255)
+        self.assertEqual(detect(Command(), excluded_frame), 0)
+
+        # 暗い青背景、下部常設UI、全画面寄りの攻撃発光は、複数回
+        # 続いても敵色として確定しない。
+        dark_blue = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        dark_blue_hsv = numpy.zeros((260, 260, 3), dtype=numpy.uint8)
+        dark_blue_hsv[:, :, 0] = 110
+        dark_blue_hsv[:, :, 1] = 180
+        dark_blue_hsv[:, :, 2] = 90
+        dark_blue[220:480, 450:710] = cv2.cvtColor(
+            dark_blue_hsv, cv2.COLOR_HSV2BGR)
+        dark_command = Command()
+        self.assertTrue(all(
+            detect(dark_command, dark_blue) == 0 for _ in range(4)))
+
+        lower_right_ui = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        lower_right_ui[500:610, 930:1190] = cv2.cvtColor(
+            numpy.tile(blue_patch_hsv[:110, :1], (1, 260, 1)),
+            cv2.COLOR_HSV2BGR)
+        ui_command = Command()
+        self.assertTrue(all(
+            detect(ui_command, lower_right_ui) == 0 for _ in range(4)))
+
+        attack_flash = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        attack_flash_hsv = numpy.zeros((360, 700, 3), dtype=numpy.uint8)
+        attack_flash_hsv[:, :, 0] = 168
+        attack_flash_hsv[:, :, 1] = 230
+        attack_flash_hsv[:, :, 2] = 240
+        attack_flash[160:520, 260:960] = cv2.cvtColor(
+            attack_flash_hsv, cv2.COLOR_HSV2BGR)
+        flash_command = Command()
+        self.assertTrue(all(
+            detect(flash_command, attack_flash) == 0 for _ in range(4)))
+
+        # FIELD確認期限が切れた画面では、正しい赤敵色も使用しない。
+        outside_field = Command()
+        outside_field._za_mega_mode5_color_field_until = 0.0
+        outside_field.ZL_state = 1
+        outside_field._za_mega_mode5_visual_lockon_until = (
+            time.monotonic() + 30.0)
+        self.assertEqual(detect(outside_field, red_frame), 0)
+
+    def test_za_mega_mode5_colored_enemy_relock_nudges_once_then_holds_zl(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        helper_name = "ZA_mega_mode5_colored_enemy_relock"
+        source_helper = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef) and node.name == helper_name)
+        fragment_helper = next(
+            node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef) and node.name == helper_name)
+        self.assertEqual(
+            ast.dump(source_helper, include_attributes=False),
+            ast.dump(fragment_helper, include_attributes=False))
+
+        class FakeTime:
+            now = 10.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+        namespace = {
+            "Direction": Direction,
+            "Stick": Stick,
+            "time": FakeTime,
+        }
+        exec(compile(ast.Module(
+            body=[source_helper], type_ignores=[]),
+            source_path, "exec"), namespace)
+        relock = namespace[helper_name]
+
+        class RelockCommand:
+            def __init__(self, x=250.0, zl=1):
+                self._za_mega_last_battle_mode = True
+                self._za_mega_movemode = 1
+                self._za_mega_colored_enemy_position = (x, 340.0)
+                self._za_mega_colored_enemy_color = "red"
+                self._za_mega_colored_relock_retry_at = 0.0
+                self._za_mega_mode5_view_search_block_until = 0.0
+                self._za_mega_mode5_lockon_confirmed_until = 12.0
+                self._za_mega_last_target_frame = numpy.zeros(
+                    (720, 1280, 3), dtype=numpy.uint8)
+                self.ZL_state = zl
+                self.stop_calls = []
+                self.zl_actions = []
+                self.presses = []
+
+            def ZA_mega_mode5_marker_search_view_stop(self, relock=False):
+                self.stop_calls.append(relock)
+                if relock and self.ZL_state == 0:
+                    self.ZA_ZL_ACTION("")
+
+            def ZA_ZL_ACTION(self, action="RELOAD"):
+                self.zl_actions.append(action)
+                self.ZL_state = 0 if action == "END" else 1
+
+            def press(self, direction, **kwargs):
+                self.presses.append((direction, kwargs))
+
+        left = RelockCommand()
+        self.assertTrue(relock(left))
+        self.assertEqual(left.stop_calls, [False])
+        self.assertEqual(left.zl_actions, [])
+        self.assertEqual(left.presses[0][0].stick, Stick.RIGHT)
+        self.assertEqual(left.presses[0][0].angle_for_show, 180.0)
+        self.assertEqual(left.presses[0][0].mag, 0.48)
+        self.assertGreaterEqual(left.presses[0][1]["duration"], 0.06)
+        self.assertLessEqual(left.presses[0][1]["duration"], 0.16)
+        self.assertEqual(left._za_mega_mode5_lockon_confirmed_until, 12.0)
+
+        # 0.85秒以内は同じ色位置で左右補正を繰り返さない。
+        FakeTime.now = 10.2
+        self.assertTrue(relock(left))
+        self.assertEqual(len(left.presses), 1)
+
+        # 中央付近では視点を動かさず、解除中のZLだけを戻す。
+        FakeTime.now = 20.0
+        centered = RelockCommand(x=640.0, zl=0)
+        self.assertTrue(relock(centered))
+        self.assertEqual(centered.presses, [])
+        self.assertEqual(centered.zl_actions, [""])
+
+        # 実マーカー／EYEのロックオン確認中は色補助でZLを解除しない。
+        FakeTime.now = 25.0
+        locked = RelockCommand(x=200.0, zl=1)
+        locked._za_mega_mode5_visual_lockon_until = 25.5
+        self.assertTrue(relock(locked))
+        self.assertEqual(locked.presses, [])
+        self.assertEqual(locked.stop_calls, [False])
+        self.assertEqual(locked.zl_actions, [])
+
+        # 開始直後の緑床優先時間も視点補正を行わない。
+        FakeTime.now = 30.0
+        blocked = RelockCommand(x=1000.0, zl=0)
+        blocked._za_mega_mode5_view_search_block_until = 32.0
+        self.assertTrue(relock(blocked))
+        self.assertEqual(blocked.presses, [])
+        self.assertEqual(blocked.stop_calls, [True])
+        self.assertEqual(blocked.zl_actions, [""])
+
+        # 時間条件とは別に、再開後の緑床確認回数が残る場合も
+        # 色補助による右スティック入力を禁止する。
+        FakeTime.now = 40.0
+        green_priority = RelockCommand(x=1000.0, zl=1)
+        green_priority._za_mega_mode5_view_search_block_until = 0.0
+        green_priority._za_mega_mode5_green_priority_checks_remaining = 3
+        self.assertTrue(relock(green_priority))
+        self.assertEqual(green_priority.presses, [])
+        self.assertEqual(green_priority.zl_actions, [])
+
+    def test_za_mega_movemode_lockon_distance_control(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        helper_name = "ZA_mega_movemode_update"
+        source_helper = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef) and node.name == helper_name)
+        fragment_helper = next(
+            node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef) and node.name == helper_name)
+        self.assertEqual(
+            ast.dump(source_helper, include_attributes=False),
+            ast.dump(fragment_helper, include_attributes=False))
+
+        class FakeTime:
+            now = 0.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+        namespace = {
+            "Direction": Direction,
+            "Stick": Stick,
+            "time": FakeTime,
+        }
+        exec(compile(ast.Module(
+            body=[source_helper], type_ignores=[]),
+            source_path, "exec"), namespace)
+
+        class Command:
+            def __init__(self, marker_angle):
+                self.marker_angle = marker_angle
+                self._za_mega_last_battle_mode = True
+                self._za_mega_movemode = 1
+                self._za_mega_field_dir5_until = 0.0
+                self._za_mega_movemode_orbit_sign = 1
+                self._za_mega_movemode_orbit_until = 0.0
+                self._za_mega_movemode_near_target = False
+                self._za_mega_target_marker_position = None
+                self.ZL_state = 1
+                self.zl_actions = []
+                self.moves = []
+                self.presses = []
+
+            def ZA_mega_target_marker_direction(self, **_kwargs):
+                self._za_mega_target_marker_position = (640.0, 600.0)
+                return Direction(Stick.LEFT, self.marker_angle, 0.5)
+
+            def ZA_MOVE_LStick(self, *_args, **_kwargs):
+                self.moves.append(_args[-2])
+
+            def press(self, direction, **kwargs):
+                self.presses.append((direction, kwargs))
+
+            def ZA_ZL_ACTION(self, action="RELOAD"):
+                self.zl_actions.append(action)
+                self.ZL_state = 0 if action == "END" else 1
+
+        update = namespace[helper_name]
+
+        class InitialMoveCommand(Command):
+            def __init__(self):
+                super().__init__(90.0)
+                self.marker_checks = 0
+                self._za_mega_mode5_initial_phase_active = True
+                self._za_mega_mode5_green_priority_checks_remaining = 8
+                self._za_mega_mode5_initial_approach_started = True
+                self._za_mega_field_dir5_until = 3.0
+                self._za_mega_mode5_view_search_block_until = 3.0
+                self._za_mega_dir5 = 90
+
+            def ZA_mega_target_marker_direction(self, **_kwargs):
+                self.marker_checks += 1
+                return super().ZA_mega_target_marker_direction(**_kwargs)
+
+        # 再開直後は90度移動中だけターゲット探索を始めない。
+        # 画像処理が重く緑床確認回数が残っても、3秒で必ず解除する。
+        initial = InitialMoveCommand()
+        FakeTime.now = 0.0
+        self.assertTrue(update(initial, 20, 90, 40, 90))
+        self.assertEqual(initial.marker_checks, 0)
+        self.assertEqual(initial.moves[-1], 5)
+        FakeTime.now = 3.1
+        self.assertTrue(update(initial, 20, 90, 40, 90))
+        self.assertEqual(initial.marker_checks, 1)
+        self.assertFalse(initial._za_mega_mode5_initial_phase_active)
+        self.assertEqual(
+            initial._za_mega_mode5_green_priority_checks_remaining, 0)
+        self.assertEqual(initial._za_mega_mode5_view_search_block_until, 0.0)
+
+        for marker_angle in (20.0, 160.0):
+            command = Command(marker_angle)
+            FakeTime.now = 0.0
+            self.assertTrue(update(command, 20, 0, 40, 0))
+            first_orbit_angle=command.moves[-1].angle_for_show
+            FakeTime.now = 3.1
+            self.assertTrue(update(command, 20, 0, 40, 0))
+            self.assertEqual(
+                command.moves[-1].angle_for_show, first_orbit_angle)
+            self.assertTrue(all(
+                20.0 <= direction.angle_for_show <= 160.0
+                for direction in command.moves
+                if isinstance(direction, Direction)))
+            self.assertNotIn(
+                0.0,
+                [direction.angle_for_show
+                 for direction in command.moves
+                 if isinstance(direction, Direction)])
+            self.assertNotIn(
+                270.0,
+                [direction.angle_for_show
+                 for direction in command.moves
+                 if isinstance(direction, Direction)])
+            self.assertTrue(all(
+                direction.mag == 1.0
+                for direction in command.moves
+                if isinstance(direction, Direction)))
+            self.assertEqual(command.presses, [])
+
+        # 遠距離でも画面端の角度をそのまま0/270度には使わない。
+        class FarCommand(Command):
+            def ZA_mega_target_marker_direction(self, **_kwargs):
+                self._za_mega_target_marker_position = (100.0, 300.0)
+                return Direction(Stick.LEFT, self.marker_angle, 0.5)
+
+        for marker_angle, expected_angle in ((0.0, 20.0), (270.0, 160.0)):
+            command = FarCommand(marker_angle)
+            FakeTime.now = 0.0
+            self.assertTrue(update(command, 20, 90, 40, 90))
+            self.assertEqual(
+                command.moves[-1].angle_for_show, expected_angle)
+
+        # 黄色低HP再開後に近距離で画像ロックオンが成立した場合は、
+        # 周回方向を時間反転せず斜め後方300度へ移動する。
+        for orbit_sign in (1, -1):
+            yellow_locked = Command(90.0)
+            yellow_locked._za_mega_mode5_low_yellow_hp_active = True
+            yellow_locked._za_mega_mode5_visual_lockon_until = 1.0
+            yellow_locked._za_mega_movemode_orbit_sign = orbit_sign
+            FakeTime.now = 0.0
+            self.assertTrue(update(yellow_locked, 20, 90, 40, 90))
+            self.assertTrue(yellow_locked._za_mega_movemode_near_target)
+            self.assertEqual(
+                yellow_locked.moves[-1].angle_for_show, 300.0)
+            self.assertAlmostEqual(
+                yellow_locked._za_mega_movemode_direction_until, 0.35)
+
+        # 十分離れた後は後退を止め、0～20度側の横移動に切り替える。
+        yellow_far = FarCommand(90.0)
+        yellow_far._za_mega_mode5_low_yellow_hp_active = True
+        yellow_far._za_mega_mode5_visual_lockon_until = 1.0
+        FakeTime.now = 0.0
+        self.assertTrue(update(yellow_far, 20, 90, 40, 90))
+        self.assertFalse(yellow_far._za_mega_mode5_lockon_retreating)
+        self.assertEqual(yellow_far.moves[-1].angle_for_show, 20.0)
+
+        # 赤／青を取れた間は固定方向の全周探索を止め、色位置へ
+        # 短く視点を寄せてからZLを再保持する。
+        class ColoredEnemyCommand(Command):
+            def __init__(self, near=False):
+                super().__init__(90.0)
+                self.near = near
+                self.view_searches = 0
+                self.view_stops = 0
+                self.color_relocks = 0
+
+            def ZA_mega_target_marker_direction(self, **_kwargs):
+                return 0
+
+            def ZA_mega_mode5_colored_enemy_direction(self, **_kwargs):
+                self._za_mega_target_marker_position = (
+                    900.0, 500.0 if self.near else 420.0)
+                self._za_mega_target_from_color = True
+                self._za_mega_colored_enemy_near = self.near
+                return Direction(Stick.LEFT, 45.0, 0.5)
+
+            def ZA_mega_mode5_marker_search_view(self):
+                self.view_searches += 1
+                return True
+
+            def ZA_mega_mode5_marker_search_view_stop(self, **_kwargs):
+                self.view_stops += 1
+                return True
+
+            def ZA_mega_mode5_colored_enemy_relock(self):
+                self.color_relocks += 1
+                return True
+
+        colored = ColoredEnemyCommand()
+        colored._za_mega_mode5_visual_lockon_until = 1.0
+        FakeTime.now = 0.0
+        self.assertTrue(update(colored, 20, 90, 40, 90))
+        self.assertEqual(colored.view_searches, 0)
+        self.assertEqual(colored.view_stops, 0)
+        self.assertEqual(colored.color_relocks, 1)
+        self.assertTrue(colored._za_mega_movemode_searching)
+        self.assertEqual(colored.moves[-1].angle_for_show, 20.0)
+        self.assertEqual(colored.moves[-1].mag, 1.0)
+
+        # 黄色低HP再開後に色補助＋画像ロックオンが成立した場合は、
+        # 近距離表示では敵へ接近せず斜め後方へ移動する。
+        yellow_colored = ColoredEnemyCommand()
+        yellow_colored._za_mega_mode5_low_yellow_hp_active = True
+        yellow_colored._za_mega_mode5_visual_lockon_until = 1.0
+        FakeTime.now = 0.0
+        self.assertTrue(update(yellow_colored, 20, 90, 40, 90))
+        self.assertTrue(yellow_colored._za_mega_movemode_near_target)
+        self.assertEqual(yellow_colored.moves[-1].angle_for_show, 300.0)
+
+        # ロックオンした赤青敵が近い場合は直進を止め、前方半面の
+        # 横移動へ切り替えて攻撃距離を残す。
+        close_colored = ColoredEnemyCommand(near=True)
+        close_colored._za_mega_mode5_visual_lockon_until = 1.0
+        FakeTime.now = 0.0
+        self.assertTrue(update(close_colored, 20, 90, 40, 90))
+        self.assertTrue(close_colored._za_mega_movemode_near_target)
+        self.assertEqual(close_colored.moves[-1].angle_for_show, 160.0)
+
+        # 黄色低HPの斜め後退は位置境界にヒステリシスを持ち、
+        # 位置揺れでは切り替わらず、十分離れた時だけ20度へ戻る。
+        class DistanceCommand(Command):
+            marker_y = 500.0
+
+            def ZA_mega_target_marker_direction(self, **_kwargs):
+                self._za_mega_target_marker_position = (
+                    640.0, self.marker_y)
+                return Direction(Stick.LEFT, self.marker_angle, 0.5)
+
+        distance = DistanceCommand(90.0)
+        distance._za_mega_mode5_low_yellow_hp_active = True
+        distance._za_mega_mode5_visual_lockon_until = 1.0
+        FakeTime.now = 0.0
+        self.assertTrue(update(distance, 20, 90, 40, 90))
+        self.assertEqual(distance.moves[-1].angle_for_show, 300.0)
+        distance.marker_y = 390.0
+        FakeTime.now = 0.1
+        self.assertTrue(update(distance, 20, 90, 40, 90))
+        self.assertEqual(distance.moves[-1].angle_for_show, 300.0)
+        distance.marker_y = 350.0
+        FakeTime.now = 0.2
+        self.assertTrue(update(distance, 20, 90, 40, 90))
+        self.assertEqual(distance.moves[-1].angle_for_show, 20.0)
+        distance.marker_y = 400.0
+        FakeTime.now = 0.3
+        self.assertTrue(update(distance, 20, 90, 40, 90))
+        self.assertEqual(distance.moves[-1].angle_for_show, 20.0)
+        distance.marker_y = 430.0
+        FakeTime.now = 0.4
+        self.assertTrue(update(distance, 20, 90, 40, 90))
+        self.assertEqual(distance.moves[-1].angle_for_show, 300.0)
+
+        # 反対側の通常方向なら、斜め後方は左右反転した240度とする。
+        mirrored = DistanceCommand(90.0)
+        mirrored._za_mega_mode5_low_yellow_hp_active = True
+        mirrored._za_mega_mode5_visual_lockon_until = 1.0
+        FakeTime.now = 0.0
+        self.assertTrue(update(mirrored, 160, 90, 40, 90))
+        self.assertEqual(mirrored.moves[-1].angle_for_show, 240.0)
+
+        # 色だけで敵方向を推測している間は従来の色座標角度を使う。
+        color_only = ColoredEnemyCommand()
+        color_only._za_mega_mode5_visual_lockon_until = 0.0
+        FakeTime.now = 0.0
+        self.assertTrue(update(color_only, 20, 90, 40, 90))
+        self.assertEqual(color_only.moves[-1].angle_for_show, 45.0)
+
+        # 黄色低HPでも画像ロックオン前は再捕捉の接近を妨げない。
+        yellow_unlocked = ColoredEnemyCommand()
+        yellow_unlocked._za_mega_mode5_low_yellow_hp_active = True
+        yellow_unlocked._za_mega_mode5_visual_lockon_until = 0.0
+        FakeTime.now = 0.0
+        self.assertTrue(update(yellow_unlocked, 20, 90, 40, 90))
+        self.assertEqual(yellow_unlocked.moves[-1].angle_for_show, 45.0)
+
+        # 黄色低HPで一度ロックオンした後は、色補助だけになっても
+        # 色座標由来の45～60度へ接近せず20度で距離を維持する。
+        yellow_post_lock_color = ColoredEnemyCommand()
+        yellow_post_lock_color._za_mega_mode5_low_yellow_hp_active = True
+        yellow_post_lock_color._za_mega_mode5_low_yellow_hp_lock_seen = True
+        yellow_post_lock_color._za_mega_mode5_visual_lockon_until = 0.0
+        FakeTime.now = 0.0
+        self.assertTrue(update(
+            yellow_post_lock_color, 20, 90, 40, 90))
+        self.assertEqual(
+            yellow_post_lock_color.moves[-1].angle_for_show, 20.0)
+
+        # 一度もマーカーを取れない場合もZLを保持したまま視点を動かす。
+        # 左スティックを中立へ戻さず、最大強度で移動しながら探索する。
+        class MissingMarkerCommand(Command):
+            def __init__(self):
+                super().__init__(0.0)
+                self.ZL_state = 1
+                self.searches = 0
+                self.search_stops = []
+                self.bursts = []
+
+            def ZA_mega_target_marker_direction(self, **_kwargs):
+                return 0
+
+            def ZA_mega_mode5_marker_search_view(self):
+                self.searches += 1
+
+            def ZA_mega_mode5_marker_search_view_stop(self, relock=False):
+                self.search_stops.append(relock)
+
+            def press(self, direction, **kwargs):
+                self.bursts.append((direction, kwargs))
+
+        command = MissingMarkerCommand()
+        FakeTime.now = 0.0
+        self.assertTrue(update(command, 20, 90, 40, 90))
+        self.assertEqual(command.searches, 1)
+        self.assertEqual(command.zl_actions, [])
+        self.assertEqual(command.ZL_state, 1)
+        self.assertTrue(command._za_mega_movemode_searching)
+        self.assertEqual(
+            command._za_mega_movemode_direction.angle_for_show, 55.0)
+        self.assertEqual(command.moves[-1].angle_for_show, 55.0)
+        self.assertEqual(command.moves[-1].mag, 1.0)
+        self.assertEqual(command.bursts, [])
+        self.assertEqual(command.search_stops, [])
+
+        FakeTime.now = 0.3
+        self.assertTrue(update(command, 20, 90, 40, 90))
+        self.assertEqual(command.moves[-1].angle_for_show, 55.0)
+        FakeTime.now = 0.5
+        self.assertTrue(update(command, 20, 90, 40, 90))
+        self.assertEqual(command.moves[-1].angle_for_show, 55.0)
+        self.assertEqual(command.bursts, [])
+        self.assertEqual(command.search_stops, [])
+
+        # 黄色低HPのロックオン直後に残っている約60度のキャッシュは
+        # 再送せず、20度の距離維持へ即座に置き換える。
+        yellow_cached = MissingMarkerCommand()
+        yellow_cached._za_mega_mode5_low_yellow_hp_active = True
+        yellow_cached._za_mega_mode5_low_yellow_hp_lock_seen = False
+        yellow_cached._za_mega_mode5_visual_lockon_until = 1.0
+        yellow_cached._za_mega_movemode_direction = Direction(
+            Stick.LEFT, 60.0, 1.0)
+        yellow_cached._za_mega_movemode_direction_until = 1.0
+        FakeTime.now = 0.0
+        self.assertTrue(update(yellow_cached, 20, 90, 40, 90))
+        self.assertTrue(yellow_cached._za_mega_mode5_low_yellow_hp_lock_seen)
+        self.assertEqual(yellow_cached.moves[-1].angle_for_show, 20.0)
+        self.assertEqual(
+            yellow_cached._za_mega_movemode_direction.angle_for_show, 20.0)
+        self.assertEqual(yellow_cached.searches, 0)
+        self.assertEqual(yellow_cached.search_stops, [False])
+
+        # ロックオン画像の有効時間が切れて方向キャッシュもない場合も、
+        # 従来の55度接近へ戻らず20度で再捕捉を待つ。
+        yellow_missing = MissingMarkerCommand()
+        yellow_missing._za_mega_mode5_low_yellow_hp_active = True
+        yellow_missing._za_mega_mode5_low_yellow_hp_lock_seen = True
+        yellow_missing._za_mega_mode5_visual_lockon_until = 0.0
+        FakeTime.now = 0.0
+        self.assertTrue(update(yellow_missing, 20, 90, 40, 90))
+        self.assertEqual(
+            yellow_missing._za_mega_movemode_direction.angle_for_show, 20.0)
+        self.assertEqual(yellow_missing.moves[-1].angle_for_show, 20.0)
+        self.assertEqual(yellow_missing.searches, 1)
+
+        # 視点探索で再検知したら、敵移動より先にZLを保持し直す。
+        reacquired = Command(90.0)
+        reacquired.ZL_state = 0
+        FakeTime.now = 2.0
+        self.assertTrue(update(reacquired, 20, 90, 40, 90))
+        self.assertEqual(reacquired.zl_actions, [""])
+        self.assertEqual(reacquired.ZL_state, 1)
+
+    def test_za_mega_dir5_and_cplus_activation_guard(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        source_functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        fragment_functions = {
+            node.name: node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        for name in (
+                "ZA_MOVE_LStick", "ZA_mega_cplus_should_press",
+                "ZA_mega_cplus_after_skill_input"):
+            self.assertEqual(
+                ast.dump(source_functions[name], include_attributes=False),
+                ast.dump(fragment_functions[name], include_attributes=False),
+                name)
+
+        helper_namespace = {}
+        exec(compile(ast.Module(
+            body=[
+                source_functions["ZA_mega_cplus_should_press"],
+                source_functions["ZA_mega_cplus_after_skill_input"],
+            ],
+            type_ignores=[]), source_path, "exec"), helper_namespace)
+        should_press = helper_namespace["ZA_mega_cplus_should_press"]
+        after_skill = helper_namespace[
+            "ZA_mega_cplus_after_skill_input"]
+        command = object()
+        self.assertTrue(should_press(
+            command, cp_mode=1, cplus_active=False))
+        self.assertFalse(should_press(
+            command, cp_mode=1, cplus_active=True))
+        self.assertFalse(should_press(
+            command, cp_mode=0, cplus_active=False))
+        self.assertFalse(after_skill(command, cplus_active=True))
+        self.assertFalse(after_skill(command, cplus_active=False))
+        helper_calls = {
+            child.func.attr
+            for child in ast.walk(
+                source_functions["ZA_mega_cplus_should_press"])
+            if isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+        }
+        self.assertNotIn("image_check", helper_calls)
+        self.assertNotIn("ZA_mega_attack_ready", helper_calls)
+
+        battle_function = source_functions["ZA_mega_evolution_battle"]
+        guarded_plus = [
+            node for node in ast.walk(battle_function)
+            if isinstance(node, ast.If)
+            and any(isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Attribute)
+                    and child.func.attr == "ZA_mega_cplus_should_press"
+                    for child in ast.walk(node.test))
+            and any(isinstance(child, ast.Attribute)
+                    and child.attr == "PLUS"
+                    for statement in node.body
+                    for child in ast.walk(statement))
+        ]
+        # 通常攻撃ループとターゲット補足後の攻撃ループの両方で、
+        # 同じcplus_activeガードを通してPLUSを送る。
+        self.assertEqual(len(guarded_plus), 2)
+        active_values = [
+            node.value.value
+            for node in ast.walk(battle_function)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "cplus_active"
+                    for target in node.targets)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, bool)
+        ]
+        self.assertGreaterEqual(active_values.count(False), 2)
+        self.assertEqual(active_values.count(True), 2)
+        old_latches = {
+            node.id for node in ast.walk(battle_function)
+            if isinstance(node, ast.Name)
+            and node.id in {
+                "cp_plus_attempted", "cplus_seen_this_battle",
+            }
+        }
+        self.assertEqual(old_latches, set())
+        consume_calls = [
+            node for node in ast.walk(battle_function)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ZA_mega_cplus_after_skill_input"
+        ]
+        # 通常攻撃とマーカー復帰側のA/B/X/Yすべてで解除する。
+        self.assertEqual(len(consume_calls), 8)
+
+        move_namespace = {
+            "time": time, "Direction": Direction, "Stick": Stick,
+        }
+        exec(compile(ast.Module(
+            body=[source_functions["ZA_MOVE_LStick"]], type_ignores=[]),
+            source_path, "exec"), move_namespace)
+        move = move_namespace["ZA_MOVE_LStick"]
+
+        class MoveCommand:
+            def __init__(self, rclick_until=0.0):
+                self._za_mega_rclick_dir3_until = rclick_until
+                self._za_mega_dir5 = 90
+                self._za_mega_field_dir5_until = time.monotonic() + 4.0
+                self._za_mega_field_dir4_until = 0.0
+                for state_name in (
+                        "Lstick_state", "Lstick_state2", "Lstick_state3",
+                        "Lstick_state4", "Lstick_state5",
+                        "Lstick_state_m1", "Lstick_state_m2"):
+                    setattr(self, state_name, 0)
+                self.keys = self
+                self.holdButton = []
+                self.held = []
+
+            def input(self, _buttons):
+                self.held = [
+                    item for item in self.holdButton
+                    if isinstance(item, Direction)
+                    and item.stick == Stick.LEFT
+                ]
+
+        starting = MoveCommand()
+        move(starting, 20, 340, 40, 0, 4, "RELOAD")
+        self.assertEqual(starting.held[-1].angle_for_show, 90)
+        self.assertEqual(starting.Lstick_state5, 1)
+        self.assertEqual(starting.Lstick_state4, 0)
+        rclick = MoveCommand(time.monotonic() + 35.0)
+        move(rclick, 20, 340, 40, 0, 5, "RELOAD")
+        self.assertEqual(rclick.held[-1].angle_for_show, 40)
+        self.assertEqual(rclick.Lstick_state3, 1)
+
+        # マーカー探索中は旧dir1～4で90度などの連続移動へ戻さない。
+        searching = MoveCommand()
+        searching._za_mega_field_dir5_until = 0.0
+        searching._za_mega_last_battle_mode = True
+        searching._za_mega_movemode = 1
+        searching._za_mega_movemode_searching = True
+        move(searching, 20, 90, 40, 90, 4, "RELOAD")
+        self.assertEqual(searching.held, [])
+        self.assertEqual(searching.holdButton, [])
+
+        # movemode値が混入してもmode 0～4なら従来のdir4保持を変えない。
+        legacy_searching = MoveCommand()
+        legacy_searching._za_mega_field_dir5_until = 0.0
+        legacy_searching._za_mega_last_battle_mode = False
+        legacy_searching._za_mega_movemode = 1
+        legacy_searching._za_mega_movemode_searching = True
+        move(legacy_searching, 20, 90, 40, 90, 4, "RELOAD")
+        self.assertEqual(
+            legacy_searching.held[-1].angle_for_show, 90)
 
     def test_za_mega_battle_faces_marker_and_forces_dir3_for_35_seconds(self):
         source_path = os.path.join(
@@ -2384,12 +9769,38 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         function_names = (
             "ZA_MOVE_LStick",
             "ZA_battle_missing_field_recovery",
+            "_ZA_mega_field_position_matches",
             "ZA_mega_target_marker_direction",
             "ZA_mega_relock_toward_marker",
             "ZA_mega_nonfield_picture_confirmed",
+            "ZA_mega_red_screen_edge_check",
+            "ZA_mega_red_edge_y_renda",
+            "ZA_mega_red_edge_dodge_if_needed",
+            "ZA_mega_last_battle_charge_dodge",
+            "ZA_mega_last_battle_charge_update",
             "ZA_mega_choice_input_guard",
+            "ZA_mega_mode5_lockon_ready",
+            "ZA_mega_mode5_a_attack_ready",
             "ZA_mega_attack_ready",
+            "ZA_mega_a_attack_ready",
+            "ZA_mega_mode5_y_attack_ready",
+            "ZA_mega_mode5_skill_attack_ready",
+            "ZA_mega_cplus_should_press",
+            "ZA_mega_cplus_after_skill_input",
             "ZA_mega_keep_left_moving",
+            "ZA_mega_mode4_view_nudge",
+            "ZA_mega_attack_unavailable_y_dodge",
+            "ZA_mega_mode5_transition",
+            "ZA_mega_mode5_trace",
+            "ZA_mega_mode5_set_start_flag",
+            "ZA_mega_mode5_event_attack_blocked",
+            "ZA_mega_mode5_event_attack_picture",
+            "ZA_mega_mode5_event_attack_axby",
+            "ZA_mega_mode5_detect_screen_state",
+            "ZA_mega_mode5_testmode1_settings",
+            "ZA_mega_mode5_begin_resume",
+            "ZA_mega_mode5_begin_post_move_wait",
+            "ZA_mega_mode5_green_and_initial_update",
             "ZA_mega_evolution_battle",
         )
         source_functions = {
@@ -2404,35 +9815,86 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         }
         for name in function_names:
             self.assertEqual(
-                ast.dump(source_functions[name], include_attributes=False),
-                ast.dump(fragment_functions[name], include_attributes=False),
+                normalized_function_ast_dump(source_functions[name]),
+                normalized_function_ast_dump(fragment_functions[name]),
                 name)
 
+        choice_guard_node = fragment_functions["ZA_mega_choice_input_guard"]
+        field_override = next(
+            node for node in choice_guard_node.body
+            if isinstance(node, ast.If)
+            and "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"
+            in ast.unparse(node.test))
+        select_guard = next(
+            node for node in choice_guard_node.body
+            if isinstance(node, ast.If)
+            and isinstance(node.test, ast.Call)
+            and isinstance(node.test.func, ast.Name)
+            and node.test.func.id == "any")
+        self.assertLess(field_override.lineno, select_guard.lineno)
+
         battle_node = fragment_functions["ZA_mega_evolution_battle"]
-        self.assertEqual(battle_node.args.args[-2].arg, "lockon_rclick")
-        self.assertEqual(ast.literal_eval(battle_node.args.defaults[-2]), 1)
+        default_arguments = battle_node.args.args[-len(
+            battle_node.args.defaults):]
+        defaults_by_name = {
+            argument.arg: ast.literal_eval(default)
+            for argument, default in zip(
+                default_arguments, battle_node.args.defaults)
+        }
+        self.assertEqual(defaults_by_name["lockon_rclick"], 1)
         self.assertEqual(
-            battle_node.args.args[-1].arg, "field_resume_dir4_seconds")
+            defaults_by_name["field_resume_dir4_seconds"], 10.0)
         self.assertEqual(
-            ast.literal_eval(battle_node.args.defaults[-1]), 10.0)
-        initial_field_gate = next(
+            defaults_by_name["red_edge_y_renda_seconds"], 0.0)
+        self.assertEqual(defaults_by_name["dir5"], -1)
+        self.assertEqual(
+            defaults_by_name["field_resume_dir5_seconds"], 4.0)
+        self.assertEqual(
+            defaults_by_name["attack_unavailable_y_dodge"], 0)
+        self.assertEqual(defaults_by_name["mode4_view_nudge"], 0)
+
+        cplus_should_press = fragment_functions[
+            "ZA_mega_cplus_should_press"]
+        cplus_after_skill = fragment_functions[
+            "ZA_mega_cplus_after_skill_input"]
+        cplus_namespace = {}
+        exec(compile(ast.Module(
+            body=[cplus_should_press, cplus_after_skill], type_ignores=[]),
+            fragment_path, "exec"), cplus_namespace)
+        cplus_command = object()
+        self.assertTrue(cplus_namespace[
+            "ZA_mega_cplus_should_press"](
+                cplus_command, cp_mode=1, cplus_active=False))
+        self.assertFalse(cplus_namespace[
+            "ZA_mega_cplus_should_press"](
+                cplus_command, cp_mode=1, cplus_active=True))
+        self.assertFalse(cplus_namespace[
+            "ZA_mega_cplus_should_press"](
+                cplus_command, cp_mode=0, cplus_active=False))
+        self.assertFalse(cplus_namespace[
+            "ZA_mega_cplus_after_skill_input"](
+                cplus_command, cplus_active=True))
+        legacy_field_prepare_gate = next(
             node for node in ast.walk(battle_node)
             if isinstance(node, ast.If)
-            and any(
-                isinstance(statement, ast.Expr)
-                and isinstance(statement.value, ast.Call)
-                and isinstance(statement.value.func, ast.Attribute)
-                and statement.value.func.attr == "ZA_ZL_ACTION"
-                for statement in node.body)
-            and any(
-                isinstance(statement, ast.Expr)
-                and isinstance(statement.value, ast.Call)
-                and isinstance(statement.value.func, ast.Attribute)
-                and statement.value.func.attr == "ZA_MOVE_LStick"
-                for statement in node.body))
+            and "field_resume_detected" in ast.unparse(node.test)
+            and "not last_battle_mode" in ast.unparse(node.test)
+            and "field_resume_dirnum" in ast.unparse(node)
+            and "_ZA_mega_field_position_matches" not in ast.unparse(node))
+        self.assertTrue(any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "ZA_MOVE_LStick"
+            for call in ast.walk(legacy_field_prepare_gate)))
+        legacy_field_resume_gate = next(
+            node for node in ast.walk(battle_node)
+            if isinstance(node, ast.If)
+            and "field_resume_detected" in ast.unparse(node.test)
+            and "not last_battle_mode" in ast.unparse(node.test)
+            and "_ZA_mega_field_position_matches" in ast.unparse(node))
         initial_calls = [
             statement.value.func.attr
-            for statement in initial_field_gate.body
+            for statement in legacy_field_resume_gate.body
             if isinstance(statement, ast.Expr)
             and isinstance(statement.value, ast.Call)
             and isinstance(statement.value.func, ast.Attribute)
@@ -2440,8 +9902,9 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(
             initial_calls[:2], ["ZA_ZL_ACTION", "ZA_MOVE_LStick"])
         position_check = next(
-            statement for statement in initial_field_gate.body
-            if isinstance(statement, ast.If))
+            node for node in ast.walk(legacy_field_resume_gate)
+            if isinstance(node, ast.If)
+            and "_ZA_mega_field_position_matches" in ast.unparse(node.test))
         success_calls = [
             statement.value.func.attr
             for statement in position_check.body
@@ -2464,7 +9927,21 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             node.value for node in ast.walk(battle_node)
             if isinstance(node, ast.Constant) and isinstance(node.value, str)
         }
-        self.assertNotIn("POKEMON_ZA_FIELD_W", battle_constants)
+        self.assertIn("POKEMON_ZA_FIELD_W", battle_constants)
+        field_w_gate = next(
+            node for node in ast.walk(battle_node)
+            if isinstance(node, ast.If)
+            and "nofiled == 0" in ast.unparse(node.test)
+            and "field_w_detected" in ast.unparse(node.test)
+            and any(
+                isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Attribute)
+                and item.func.attr == "etc_sendCommand"
+                and item.args
+                and isinstance(item.args[0], ast.Constant)
+                and item.args[0].value == "Lbutton_up"
+                for statement in node.body for item in ast.walk(statement)))
+        self.assertIsInstance(field_w_gate, ast.If)
         raw_plus_calls = [
             node for node in ast.walk(battle_node)
             if isinstance(node, ast.Call)
@@ -2549,11 +10026,52 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         outer_loop = next(
             statement for statement in battle_node.body
             if isinstance(statement, ast.While))
+        mode5_detection_gate = next(
+            statement for statement in outer_loop.body
+            if isinstance(statement, ast.If)
+            and ast.unparse(statement.test) == "last_battle_mode"
+            and "field_w_detected" in ast.unparse(statement))
+        field_w_assignment = next(
+            statement for statement in mode5_detection_gate.body
+            if isinstance(statement, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "field_w_detected"
+                    for target in statement.targets))
+        battle_screen_assignment = next(
+            statement for statement in mode5_detection_gate.body
+            if isinstance(statement, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "battle_screen_detected"
+                    for target in statement.targets))
+        choice_guard_assignment = next(
+            statement for statement in mode5_detection_gate.body
+            if isinstance(statement, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "choice_input_guard"
+                    for target in statement.targets))
+        self.assertLess(field_w_assignment.lineno,
+                        battle_screen_assignment.lineno)
+        self.assertLess(battle_screen_assignment.lineno,
+                        choice_guard_assignment.lineno)
+        self.assertEqual(
+            ast.unparse(choice_guard_assignment.value),
+            "mode5_screen['choice_guard']")
+        self.assertEqual(
+            ast.unparse(battle_screen_assignment.value),
+            "mode5_screen['battle_screen']")
+        mode5_screen_helper = fragment_functions[
+            "ZA_mega_mode5_detect_screen_state"]
+        mode5_screen_source = ast.unparse(mode5_screen_helper)
+        self.assertIn(
+            "False if resume_screen_detected",
+            mode5_screen_source)
+        self.assertIn("POKEMON_ZA_BATTLE", mode5_screen_source)
         resume_move_gate = next(
             statement for statement in outer_loop.body
             if isinstance(statement, ast.If)
-            and isinstance(statement.test, ast.Name)
-            and statement.test.id == "field_resume_detected")
+            and "field_resume_detected" in ast.unparse(statement.test)
+            and "last_battle_mode" in ast.unparse(statement.test)
+            and "not last_battle_mode" not in ast.unparse(statement.test))
         endpicture_gate = next(
             statement for statement in outer_loop.body
             if isinstance(statement, ast.If)
@@ -2574,20 +10092,115 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 isinstance(target, ast.Name)
                 and target.id == "loop_attack_ready"
                 for target in statement.targets))
+        green_priority_gate = next(
+            statement for statement in outer_loop.body
+            if isinstance(statement, ast.If)
+            and "nofiled == 0" in ast.unparse(statement.test)
+            and any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr
+                == "ZA_mega_mode5_green_and_initial_update"
+                for call in ast.walk(statement)))
         self.assertLess(endpicture_gate.lineno,
+                        resume_move_gate.lineno)
+        self.assertLess(resume_move_gate.lineno,
+                        green_priority_gate.lineno)
+        self.assertLess(green_priority_gate.lineno,
                         attack_ready_assignment.lineno)
         self.assertLess(attack_ready_assignment.lineno,
                         recovery_gate.lineno)
-        self.assertLess(recovery_gate.lineno, resume_move_gate.lineno)
-        resume_calls = [
-            statement.value for statement in resume_move_gate.body
-            if isinstance(statement, ast.Expr)
-            and isinstance(statement.value, ast.Call)
-            and isinstance(statement.value.func, ast.Attribute)
+        last_battle_resume_gate = resume_move_gate
+        resume_direction_values = {
+            ast.literal_eval(node.value)
+            for node in ast.walk(resume_move_gate)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "field_resume_dirnum"
+                    for target in node.targets)
+        }
+        self.assertEqual(resume_direction_values, {4, 5})
+        begin_resume_node = fragment_functions[
+            "ZA_mega_mode5_begin_resume"]
+        green_initial_node = fragment_functions[
+            "ZA_mega_mode5_green_and_initial_update"]
+
+        def start_flag_values(node):
+            return {
+                ast.literal_eval(call.args[0])
+                for call in ast.walk(node)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "ZA_mega_mode5_set_start_flag"
+                and call.args
+                and isinstance(call.args[0], ast.Constant)}
+
+        # 通常開始は2。緑床後のLEGACY固定または選択なし
+        # FIELD再開では固定障害物移動を再実行せず3へ直接進む。
+        self.assertEqual(start_flag_values(begin_resume_node), {2, 3})
+        self.assertEqual(start_flag_values(green_initial_node), {3})
+        self.assertTrue({0, 1, 4}.issubset(start_flag_values(battle_node)))
+        self.assertIn("BLACK_COMMENT_SELECT_HANDLED", ast.unparse(battle_node))
+        self.assertTrue(any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "ZA_MOVE_SEE"
+            and any(
+                keyword.arg == "action"
+                and isinstance(keyword.value, ast.Constant)
+                and keyword.value.value == "END"
+                for keyword in call.keywords)
+            for call in ast.walk(begin_resume_node)))
+        self.assertTrue(any(
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "ZA_mega_mode5_marker_search_view_stop"
+            for call in ast.walk(begin_resume_node)))
+        self.assertTrue(any(
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Attribute)
+                and target.attr == "_za_mega_mode5_initial_phase_active"
+                for target in node.targets)
+            for node in ast.walk(begin_resume_node)))
+        priority_assignments = [
+            node for node in ast.walk(begin_resume_node)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Attribute)
+                    and target.attr
+                    == "_za_mega_mode5_green_priority_checks_remaining"
+                    for target in node.targets)
         ]
+        self.assertEqual(len(priority_assignments), 1)
+        priority_value = priority_assignments[0].value
+        self.assertIsInstance(priority_value, ast.IfExp)
+        manual_settings_node = fragment_functions[
+            "ZA_mega_mode5_testmode1_settings"]
+        manual_settings = ast.literal_eval(next(
+            node.value for node in manual_settings_node.body
+            if isinstance(node, ast.Return)))
+        # 手動調整値は実ソースを正とする。現在は初期緑床確認／待機を
+        # 0にしており、必要なら設定辞書だけで再度有効化できる。
+        self.assertEqual(manual_settings["INITIAL_GREEN_CHECK_COUNT"], 0)
+        self.assertEqual(manual_settings["INITIAL_GREEN_CHECK_SECONDS"], 0.0)
+        self.assertEqual(manual_settings["INITIAL_GREEN_WAIT_SECONDS"], 0.0)
+        self.assertIn(
+            "INITIAL_GREEN_CHECK_COUNT", ast.unparse(priority_value.body))
+        self.assertEqual(ast.literal_eval(priority_value.orelse), 0)
+        outer_sources = [ast.unparse(statement) for statement in outer_loop.body]
+        resume_green_index = outer_loop.body.index(green_priority_gate)
+        movemode_index = next(
+            index for index, source in enumerate(outer_sources)
+            if "self.ZA_mega_movemode_update" in source)
+        self.assertLess(resume_green_index, movemode_index)
+        # 古い直接呼び出しでもY判定自体は安全だが、mode 5入口ではYを無効化する。
         self.assertEqual(
-            [call.func.attr for call in resume_calls], ["ZA_MOVE_LStick"])
-        self.assertEqual(ast.literal_eval(resume_calls[0].args[4]), 4)
+            sum(
+                1 for call in ast.walk(battle_node)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "ZA_mega_mode5_y_attack_ready"),
+            2)
         marker_lock_gate = next(
             node for node in ast.walk(battle_node)
             if isinstance(node, ast.If)
@@ -2736,7 +10349,19 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             def image_check(self, name):
                 if name == "END":
                     self.end_checks += 1
+                    if getattr(
+                            self, "_za_mega_last_battle_mode", False):
+                        self._za_mega_mode5_battle_active = True
+                        self._za_mega_mode5_start_flag = 4
                     return self.end_checks >= 2
+                if (name == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"
+                        and getattr(
+                            self, "_za_mega_last_battle_mode", False)):
+                    return True
+                if (name == "POKEMON_ZA_EYE_CHECK"
+                        and getattr(
+                            self, "_za_mega_last_battle_mode", False)):
+                    return True
                 return name == "POKEMON_ZA_C+"
 
             def press(self, button, *args, **kwargs):
@@ -2754,12 +10379,16 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             def ZA_ZL_ACTION(self, *args, **kwargs):
                 pass
 
-            def ZA_mega_target_marker_direction(self):
-                return battle_namespace["ZA_mega_target_marker_direction"](self)
+            def ZA_mega_target_marker_direction(self, **kwargs):
+                return battle_namespace["ZA_mega_target_marker_direction"](
+                    self, **kwargs)
 
             def ZA_mega_keep_left_moving(self, *args, **kwargs):
                 return battle_namespace["ZA_mega_keep_left_moving"](
                     self, *args, **kwargs)
+
+            def ZA_mega_mode5_marker_search_view(self):
+                return True
 
             def ZA_mega_relock_toward_marker(self, *args, **kwargs):
                 return battle_namespace["ZA_mega_relock_toward_marker"](
@@ -2773,13 +10402,88 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 return battle_namespace[
                     "ZA_mega_choice_input_guard"](self)
 
+            def ZA_mega_mode5_detect_screen_state(self, nofiled):
+                return battle_namespace[
+                    "ZA_mega_mode5_detect_screen_state"](self, nofiled)
+
+            def ZA_mega_mode5_event_attack_picture(self, **kwargs):
+                return battle_namespace[
+                    "ZA_mega_mode5_event_attack_picture"](self, **kwargs)
+
             def ZA_mega_attack_ready(self):
                 return battle_namespace["ZA_mega_attack_ready"](self)
+
+            def ZA_mega_mode5_lockon_ready(self, refresh=False):
+                return battle_namespace[
+                    "ZA_mega_mode5_lockon_ready"](
+                        self, refresh=refresh)
+
+            def ZA_mega_mode5_a_attack_ready(self, **kwargs):
+                return battle_namespace[
+                    "ZA_mega_mode5_a_attack_ready"](self, **kwargs)
+
+            def ZA_mega_a_attack_ready(self, **kwargs):
+                return battle_namespace[
+                    "ZA_mega_a_attack_ready"](self, **kwargs)
+
+            def ZA_mega_mode5_y_attack_ready(self):
+                return battle_namespace[
+                    "ZA_mega_mode5_y_attack_ready"](self)
+
+            def ZA_mega_mode5_skill_attack_ready(self):
+                return battle_namespace[
+                    "ZA_mega_mode5_skill_attack_ready"](self)
+
+            def ZA_mega_mode5_trace(self, *args, **kwargs):
+                return battle_namespace["ZA_mega_mode5_trace"](
+                    self, *args, **kwargs)
+
+            def ZA_mega_mode5_set_start_flag(self, *args, **kwargs):
+                return battle_namespace["ZA_mega_mode5_set_start_flag"](
+                    self, *args, **kwargs)
+
+            def ZA_mega_cplus_should_press(self, *args, **kwargs):
+                return battle_namespace["ZA_mega_cplus_should_press"](
+                    self, *args, **kwargs)
+
+            def ZA_mega_cplus_after_skill_input(self, *args, **kwargs):
+                return battle_namespace[
+                    "ZA_mega_cplus_after_skill_input"](
+                    self, *args, **kwargs)
+
+            def _ZA_mega_field_position_matches(self, *args, **kwargs):
+                return battle_namespace[
+                    "_ZA_mega_field_position_matches"](
+                    self, *args, **kwargs)
+
+            def ZA_mega_red_edge_dodge_if_needed(self, *args, **kwargs):
+                return battle_namespace[
+                    "ZA_mega_red_edge_dodge_if_needed"](
+                    self, *args, **kwargs)
+
+            def ZA_mega_last_battle_charge_dodge(self, *args, **kwargs):
+                return battle_namespace[
+                    "ZA_mega_last_battle_charge_dodge"](
+                    self, *args, **kwargs)
+
+            def ZA_mega_last_battle_charge_update(self, *args, **kwargs):
+                return battle_namespace[
+                    "ZA_mega_last_battle_charge_update"](
+                    self, *args, **kwargs)
+
+            def ZA_mega_attack_unavailable_y_dodge(
+                    self, *args, **kwargs):
+                return battle_namespace[
+                    "ZA_mega_attack_unavailable_y_dodge"](
+                    self, *args, **kwargs)
 
             def ZA_battle_missing_field_recovery(self, *args, **kwargs):
                 return battle_namespace[
                     "ZA_battle_missing_field_recovery"](
                         self, *args, **kwargs)
+
+            def ZA_battle_reword_recovery(self):
+                return False
 
             def ZA_story_Template_Field_HardGaurd(self, mode=0):
                 return False
@@ -2790,7 +10494,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             def pressRep(self, button, *args, **kwargs):
                 self.pressed_reps.append((button, args, kwargs))
 
-            def etc_sendCommand(self, command):
+            def etc_sendCommand(self, command, *args, **kwargs):
                 self.serial_commands.append(command)
 
             def wait(self, duration):
@@ -2860,6 +10564,46 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                  if button in (Button.A, Button.X, Button.Y)]),
             10)
 
+        # 最終戦の明示C+モードはAを常用し、C+表示を確認できる間だけ
+        # Y/B/Xも技として循環する。
+        final_cplus = BattleCommand()
+        self.assertTrue(battle(
+            final_cplus, Aaction=1, Yaction=1, Baction=1, Xaction=1,
+            endpicture="END", last_battle_mode=1, Cplus_attack=1))
+        final_attack_buttons = [
+            button for button, _args, _kwargs in final_cplus.pressed_reps
+            if button in (Button.A, Button.Y, Button.B, Button.X)]
+        self.assertEqual(
+            final_attack_buttons,
+            [Button.A, Button.Y, Button.B, Button.X,
+             Button.A, Button.Y, Button.B, Button.X,
+             Button.A, Button.Y])
+        self.assertEqual(
+            len([button for button, _args in final_cplus.pressed
+                 if button == Button.PLUS]),
+            len(final_attack_buttons))
+
+        class FinalNoCplusCommand(BattleCommand):
+            def image_check(self, name):
+                if name in ("POKEMON_ZA_C+", "POKEMON_ZA_C+_LOW"):
+                    return False
+                return super().image_check(name)
+
+        # C+表示が取れない場合も戦闘FIELDならAだけを継続し、PLUSは送らない。
+        final_without_cplus = FinalNoCplusCommand()
+        self.assertTrue(battle(
+            final_without_cplus, Aaction=1, Yaction=1,
+            Baction=1, Xaction=1, endpicture="END",
+            last_battle_mode=1, Cplus_attack=1))
+        self.assertEqual(
+            [button for button, _args, _kwargs
+             in final_without_cplus.pressed_reps
+             if button in (Button.A, Button.Y, Button.B, Button.X)],
+            [Button.A] * 10)
+        self.assertNotIn(
+            Button.PLUS,
+            [button for button, _args in final_without_cplus.pressed])
+
         class BlackMenuCommand(BattleCommand):
             def image_check(self, name):
                 if name == "END":
@@ -2906,17 +10650,24 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             def __init__(self, matched):
                 self.matched = set(matched)
                 self.events = []
+                self._za_mega_last_battle_mode = False
+                self._za_mega_movemode = 0
 
             def image_check(self, name):
                 self.events.append(("check", name))
                 return name in self.matched
 
-            def ZA_mega_target_marker_direction(self):
-                return battle_namespace["ZA_mega_target_marker_direction"](self)
+            def ZA_mega_target_marker_direction(self, **kwargs):
+                return battle_namespace["ZA_mega_target_marker_direction"](
+                    self, **kwargs)
 
             def ZA_mega_keep_left_moving(self, *args, **kwargs):
                 return battle_namespace["ZA_mega_keep_left_moving"](
                     self, *args, **kwargs)
+
+            def ZA_mega_mode5_marker_search_view(self):
+                self.events.append(("marker_search",))
+                return True
 
             def ZA_ZL_ACTION(self, action="RELOAD"):
                 self.events.append(("zl", action))
@@ -2944,6 +10695,10 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         class CoordinateMarkerCommand:
             def __init__(self, frame, left_path, right_path):
                 self.camera = CoordinateCamera(frame)
+                self._za_mega_last_battle_mode = True
+                self._za_mega_movemode = 1
+                self._za_mega_marker_search_direction = 0.0
+                self._za_mega_marker_search_retry_at = 0.0
                 self.IMAGE_DETECTION_TARGETS = {
                     "POKEMON_ZA_TARGET_LEFT_LOW": [{
                         "template_path": left_path,
@@ -2966,10 +10721,22 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 return False
 
         random_generator = numpy.random.default_rng(12345)
-        left_template = random_generator.integers(
-            0, 256, (12, 12, 3), dtype=numpy.uint8)
-        right_template = random_generator.integers(
-            0, 256, (12, 12, 3), dtype=numpy.uint8)
+        left_hsv = numpy.empty((12, 12, 3), dtype=numpy.uint8)
+        left_hsv[:, :, 0] = random_generator.integers(
+            90, 106, (12, 12), dtype=numpy.uint8)
+        left_hsv[:, :, 1] = random_generator.integers(
+            140, 256, (12, 12), dtype=numpy.uint8)
+        left_hsv[:, :, 2] = random_generator.integers(
+            150, 256, (12, 12), dtype=numpy.uint8)
+        right_hsv = numpy.empty((12, 12, 3), dtype=numpy.uint8)
+        right_hsv[:, :, 0] = random_generator.integers(
+            90, 106, (12, 12), dtype=numpy.uint8)
+        right_hsv[:, :, 1] = random_generator.integers(
+            140, 256, (12, 12), dtype=numpy.uint8)
+        right_hsv[:, :, 2] = random_generator.integers(
+            150, 256, (12, 12), dtype=numpy.uint8)
+        left_template = cv2.cvtColor(left_hsv, cv2.COLOR_HSV2BGR)
+        right_template = cv2.cvtColor(right_hsv, cv2.COLOR_HSV2BGR)
         marker_frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
         # 同じ完全一致を左上マップ内にも置き、除外が効くことを確認する。
         marker_frame[100:112, 100:112] = left_template
@@ -2983,6 +10750,53 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 marker_frame, left_path, right_path)
             coordinate_direction = battle_namespace[
                 "ZA_mega_target_marker_direction"](coordinate_command)
+
+            # mode 5の左下固定UI内は、形と青緑色が完全一致しても
+            # ターゲットマーカー候補にしない。mode 0～4相当では
+            # この専用除外を適用せず、従来の照合範囲を維持する。
+            lower_left_ui_frame = numpy.zeros(
+                (720, 1280, 3), dtype=numpy.uint8)
+            lower_left_ui_frame[544:556, 65:77] = left_template
+            lower_left_ui_command = CoordinateMarkerCommand(
+                lower_left_ui_frame, left_path, right_path)
+            lower_left_ui_direction = battle_namespace[
+                "ZA_mega_target_marker_direction"](lower_left_ui_command)
+            legacy_lower_left_command = CoordinateMarkerCommand(
+                lower_left_ui_frame, left_path, right_path)
+            legacy_lower_left_command._za_mega_last_battle_mode = False
+            legacy_lower_left_command._za_mega_movemode = 0
+            legacy_lower_left_direction = battle_namespace[
+                "ZA_mega_target_marker_direction"](
+                    legacy_lower_left_command)
+
+            upper_frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+            # 画面上端から25%欠けた同一マーカーをマップ内外へ置く。
+            upper_frame[0:9, 100:112] = left_template[3:, :]
+            upper_frame[0:9, 300:312] = left_template[3:, :]
+            upper_command = CoordinateMarkerCommand(
+                upper_frame, left_path, right_path)
+            upper_default_direction = battle_namespace[
+                "ZA_mega_target_marker_direction"](upper_command)
+            upper_mode4_direction = battle_namespace[
+                "ZA_mega_target_marker_direction"](
+                    upper_command, include_upper=True)
+            # mode 5では形が完全一致しても、青緑でない紫の壁候補を
+            # ターゲットマーカーとして採用しない。
+            purple_template = numpy.zeros(
+                (12, 12, 3), dtype=numpy.uint8)
+            purple_template[:, :, 0] = random_generator.integers(
+                120, 256, (12, 12), dtype=numpy.uint8)
+            purple_template[:, :, 2] = random_generator.integers(
+                120, 256, (12, 12), dtype=numpy.uint8)
+            purple_path = os.path.join(marker_directory, "purple.png")
+            self.assertTrue(cv2.imwrite(purple_path, purple_template))
+            purple_frame = numpy.zeros(
+                (720, 1280, 3), dtype=numpy.uint8)
+            purple_frame[400:412, 300:312] = purple_template
+            purple_command = CoordinateMarkerCommand(
+                purple_frame, purple_path, right_path)
+            purple_direction = battle_namespace[
+                "ZA_mega_target_marker_direction"](purple_command)
         self.assertIsInstance(coordinate_direction, Direction)
         self.assertEqual(coordinate_direction.stick, Stick.LEFT)
         self.assertEqual(coordinate_direction.mag, 0.5)
@@ -2994,6 +10808,39 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(
             coordinate_command.last_image_detection["position"],
             (300, 400))
+        self.assertEqual(lower_left_ui_direction, 0)
+        self.assertFalse(
+            lower_left_ui_command.last_image_detection["matched"])
+        self.assertIsNone(
+            lower_left_ui_command._za_mega_target_marker_position)
+        self.assertIsInstance(legacy_lower_left_direction, Direction)
+        self.assertEqual(
+            legacy_lower_left_command.last_image_detection["position"],
+            (65, 544))
+        self.assertGreaterEqual(
+            coordinate_command.last_image_detection["marker_color_ratio"],
+            0.22)
+        self.assertEqual(
+            coordinate_command._za_mega_marker_search_direction, 0.0)
+        self.assertEqual(
+            coordinate_command._za_mega_marker_last_side, 180.0)
+        self.assertGreater(
+            coordinate_command._za_mega_marker_search_retry_at, 0.0)
+        self.assertEqual(upper_default_direction, 0)
+        self.assertIsInstance(upper_mode4_direction, Direction)
+        self.assertTrue(
+            upper_command.last_image_detection.get("upper_clipped"))
+        self.assertEqual(
+            upper_command.last_image_detection["position"],
+            (300, -3))
+        self.assertAlmostEqual(
+            upper_mode4_direction.angle_for_show,
+            (math.degrees(math.atan2(717.0, -334.0)) + 360.0)
+            % 360.0)
+        self.assertEqual(purple_direction, 0)
+        self.assertLess(
+            purple_command.last_image_detection["marker_color_ratio"],
+            0.22)
 
         left = RelockCommand({"POKEMON_ZA_TARGET_LEFT_LOW"})
         relock(left, 20, 340, 40, 300, dodge_repeat=5)
@@ -3034,6 +10881,36 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(
             right.events[-1],
             ("move", (20, 340, 40, 300, 4, "RELOAD")))
+
+        mode5 = RelockCommand({"POKEMON_ZA_TARGET_LEFT_LOW"})
+        mode5._za_mega_last_battle_mode = True
+        mode5._za_mega_movemode = 1
+        relock(mode5, 20, 340, 40, 300)
+        self.assertIn(("wait", 0.1), mode5.events)
+        self.assertNotIn(("wait", 0.2), mode5.events)
+        self.assertIn(("zl", "END"), mode5.events)
+        self.assertIn(("zl", ""), mode5.events)
+
+        no_marker = RelockCommand(set())
+        no_marker._za_mega_last_battle_mode = True
+        no_marker._za_mega_movemode = 1
+        relock(no_marker, 20, 340, 40, 300)
+        self.assertIn(("marker_search",), no_marker.events)
+        self.assertFalse(any(
+            event[0] in ("zl", "wait", "pressRep")
+            for event in no_marker.events))
+
+        # mode 0～4はマーカー未検知でも従来どおりZLを解除・再保持する。
+        normal_no_marker = RelockCommand(set())
+        relock(normal_no_marker, 20, 340, 40, 300)
+        self.assertNotIn(("marker_search",), normal_no_marker.events)
+        self.assertIn(("zl", "END"), normal_no_marker.events)
+        self.assertIn(("wait", 0.1), normal_no_marker.events)
+        self.assertIn(("zl", ""), normal_no_marker.events)
+        self.assertLess(
+            next(index for index, event in enumerate(normal_no_marker.events)
+                 if event[0] == "check"),
+            normal_no_marker.events.index(("zl", "END")))
 
         cooldown = RelockCommand({"POKEMON_ZA_TARGET_LEFT_LOW"})
         cooldown._za_mega_relock_retry_at = time.monotonic() + 1.0
@@ -3084,7 +10961,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             def __init__(self, active_state=None):
                 for state_name in (
                         "Lstick_state", "Lstick_state2", "Lstick_state3",
-                        "Lstick_state4", "Lstick_state_m1",
+                        "Lstick_state4", "Lstick_state5", "Lstick_state_m1",
                         "Lstick_state_m2"):
                     setattr(self, state_name, int(state_name == active_state))
                 self.moves = []
@@ -3119,11 +10996,14 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         class MoveCommand:
             def __init__(self, until):
                 self._za_mega_rclick_dir3_until = until
+                self._za_mega_dir5 = -1
+                self._za_mega_field_dir5_until = 0.0
                 self._za_mega_field_dir4_until = 0.0
                 self.Lstick_state = 0
                 self.Lstick_state2 = 0
                 self.Lstick_state3 = 0
                 self.Lstick_state4 = 0
+                self.Lstick_state5 = 0
                 self.Lstick_state_m1 = 0
                 self.Lstick_state_m2 = 0
                 self.held = []
@@ -3190,6 +11070,14 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(resumed_marker.held[-1].angle_for_show, 300)
         self.assertEqual(resumed_marker.Lstick_state4, 1)
 
+        resumed_dir5 = MoveCommand(0.0)
+        resumed_dir5._za_mega_dir5 = 90
+        resumed_dir5._za_mega_field_dir5_until = time.monotonic() + 4.0
+        move(resumed_dir5, 20, 340, 40, 0, 4, "RELOAD")
+        self.assertEqual(resumed_dir5.held[-1].angle_for_show, 90)
+        self.assertEqual(resumed_dir5.Lstick_state5, 1)
+        self.assertEqual(resumed_dir5.Lstick_state4, 0)
+
         resumed_coordinate_marker = MoveCommand(0.0)
         resumed_coordinate_marker._za_mega_field_dir4_until = (
             time.monotonic() + 10.0)
@@ -3207,6 +11095,14 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(rclick_over_resume.held[-1].angle_for_show, 40)
         self.assertEqual(rclick_over_resume.Lstick_state3, 1)
 
+        rclick_over_dir5 = MoveCommand(time.monotonic() + 35.0)
+        rclick_over_dir5._za_mega_dir5 = 90
+        rclick_over_dir5._za_mega_field_dir5_until = (
+            time.monotonic() + 4.0)
+        move(rclick_over_dir5, 20, 340, 40, 0, 1, "RELOAD")
+        self.assertEqual(rclick_over_dir5.held[-1].angle_for_show, 40)
+        self.assertEqual(rclick_over_dir5.Lstick_state3, 1)
+
         same_direction = MoveCommand(0.0)
         same_direction.Lstick_state3 = 1
         move(same_direction, 20, 340, 40, 300, 3, "RELOAD")
@@ -3223,6 +11119,557 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(len(direction_change.input_packets), 1)
         self.assertEqual(direction_change.waits, [])
 
+    def test_za_tower_field_w_battles_send_up_through_battle_mode(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            tree = ast.parse(stream.read())
+
+        functions = {
+            node.name: node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"_2_story_tower_59", "_2_story_tower_82"}
+        }
+        self.assertEqual(
+            set(functions), {"_2_story_tower_59", "_2_story_tower_82"})
+        for name, function in functions.items():
+            common_mode = any(
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr
+                == "ZA_story_Template_battle_function_renda_route"
+                and any(
+                    keyword.arg == "battle_mode"
+                    and ast.literal_eval(keyword.value) == 1
+                    for keyword in call.keywords)
+                for call in ast.walk(function) if isinstance(call, ast.Call))
+            direct_field_up = any(
+                any(isinstance(item, ast.Constant)
+                    and item.value == "POKEMON_ZA_FIELD_W"
+                    for item in ast.walk(condition.test))
+                and any(isinstance(item, ast.Constant)
+                        and item.value == "Lbutton_up"
+                        for statement in condition.body
+                        for item in ast.walk(statement))
+                for condition in ast.walk(function)
+                if isinstance(condition, ast.If))
+            self.assertTrue(common_mode or direct_field_up, name)
+
+        template_node = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_story_Template_battle_function")
+        template_module = ast.Module(body=[template_node], type_ignores=[])
+        ast.fix_missing_locations(template_module)
+        template_namespace = {"Button": Button}
+        exec(compile(template_module, source_path, "exec"), template_namespace)
+
+        class TemplateFieldWCommand:
+            def __init__(self):
+                self.commands = []
+                self.attack_options = []
+
+            @staticmethod
+            def image_check(name):
+                return name in {
+                    "POKEMON_ZA_BATTLE_BALL_CHECK",
+                    "POKEMON_ZA_FIELD_W",
+                }
+
+            def etc_sendCommand(self, command):
+                self.commands.append(command)
+
+            def ZA_battle_coCp_noloop(self, **options):
+                self.attack_options.append(options)
+
+        template_command = TemplateFieldWCommand()
+        result = template_namespace["ZA_story_Template_battle_function"](
+            template_command,
+            bkprg_ret="BEFORE", prg_ret="AFTER", noprg_ret="BATTLE",
+            noCp=1, battle_mode=1)
+        self.assertEqual(result, "BATTLE")
+        self.assertEqual(template_command.commands, ["Lbutton_up"])
+        self.assertEqual(len(template_command.attack_options), 1)
+        self.assertTrue(
+            template_command.attack_options[0]["selection_up_handled"])
+
+        battle_once_node = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_battle_coCp_noloop")
+        function_module = ast.Module(
+            body=[battle_once_node], type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {"Button": Button}
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        class FieldWCommand:
+            def __init__(self):
+                self.commands = []
+                self.command_options = []
+
+            @staticmethod
+            def image_check(name):
+                return name == "POKEMON_ZA_FIELD_W"
+
+            def etc_sendCommand(self, command):
+                self.commands.append(command)
+
+            @staticmethod
+            def ZA_battle_missing_field_recovery(*_args, **_kwargs):
+                return False
+
+            @staticmethod
+            def ZA_ZL_ACTION(*_args, **_kwargs):
+                return None
+
+            @staticmethod
+            def wait(*_args, **_kwargs):
+                return None
+
+            @staticmethod
+            def pressRep(*_args, **_kwargs):
+                return None
+
+        command = FieldWCommand()
+        namespace["ZA_battle_coCp_noloop"](command, battle_mode=1)
+        self.assertEqual(command.commands, ["Lbutton_up"])
+
+        class SelectionCommand:
+            def __init__(
+                    self, selection_picture="POKEMON_ZA_2_SELECT",
+                    selection_after_lockon=False):
+                self.selection_picture = selection_picture
+                self.selection_after_lockon = selection_after_lockon
+                self.selection_visible = not selection_after_lockon
+                self.buttons = []
+                self.lockon_actions = []
+
+            def image_check(self, name):
+                return (
+                    self.selection_visible
+                    and name == self.selection_picture)
+
+            @staticmethod
+            def etc_sendCommand(_command):
+                return None
+
+            @staticmethod
+            def ZA_battle_missing_field_recovery(*_args, **_kwargs):
+                return False
+
+            def ZA_ZL_ACTION(self, action):
+                self.lockon_actions.append(action)
+                if self.selection_after_lockon and action == "":
+                    self.selection_visible = True
+
+            @staticmethod
+            def wait(*_args, **_kwargs):
+                return None
+
+            def pressRep(self, button, **_kwargs):
+                self.buttons.append(button)
+
+        for picture in (
+                "POKEMON_ZA_1_SELECT",
+                "POKEMON_ZA_2_SELECT",
+                "POKEMON_ZA_3_SELECT",
+                "POKEMON_ZA_4_SELECT"):
+            visible_selection = SelectionCommand(picture)
+            namespace["ZA_battle_coCp_noloop"](
+                visible_selection, Xaction=1, Aaction=1, Baction=1)
+            self.assertEqual(visible_selection.buttons, [Button.A])
+            self.assertEqual(visible_selection.lockon_actions, [])
+
+        selection_after_lockon = SelectionCommand(
+            selection_after_lockon=True)
+        namespace["ZA_battle_coCp_noloop"](
+            selection_after_lockon, Xaction=1, Aaction=1, Baction=1)
+        self.assertEqual(selection_after_lockon.buttons, [Button.A])
+        self.assertEqual(selection_after_lockon.lockon_actions, [""])
+
+    def test_za_mega_common_battle_handles_field_w_up(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        source_function = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_mega_evolution_battle")
+        fragment_function = next(
+            node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_mega_evolution_battle")
+        source_position_match = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_ZA_mega_field_position_matches")
+        fragment_position_match = next(
+            node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_ZA_mega_field_position_matches")
+        source_detect_screen = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_mega_mode5_detect_screen_state")
+        fragment_detect_screen = next(
+            node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_mega_mode5_detect_screen_state")
+        self.assertEqual(
+            ast.dump(source_function, include_attributes=False),
+            ast.dump(fragment_function, include_attributes=False))
+        self.assertEqual(
+            ast.dump(source_position_match, include_attributes=False),
+            ast.dump(fragment_position_match, include_attributes=False))
+        self.assertEqual(
+            ast.dump(source_detect_screen, include_attributes=False),
+            ast.dump(fragment_detect_screen, include_attributes=False))
+
+        assignments = {}
+        for function_node in (source_function, source_detect_screen):
+            for node in ast.walk(function_node):
+                if (not isinstance(node, ast.Assign)
+                        or len(node.targets) != 1
+                        or not isinstance(node.targets[0], ast.Name)):
+                    continue
+                target_name = node.targets[0].id
+                if target_name not in {
+                        "field_w_detected", "field_back_w_detected",
+                        "field_screen_detected", "battle_screen_detected",
+                        "resume_screen_detected", "field_resume_detected"}:
+                    continue
+                assignments.setdefault(target_name, []).append(node.value)
+        assignment_sources = {
+            name: [ast.unparse(value) for value in values]
+            for name, values in assignments.items()
+        }
+        self.assertTrue(any(
+            "POKEMON_ZA_FIELD_W" in value
+            for value in assignment_sources["field_w_detected"]))
+        self.assertTrue(any(
+            "POKEMON_ZA_FIELD_BACK_W" in value
+            for value in assignment_sources["field_back_w_detected"]))
+        resume_test = next(
+            value for value in assignment_sources["field_resume_detected"]
+            if "nofiled == 1" in value)
+        self.assertIn("resume_screen_detected", resume_test)
+        self.assertTrue(any(
+            "field_w_detected" in value
+            and "field_back_w_detected" in value
+            for value in assignment_sources["field_screen_detected"]))
+        self.assertTrue(any(
+            "POKEMON_ZA_BATTLE" in value
+            for value in assignment_sources["battle_screen_detected"]))
+        self.assertIn("False", assignment_sources["battle_screen_detected"])
+        self.assertTrue(any(
+            "field_screen_detected" in value
+            and "battle_screen_detected" in value
+            for value in assignment_sources["resume_screen_detected"]))
+        self.assertIn(
+            "field_screen_detected",
+            assignment_sources["resume_screen_detected"])
+        self.assertNotIn("NO_BATTLE_FIELD_HARD_CHECK", resume_test)
+
+        normal_field_w_gate = next(
+            node for node in ast.walk(source_function)
+            if isinstance(node, ast.If)
+            and "nofiled == 0" in ast.unparse(node.test)
+            and "field_w_detected" in ast.unparse(node.test)
+            and any(
+                isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Attribute)
+                and item.func.attr == "etc_sendCommand"
+                and item.args
+                and isinstance(item.args[0], ast.Constant)
+                and item.args[0].value == "Lbutton_up"
+                for statement in node.body for item in ast.walk(statement)))
+        self.assertIsInstance(normal_field_w_gate, ast.If)
+        normal_field_w_test = ast.unparse(normal_field_w_gate.test)
+        self.assertNotIn("_za_mega_movemode", normal_field_w_test)
+        self.assertNotIn(
+            "_za_mega_field_w_up_latched",
+            ast.unparse(normal_field_w_gate))
+        duplicate_field_active_up = [
+            node for node in ast.walk(source_function)
+            if isinstance(node, ast.If)
+            and "field_active" in ast.unparse(node.test)
+            and any(
+                isinstance(item, ast.Call)
+                and isinstance(item.func, ast.Attribute)
+                and item.func.attr == "etc_sendCommand"
+                and item.args
+                and isinstance(item.args[0], ast.Constant)
+                and item.args[0].value == "Lbutton_up"
+                for statement in node.body for item in ast.walk(statement))
+        ]
+        self.assertEqual(duplicate_field_active_up, [])
+
+        self.assertIn(
+            "ZA_mega_mode5_field_w_up_retry",
+            ast.unparse(source_function))
+        choice_guard = next(
+            node for node in ast.walk(source_function)
+            if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "choice_input_guard")
+        choice_guard_source = ast.unparse(choice_guard)
+        self.assertIn("last_battle_mode", choice_guard_source)
+        self.assertIn(
+            "self._za_mega_field_w_up_attempts = 0",
+            choice_guard_source)
+        self.assertIn(
+            "self._za_mega_field_w_up_retry_at = 0.0",
+            choice_guard_source)
+
+        resume_direction_gate = next(
+            node for node in ast.walk(source_function)
+            if isinstance(node, ast.If)
+            and "field_resume_detected" in ast.unparse(node.test)
+            and "not last_battle_mode" in ast.unparse(node.test)
+            and "_ZA_mega_field_position_matches" in ast.unparse(node))
+        resume_commands = [
+            item.args[0].value
+            for item in ast.walk(resume_direction_gate)
+            if isinstance(item, ast.Call)
+            and isinstance(item.func, ast.Attribute)
+            and item.func.attr == "etc_sendCommand"
+            and item.args
+            and isinstance(item.args[0], ast.Constant)
+        ]
+        self.assertEqual(resume_commands, ["Lbutton_up", "Lbutton_left"])
+
+        position_module = ast.fix_missing_locations(ast.Module(
+            body=[source_position_match], type_ignores=[]))
+        namespace = {}
+        exec(compile(position_module, source_path, "exec"), namespace)
+        position_matches = namespace["_ZA_mega_field_position_matches"]
+
+        class PositionCommand:
+            def __init__(self, matched):
+                self.matched = set(matched)
+
+            def image_check(self, name):
+                return name in self.matched
+
+        for usenum in range(1, 7):
+            for prefix in ("POKEMON_ZA_FIELD", "POKEMON_ZA_FIELD_BACK"):
+                with self.subTest(usenum=usenum, prefix=prefix):
+                    command = PositionCommand({"{}{}".format(prefix, usenum)})
+                    self.assertTrue(position_matches(command, usenum))
+            wrong = usenum % 6 + 1
+            command = PositionCommand({"POKEMON_ZA_FIELD{}".format(wrong)})
+            self.assertFalse(position_matches(command, usenum))
+        self.assertFalse(position_matches(PositionCommand(set()), 0))
+
+    def test_za_mega_mode5_retries_field_w_up_until_back_w(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        helper_name = "ZA_mega_mode5_field_w_up_retry"
+        source_helper = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef) and node.name == helper_name)
+        fragment_helper = next(
+            node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef) and node.name == helper_name)
+        self.assertEqual(
+            normalized_function_ast_dump(source_helper),
+            normalized_function_ast_dump(fragment_helper))
+
+        class FakeTime:
+            now = 0.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.now
+
+        namespace = {"time": FakeTime, "Button": Button}
+        exec(compile(ast.Module(
+            body=[source_helper], type_ignores=[]),
+            source_path, "exec"), namespace)
+        retry = namespace[helper_name]
+
+        class Keys:
+            def __init__(self):
+                self.replays = 0
+
+            def input(self, keys):
+                self.assert_empty = keys
+                self.replays += 1
+
+        class Command:
+            def __init__(self, mode5=True, menu_after_x=True):
+                self._za_mega_last_battle_mode = mode5
+                self._za_mega_field_w_up_attempts = 0
+                self._za_mega_field_w_up_retry_at = 0.0
+                self._za_mega_field_w_up_latched = False
+                self._za_mega_mode5_battle_active = True
+                self.commands = []
+                self.command_options = []
+                self.keys = Keys()
+                self.menu_after_x = menu_after_x
+                self.menu_open = False
+                self.images = set()
+                self.press_events = []
+                self.waits = []
+                self.stop_events = []
+                self.transitions = []
+                self.start_flags = []
+
+            def etc_sendCommand(self, command, **kwargs):
+                self.commands.append(command)
+                self.command_options.append(kwargs)
+
+            def image_check(self, picture):
+                if picture == "POKEMON_ZA_X_MENU_OPEN":
+                    return self.menu_open
+                return picture in self.images
+
+            def pressRep(self, button, **kwargs):
+                self.press_events.append((button, kwargs))
+                if button == Button.X and self.menu_after_x:
+                    self.menu_open = True
+                elif button == Button.B:
+                    self.menu_open = False
+
+            def ZA_mega_mode5_marker_search_view_stop(self, relock=False):
+                self.stop_events.append(("marker", relock))
+
+            def ZA_MOVE_SEE(self, **kwargs):
+                self.stop_events.append(("view", kwargs))
+
+            def ZA_ZL_ACTION(self, action):
+                self.stop_events.append(("zl", action))
+
+            def ZA_mega_mode5_transition(self, phase, reason):
+                self.transitions.append((phase, reason))
+
+            def ZA_mega_mode5_set_start_flag(
+                    self, value, detection, reason):
+                self.start_flags.append((value, detection, reason))
+
+            def checkIfAlive(self):
+                return None
+
+            def wait(self, seconds):
+                self.waits.append(seconds)
+
+        command = Command()
+        self.assertTrue(retry(command, True, False))
+        FakeTime.now = 0.2
+        self.assertFalse(retry(command, True, False))
+        for timestamp in (0.3, 0.6, 0.9, 1.2):
+            FakeTime.now = timestamp
+            self.assertTrue(retry(command, True, False))
+        FakeTime.now = 1.5
+        left_stops = []
+        self.assertEqual(
+            retry(
+                command, True, False,
+                before_recovery=lambda: left_stops.append("left")),
+            "menu_recovery")
+        self.assertEqual(command.commands, ["Lbutton_up"] * 5)
+        self.assertEqual(
+            command.command_options, [{"wait": 0.10}] * 5)
+        self.assertEqual(command.keys.replays, 5)
+        self.assertEqual(left_stops, ["left"])
+        self.assertEqual(
+            [event[0] for event in command.press_events],
+            [Button.X, Button.B])
+        self.assertFalse(command.menu_open)
+        self.assertEqual(command._za_mega_field_w_up_attempts, 0)
+        self.assertEqual(command.start_flags[-1][0:2], (
+            3, "FIELD_W_X_MENU_RECOVERY"))
+
+        # Xメニュー開閉後のFIELD_Wは新しい再試行周期になる。
+        FakeTime.now = 1.6
+        self.assertTrue(retry(command, True, False))
+        self.assertEqual(command.commands, ["Lbutton_up"] * 6)
+        # BACK_Wを取った時点で停止・リセットする。
+        self.assertFalse(retry(command, False, True))
+        self.assertEqual(command._za_mega_field_w_up_attempts, 0)
+
+        # コメント／選択肢中はX/Bを送らず、回数を保持して次周期に再判定。
+        blocked = Command()
+        FakeTime.now = 0.0
+        for timestamp in (0.0, 0.3, 0.6, 0.9, 1.2):
+            FakeTime.now = timestamp
+            self.assertTrue(retry(blocked, True, False))
+        blocked.images.add("POKEMON_ZA_TEXT_BLACK_COMMENT")
+        FakeTime.now = 1.5
+        self.assertFalse(retry(blocked, True, False))
+        self.assertEqual(blocked.press_events, [])
+        self.assertEqual(blocked._za_mega_field_w_up_attempts, 5)
+        blocked.images.clear()
+        FakeTime.now = 1.8
+        self.assertEqual(retry(blocked, True, False), "menu_recovery")
+
+        # Xが欠落してメニューを確認できない場合は、戦闘中のBへ化けない。
+        no_menu = Command(menu_after_x=False)
+        FakeTime.now = 0.0
+        for timestamp in (0.0, 0.3, 0.6, 0.9, 1.2):
+            FakeTime.now = timestamp
+            self.assertTrue(retry(no_menu, True, False))
+        FakeTime.now = 1.5
+        self.assertEqual(retry(no_menu, True, False), "menu_recovery")
+        self.assertEqual(
+            [event[0] for event in no_menu.press_events], [Button.X])
+        self.assertEqual(no_menu.waits, [0.1] * 10)
+
+        # 復旧を始めた周期は、両呼び出し位置とも攻撃処理へ進めない。
+        mega_battle = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_mega_evolution_battle")
+        recovery_guards = [
+            node for node in ast.walk(mega_battle)
+            if isinstance(node, ast.If)
+            and "field_w_action == 'menu_recovery'" in ast.unparse(node.test)
+        ]
+        self.assertEqual(len(recovery_guards), 2)
+        self.assertTrue(all(
+            len(node.body) == 1 and isinstance(node.body[0], ast.Continue)
+            for node in recovery_guards))
+
+        # 開始時と戦闘中の両方で、FIELD_W中は上入力再送を優先し、
+        # 同じ周回のロックオン・移動・攻撃へ進めない。
+        field_w_priority_guards = [
+            node for node in ast.walk(mega_battle)
+            if isinstance(node, ast.If)
+            and ast.unparse(node.test) == "field_w_detected"
+            and "ZA_mega_mode5_field_w_up_retry" in ast.unparse(node)
+        ]
+        self.assertEqual(len(field_w_priority_guards), 2)
+        self.assertTrue(all(
+            any(isinstance(statement, ast.Continue)
+                for statement in node.body)
+            for node in field_w_priority_guards))
+        battle_field_guard = next(
+            node for node in field_w_priority_guards
+            if "battle interrupted" in ast.unparse(node))
+        self.assertIn(
+            "ZA_mega_mode5_field_w_up_retry(True, False",
+            ast.unparse(battle_field_guard))
+
+        # mode 5以外には再送処理を適用しない。
+        non_mode5 = Command(mode5=False)
+        self.assertFalse(retry(non_mode5, True, False))
+        self.assertEqual(non_mode5.commands, [])
+
     def test_za_field_reach_checks_use_no_battle_hard_guard(self):
         source_path = os.path.join(
             SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
@@ -3235,6 +11682,18 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             node for node in ast.walk(tree)
             if isinstance(node, ast.FunctionDef)
             and node.name == "ZA_story_Template_Field_HardGaurd")
+        mega_position_match = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_ZA_mega_field_position_matches")
+        mega_battle = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_mega_evolution_battle")
+        mega_detect_screen = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_mega_mode5_detect_screen_state")
         source_lines = source.splitlines(keepends=True)
         audited_source = "".join(
             source_lines[:protected.lineno - 1]
@@ -3255,6 +11714,21 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 continue
             if protected.lineno <= node.lineno <= protected.end_lineno:
                 continue
+            if (mega_position_match.lineno <= node.lineno
+                    <= mega_position_match.end_lineno):
+                # Mega開始直後はFIELD_W/BACK_Wを入口にした後で、
+                # usenumの番号画像を直接比較する。
+                continue
+            if (node.args[0].value == "POKEMON_ZA_FIELD_BACK_W"
+                    and mega_battle.lineno <= node.lineno
+                    <= mega_battle.end_lineno):
+                continue
+            if (node.args[0].value == "POKEMON_ZA_FIELD_BACK_W"
+                    and mega_detect_screen.lineno <= node.lineno
+                    <= mega_detect_screen.end_lineno):
+                # mode 5専用画面判定へ共通関数内の優先検知を移しただけで、
+                # FIELD到達判定として流用する箇所ではない。
+                continue
             self.assertIn(
                 "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
                 source_lines[node.lineno - 1])
@@ -3272,11 +11746,13 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             if "#FIELDから変更" in line]
         # Mega battle now reuses one field_active result instead of repeating
         # three identical hard-field checks inside the BLACK/select branches.
-        # FILED_HARD_CHECK_1 is an intentional mode=1 exception used by the
-        # evolution flow, not a migrated FIELD reach check.
+        # FILED_HARD_CHECK_0/1 are intentional evolution-flow exceptions,
+        # not migrated FIELD reach checks.
         self.assertEqual(len(changed_lines), 501)
         self.assertTrue(all(
-            "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK" in line
+            ("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK" in line
+             or "POKEMON_ZA_FILED_HARD_CHECK_0" in line
+             or "POKEMON_ZA_FILED_HARD_CHECK_1" in line)
             for line in changed_lines))
 
         fragment_paths = (
@@ -3299,6 +11775,18 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 fragment = stream.read()
             fragment_tree = ast.parse(fragment)
             fragment_lines = fragment.splitlines(keepends=True)
+            fragment_position_match = next((
+                node for node in ast.walk(fragment_tree)
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "_ZA_mega_field_position_matches"), None)
+            fragment_mega_battle = next((
+                node for node in ast.walk(fragment_tree)
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "ZA_mega_evolution_battle"), None)
+            fragment_mega_detect_screen = next((
+                node for node in ast.walk(fragment_tree)
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "ZA_mega_mode5_detect_screen_state"), None)
             fragment_protected = next((
                 node for node in ast.walk(fragment_tree)
                 if isinstance(node, ast.FunctionDef)
@@ -3315,6 +11803,20 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                         and fragment_protected.lineno <= node.lineno
                         <= fragment_protected.end_lineno):
                     continue
+                if (fragment_position_match is not None
+                        and fragment_position_match.lineno <= node.lineno
+                        <= fragment_position_match.end_lineno):
+                    continue
+                if (node.args[0].value == "POKEMON_ZA_FIELD_BACK_W"
+                        and fragment_mega_battle is not None
+                        and fragment_mega_battle.lineno <= node.lineno
+                        <= fragment_mega_battle.end_lineno):
+                    continue
+                if (node.args[0].value == "POKEMON_ZA_FIELD_BACK_W"
+                        and fragment_mega_detect_screen is not None
+                        and fragment_mega_detect_screen.lineno <= node.lineno
+                        <= fragment_mega_detect_screen.end_lineno):
+                    continue
                 self.assertIn(
                     "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
                     fragment_lines[node.lineno - 1], relative_path)
@@ -3329,7 +11831,1736 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 'endpicture2="POKEMON_ZA_FIELD_BACK_W"',
                 fragment, relative_path)
             fragment_changes += fragment.count("#FIELDから変更")
-        self.assertEqual(fragment_changes, 61)
+        self.assertEqual(fragment_changes, 53)
+
+    def test_za_battle_after_waits_for_field_or_three_endpictures(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        source_function = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_story_Template_battle_after")
+        fragment_function = next(
+            node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_story_Template_battle_after")
+        self.assertEqual(
+            ast.dump(source_function, include_attributes=False),
+            ast.dump(fragment_function, include_attributes=False))
+
+        module = ast.fix_missing_locations(ast.Module(
+            body=[source_function], type_ignores=[]))
+        namespace = {"Button": Button}
+        exec(compile(module, source_path, "exec"), namespace)
+        battle_after = namespace["ZA_story_Template_battle_after"]
+
+        class Command:
+            def __init__(self, matched=(), next_matched=()):
+                self.matched = set(matched)
+                self.next_matched = [set(value) for value in next_matched]
+                self.buttons = []
+                self.commands = []
+                self.checked = []
+                self.alive_checks = 0
+
+            def checkIfAlive(self):
+                self.alive_checks += 1
+
+            def image_check(self, name):
+                self.checked.append(name)
+                return name in self.matched
+
+            def pressRep(self, button, **_kwargs):
+                self.buttons.append(button)
+
+            def wait(self, _duration):
+                if self.next_matched:
+                    self.matched = self.next_matched.pop(0)
+
+            def etc_sendCommand(self, command):
+                self.commands.append(command)
+
+        field = Command({"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"})
+        self.assertEqual(
+            battle_after(field, "BATTLE", "NEXT"), "NEXT")
+        self.assertEqual(field.buttons, [])
+
+        for argument, picture in (
+                ("endpicture", "END_ONE"),
+                ("endpicture2", "END_TWO"),
+                ("endpicture3", "END_THREE")):
+            command = Command({picture, "POKEMON_ZA_BATTLE_ACTIVE_LEVEL"})
+            self.assertEqual(
+                battle_after(
+                    command, "BATTLE", "NEXT", **{argument: picture}),
+                "NEXT")
+            self.assertNotIn("POKEMON_ZA_BATTLE_BALL_CHECK", command.checked)
+
+        battle = Command({"POKEMON_ZA_BATTLE_ACTIVE_LEVEL"})
+        self.assertEqual(
+            battle_after(battle, "BATTLE", "NEXT"), "BATTLE")
+
+        comment = Command(
+            {"POKEMON_ZA_TEXT_BLACK_COMMENT"},
+            [{"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"}])
+        self.assertEqual(
+            battle_after(comment, "BATTLE", "NEXT"), "NEXT")
+        self.assertEqual(comment.buttons, [Button.A])
+        self.assertGreaterEqual(comment.alive_checks, 2)
+
+        white_comment = Command(
+            {"POKEMON_ZA_TEXT_WHITE_COMMENT"},
+            [{"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"}])
+        self.assertEqual(
+            battle_after(white_comment, "BATTLE", "NEXT"), "NEXT")
+        self.assertEqual(white_comment.buttons, [Button.B])
+
+        unknown = Command(
+            (), [{"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"}])
+        self.assertEqual(
+            battle_after(unknown, "BATTLE", "NEXT"), "NEXT")
+        self.assertEqual(unknown.buttons, [])
+        self.assertNotIn("POKEMON_ZA_FALSE_RETURN", unknown.checked)
+
+    def test_za_battle_active_level_target_is_registered(self):
+        profile_path = os.path.join(
+            SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
+        with open(profile_path, "r", encoding="utf-8") as stream:
+            library = json.load(stream)
+        level_target = library["targets"][
+            "POKEMON_ZA_BATTLE_ACTIVE_LEVEL"]
+        self.assertEqual(level_target["operator"], "OR")
+        self.assertEqual(len(level_target["variants"]), 1)
+        level_variant = level_target["variants"][0]
+        self.assertEqual(level_variant["crop"], [120, 500, 300, 580])
+        self.assertEqual(level_variant["threshold"], 0.75)
+        self.assertFalse(level_variant["use_gray"])
+        level_path = os.path.join(
+            SERIAL_CONTROLLER,
+            level_variant["template_path"].replace("/", os.sep))
+        level_image = cv2.imread(level_path)
+        self.assertIsNotNone(level_image)
+        self.assertEqual(level_image.shape[:2], (13, 20))
+
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+        target_marker = "'POKEMON_ZA_BATTLE_ACTIVE_LEVEL': ["
+        target_blocks = source.split(target_marker)[1:]
+        self.assertEqual(len(target_blocks), 2)
+        for target_block in target_blocks:
+            self.assertIn(
+                "'threshold': 0.75", target_block.split("}]", 1)[0])
+
+    def test_za_cplus_white_background_variants_are_registered(self):
+        profile_path = os.path.join(
+            SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
+        with open(profile_path, "r", encoding="utf-8") as stream:
+            library = json.load(stream)
+
+        normal_variants = library["targets"][
+            "POKEMON_ZA_C+"]["variants"]
+        low_variants = library["targets"][
+            "POKEMON_ZA_C+_LOW"]["variants"]
+        normal_white = next(
+            variant for variant in normal_variants
+            if variant["template_path"].endswith("C+_white.png"))
+        low_white = next(
+            variant for variant in low_variants
+            if variant["template_path"].endswith("C+_white.png"))
+        self.assertEqual(normal_white["threshold"], 0.75)
+        self.assertEqual(low_white["threshold"], 0.6)
+        self.assertEqual(normal_white["crop"], [1000, 565, 1280, 720])
+        self.assertEqual(low_white["crop"], normal_white["crop"])
+        self.assertFalse(normal_white["use_gray"])
+        self.assertFalse(low_white["use_gray"])
+
+        template_path = os.path.join(
+            SERIAL_CONTROLLER,
+            normal_white["template_path"].replace("/", os.sep))
+        template = cv2.imread(template_path)
+        self.assertIsNotNone(template)
+        self.assertEqual(template.shape[:2], (19, 21))
+
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        source_targets = ast.literal_eval(next(
+            node.value for node in ast.walk(source_tree)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "IMAGE_DETECTION_TARGETS"
+                    for target in node.targets)))
+        self.assertEqual(
+            source_targets["POKEMON_ZA_C+"], normal_variants)
+        self.assertEqual(
+            source_targets["POKEMON_ZA_C+_LOW"], low_variants)
+
+    def test_za_escape_normal_and_red_variants_are_registered(self):
+        profile_path = os.path.join(
+            SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
+        with open(profile_path, "r", encoding="utf-8") as stream:
+            library = json.load(stream)
+
+        variants = library["targets"]["POKEMON_ZA_ESCAPE"]["variants"]
+        expected_paths = {
+            "Template/ZA_Story/Common/escape_full_normal.png",
+            "Template/ZA_Story/Common/escape_full_thin_red.png",
+            "Template/ZA_Story/Common/escape_full_red.png",
+        }
+        full_icon_variants = [
+            variant for variant in variants
+            if variant["template_path"] in expected_paths
+        ]
+        self.assertEqual(
+            {variant["template_path"] for variant in full_icon_variants},
+            expected_paths)
+        for variant in full_icon_variants:
+            self.assertEqual(variant["crop"], [10, 450, 62, 525])
+            self.assertEqual(variant["threshold"], 0.85)
+            self.assertTrue(variant["use_gray"])
+            template_path = os.path.join(
+                SERIAL_CONTROLLER,
+                variant["template_path"].replace("/", os.sep))
+            template = cv2.imread(template_path)
+            self.assertIsNotNone(template)
+            self.assertEqual(template.shape[:2], (45, 32))
+
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        source_targets = ast.literal_eval(next(
+            node.value for node in ast.walk(source_tree)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "IMAGE_DETECTION_TARGETS"
+                    for target in node.targets)))
+        self.assertEqual(source_targets["POKEMON_ZA_ESCAPE"], variants)
+
+    def test_za_absol_move1_and_move2_green_comment_reset_to_move0(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        step_functions = [
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {
+                "_2_story_absol_move0", "_2_story_absol_move1",
+                "_2_story_absol_move2"}]
+        namespace = {
+            "Button": Button,
+            "Direction": Direction,
+            "Stick": Stick,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=step_functions, type_ignores=[])),
+            source_path, "exec"), namespace)
+
+        class Command:
+            def __init__(self, matched=(), comment_out=True):
+                self.matched = set(matched)
+                self.comment_out = comment_out
+                self.comment_calls = 0
+                self.movements = []
+                self.reset_calls = 0
+                self.waits = []
+
+            def image_check(self, name):
+                return name in self.matched
+
+            def ZA_story_Template_Comment_Out(self):
+                self.comment_calls += 1
+                return self.comment_out
+
+            def press(self, direction, **kwargs):
+                self.movements.append((direction, kwargs))
+
+            def wait(self, duration):
+                self.waits.append(duration)
+
+            def ZA_gamereset(self):
+                self.reset_calls += 1
+
+        for step_name in (
+                "_2_story_absol_move1", "_2_story_absol_move2"):
+            with self.subTest(step=step_name):
+                command = Command({
+                    "POKEMON_ZA_TEXT_GREEN_COMMENT",
+                    "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+                })
+                self.assertEqual(
+                    namespace[step_name](command),
+                    "2_STORY_ABSOL_MOVE0")
+                self.assertEqual(command.comment_calls, 0)
+                self.assertEqual(command.movements, [])
+                self.assertEqual(
+                    namespace["_2_story_absol_move0"](command),
+                    "2_STORY_ABSOL_MOVE1")
+                self.assertEqual(command.reset_calls, 1)
+
+        white_comment = Command({"POKEMON_ZA_TEXT_WHITE_COMMENT"})
+        self.assertEqual(
+            namespace["_2_story_absol_move2"](white_comment),
+            "2_STORY_ABSOL_BATTLE")
+        self.assertEqual(white_comment.comment_calls, 1)
+
+    def test_za_absol_move17_prioritizes_all_select_a(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        step_functions = [
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {
+                "_2_story_absol_move16", "_2_story_absol_move17"}]
+        namespace = {
+            "Button": Button,
+            "Direction": Direction,
+            "Stick": Stick,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=step_functions, type_ignores=[])),
+            source_path, "exec"), namespace)
+        step = namespace["_2_story_absol_move17"]
+        move16 = namespace["_2_story_absol_move16"]
+
+        class Command:
+            def __init__(self, matched=()):
+                self.matched = set(matched)
+                self.buttons = []
+                self.before_calls = []
+                self.movements = []
+                self.waits = []
+
+            def image_check(self, name):
+                return name in self.matched
+
+            def pressRep(self, button, **kwargs):
+                self.buttons.append((button, kwargs))
+
+            def press(self, direction, **kwargs):
+                self.movements.append((direction, kwargs))
+
+            def wait(self, duration):
+                self.waits.append(duration)
+
+            def ZA_story_Template_battle_before_renda_route(self, **kwargs):
+                self.before_calls.append(kwargs)
+                return "COMMON_BEFORE"
+
+        # FIELD系が同時に見えていても、1～4_SELECTを先にAで確定する。
+        for picture in (
+                "POKEMON_ZA_1_SELECT",
+                "POKEMON_ZA_2_SELECT",
+                "POKEMON_ZA_3_SELECT",
+                "POKEMON_ZA_4_SELECT"):
+            with self.subTest(picture=picture):
+                selection = Command({
+                    picture,
+                    "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+                })
+                self.assertEqual(
+                    step(selection), "2_STORY_ABSOL_MOVE17")
+                self.assertEqual(len(selection.buttons), 1)
+                self.assertEqual(selection.buttons[0][0], Button.A)
+                self.assertEqual(selection.buttons[0][1], {
+                    "repeat": 1,
+                    "duration": 0.15,
+                    "wait": 0.5,
+                    "interval": 0.1,
+                })
+                self.assertEqual(selection.before_calls, [])
+
+        normal = Command()
+        self.assertEqual(step(normal), "COMMON_BEFORE")
+        self.assertEqual(normal.buttons, [])
+        self.assertEqual(normal.before_calls, [{
+            "noprg_ret": "2_STORY_ABSOL_MOVE17",
+            "prg_ret": "2_STORY_ABSOL_MOVE18",
+            "battle_flow_key": "2_STORY_ABSOL",
+            "green_check": 1,
+        }])
+
+        # MOVE14～16を回って17へ再入場する場合は、前回の30秒計時を
+        # 持ち越さず、17へ入った時点から測り直す。
+        reentry = Command({"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"})
+        reentry._za_story_event_entry_recovery_started = {
+            "2_STORY_ABSOL_MOVE17": 1.0,
+            "OTHER_STEP": 2.0,
+        }
+        self.assertEqual(move16(reentry), "2_STORY_ABSOL_MOVE17")
+        self.assertEqual(
+            reentry._za_story_event_entry_recovery_started,
+            {"OTHER_STEP": 2.0})
+
+    def test_za_absol_move17_waits_two_minutes_and_black_retries_move17(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        source_class = next(
+            node for node in source_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ZA_story_Base")
+        functions = {
+            node.name: node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        assignments = {
+            node.targets[0].id: node.value
+            for node in source_class.body
+            if (isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name))
+        }
+        per_state_seconds = ast.literal_eval(assignments[
+            "ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS_BY_STATE"])
+        self.assertEqual(
+            per_state_seconds["2_STORY_ABSOL_MOVE17"], 120.0)
+
+        move18_return = functions["_2_story_absol_move18"].body[-1]
+        self.assertIsInstance(move18_return, ast.Return)
+        move18_options = {
+            keyword.arg: ast.literal_eval(keyword.value)
+            for keyword in move18_return.value.keywords
+        }
+        self.assertEqual(
+            move18_options["bkprg_ret"], "2_STORY_ABSOL_MOVE17")
+        self.assertTrue(move18_options["black_comment_is_defeat"])
+        self.assertEqual(
+            move18_options["result_picture"],
+            "POKEMON_ZA_MISSION_COMPLETE")
+        self.assertEqual(move18_options["white_comment_result_retries"], 3)
+
+        now = [0.0]
+        namespace = {
+            "time": types.SimpleNamespace(monotonic=lambda: now[0]),
+        }
+        timeout_node = functions[
+            "_ZA_story_event_entry_recovery_timeout"]
+        reset_node = functions[
+            "_ZA_story_reset_absol_infi_reentry"]
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[reset_node, timeout_node], type_ignores=[])),
+            source_path, "exec"),
+            namespace)
+
+        class Command:
+            ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS = 30.0
+            ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS_BY_STATE = (
+                per_state_seconds)
+            ZA_STORY_FURADARI_COMMENT_SKIP_TARGETS = {}
+            _ZA_story_event_entry_recovery_timeout = namespace[
+                "_ZA_story_event_entry_recovery_timeout"]
+            _ZA_story_reset_absol_infi_reentry = namespace[
+                "_ZA_story_reset_absol_infi_reentry"]
+
+        command = Command()
+        command.chicketmaxflag = 2
+        command.za_infi_main_current_state = "ZA_INFI_MAIN_BENCH"
+        command.bench_current_state = "BENCH_CHECK_TIME"
+        command.battle_current_state = "BATTLE_MOVE"
+        timers = {}
+        state = "2_STORY_ABSOL_MOVE17"
+        self.assertEqual(command._ZA_story_event_entry_recovery_timeout(
+            state, "2_STORY_ABSOL_MOVE14", state,
+            "battle_before", timers), state)
+        now[0] = 119.9
+        self.assertEqual(command._ZA_story_event_entry_recovery_timeout(
+            state, "2_STORY_ABSOL_MOVE14", state,
+            "battle_before", timers), state)
+        now[0] = 120.0
+        self.assertEqual(command._ZA_story_event_entry_recovery_timeout(
+            state, "2_STORY_ABSOL_MOVE14", state,
+            "battle_before", timers), "2_STORY_ABSOL_MOVE14")
+        self.assertEqual(command.chicketmaxflag, 0)
+        self.assertEqual(
+            command.za_infi_main_current_state, "ZA_INFI_MAIN_START")
+        self.assertEqual(command.bench_current_state, "BENCH_START")
+        self.assertEqual(command.battle_current_state, "BATTLE_START")
+
+    def test_za_absol_white_comment_only_advances_when_it_continues(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        selected = [functions[name] for name in (
+            "_ZA_story_battle_flow_state",
+            "_ZA_story_battle_flow_mark",
+            "_ZA_story_battle_white_comment_continues",
+            "ZA_story_Template_battle_function_active_level",
+        )]
+        namespace = {"Button": Button, "time": time}
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=selected, type_ignores=[])), source_path, "exec"),
+            namespace)
+
+        class Command:
+            _ZA_story_battle_flow_state = namespace[
+                "_ZA_story_battle_flow_state"]
+            _ZA_story_battle_flow_mark = namespace[
+                "_ZA_story_battle_flow_mark"]
+            _ZA_story_battle_white_comment_continues = namespace[
+                "_ZA_story_battle_white_comment_continues"]
+
+            def __init__(self, white_results):
+                self.white_results = list(white_results)
+                self.buttons = []
+                self.waits = []
+
+            def image_check(self, name):
+                if name == "POKEMON_ZA_TEXT_WHITE_COMMENT":
+                    if self.white_results:
+                        return self.white_results.pop(0)
+                    return False
+                return False
+
+            def pressRep(self, button, **_kwargs):
+                self.buttons.append(button)
+
+            def wait(self, duration):
+                self.waits.append(duration)
+
+            @staticmethod
+            def checkIfAlive():
+                return None
+
+        battle = namespace[
+            "ZA_story_Template_battle_function_active_level"]
+        options = {
+            "bkprg_ret": "2_STORY_ABSOL_MOVE17",
+            "prg_ret": "2_STORY_ABSOL_MOVE19",
+            "noprg_ret": "2_STORY_ABSOL_MOVE18",
+            "battle_flow_key": "2_STORY_ABSOL",
+            "result_picture": "POKEMON_ZA_MISSION_COMPLETE",
+            "white_comment_result_retries": 3,
+        }
+
+        single = Command([True, False, False, False])
+        single_state = single._ZA_story_battle_flow_state(
+            "2_STORY_ABSOL")
+        single_state.update(phase="ACTIVE_SEEN", active_seen=True)
+        self.assertEqual(
+            battle(single, **options), "2_STORY_ABSOL_MOVE18")
+        self.assertEqual(single.buttons, [Button.B])
+        self.assertFalse(single_state["result_seen"])
+
+        reappeared = Command([True, False, True])
+        reappeared_state = reappeared._ZA_story_battle_flow_state(
+            "2_STORY_ABSOL")
+        reappeared_state.update(phase="ACTIVE_SEEN", active_seen=True)
+        self.assertEqual(
+            battle(reappeared, **options), "2_STORY_ABSOL_MOVE19")
+        self.assertEqual(reappeared.buttons, [Button.B])
+        self.assertTrue(reappeared_state["result_seen"])
+
+        continued = Command([True, True, True, True])
+        continued_state = continued._ZA_story_battle_flow_state(
+            "2_STORY_ABSOL")
+        continued_state.update(phase="ACTIVE_SEEN", active_seen=True)
+        self.assertEqual(
+            battle(continued, **options), "2_STORY_ABSOL_MOVE19")
+        self.assertEqual(continued.buttons, [Button.B] * 3)
+        self.assertTrue(continued_state["result_seen"])
+
+    def test_za_w_rank_defeat_returns_to_battle_before(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        selected = [functions[name] for name in (
+            "_ZA_story_battle_flow_state",
+            "_ZA_story_battle_flow_mark",
+            "ZA_story_Template_battle_function_active_level",
+            "ZA_story_Template_battle_after_active_level",
+            "_ZA_story_battle_before_safe_renda_once",
+            "ZA_story_Template_battle_before_renda_route",
+            "ZA_story_Template_battle_function_renda_route",
+            "_2_story_w_lank_move12",
+            "_2_story_w_lank_move13",
+        )]
+        module = ast.fix_missing_locations(ast.Module(
+            body=selected, type_ignores=[]))
+        namespace = {"Button": Button, "time": time}
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            _ZA_story_battle_flow_state = namespace[
+                "_ZA_story_battle_flow_state"]
+            _ZA_story_battle_flow_mark = namespace[
+                "_ZA_story_battle_flow_mark"]
+            _ZA_story_battle_before_safe_renda_once = namespace[
+                "_ZA_story_battle_before_safe_renda_once"]
+            ZA_story_Template_battle_function_active_level = namespace[
+                "ZA_story_Template_battle_function_active_level"]
+
+            def __init__(self, matched=()):
+                self.matched = set(matched)
+                self.buttons = []
+
+            def image_check(self, name):
+                return name in self.matched
+
+            def pressRep(self, button, **_kwargs):
+                self.buttons.append(button)
+
+            @staticmethod
+            def wait(_duration):
+                return None
+
+            @staticmethod
+            def checkIfAlive():
+                return None
+
+        before = namespace[
+            "ZA_story_Template_battle_before_renda_route"]
+        battle = namespace[
+            "ZA_story_Template_battle_function_renda_route"]
+        after = namespace[
+            "ZA_story_Template_battle_after_active_level"]
+        battle_options = {
+            "bkprg_ret": "2_STORY_W_LANK_MOVE11",
+            "prg_ret": "2_STORY_W_LANK_MOVE13",
+            "noprg_ret": "2_STORY_W_LANK_MOVE12",
+            "battle_flow_key": "2_STORY_W_LANK",
+            "result_picture": "POKEMON_ZA_W_BATTLE_END",
+            "black_comment_is_defeat": True,
+            "green_comment_is_victory": True,
+            "field_after_active_is_victory": True,
+        }
+
+        black_defeat = Command({"POKEMON_ZA_TEXT_BLACK_COMMENT"})
+        black_state = black_defeat._ZA_story_battle_flow_state(
+            "2_STORY_W_LANK")
+        black_state.update(phase="ACTIVE_SEEN", active_seen=True)
+        self.assertEqual(
+            battle(black_defeat, **battle_options),
+            "2_STORY_W_LANK_MOVE11")
+        self.assertEqual(black_state["phase"], "RETRY_ENTRY")
+        self.assertFalse(black_state["active_seen"])
+        self.assertFalse(black_state["result_seen"])
+        self.assertEqual(black_defeat.buttons, [Button.A])
+
+        black_before = Command({"POKEMON_ZA_TEXT_BLACK_COMMENT"})
+        self.assertEqual(before(
+            black_before,
+            noprg_ret="2_STORY_W_LANK_MOVE11",
+            prg_ret="2_STORY_W_LANK_MOVE12",
+            battle_flow_key="2_STORY_W_LANK",
+            green_check=1,
+            black_comment_is_defeat=True),
+            "2_STORY_W_LANK_MOVE11")
+        self.assertEqual(
+            black_before._ZA_story_battle_flow_state(
+                "2_STORY_W_LANK")["phase"],
+            "RETRY_ENTRY")
+
+        black_after = Command({"POKEMON_ZA_TEXT_BLACK_COMMENT"})
+        black_after_state = black_after._ZA_story_battle_flow_state(
+            "2_STORY_W_LANK")
+        black_after_state.update(
+            phase="RESULT_SEEN", active_seen=True, result_seen=True)
+        self.assertEqual(after(
+            black_after,
+            bkprg_ret="2_STORY_W_LANK_MOVE11",
+            prg_ret="2_STORY_ABSOL_MOVE1",
+            battle_flow_key="2_STORY_W_LANK",
+            black_comment_is_defeat=True),
+            "2_STORY_W_LANK_MOVE11")
+        self.assertEqual(black_after_state["phase"], "RETRY_ENTRY")
+        self.assertFalse(black_after_state["active_seen"])
+        self.assertFalse(black_after_state["result_seen"])
+        self.assertEqual(black_after.buttons, [Button.A])
+
+        defeated = Command({"POKEMON_ZA_TEXT_WHITE_COMMENT"})
+        state = defeated._ZA_story_battle_flow_state("2_STORY_W_LANK")
+        state.update(phase="ACTIVE_SEEN", active_seen=True)
+        self.assertEqual(
+            battle(defeated, **battle_options),
+            "2_STORY_W_LANK_MOVE12")
+        self.assertEqual(state["phase"], "ACTIVE_SEEN")
+        self.assertTrue(state["active_seen"])
+        self.assertFalse(state["result_seen"])
+        self.assertEqual(defeated.buttons, [Button.B])
+
+        comment_marker = Command({"POKEMON_ZA_COMMENT_MARKER"})
+        marker_state = comment_marker._ZA_story_battle_flow_state(
+            "2_STORY_W_LANK")
+        marker_state.update(phase="ACTIVE_SEEN", active_seen=True)
+        self.assertEqual(
+            battle(comment_marker, **battle_options),
+            "2_STORY_W_LANK_MOVE12")
+        self.assertEqual(marker_state["phase"], "ACTIVE_SEEN")
+        self.assertTrue(marker_state["active_seen"])
+        self.assertEqual(comment_marker.buttons, [Button.B])
+
+        green_victory = Command({"POKEMON_ZA_TEXT_GREEN_COMMENT"})
+        green_victory_state = green_victory._ZA_story_battle_flow_state(
+            "2_STORY_W_LANK")
+        green_victory_state.update(phase="ACTIVE_SEEN", active_seen=True)
+        self.assertEqual(
+            battle(green_victory, **battle_options),
+            "2_STORY_W_LANK_MOVE13")
+        self.assertEqual(green_victory_state["phase"], "RESULT_SEEN")
+        self.assertTrue(green_victory_state["result_seen"])
+        self.assertEqual(green_victory.buttons, [])
+
+        green_without_battle = Command({"POKEMON_ZA_TEXT_GREEN_COMMENT"})
+        self.assertEqual(
+            battle(green_without_battle, **battle_options),
+            "2_STORY_W_LANK_MOVE11")
+        self.assertEqual(green_without_battle.buttons, [Button.B])
+
+        self.assertEqual(before(
+            defeated,
+            noprg_ret="2_STORY_W_LANK_MOVE11",
+            prg_ret="2_STORY_W_LANK_MOVE12",
+            battle_flow_key="2_STORY_W_LANK",
+            green_check=1), "2_STORY_W_LANK_MOVE12")
+        self.assertEqual(state["phase"], "RESULT_CANDIDATE")
+        self.assertEqual(defeated.buttons, [Button.B])
+
+        defeated.matched = {"POKEMON_ZA_BATTLE_ACTIVE_LEVEL"}
+        self.assertEqual(before(
+            defeated,
+            noprg_ret="2_STORY_W_LANK_MOVE11",
+            prg_ret="2_STORY_W_LANK_MOVE12",
+            battle_flow_key="2_STORY_W_LANK",
+            green_check=1), "2_STORY_W_LANK_MOVE12")
+        self.assertEqual(state["phase"], "ACTIVE_SEEN")
+        self.assertTrue(state["active_seen"])
+
+        victory = Command({"POKEMON_ZA_W_BATTLE_END"})
+        victory_state = victory._ZA_story_battle_flow_state(
+            "2_STORY_W_LANK")
+        victory_state.update(phase="ACTIVE_SEEN", active_seen=True)
+        self.assertEqual(
+            battle(victory, **battle_options),
+            "2_STORY_W_LANK_MOVE13")
+        self.assertTrue(victory_state["result_seen"])
+
+        battle_step_options = namespace["_2_story_w_lank_move12"](
+            types.SimpleNamespace(
+                ZA_story_Template_battle_function_renda_route=
+                lambda **kwargs: kwargs))
+        self.assertTrue(battle_step_options["green_comment_is_victory"])
+        self.assertTrue(
+            battle_step_options["field_after_active_is_victory"])
+
+        field_after_victory = Command(
+            {"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"})
+        field_victory_state = field_after_victory._ZA_story_battle_flow_state(
+            "2_STORY_W_LANK")
+        field_victory_state.update(phase="ACTIVE_SEEN", active_seen=True)
+        self.assertEqual(
+            battle(field_after_victory, **battle_options),
+            "2_STORY_W_LANK_MOVE12")
+        field_victory_state["field_result_since"] = time.monotonic() - 1.0
+        self.assertEqual(
+            battle(field_after_victory, **battle_options),
+            "2_STORY_W_LANK_MOVE13")
+        self.assertEqual(field_victory_state["phase"], "RESULT_SEEN")
+        self.assertTrue(field_victory_state["result_seen"])
+
+        field_after_defeat = Command(
+            {"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"})
+        field_defeat_state = field_after_defeat._ZA_story_battle_flow_state(
+            "2_STORY_W_LANK")
+        field_defeat_state.update(
+            phase="RETRY_ENTRY", active_seen=False,
+            field_result_count=1,
+            field_result_since=time.monotonic() - 1.0)
+        self.assertEqual(
+            battle(field_after_defeat, **battle_options),
+            "2_STORY_W_LANK_MOVE12")
+        self.assertEqual(field_defeat_state["phase"], "RETRY_ENTRY")
+
+        no_battle = Command({"POKEMON_ZA_TEXT_WHITE_COMMENT"})
+        self.assertEqual(before(
+            no_battle,
+            noprg_ret="2_STORY_W_LANK_MOVE11",
+            prg_ret="2_STORY_W_LANK_MOVE12",
+            battle_flow_key="2_STORY_W_LANK",
+            green_check=1), "2_STORY_W_LANK_MOVE11")
+        self.assertEqual(no_battle.buttons, [Button.B])
+        self.assertEqual(
+            no_battle._ZA_story_battle_flow_state(
+                "2_STORY_W_LANK")["phase"],
+            "WAIT_ENTRY")
+
+        no_battle_in_function = Command(
+            {"POKEMON_ZA_TEXT_WHITE_COMMENT"})
+        self.assertEqual(
+            battle(no_battle_in_function, **battle_options),
+            "2_STORY_W_LANK_MOVE11")
+        self.assertEqual(no_battle_in_function.buttons, [Button.B])
+
+        no_picture = Command()
+        self.assertEqual(
+            battle(no_picture, **battle_options),
+            "2_STORY_W_LANK_MOVE12")
+
+        after_options = namespace["_2_story_w_lank_move13"](
+            types.SimpleNamespace(
+                ZA_story_Template_battle_after_renda_route=
+                lambda **kwargs: kwargs))
+        self.assertEqual(
+            after_options["bkprg_ret"], "2_STORY_W_LANK_MOVE11")
+        self.assertTrue(after_options["black_comment_is_defeat"])
+
+    def test_za_active_level_before_recenters_event_before_talking(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        selected = [functions[name] for name in (
+            "_ZA_story_battle_flow_state",
+            "_ZA_story_battle_flow_mark",
+            "_ZA_story_battle_before_safe_renda_once",
+            "ZA_story_Template_battle_before_renda_route",
+            "ZA_story_Template_battle_function_active_level",
+            "ZA_story_Template_battle_after_active_level",
+        )]
+        module = ast.fix_missing_locations(ast.Module(
+            body=selected, type_ignores=[]))
+        namespace = {
+            "Button": Button,
+            "Direction": Direction,
+            "Stick": Stick,
+        }
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            _ZA_story_battle_flow_state = namespace[
+                "_ZA_story_battle_flow_state"]
+            _ZA_story_battle_flow_mark = namespace[
+                "_ZA_story_battle_flow_mark"]
+            _ZA_story_battle_before_safe_renda_once = namespace[
+                "_ZA_story_battle_before_safe_renda_once"]
+
+            def __init__(
+                    self, matched=(), marker_centered=False,
+                    chat_after_moves=None):
+                self.matched = set(matched)
+                self.marker_centered = marker_centered
+                self.chat_after_moves = chat_after_moves
+                self.marker_calls = []
+                self.buttons = []
+                self.movements = []
+                self.waits = []
+                self.actions = []
+
+            def image_check(self, name):
+                if (name == "POKEMON_ZA_CHAT_MARKER"
+                        and self.chat_after_moves is not None
+                        and len(self.movements) >= self.chat_after_moves):
+                    return True
+                return name in self.matched
+
+            def ZA_markerdir(
+                    self, marker_type, search_mode=0, nofiled=False):
+                self.marker_calls.append(
+                    (marker_type, search_mode, nofiled))
+                return self.marker_centered
+
+            def pressRep(self, button, **_kwargs):
+                self.buttons.append(button)
+                self.actions.append("button")
+
+            def press(self, direction, **kwargs):
+                self.movements.append((direction, kwargs))
+                self.actions.append("move")
+
+            def wait(self, duration):
+                self.waits.append(duration)
+
+            @staticmethod
+            def checkIfAlive():
+                return None
+
+        before = namespace[
+            "ZA_story_Template_battle_before_renda_route"]
+        battle = namespace[
+            "ZA_story_Template_battle_function_active_level"]
+
+        for matched in (set(), {"POKEMON_ZA_X_MENU_OPEN"}):
+            default_b = Command(matched)
+            self.assertEqual(before(
+                default_b,
+                noprg_ret="BEFORE", prg_ret="BATTLE",
+                battle_flow_key="DEFAULT_B"), "BEFORE")
+            self.assertEqual(default_b.buttons, [Button.B])
+
+        class LateSelectionCommand(Command):
+            def __init__(self):
+                super().__init__()
+                self.select_checks = 0
+
+            def image_check(self, name):
+                if name == "POKEMON_ZA_2_SELECT":
+                    self.select_checks += 1
+                    # 最初の選択肢確認後、既定Bの直前に表示された状態。
+                    return self.select_checks >= 2
+                return super().image_check(name)
+
+        late_selection = LateSelectionCommand()
+        self.assertEqual(before(
+            late_selection,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="LATE_SELECTION"), "BEFORE")
+        self.assertEqual(late_selection.buttons, [Button.A])
+
+        help_picture = Command({"POKEMON_ZA_HELP_MARKER"})
+        self.assertEqual(before(
+            help_picture,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="HELP"), "BEFORE")
+        self.assertEqual(help_picture.buttons, [Button.A])
+
+        selection = Command({"POKEMON_ZA_1_SELECT"})
+        self.assertEqual(before(
+            selection,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="SELECTION"), "BEFORE")
+        self.assertEqual(selection.buttons, [Button.A])
+
+        field_selection = Command(
+            {"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+             "POKEMON_ZA_1_SELECT"},
+            marker_centered=True)
+        self.assertEqual(before(
+            field_selection,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="FIELD_SELECTION"), "BEFORE")
+        self.assertEqual(field_selection.buttons, [])
+        self.assertEqual(
+            field_selection.marker_calls, [("EVENT", 1, False)])
+        self.assertEqual(len(field_selection.movements), 1)
+
+        field_help = Command(
+            {"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+             "POKEMON_ZA_HELP_MARKER"},
+            marker_centered=True)
+        self.assertEqual(before(
+            field_help,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="FIELD_HELP"), "BEFORE")
+        self.assertEqual(field_help.buttons, [Button.A])
+        self.assertEqual(field_help.marker_calls, [])
+
+        battle_selection = Command({"POKEMON_ZA_2_SELECT"})
+        self.assertEqual(battle(
+            battle_selection,
+            bkprg_ret="BEFORE", prg_ret="AFTER",
+            noprg_ret="BATTLE"), "BATTLE")
+        self.assertEqual(battle_selection.buttons, [Button.A])
+
+        battle_field_selection = Command({
+            "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+            "POKEMON_ZA_2_SELECT",
+        })
+        self.assertEqual(battle(
+            battle_field_selection,
+            bkprg_ret="BEFORE", prg_ret="AFTER",
+            noprg_ret="BATTLE"), "BEFORE")
+        self.assertEqual(battle_field_selection.buttons, [])
+
+        battle_active_field_selection = Command({
+            "POKEMON_ZA_BATTLE_ACTIVE_LEVEL",
+            "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+            "POKEMON_ZA_2_SELECT",
+        })
+        self.assertEqual(battle(
+            battle_active_field_selection,
+            bkprg_ret="BEFORE", prg_ret="AFTER",
+            noprg_ret="BATTLE"), "BATTLE")
+        self.assertEqual(
+            battle_active_field_selection.buttons, [Button.A])
+
+        completion = Command({"POKEMON_ZA_MISSION_COMPLETE"})
+        self.assertEqual(before(
+            completion,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="COMPLETE"), "BATTLE")
+        self.assertEqual(completion.buttons, [])
+        self.assertEqual(
+            completion._ZA_story_battle_flow_state("COMPLETE")["phase"],
+            "RESULT_CANDIDATE")
+
+        active_level = Command({"POKEMON_ZA_BATTLE_ACTIVE_LEVEL"})
+        self.assertEqual(before(
+            active_level,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="ACTIVE"), "BATTLE")
+        self.assertEqual(active_level.buttons, [])
+        self.assertEqual(
+            active_level._ZA_story_battle_flow_state("ACTIVE")["phase"],
+            "ACTIVE_SEEN")
+
+        black_defeat = Command({"POKEMON_ZA_TEXT_BLACK_COMMENT"})
+        self.assertEqual(before(
+            black_defeat,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="BLACK",
+            black_comment_is_defeat=True), "BEFORE")
+        self.assertEqual(black_defeat.buttons, [Button.B])
+        self.assertEqual(
+            black_defeat._ZA_story_battle_flow_state("BLACK")["phase"],
+            "RETRY_ENTRY")
+
+        off_center = Command(
+            {"POKEMON_ZA_CHAT_MARKER"}, marker_centered=False)
+        self.assertEqual(before(
+            off_center,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="TEST"), "BEFORE")
+        self.assertEqual(off_center.marker_calls, [("EVENT", 1, True)])
+        self.assertEqual(off_center.buttons, [])
+
+        centered = Command(
+            {"POKEMON_ZA_CHAT_MARKER"}, marker_centered=True)
+        self.assertEqual(before(
+            centered,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="TEST"), "BEFORE")
+        self.assertEqual(centered.marker_calls, [("EVENT", 1, True)])
+        self.assertEqual(len(centered.movements), 1)
+        self.assertEqual(centered.movements[0][1]["duration"], 0.05)
+        self.assertEqual(centered.buttons, [Button.A])
+        self.assertEqual(centered.actions, ["move", "button"])
+
+        no_rebattle_chat = Command(
+            {"POKEMON_ZA_CHAT_MARKER"}, marker_centered=True)
+        self.assertEqual(before(
+            no_rebattle_chat,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="NO_REBATTLE_CHAT", rebattle=0), "BEFORE")
+        self.assertEqual(no_rebattle_chat.marker_calls, [])
+        self.assertEqual(no_rebattle_chat.movements, [])
+        self.assertEqual(no_rebattle_chat.buttons, [Button.A])
+
+        stale_battle = Command({"POKEMON_ZA_CHAT_MARKER"})
+        self.assertEqual(battle(
+            stale_battle,
+            bkprg_ret="BEFORE", prg_ret="AFTER", noprg_ret="BATTLE",
+            battle_flow_key="TEST"), "BEFORE")
+        self.assertEqual(stale_battle.buttons, [])
+        self.assertEqual(stale_battle.marker_calls, [])
+
+        no_rebattle_black = Command({"POKEMON_ZA_TEXT_BLACK_COMMENT"})
+        no_rebattle_black_state = (
+            no_rebattle_black._ZA_story_battle_flow_state(
+                "NO_REBATTLE_BLACK"))
+        no_rebattle_black_state.update(
+            phase="ACTIVE_SEEN", active_seen=True)
+        self.assertEqual(battle(
+            no_rebattle_black,
+            bkprg_ret="BEFORE", prg_ret="AFTER", noprg_ret="BATTLE",
+            battle_flow_key="NO_REBATTLE_BLACK",
+            black_comment_is_defeat=True, rebattle=0), "AFTER")
+        self.assertEqual(no_rebattle_black.buttons, [Button.A])
+        self.assertEqual(no_rebattle_black_state["phase"], "RESULT_SEEN")
+        self.assertTrue(no_rebattle_black_state["result_seen"])
+        self.assertFalse(no_rebattle_black_state["active_seen"])
+
+        field = Command(
+            {"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"},
+            marker_centered=True)
+        self.assertEqual(before(
+            field,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="TEST"), "BEFORE")
+        self.assertEqual(field.marker_calls, [("EVENT", 1, False)])
+        self.assertEqual(len(field.movements), 1)
+        self.assertEqual(field.movements[0][1]["duration"], 0.05)
+
+        fast_rebattle = Command(
+            {"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"},
+            marker_centered=True, chat_after_moves=3)
+        self.assertEqual(before(
+            fast_rebattle,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="FAST_REBATTLE",
+            event_move_duration=0.1,
+            event_move_attempts=10), "BEFORE")
+        self.assertEqual(fast_rebattle.marker_calls, [("EVENT", 1, False)])
+        self.assertEqual(len(fast_rebattle.movements), 3)
+        self.assertTrue(all(
+            kwargs == {"duration": 0.1, "wait": 0.2}
+            for _direction, kwargs in fast_rebattle.movements))
+        self.assertEqual(fast_rebattle.buttons, [Button.A])
+
+        fast_chat = Command({"POKEMON_ZA_CHAT_MARKER"})
+        self.assertEqual(before(
+            fast_chat,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="FAST_CHAT",
+            event_move_attempts=10), "BEFORE")
+        self.assertEqual(fast_chat.marker_calls, [])
+        self.assertEqual(fast_chat.movements, [])
+        self.assertEqual(fast_chat.buttons, [Button.A])
+
+        no_rebattle_field = Command(
+            {"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"},
+            marker_centered=True)
+        self.assertEqual(before(
+            no_rebattle_field,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="NO_REBATTLE_FIELD", rebattle=0), "BEFORE")
+        self.assertEqual(no_rebattle_field.marker_calls, [])
+        self.assertEqual(no_rebattle_field.movements, [])
+        self.assertEqual(no_rebattle_field.buttons, [])
+
+        after_seen = Command(
+            {"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"},
+            marker_centered=True)
+        after_state = after_seen._ZA_story_battle_flow_state("TEST")
+        after_state.update(phase="RESULT_SEEN", result_seen=True)
+        self.assertEqual(before(
+            after_seen,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="TEST"), "BEFORE")
+        self.assertEqual(after_seen.marker_calls, [])
+        self.assertEqual(after_seen.movements, [])
+
+        after_function = functions[
+            "ZA_story_Template_battle_after_renda_route"]
+        self.assertFalse(any(
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ZA_markerdir"
+            for node in ast.walk(after_function)))
+
+    def test_za_story_steps_use_renda_route_battle_templates(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        legacy_names = {
+            "ZA_story_Template_battle_before",
+            "ZA_story_Template_battle_function",
+            "ZA_story_Template_battle_after",
+        }
+        legacy_calls = [
+            (node.func.attr, node.lineno)
+            for node in ast.walk(source_tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in legacy_names
+        ]
+        self.assertEqual(legacy_calls, [])
+
+        active_level_names = {
+            "ZA_story_Template_battle_before_active_level",
+            "ZA_story_Template_battle_function_active_level",
+            "ZA_story_Template_battle_after_active_level",
+        }
+        active_level_callers = []
+        for function in (
+                node for node in ast.walk(source_tree)
+                if isinstance(node, ast.FunctionDef)):
+            for call in (
+                    node for node in ast.walk(function)
+                    if isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in active_level_names):
+                active_level_callers.append(
+                    (function.name, call.func.attr))
+        self.assertEqual(active_level_callers, [
+            ("ZA_story_Template_battle_function_renda_route",
+             "ZA_story_Template_battle_function_active_level"),
+        ])
+
+        functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        for function_name, expected_template in (
+                ("_3_story_canari_48",
+                 "ZA_story_Template_battle_before_renda_route"),
+                ("_3_story_canari_49",
+                 "ZA_story_Template_battle_function_renda_route"),
+                ("_3_story_canari_50",
+                 "ZA_story_Template_battle_after_renda_route")):
+            call = next(
+                node for node in ast.walk(functions[function_name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr.startswith("ZA_story_Template_battle_"))
+            self.assertEqual(call.func.attr, expected_template)
+
+        active_function_args = {
+            argument.arg for argument in functions[
+                "ZA_story_Template_battle_function_renda_route"].args.args
+        }
+        active_before_args = {
+            argument.arg for argument in functions[
+                "ZA_story_Template_battle_before_renda_route"].args.args
+        }
+        active_after_args = {
+            argument.arg for argument in functions[
+                "ZA_story_Template_battle_after_renda_route"].args.args
+        }
+        self.assertIn("rebattle", active_before_args)
+        self.assertIn("rebattle", active_function_args)
+        self.assertTrue({
+            "endpicture", "endpicture2", "endpicture3",
+        }.issubset(active_after_args))
+
+        hotel_before_call = next(
+            node for node in ast.walk(functions["_1_story_hote_z_move15"])
+            if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr
+                == "ZA_story_Template_battle_before_renda_route"))
+        hotel_before_options = {
+            keyword.arg: ast.literal_eval(keyword.value)
+            for keyword in hotel_before_call.keywords
+        }
+        self.assertEqual(hotel_before_options["rebattle"], 0)
+
+        # GURI140へ入る前のEVENT接近はbefore（GURI139）が担当する。
+        # battle_function側の未使用引数ではなく、実際の移動時間へ渡す。
+        guri_before_call = next(
+            node for node in ast.walk(functions["_7_story_guri_139"])
+            if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr
+                == "ZA_story_Template_battle_before_renda_route"))
+        guri_before_options = {
+            keyword.arg: ast.literal_eval(keyword.value)
+            for keyword in guri_before_call.keywords
+        }
+        self.assertEqual(guri_before_options["event_move_duration"], 2.0)
+
+        guri_battle_call = next(
+            node for node in ast.walk(functions["_7_story_guri_140"])
+            if (isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr
+                == "ZA_story_Template_battle_function_renda_route"))
+        self.assertNotIn(
+            "rebattle_move_fast",
+            {keyword.arg for keyword in guri_battle_call.keywords})
+
+    def test_za_active_level_after_ignores_completion_until_field(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        selected = [functions[name] for name in (
+            "_ZA_story_battle_flow_state",
+            "_ZA_story_battle_flow_mark",
+            "_ZA_story_battle_flow_reset",
+            "ZA_story_Template_battle_after_active_level",
+        )]
+        module = ast.fix_missing_locations(ast.Module(
+            body=selected, type_ignores=[]))
+        namespace = {"Button": Button}
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            _ZA_story_battle_flow_state = namespace[
+                "_ZA_story_battle_flow_state"]
+            _ZA_story_battle_flow_mark = namespace[
+                "_ZA_story_battle_flow_mark"]
+            _ZA_story_battle_flow_reset = namespace[
+                "_ZA_story_battle_flow_reset"]
+
+            def __init__(self, completion_picture):
+                self.matched = {completion_picture}
+                self.next_matched = [
+                    {"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"},
+                    {"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"},
+                ]
+                self.buttons = []
+                self.alive_checks = 0
+
+            def image_check(self, name):
+                return name in self.matched
+
+            def checkIfAlive(self):
+                self.alive_checks += 1
+
+            def wait(self, _duration):
+                if self.next_matched:
+                    self.matched = self.next_matched.pop(0)
+
+            def pressRep(self, button, **_kwargs):
+                self.buttons.append(button)
+                if self.next_matched:
+                    self.matched = self.next_matched.pop(0)
+
+            @staticmethod
+            def etc_sendCommand(_command):
+                return None
+
+        battle_after = namespace[
+            "ZA_story_Template_battle_after_active_level"]
+        for completion_picture, expected_buttons in (
+                ("POKEMON_ZA_IN_ICON", []),
+                ("POKEMON_ZA_MISSION_COMPLETE", [Button.A])):
+            command = Command(completion_picture)
+            self.assertEqual(battle_after(
+                command, bkprg_ret="BATTLE", prg_ret="NEXT"), "NEXT")
+            self.assertGreaterEqual(command.alive_checks, 3)
+            self.assertEqual(command.buttons, expected_buttons)
+
+    def test_za_renda_route_after_uses_safe_buttons_and_stop_reasons(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        selected = [functions[name] for name in (
+            "_ZA_story_battle_flow_state",
+            "_ZA_story_battle_flow_mark",
+            "_ZA_story_battle_flow_reset",
+            "_ZA_story_battle_after_safe_renda",
+            "ZA_story_Template_battle_after_renda_route",
+        )]
+        module = ast.fix_missing_locations(ast.Module(
+            body=selected, type_ignores=[]))
+        namespace = {"Button": Button}
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            _ZA_story_battle_flow_state = namespace[
+                "_ZA_story_battle_flow_state"]
+            _ZA_story_battle_flow_mark = namespace[
+                "_ZA_story_battle_flow_mark"]
+            _ZA_story_battle_flow_reset = namespace[
+                "_ZA_story_battle_flow_reset"]
+            _ZA_story_battle_after_safe_renda = namespace[
+                "_ZA_story_battle_after_safe_renda"]
+
+            def __init__(self, matched=(), next_frames=()):
+                self.matched = set(matched)
+                self.next_frames = [set(frame) for frame in next_frames]
+                self.buttons = []
+                self.alive_checks = 0
+                self.commands = []
+
+            def image_check(self, name):
+                return name in self.matched
+
+            def checkIfAlive(self):
+                self.alive_checks += 1
+
+            def pressRep(self, button, **_kwargs):
+                self.buttons.append(button)
+                if self.next_frames:
+                    self.matched = self.next_frames.pop(0)
+
+            def wait(self, _duration):
+                return None
+
+            def etc_sendCommand(self, command):
+                self.commands.append(command)
+
+        battle_after = namespace[
+            "ZA_story_Template_battle_after_renda_route"]
+        field = {"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"}
+
+        for first_picture in (
+                set(),
+                {"POKEMON_ZA_MISSION_COMPLETE"},
+                {"POKEMON_ZA_IN_ICON"},
+                {"POKEMON_ZA_TEXT_WHITE_COMMENT"},
+                {"POKEMON_ZA_TEXT_GREEN_COMMENT"},
+                {"POKEMON_ZA_COMMENT_MARKER"},
+                {"POKEMON_ZA_X_MENU_OPEN"},
+                {"POKEMON_ZA_CHAT_MARKER"},
+                {"POKEMON_ZA_COIN_ICON"}):
+            command = Command(first_picture, [field])
+            self.assertEqual(battle_after(
+                command, bkprg_ret="BATTLE", prg_ret="NEXT"), "NEXT")
+            self.assertEqual(command.buttons, [Button.B])
+
+        selection = Command({"POKEMON_ZA_1_SELECT"}, [field])
+        self.assertEqual(battle_after(
+            selection, bkprg_ret="BATTLE", prg_ret="NEXT"), "NEXT")
+        self.assertEqual(selection.buttons, [Button.A])
+
+        for time_picture in ("POKEMON_ZA_MORNING", "POKEMON_ZA_NIGHT"):
+            time_change = Command({time_picture}, [field])
+            self.assertEqual(battle_after(
+                time_change,
+                bkprg_ret="BATTLE", prg_ret="NEXT"), "NEXT")
+            self.assertEqual(time_change.buttons, [Button.A])
+
+        help_over_end = Command(
+            {"POKEMON_ZA_HELP_MARKER", "CUSTOM_END"},
+            [{"CUSTOM_END"}])
+        self.assertEqual(battle_after(
+            help_over_end,
+            bkprg_ret="BATTLE", prg_ret="NEXT",
+            endpicture="CUSTOM_END"), "NEXT")
+        self.assertEqual(help_over_end.buttons, [Button.A])
+
+        explicit_end = Command({"CUSTOM_END"})
+        self.assertEqual(battle_after(
+            explicit_end,
+            bkprg_ret="BATTLE", prg_ret="NEXT",
+            endpicture="CUSTOM_END"), "NEXT")
+        self.assertEqual(explicit_end.buttons, [])
+
+        select_as_end = Command({"POKEMON_ZA_4_SELECT"})
+        self.assertEqual(battle_after(
+            select_as_end,
+            bkprg_ret="BATTLE", prg_ret="NEXT",
+            endpicture="POKEMON_ZA_4_SELECT"), "NEXT")
+        self.assertEqual(select_as_end.buttons, [])
+
+        active_level = Command({"POKEMON_ZA_BATTLE_ACTIVE_LEVEL"})
+        self.assertEqual(battle_after(
+            active_level,
+            bkprg_ret="BATTLE", prg_ret="NEXT",
+            battle_flow_key="ACTIVE_TEST"), "BATTLE")
+        active_state = active_level._ZA_story_battle_flow_state("ACTIVE_TEST")
+        self.assertEqual(active_state["phase"], "ACTIVE_SEEN")
+        self.assertTrue(active_state["active_seen"])
+        self.assertFalse(active_state["result_seen"])
+        self.assertEqual(active_level.buttons, [])
+
+        black_defeat = Command(
+            {"POKEMON_ZA_TEXT_BLACK_COMMENT"}, [field])
+        self.assertEqual(battle_after(
+            black_defeat,
+            bkprg_ret="BEFORE", prg_ret="NEXT",
+            battle_flow_key="BLACK_TEST",
+            black_comment_is_defeat=True), "BEFORE")
+        black_state = black_defeat._ZA_story_battle_flow_state("BLACK_TEST")
+        self.assertEqual(black_state["phase"], "RETRY_ENTRY")
+        self.assertFalse(black_state["active_seen"])
+        self.assertFalse(black_state["result_seen"])
+        self.assertEqual(black_defeat.buttons, [Button.B])
+
+        confirmed_victory_black = Command(
+            {"POKEMON_ZA_TEXT_BLACK_COMMENT"}, [field])
+        confirmed_victory_state = (
+            confirmed_victory_black._ZA_story_battle_flow_state(
+                "CONFIRMED_W_VICTORY"))
+        confirmed_victory_state.update(
+            phase="RESULT_SEEN", active_seen=True, result_seen=True)
+        self.assertEqual(battle_after(
+            confirmed_victory_black,
+            bkprg_ret="2_STORY_W_LANK_MOVE11",
+            prg_ret="2_STORY_ABSOL_MOVE1",
+            battle_flow_key="CONFIRMED_W_VICTORY",
+            black_comment_is_defeat=True), "2_STORY_ABSOL_MOVE1")
+        self.assertEqual(confirmed_victory_black.buttons, [Button.B])
+
+        persistent_black_item = Command(
+            {"POKEMON_ZA_TEXT_BLACK_COMMENT"},
+            [{"POKEMON_ZA_TEXT_BLACK_COMMENT"}] * 10 + [field])
+        persistent_item_state = (
+            persistent_black_item._ZA_story_battle_flow_state(
+                "BLACK_ITEM_TEST"))
+        self.assertEqual(battle_after(
+            persistent_black_item,
+            bkprg_ret="BEFORE", prg_ret="NEXT",
+            battle_flow_key="BLACK_ITEM_TEST",
+            black_comment_is_defeat=True), "NEXT")
+        self.assertEqual(
+            persistent_black_item.buttons,
+            [Button.B] * 10 + [Button.A])
+        self.assertEqual(persistent_item_state["phase"], "RESULT_SEEN")
+        self.assertTrue(persistent_item_state["result_seen"])
+
+        black_dialogue = Command(
+            {"POKEMON_ZA_TEXT_BLACK_COMMENT"}, [field])
+        self.assertEqual(battle_after(
+            black_dialogue,
+            bkprg_ret="BATTLE", prg_ret="NEXT"), "NEXT")
+        self.assertEqual(black_dialogue.buttons, [Button.B])
+
+    def test_za_mission_complete_requires_three_of_four_letter_regions(self):
+        profile_path = os.path.join(
+            SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
+        with open(profile_path, "r", encoding="utf-8") as stream:
+            library = json.load(stream)
+        target = library["targets"]["POKEMON_ZA_MISSION_COMPLETE"]
+        variants = target["variants"]
+        self.assertEqual(target["operator"], "AT_LEAST_3")
+        self.assertEqual(len(variants), 4)
+        self.assertEqual(
+            [variant["template_path"] for variant in variants],
+            ["Template/ZA_Story/Common/POKEMON_ZA_MISSION_COMPLETE_C.png",
+             "Template/ZA_Story/Common/POKEMON_ZA_MISSION_COMPLETE_M.png",
+             "Template/ZA_Story/Common/POKEMON_ZA_MISSION_COMPLETE_P.png",
+             "Template/ZA_Story/Common/POKEMON_ZA_MISSION_COMPLETE_T.png"])
+        self.assertTrue(all(
+            "template_crop" not in variant for variant in variants))
+        self.assertTrue(all(os.path.isfile(os.path.join(
+            SERIAL_CONTROLLER, variant["template_path"]))
+            for variant in variants))
+        self.assertTrue(all(
+            variant["threshold"] == 0.5 and variant["use_gray"]
+            for variant in variants))
+
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        embedded_targets = []
+        for node in ast.walk(source_tree):
+            value = None
+            if (isinstance(node, ast.Assign)
+                    and any(isinstance(target, ast.Name)
+                            and target.id == "IMAGE_DETECTION_TARGETS"
+                            for target in node.targets)):
+                value = node.value
+            elif (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "IMAGE_DETECTION_TARGETS"
+                    and node.func.attr == "update"
+                    and node.args):
+                value = node.args[0]
+            if value is None:
+                continue
+            target_map = ast.literal_eval(value)
+            if "POKEMON_ZA_MISSION_COMPLETE" in target_map:
+                embedded_targets.append(
+                    target_map["POKEMON_ZA_MISSION_COMPLETE"])
+        self.assertGreaterEqual(len(embedded_targets), 2)
+        self.assertTrue(all(target == variants for target in embedded_targets))
+
+        embedded_operators = []
+        for node in ast.walk(source_tree):
+            value = None
+            if (isinstance(node, ast.Assign)
+                    and any(isinstance(target_node, ast.Name)
+                            and target_node.id == "IMAGE_DETECTION_OPERATORS"
+                            for target_node in node.targets)):
+                value = node.value
+            elif (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "IMAGE_DETECTION_OPERATORS"
+                    and node.func.attr == "update"
+                    and node.args):
+                value = node.args[0]
+            if value is None:
+                continue
+            operator_map = ast.literal_eval(value)
+            if "POKEMON_ZA_MISSION_COMPLETE" in operator_map:
+                embedded_operators.append(
+                    operator_map["POKEMON_ZA_MISSION_COMPLETE"])
+        self.assertGreaterEqual(len(embedded_operators), 2)
+        self.assertTrue(all(
+            operator == "AT_LEAST_3" for operator in embedded_operators))
+
+    def test_za_reibi_skill_crop_covers_the_selected_machine_row(self):
+        profile_path = os.path.join(
+            SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
+        with open(profile_path, "r", encoding="utf-8") as stream:
+            library = json.load(stream)
+        variants = library["targets"]["POKEMON_ZA_REIBI_SKILL"]["variants"]
+        self.assertEqual(variants[0]["crop"], [40, 200, 320, 550])
+
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        embedded_targets = []
+        for node in ast.walk(source_tree):
+            value = None
+            if (isinstance(node, ast.Assign)
+                    and any(isinstance(target, ast.Name)
+                            and target.id == "IMAGE_DETECTION_TARGETS"
+                            for target in node.targets)):
+                value = node.value
+            elif (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "IMAGE_DETECTION_TARGETS"
+                    and node.func.attr == "update"
+                    and node.args):
+                value = node.args[0]
+            if value is None:
+                continue
+            target_map = ast.literal_eval(value)
+            if "POKEMON_ZA_REIBI_SKILL" in target_map:
+                embedded_targets.append(target_map["POKEMON_ZA_REIBI_SKILL"])
+        self.assertGreaterEqual(len(embedded_targets), 1)
+        self.assertTrue(all(target == variants for target in embedded_targets))
+
+    def test_za_evolution_prioritizes_status_over_false_3_select(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_CommonPokemonManagement",
+            "ZA_CommonPokemonManagement.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        function_names = {
+            "ZA_common_evolution_exec", "ZA_common_evolution_loop"}
+        source_functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in function_names
+        }
+        fragment_functions = {
+            node.name: node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in function_names
+        }
+        for name in function_names:
+            self.assertEqual(
+                ast.dump(source_functions[name], include_attributes=False),
+                ast.dump(fragment_functions[name], include_attributes=False),
+                name)
+
+        target_assignment = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "IMAGE_DETECTION_TARGETS"
+                    for target in node.targets))
+        targets = ast.literal_eval(target_assignment.value)
+        evolution_confirm = targets["POKEMON_ZA_EVOLUTION_CONFIRM"][0]
+        self.assertEqual(evolution_confirm["crop"], [880, 380, 1220, 580])
+        self.assertEqual(evolution_confirm["threshold"], 0.8)
+        self.assertEqual(
+            evolution_confirm["template_path"],
+            "Template/ZA_Story/Common/evolution_2_select.png")
+
+        module = ast.fix_missing_locations(ast.Module(
+            body=list(source_functions.values()), type_ignores=[]))
+        namespace = {"Button": Button}
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            def __init__(self, matched):
+                self.matched = set(matched)
+                self.checked = []
+                self.buttons = []
+
+            def image_check(self, name):
+                self.checked.append(name)
+                return name in self.matched
+
+            def pressRep(self, button, **_kwargs):
+                self.buttons.append(button)
+
+            @staticmethod
+            def wait(_duration):
+                return None
+
+        execute = namespace["ZA_common_evolution_exec"]
+        cases = (
+            ({"POKEMON_ZA_EVOLUTION_CONFIRM", "POKEMON_ZA_X_MENU_OPEN"},
+             Button.A),
+            ({"POKEMON_ZA_2_SELECT", "POKEMON_ZA_X_MENU_OPEN"},
+             Button.A),
+            ({"POKEMON_ZA_SKILL_PAGE_WINDOW", "POKEMON_ZA_3_SELECT"},
+             Button.B),
+            ({"POKEMON_ZA_X_MENU_OPEN", "POKEMON_ZA_3_SELECT"},
+             Button.B),
+            ({"POKEMON_ZA_X_MENU_EVO_MENU", "POKEMON_ZA_3_SELECT"},
+             Button.A),
+            ({"POKEMON_ZA_3_SELECT"}, Button.A),
+        )
+        for matched, expected_button in cases:
+            with self.subTest(matched=matched):
+                command = Command(matched)
+                self.assertEqual(
+                    execute(command), "COMMON_EVOLUTION_EXEC")
+                self.assertEqual(command.buttons, [expected_button])
+                if ("POKEMON_ZA_3_SELECT" in matched
+                        and matched != {"POKEMON_ZA_3_SELECT"}):
+                    self.assertNotIn(
+                        "POKEMON_ZA_3_SELECT", command.checked)
+
+        class DelayedConfirmation(Command):
+            def __init__(self):
+                super().__init__({"POKEMON_ZA_X_MENU_OPEN"})
+                self.select_checks = 0
+                self.waits = []
+
+            def image_check(self, name):
+                self.checked.append(name)
+                if name == "POKEMON_ZA_2_SELECT":
+                    self.select_checks += 1
+                    return self.select_checks >= 2
+                return name in self.matched
+
+            def wait(self, duration):
+                self.waits.append(duration)
+
+        delayed = DelayedConfirmation()
+        self.assertEqual(execute(delayed), "COMMON_EVOLUTION_EXEC")
+        self.assertEqual(delayed.buttons, [Button.A])
+        self.assertEqual(delayed.select_checks, 2)
+        self.assertEqual(delayed.waits, [0.1, 0.5])
+
+        completed = Command({"POKEMON_ZA_TEXT_BLACK_COMMENT"})
+        self.assertEqual(
+            execute(completed), "COMMON_EVOLUTION_LOOP")
+        self.assertEqual(completed.buttons, [])
+
+        loop = namespace["ZA_common_evolution_loop"]
+        status_with_field = Command({
+            "POKEMON_ZA_SKILL_PAGE_WINDOW",
+            "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_1",
+        })
+        self.assertEqual(
+            loop(status_with_field), "COMMON_EVOLUTION_LOOP")
+        self.assertEqual(status_with_field.buttons, [Button.B])
+        field = Command({"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_1"})
+        self.assertEqual(loop(field), "COMMON_EVOLUTION_END")
 
     def test_za_no_battle_hard_guard_supports_mode_zero_and_one_exceptions(self):
         source_path = os.path.join(
@@ -3426,6 +13657,35 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
 
 class ImageDetectionDetailTests(unittest.TestCase):
+    def test_template_crop_matches_only_the_requested_letter_region(self):
+        template = numpy.array(
+            [[[10 + x * 19, 30 + y * 17, 40 + (x + y) * 13]
+              for x in range(8)] for y in range(6)], dtype=numpy.uint8)
+        frame = numpy.zeros((60, 70, 3), dtype=numpy.uint8)
+        frame[22:28, 31:35] = template[:, 4:8]
+
+        class CameraStub:
+            def readFreshFrame(self, timeout=0.75):
+                return frame.copy()
+
+        command = types.SimpleNamespace(camera=CameraStub())
+        with tempfile.TemporaryDirectory() as root:
+            template_path = os.path.join(root, "complete.png")
+            self.assertTrue(cv2.imwrite(template_path, template))
+            detail = detect_image(
+                command,
+                name="COMPLETE_LETTERS",
+                template_path=template_path,
+                template_crop=[4, 0, 8, 6],
+                crop=[20, 10, 50, 40],
+                threshold=0.99,
+                use_gray=False,
+                show_position=False)
+
+        self.assertTrue(detail["matched"])
+        self.assertEqual(detail["position"], (31, 22))
+        self.assertEqual(detail["template_size"], (4, 6))
+
     def test_excluded_region_removes_matches_crossing_its_border(self):
         template = numpy.array(
             [[[10 + x * 17, 20 + y * 23, 30 + (x + y) * 11]
@@ -3546,6 +13806,40 @@ class ImageHealthCheckTests(unittest.TestCase):
             }]}}, "lists": {}}
         source = generate_image_check(data, "TEXT_COLOR", "target")
         self.assertIn("detect_settings.pop('health_ignored_warnings', None)", source)
+
+    def test_generated_image_check_supports_three_of_four_variants(self):
+        data = {"targets": {"COMPLETE": {
+            "operator": "AT_LEAST_3", "description": "", "variants": [
+                {"template_path": "part{}.png".format(index)}
+                for index in range(4)
+            ]}}, "lists": {}}
+        source = generate_image_check(data, "COMPLETE", "target")
+        outcomes = iter((True, False, True, True))
+
+        class History:
+            pass
+
+        def fake_detect(_command, **_settings):
+            matched = next(outcomes)
+            return {
+                "matched": matched,
+                "score": 1.0 if matched else 0.0,
+                "threshold": 0.8,
+            }
+
+        namespace = {
+            "SimilarityHistory": History,
+            "detect_image": fake_detect,
+        }
+        exec(compile(source, "<generated-three-of-four>", "exec"),
+             namespace)
+
+        dummy = types.SimpleNamespace(
+            IMAGE_DETECTION_TARGETS=namespace["IMAGE_DETECTION_TARGETS"],
+            IMAGE_DETECTION_OPERATORS=namespace[
+                "IMAGE_DETECTION_OPERATORS"])
+        self.assertTrue(namespace["_image_check_target"](
+            dummy, "COMPLETE"))
 
     def test_generated_image_check_waits_for_fresh_camera_without_crashing(self):
         data = {"targets": {"FIELD": {
@@ -3944,6 +14238,53 @@ class CommandRecoveryScriptTests(unittest.TestCase):
         def writeRow(self, row, is_show=False, priority=False):
             self.rows.append((row, bool(priority)))
 
+    @staticmethod
+    def _loop_recovery_app():
+        from Window import PokeControllerApp
+
+        class RecoveryTarget:
+            def __init__(self):
+                self.alive = True
+                self.NAME = "Story"
+                self.pause_requested = False
+                self.pause_count = 0
+                self.STATE_1_STORY_FUNCTION = {"A": None, "B": None, "C": None}
+                self._1_story_current_state = "A"
+
+            def request_pause(self):
+                self.pause_requested = True
+                self.pause_count += 1
+
+        command = RecoveryTarget()
+        alerts = []
+        releases = []
+        app = types.SimpleNamespace(
+            cur_command=command,
+            _command_recovery_detector_command=None,
+            _command_recovery_timeline=CommandStateTimeline(loop_cycles=3),
+            _command_recovery_input_tracker=CommandInputActivityTracker(60.0),
+            _command_recovery_last_check=0.0,
+            _command_recovery_executor=None,
+            _command_recovery_context_command=None,
+            _command_recovery_loop_pause_command=None,
+            _command_recovery_loop_pause_cycle=None,
+            _command_recovery_paused_command=None,
+            _command_recovery_resume_when_safe=False,
+            _commands_dark_safety_paused_command=None,
+            _command_recovery_window_exists=lambda: False,
+            _command_recovery_context_text=lambda target: target.NAME,
+            _release_command_input_for_dark_pause=lambda target: releases.append(target),
+        )
+
+        def show(reason, **options):
+            alerts.append((reason, options))
+            if options.get("pause_command"):
+                PokeControllerApp._claim_command_recovery_pause(app, command)
+            return True
+
+        app._show_command_recovery_window = show
+        return app, command, alerts, releases
+
     def test_favorite_create_edit_delete_and_validation(self):
         scripts = save_recovery_favorite(
             [], "メニューを閉じる", "press(Button.B)")
@@ -4040,8 +14381,128 @@ class CommandRecoveryScriptTests(unittest.TestCase):
         self.assertTrue(triggered)
         self.assertEqual(len(alerts), 1)
         self.assertIn("Stepループ", alerts[0][0])
+        self.assertIn("一時停止しますか？", alerts[0][0])
         self.assertTrue(alerts[0][1]["automatic"])
-        self.assertTrue(alerts[0][1]["pause_command"])
+        self.assertFalse(alerts[0][1]["pause_command"])
+
+    def test_three_cycle_notice_can_pause_at_next_complete_loop(self):
+        from Window import PokeControllerApp
+
+        app, command, alerts, releases = self._loop_recovery_app()
+        for index, value in enumerate(("A", "B", "A", "B", "A", "B"), start=1):
+            command._1_story_current_state = value
+            PokeControllerApp._poll_command_recovery_alerts(
+                app, now=float(index), running=True)
+        self.assertEqual(command.pause_count, 0)
+        self.assertEqual(len(alerts), 1)
+        self.assertTrue(PokeControllerApp.pause_command_on_next_loop(app))
+        self.assertEqual(app._command_recovery_loop_pause_cycle, 4)
+
+        command._1_story_current_state = "A"
+        self.assertFalse(PokeControllerApp._poll_command_recovery_alerts(
+            app, now=7.0, running=True))
+        self.assertEqual(command.pause_count, 0)
+        command._1_story_current_state = "B"
+        self.assertTrue(PokeControllerApp._poll_command_recovery_alerts(
+            app, now=8.0, running=True))
+        self.assertEqual(command.pause_count, 1)
+        self.assertEqual(releases, [command])
+        self.assertIn("予約した次", alerts[-1][0])
+
+    def test_unhandled_loop_does_not_pause_without_confirmation(self):
+        from Window import PokeControllerApp
+
+        app, command, alerts, releases = self._loop_recovery_app()
+        now = 0.0
+        for cycle in range(1, 31):
+            for value in ("A", "B"):
+                now += 1.0
+                command._1_story_current_state = value
+                triggered = PokeControllerApp._poll_command_recovery_alerts(
+                    app, now=now, running=True)
+            self.assertEqual(command.pause_count, 0, cycle)
+        self.assertFalse(triggered)
+        self.assertEqual(command.pause_count, 0)
+        self.assertEqual(releases, [])
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("一時停止しますか？", alerts[0][0])
+
+    def test_confirmed_loop_can_alert_again_after_resume(self):
+        from Window import PokeControllerApp
+
+        app, command, alerts, releases = self._loop_recovery_app()
+        now = 0.0
+        for value in ("A", "B", "A", "B", "A", "B"):
+            now += 1.0
+            command._1_story_current_state = value
+            PokeControllerApp._poll_command_recovery_alerts(
+                app, now=now, running=True)
+        self.assertEqual(len(alerts), 1)
+        self.assertTrue(PokeControllerApp.pause_command_on_next_loop(app))
+
+        for value in ("A", "B"):
+            now += 1.0
+            command._1_story_current_state = value
+            PokeControllerApp._poll_command_recovery_alerts(
+                app, now=now, running=True)
+        self.assertEqual(command.pause_count, 1)
+        self.assertTrue(PokeControllerApp.resume_command_after_recovery(
+            app, wait_for_visual=False))
+
+        for value in ("A", "B", "A", "B", "A", "B"):
+            now += 1.0
+            command._1_story_current_state = value
+            triggered = PokeControllerApp._poll_command_recovery_alerts(
+                app, now=now, running=True)
+        self.assertTrue(triggered)
+        self.assertEqual(command.pause_count, 1)
+        self.assertEqual(releases, [command])
+        self.assertEqual(len(alerts), 3)
+        self.assertIn("一時停止しますか？", alerts[-1][0])
+        self.assertFalse(alerts[-1][1]["pause_command"])
+
+    def test_loop_alerts_again_after_leaving_and_reentering(self):
+        from Window import PokeControllerApp
+
+        app, command, alerts, releases = self._loop_recovery_app()
+        now = 0.0
+        for value in ("A", "B", "A", "B", "A", "B"):
+            now += 1.0
+            command._1_story_current_state = value
+            PokeControllerApp._poll_command_recovery_alerts(
+                app, now=now, running=True)
+        self.assertEqual(len(alerts), 1)
+
+        now += 1.0
+        command._1_story_current_state = "C"
+        self.assertFalse(PokeControllerApp._poll_command_recovery_alerts(
+            app, now=now, running=True))
+        for value in ("A", "B", "A", "B", "A", "B"):
+            now += 1.0
+            command._1_story_current_state = value
+            triggered = PokeControllerApp._poll_command_recovery_alerts(
+                app, now=now, running=True)
+        self.assertTrue(triggered)
+        self.assertEqual(command.pause_count, 0)
+        self.assertEqual(releases, [])
+        self.assertEqual(len(alerts), 2)
+        self.assertIn("一時停止しますか？", alerts[-1][0])
+
+    def test_leaving_loop_cancels_next_boundary_pause_request(self):
+        from Window import PokeControllerApp
+
+        app, command, _alerts, _releases = self._loop_recovery_app()
+        for index, value in enumerate(("A", "B", "A", "B", "A", "B"), start=1):
+            command._1_story_current_state = value
+            PokeControllerApp._poll_command_recovery_alerts(
+                app, now=float(index), running=True)
+        self.assertTrue(PokeControllerApp.pause_command_on_next_loop(app))
+        command._1_story_current_state = "C"
+        self.assertFalse(PokeControllerApp._poll_command_recovery_alerts(
+            app, now=7.0, running=True))
+        self.assertIsNone(app._command_recovery_loop_pause_command)
+        self.assertIsNone(app._command_recovery_loop_pause_cycle)
+        self.assertEqual(command.pause_count, 0)
 
     def test_key_inactivity_alone_never_pauses_commands(self):
         from Window import PokeControllerApp
@@ -4224,6 +14685,275 @@ class CommandRecoveryScriptTests(unittest.TestCase):
         self.assertIn("30_move", window.status.get())
 
 
+class CommandFocusRepairTests(unittest.TestCase):
+    def test_worker_focus_trace_keeps_short_target_call_lines_and_return(self):
+        command = PythonCommand()
+        ready = threading.Event()
+        begin = threading.Event()
+
+        def focused_battle_function():
+            # The request is serviced after this target is already active;
+            # the tracer must attach to the in-flight caller as well.
+            command._service_execution_path_trace()
+            value = 1
+            value += 2
+            return value
+
+        def unrelated_helper():
+            return 99
+
+        def worker_body():
+            command.thread = threading.current_thread()
+            ready.set()
+            begin.wait(1.0)
+            focused_battle_function()
+            unrelated_helper()
+            # checkIfAlive() clears this before do_safe() reaches finally.
+            command.thread = None
+            command._finish_focus_repair_trace()
+
+        worker = threading.Thread(target=worker_body)
+        command.thread = worker
+        project = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        # PokeCon arms the focused trace immediately before start().
+        self.assertTrue(command.request_focus_repair_trace(
+            ["self.focused_battle_function"], project_root=project))
+        worker.start()
+        try:
+            self.assertTrue(ready.wait(1.0))
+            begin.set()
+            worker.join(2.0)
+            trace = command.focus_repair_trace_snapshot(drain=True)
+            self.assertTrue(trace["complete"])
+            self.assertEqual(trace["dropped"], 0)
+            self.assertTrue(trace["events"])
+            self.assertEqual({event["focus_function"]
+                              for event in trace["events"]},
+                             {"focused_battle_function"})
+            phases = [event["phase"] for event in trace["events"]]
+            self.assertIn("call", phases)
+            self.assertIn("line", phases)
+            self.assertIn("return", phases)
+            self.assertEqual(
+                command.focus_repair_trace_snapshot(drain=True)["events"], [])
+        finally:
+            begin.set()
+            worker.join(2.0)
+
+    def test_focus_targets_accept_self_prefix_and_preserve_order(self):
+        self.assertEqual(parse_focus_function_targets(
+            "self.ZA_story_Template_battle_before(), "
+            "self.ZA_story_Template_battle_function;\n"
+            "ZA_story_Template_battle_before"), [
+                "ZA_story_Template_battle_before",
+                "ZA_story_Template_battle_function",
+            ])
+
+    def test_focus_match_finds_outer_target_in_recorded_stack(self):
+        location = {
+            "function": "wait",
+            "stack": [
+                {"function": "wait"},
+                {"function": "ZA_story_Template_battle_function"},
+                {"function": "main"},
+            ],
+        }
+        self.assertEqual(matching_focus_functions(location, [
+            "ZA_story_Template_battle_before",
+            "ZA_story_Template_battle_function",
+        ]), ["ZA_story_Template_battle_function"])
+
+    def test_focus_segments_keep_locationless_events_and_split_target_changes(self):
+        def event(index, at, function="", kind="execution"):
+            return {
+                "index": index, "video_time": at, "event": kind,
+                "step_text": "STEP_{}".format(index),
+                "location": {"function": function, "file": "story.py", "line": index}
+                if function else {},
+            }
+
+        events = [
+            event(1, 0.0, "ZA_story_Template_battle_before"),
+            event(2, 0.5, "", "variable_watch"),
+            event(3, 1.0, "ZA_story_Template_battle_function"),
+            event(4, 3.0, "outside"),
+            event(5, 4.0, "ZA_story_Template_battle_before"),
+        ]
+        segments = build_focus_segments(events, [
+            "ZA_story_Template_battle_before",
+            "ZA_story_Template_battle_function",
+        ], duration=5.0)
+        self.assertEqual(
+            [(item["function"], item["start_time"], item["end_time"])
+             for item in segments], [
+                ("ZA_story_Template_battle_before", 0.0, 1.0),
+                ("ZA_story_Template_battle_function", 1.0, 3.0),
+                ("ZA_story_Template_battle_before", 4.0, 5.0),
+            ])
+        self.assertEqual(segments[0]["event_count"], 2)
+
+    def test_exact_focus_return_closes_segment_without_later_stack_sample(self):
+        events = [
+            {
+                "index": 1, "video_time": 1.0, "event": "focus_call",
+                "focus_function": "battle_before",
+                "focus_trace": True,
+                "focus_trace_phase": "call",
+                "location": {"function": "battle_before", "line": 10},
+            },
+            {
+                "index": 2, "video_time": 1.2, "event": "focus_line",
+                "focus_function": "battle_before",
+                "focus_trace": True,
+                "focus_trace_phase": "line",
+                "location": {"function": "battle_before", "line": 11},
+            },
+            {
+                "index": 3, "video_time": 1.3, "event": "focus_return",
+                "focus_function": "battle_before",
+                "focus_trace": True,
+                "focus_trace_phase": "return",
+                "location": {"function": "battle_before", "line": 12},
+            },
+        ]
+        segments = build_focus_segments(
+            events, ["battle_before"], duration=10.0)
+        self.assertEqual(len(segments), 1)
+        self.assertEqual(segments[0]["start_time"], 1.0)
+        self.assertEqual(segments[0]["end_time"], 1.3)
+
+    def test_nested_exact_targets_keep_overlapping_outer_interval(self):
+        def exact(index, at, function, phase, depth=1):
+            return {
+                "index": index, "video_time": at,
+                "event": "focus_" + phase,
+                "focus_function": function,
+                "focus_trace": True,
+                "focus_trace_phase": phase,
+                "focus_trace_depth": depth,
+                "location": {"function": function, "line": index},
+            }
+
+        events = [
+            exact(1, 1.0, "battle_before", "call"),
+            exact(2, 1.1, "battle_before", "line"),
+            exact(3, 1.2, "battle_function", "call"),
+            exact(4, 1.5, "battle_function", "return"),
+            exact(5, 1.6, "battle_before", "line"),
+            exact(6, 2.0, "battle_before", "return"),
+        ]
+        segments = build_focus_segments(
+            events, ["battle_before", "battle_function"], duration=3.0)
+        self.assertEqual([
+            (segment["function"], segment["start_time"], segment["end_time"])
+            for segment in segments
+        ], [
+            ("battle_before", 1.0, 2.0),
+            ("battle_function", 1.2, 1.5),
+        ])
+
+    def test_focus_report_and_export_keep_video_source_step_and_notes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            snapshot_dir = os.path.join(folder, "source_snapshots")
+            os.makedirs(snapshot_dir)
+            snapshot = os.path.join(snapshot_dir, "story.py")
+            with open(snapshot, "w", encoding="utf-8") as stream:
+                stream.write(
+                    "class Story:\n"
+                    "    def ZA_story_Template_battle_before(self):\n"
+                    "        return 'NEXT_STEP'\n"
+                    "\n"
+                    "    def helper(self):\n"
+                    "        pass\n")
+            metadata = {
+                "command": "ZA_story",
+                "duration": 4.0,
+                "states": ["STEP_A"],
+                "focus_repair": {
+                    "enabled": True,
+                    "targets": ["ZA_story_Template_battle_before"],
+                    "matched_functions": ["ZA_story_Template_battle_before"],
+                },
+            }
+            with open(os.path.join(folder, "command_monitor.json"),
+                      "w", encoding="utf-8") as stream:
+                json.dump(metadata, stream)
+            events = [
+                {
+                    "event": "execution", "video_time": 0.5,
+                    "step_path": "STEP_A",
+                    "location": {
+                        "file": snapshot, "function": "helper", "line": 6,
+                        "snapshot": "source_snapshots/story.py",
+                        "stack": [{
+                            "file": snapshot,
+                            "function": "ZA_story_Template_battle_before",
+                            "line": 3,
+                            "source": "return 'NEXT_STEP'",
+                            "snapshot": "source_snapshots/story.py",
+                        }],
+                    },
+                },
+                {
+                    "event": "execution", "video_time": 2.5,
+                    "step_path": "STEP_B",
+                    "location": {
+                        "file": snapshot, "function": "outside", "line": 1,
+                        "snapshot": "source_snapshots/story.py",
+                    },
+                },
+            ]
+            with open(os.path.join(folder, "steps.jsonl"),
+                      "w", encoding="utf-8") as stream:
+                for item in events:
+                    stream.write(json.dumps(item) + "\n")
+            with open(os.path.join(folder, "recording.avi"), "wb") as stream:
+                stream.write(b"test avi")
+
+            request = load_focus_request(folder)
+            self.assertEqual(request["targets"], [
+                "ZA_story_Template_battle_before"])
+            report = build_focus_report(folder, request["targets"])
+            self.assertEqual(len(report["segments"]), 1)
+            self.assertEqual(report["segments"][0]["start_time"], 0.5)
+            self.assertEqual(report["segments"][0]["end_time"], 2.5)
+            self.assertIn("return 'NEXT_STEP'", report["sources"][
+                "ZA_story_Template_battle_before"]["text"])
+            segment_id = report["segments"][0]["id"]
+            request["global_request"] = "誤った戻り先を調べてください。"
+            request["annotations"] = {
+                segment_id: {
+                    "expected_step": "NEXT_STEP",
+                    "status": "確認中",
+                    "issue": "STEP_BではなくNEXT_STEPへ進むべきです。",
+                },
+            }
+            save_focus_request(folder, request)
+            prompt = build_focus_prompt(report, request)
+            self.assertIn("NEXT_STEP", prompt)
+            self.assertIn("00:00.500", prompt)
+            self.assertIn("return 'NEXT_STEP'", prompt)
+
+            class Completed:
+                returncode = 0
+                stderr = ""
+
+            def fake_ffmpeg(command, **_kwargs):
+                with open(command[-1], "wb") as stream:
+                    stream.write(b"x" * 2048)
+                return Completed()
+
+            exported = export_focus_bundle(
+                report, request, ffmpeg_path="ffmpeg",
+                run_command=fake_ffmpeg,
+                now=datetime.datetime(2026, 8, 24, 12, 0, 0))
+            self.assertTrue(os.path.isfile(exported["prompt_path"]))
+            self.assertTrue(os.path.isfile(exported["manifest_path"]))
+            self.assertIn(segment_id, exported["clip_paths"])
+            self.assertTrue(os.path.isfile(os.path.join(
+                exported["destination"], exported["clip_paths"][segment_id])))
+
+
 class CommandMonitorRecordingTests(unittest.TestCase):
     def test_command_stop_recording_choice_does_not_wait_for_worker_exit(self):
         source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
@@ -4346,6 +15076,7 @@ class CommandMonitorRecordingTests(unittest.TestCase):
 
         command = object()
         calls = []
+        popup_values = []
         dummy = types.SimpleNamespace(
             record_monitor_auto_arm=Value(True),
             record_mode=Value("Template"),
@@ -4356,7 +15087,8 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             _recording_normal_mode="Manual",
             _select_recording_mode_page=lambda: calls.append("select"),
             _arm_command_monitor_recording=lambda show_popup: (
-                setattr(dummy, "record_armed", True) or True),
+                popup_values.append(show_popup)
+                or setattr(dummy, "record_armed", True) or True),
             _command_monitor_begin_session=lambda value: calls.append(value),
             show_output=lambda *_args, **_kwargs: None,
         )
@@ -4364,6 +15096,32 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         self.assertEqual(dummy.record_mode.get(), "CommandMonitor")
         self.assertEqual(dummy._command_monitor_previous_record_mode, "Template")
         self.assertEqual(calls, ["select", command])
+        self.assertEqual(popup_values, [False])
+
+    def test_commands_exposes_stop_before_automatic_monitor_setup(self):
+        source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        methods = {
+            item.name: item for node in module.body
+            if isinstance(node, ast.ClassDef) for item in node.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name in ("startPlay", "startShortcutPlay")
+        }
+
+        def call_line(method, name):
+            return min(
+                node.lineno for node in ast.walk(method)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == name)
+
+        for method in methods.values():
+            ui_line = call_line(method, "_set_command_running_ui")
+            self.assertLess(
+                ui_line, call_line(method, "_auto_arm_command_monitor_recording"))
+            self.assertLess(ui_line, call_line(method, "start"))
 
     def test_command_stop_recording_choice_is_consumed_only_once(self):
         source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
@@ -4419,6 +15177,105 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         visible, page, page_count = timeline_page(events, page=19, page_size=500)
         self.assertEqual((page, page_count, len(visible)), (19, 20, 500))
         self.assertEqual(visible[-1]["index"], 10000)
+
+    def test_execution_path_can_show_only_the_recorded_commands_source(self):
+        source = os.path.abspath(os.path.join("Commands", "Story.py"))
+        framework = os.path.abspath(os.path.join(
+            "Commands", "PythonCommandBase.py"))
+        metadata = {"source": {"file": source}}
+        events = [{
+            "index": 1,
+            "event": "execution_path",
+            "location": {
+                "file": framework, "function": "checkIfAlive", "line": 10,
+                "stack": [{"file": source, "function": "step", "line": 50}],
+            },
+        }, {
+            "index": 2,
+            "event": "execution_path",
+            "location": {
+                "file": source, "function": "step", "line": 51,
+            },
+        }]
+
+        self.assertEqual(command_source_file(metadata), source)
+        self.assertFalse(event_is_in_source(events[0], source))
+        self.assertTrue(event_is_in_source(events[1], source))
+        self.assertEqual(
+            [event["index"] for event in filtered_timeline(
+                events, source_file=source)],
+            [2])
+        self.assertEqual(
+            [event["index"] for event in filtered_timeline(events)],
+            [1, 2])
+
+    def test_execution_path_source_only_choice_is_shared_with_devstudio(self):
+        from Window import PokeControllerApp
+
+        source = os.path.abspath(os.path.join("Commands", "Story.py"))
+        framework = os.path.abspath("PythonCommandBase.py")
+        self.assertTrue(PokeControllerApp._execution_path_same_source(
+            {"file": source}, source))
+        self.assertFalse(PokeControllerApp._execution_path_same_source(
+            {"file": framework}, source))
+
+        with tokenize.open(os.path.join(SERIAL_CONTROLLER, "Window.py")) as stream:
+            window_source = stream.read()
+        with tokenize.open(os.path.join(
+                DEV_STUDIO, "CommandRecordingStudio.py")) as stream:
+            studio_source = stream.read()
+        self.assertIn("Commandsソース内のみ", window_source)
+        self.assertIn('"source_only_default"', window_source)
+        self.assertIn('if "source_only_default" in metadata:', studio_source)
+
+        class Variable:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        class Tree:
+            def __init__(self):
+                self.rows = []
+
+            def get_children(self, parent=""):
+                return []
+
+            def delete(self, _item):
+                return None
+
+            def insert(self, parent, _position, **options):
+                iid = "row-{}".format(len(self.rows))
+                self.rows.append((parent, options))
+                return iid
+
+        tree = Tree()
+        status = mock.Mock()
+        app = types.SimpleNamespace(
+            execution_path_tree=tree,
+            execution_path_source_only=Variable(True),
+            execution_path_status=status,
+            _execution_path_snapshot_history=[{
+                "captured": "12:00:00.000",
+                "step_path": "MAIN > STEP",
+                "command_name": "Story",
+                "source_file": source,
+                "stack": [
+                    {"file": framework, "function": "wait", "line": 10},
+                    {"file": source, "function": "step", "line": 51},
+                ],
+            }],
+            _execution_path_same_source=
+                PokeControllerApp._execution_path_same_source,
+        )
+        PokeControllerApp.refresh_execution_path_snapshots(app)
+
+        self.assertEqual(len(tree.rows), 2)
+        self.assertEqual(tree.rows[1][1]["text"], "Commandsソース")
+        self.assertEqual(tree.rows[1][1]["values"][0], "step")
+        self.assertEqual(
+            len(app._execution_path_snapshot_history[0]["stack"]), 2)
 
     def test_recorded_function_block_works_on_python_37_ast_positions(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -4574,15 +15431,15 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
-            def ZA_story_Template_battle_before(self, **options):
+            def ZA_story_Template_battle_before_renda_route(self, **options):
                 self.calls.append(("before", options))
                 return "before-result"
 
-            def ZA_story_Template_battle_function(self, **options):
+            def ZA_story_Template_battle_function_renda_route(self, **options):
                 self.calls.append(("function", options))
                 return "function-result"
 
-            def ZA_story_Template_battle_after(self, **options):
+            def ZA_story_Template_battle_after_renda_route(self, **options):
                 self.calls.append(("after", options))
                 return "after-result"
 
@@ -4642,15 +15499,15 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             def __init__(self):
                 self.calls = []
 
-            def ZA_story_Template_battle_before(self, **options):
+            def ZA_story_Template_battle_before_renda_route(self, **options):
                 self.calls.append(("before", options))
                 return "before-result"
 
-            def ZA_story_Template_battle_function(self, **options):
+            def ZA_story_Template_battle_function_renda_route(self, **options):
                 self.calls.append(("function", options))
                 return "function-result"
 
-            def ZA_story_Template_battle_after(self, **options):
+            def ZA_story_Template_battle_after_renda_route(self, **options):
                 self.calls.append(("after", options))
                 return "after-result"
 
@@ -4745,7 +15602,52 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             "Yaction": 0,
             "Baction": 0,
             "battle_mode": 0,
+            "selection_up_handled": False,
         }])
+
+    def test_battle_template_non_battle_comments_return_to_before(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA", "ZA_story",
+            "ZA_story.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        command_class = next(
+            node for node in module.body
+            if isinstance(node, ast.ClassDef) and any(
+                isinstance(item, ast.FunctionDef)
+                and item.name == "ZA_story_Template_battle_function"
+                for item in node.body))
+        method = next(
+            item for item in command_class.body
+            if isinstance(item, ast.FunctionDef)
+            and item.name == "ZA_story_Template_battle_function")
+        function_module = ast.Module(body=[method], type_ignores=[])
+        ast.fix_missing_locations(function_module)
+        namespace = {"Button": Button}
+        exec(compile(function_module, source_path, "exec"), namespace)
+
+        class Dummy:
+            def __init__(self, comment_name):
+                self.comment_name = comment_name
+                self.checked = []
+
+            def image_check(self, name):
+                self.checked.append(name)
+                return name == self.comment_name
+
+        for comment_name in (
+                "POKEMON_ZA_TEXT_GREEN_COMMENT",
+                "POKEMON_ZA_TEXT_WHITE_COMMENT"):
+            dummy = Dummy(comment_name)
+            result = namespace["ZA_story_Template_battle_function"](
+                dummy,
+                bkprg_ret="BEFORE",
+                prg_ret="AFTER",
+                noprg_ret="BATTLE",
+                noCp=1)
+            self.assertEqual(result, "BEFORE", comment_name)
+            self.assertIn(comment_name, dummy.checked)
 
     def test_battle_template_runs_help_and_x_menu_loops_only_on_match(self):
         source_path = os.path.join(
@@ -5250,14 +16152,27 @@ class CommandMonitorRecordingTests(unittest.TestCase):
                 with open(os.path.join(session_dir, snapshot_relative),
                           "w", encoding="utf-8") as stream:
                     stream.write("def step_{}(self):\n    pass\n".format(index))
+                step_frame_relative = os.path.join(
+                    "step_frames", "step_{:06d}.jpg".format(index))
+                os.makedirs(os.path.join(session_dir, "step_frames"))
+                self.assertTrue(cv2.imwrite(
+                    os.path.join(session_dir, step_frame_relative),
+                    numpy.full((12, 16, 3), index * 30, dtype=numpy.uint8)))
                 with open(os.path.join(session_dir, "steps.jsonl"),
                           "w", encoding="utf-8") as stream:
                     stream.write(json.dumps({
                         "event": "execution", "step_path": state,
                         "chunk_time": 1.25,
+                        "step_frame": step_frame_relative,
+                        "clean_frame": True,
                         "location": {
                             "file": "story.py", "function": "step_{}".format(index),
                             "line": 1, "snapshot": snapshot_relative,
+                            "stack": [{
+                                "file": "story.py",
+                                "function": "focus_{}".format(index),
+                                "line": 1, "snapshot": snapshot_relative,
+                            }],
                         },
                     }) + "\n")
                     # This stale event is outside the three-second source
@@ -5283,6 +16198,12 @@ class CommandMonitorRecordingTests(unittest.TestCase):
                         "file": "story.py", "function": "step_{}".format(index),
                         "line": 1, "snapshot": snapshot_relative,
                     },
+                    "focus_matched": True,
+                    "focus_repair": {
+                        "enabled": True,
+                        "targets": ["focus_1", "focus_2"],
+                        "matched_functions": ["focus_{}".format(index)],
+                    },
                 })
             chunks[0]["pinned"] = True
 
@@ -5290,7 +16211,10 @@ class CommandMonitorRecordingTests(unittest.TestCase):
                 returncode = 0
                 stderr = ""
 
+            merged_commands = []
+
             def fake_ffmpeg(command, **_kwargs):
+                merged_commands.append(list(command))
                 with open(command[-1], "wb") as stream:
                     stream.write(b"merged mp4")
                 return Completed()
@@ -5303,6 +16227,7 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             self.assertTrue(merged["pinned"])
             self.assertEqual(merged["states"], ["STEP_A", "STEP_B"])
             self.assertEqual(merged["duration_saved"], 6.0)
+            self.assertIn("apad", merged_commands[0])
             self.assertTrue(os.path.isfile(os.path.join(
                 merged["session_dir"], "recording.mp4")))
             with open(os.path.join(merged["session_dir"], "commands.log"),
@@ -5319,15 +16244,168 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             self.assertEqual(metadata["execution_path"]["video_start"], 0.0)
             self.assertEqual(metadata["execution_path"]["video_end"], 6.0)
             self.assertEqual(metadata["execution_path"]["event_count"], 2)
+            self.assertTrue(metadata["focus_matched"])
+            self.assertEqual(metadata["focus_repair"]["targets"], [
+                "focus_1", "focus_2"])
+            self.assertEqual(metadata["focus_repair"]["matched_functions"], [
+                "focus_1", "focus_2"])
             timeline = load_command_timeline(merged["session_dir"])
             self.assertEqual(len(timeline), 2)
             self.assertEqual(timeline[0]["video_time"], 1.25)
             self.assertEqual(timeline[1]["video_time"], 4.25)
             self.assertTrue(os.path.isfile(os.path.join(
                 merged["session_dir"], timeline[0]["location"]["snapshot"])))
+            self.assertTrue(os.path.isfile(os.path.join(
+                merged["session_dir"],
+                timeline[0]["location"]["stack"][0]["snapshot"])))
+            self.assertTrue(timeline[0]["clean_frame"])
+            self.assertTrue(os.path.isfile(os.path.join(
+                merged["session_dir"], timeline[0]["step_frame"])))
             # Source deletion is deliberately a later GUI step, only after a
             # fully written merged folder is returned.
             self.assertTrue(os.path.isdir(chunks[0]["session_dir"]))
+
+    def test_command_merge_rejects_declared_tail_missing_from_real_avi(self):
+        with tempfile.TemporaryDirectory() as root:
+            session = os.path.join(root, "chunk")
+            os.makedirs(session)
+            video = os.path.join(session, "recording.avi")
+            with open(video, "wb") as stream:
+                stream.write(b"avi")
+            chunk = {
+                "session_dir": session,
+                "started": 100.0,
+                "ended": 160.0,
+            }
+            measured = {"fps": 60.0, "frames": 60, "duration": 1.0}
+            with mock.patch(
+                    "CommandRecordingMerge._video_duration_info",
+                    return_value=measured):
+                with self.assertRaisesRegex(RuntimeError, "実映像は1.0秒"):
+                    _validated_chunk_media([chunk], [session], strict=True)
+
+    def test_command_merge_rejects_cfr_fill_without_live_presentations(self):
+        with tempfile.TemporaryDirectory() as root:
+            session = os.path.join(root, "chunk")
+            os.makedirs(session)
+            with open(os.path.join(session, "recording.avi"), "wb") as stream:
+                stream.write(b"avi")
+            with open(os.path.join(session, "recording_timing.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump({"video": {
+                    "elapsed_seconds": 60.0,
+                    "presentation_frames": 1,
+                    "presentation_mode": "preview_presented",
+                }}, stream)
+            measured = {
+                "fps": 60.0, "frames": 3600, "duration": 60.0,
+            }
+            with mock.patch(
+                    "CommandRecordingMerge._video_duration_info",
+                    return_value=measured):
+                with self.assertRaisesRegex(RuntimeError, "実表示フレームが1枚"):
+                    _validated_chunk_media(
+                        [{"session_dir": session,
+                          "started": 100.0, "ended": 160.0}],
+                        [session], strict=True)
+
+    def test_command_merge_inserts_one_second_loop_skip_slate(self):
+        with tempfile.TemporaryDirectory() as root:
+            chunks = []
+            for index in range(2):
+                session_dir = os.path.join(root, "chunk{}".format(index + 1))
+                os.makedirs(session_dir)
+                for name, value in (("recording.avi", b"avi"),
+                                    ("recording.wav", b"wav")):
+                    with open(os.path.join(session_dir, name), "wb") as stream:
+                        stream.write(value + bytes([index]))
+                with open(os.path.join(session_dir, "steps.jsonl"),
+                          "w", encoding="utf-8") as stream:
+                    stream.write(json.dumps({
+                        "event": "execution",
+                        "step_path": "STEP_{}".format(index + 1),
+                        "chunk_time": 1.0,
+                        "location": {},
+                    }) + "\n")
+                with open(os.path.join(session_dir, "commands.log"),
+                          "w", encoding="utf-8") as stream:
+                    stream.write("log {}\n".format(index + 1))
+                chunks.append({
+                    "id": "chunk{}".format(index + 1),
+                    "session_dir": session_dir,
+                    "started": 0.0 if index == 0 else 123.0,
+                    "ended": 3.0 if index == 0 else 126.0,
+                    "started_wall": "2026-08-23T00:00:0{}".format(index),
+                    "states": ["STEP_{}".format(index + 1)],
+                    "command": "ZA_story",
+                    "command_session_id": "run-loop",
+                    "pinned": True,
+                })
+            chunks[1]["loop_gap_before"] = True
+            chunks[1]["loop_gap_seconds"] = 120.0
+
+            captured_lists = {}
+
+            class Completed:
+                returncode = 0
+                stderr = ""
+
+            def fake_skip(_video, _wav, building, index,
+                          _omitted, duration=1.0):
+                video = os.path.join(
+                    building, "loop_skip_{:03d}.avi".format(index))
+                audio = os.path.join(
+                    building, "loop_skip_{:03d}.wav".format(index))
+                for path in (video, audio):
+                    with open(path, "wb") as stream:
+                        stream.write(b"skip")
+                return video, audio, duration
+
+            def fake_ffmpeg(command, **_kwargs):
+                for value in command:
+                    if str(value).endswith("_concat.txt"):
+                        with open(value, "r", encoding="utf-8") as stream:
+                            captured_lists[os.path.basename(value)] = stream.read()
+                with open(command[-1], "wb") as stream:
+                    stream.write(b"merged mp4")
+                return Completed()
+
+            with mock.patch(
+                    "CommandRecordingMerge._create_loop_skip_media",
+                    side_effect=fake_skip):
+                merged = merge_command_recording_chunks(
+                    chunks, root, "run-loop", ffmpeg_path="ffmpeg",
+                    run_command=fake_ffmpeg,
+                    now=datetime.datetime(2026, 8, 23, 12, 0, 0))
+
+            self.assertEqual(merged["duration_saved"], 7.0)
+            video_list = captured_lists["video_concat.txt"]
+            audio_list = captured_lists["audio_concat.txt"]
+            self.assertLess(video_list.index("chunk1"),
+                            video_list.index("loop_skip_001.avi"))
+            self.assertLess(video_list.index("loop_skip_001.avi"),
+                            video_list.index("chunk2"))
+            self.assertIn("loop_skip_001.wav", audio_list)
+
+            with open(os.path.join(merged["session_dir"], "command_monitor.json"),
+                      "r", encoding="utf-8") as stream:
+                metadata = json.load(stream)
+            self.assertTrue(metadata["loop_compaction"]["applied"])
+            self.assertEqual(
+                metadata["loop_compaction"]["gaps"][0]["omitted_seconds"],
+                120.0)
+            self.assertEqual(
+                metadata["loop_compaction"]["gaps"][0]["video_time"], 3.0)
+            self.assertEqual(metadata["execution_path"]["video_end"], 7.0)
+
+            timeline = load_command_timeline(merged["session_dir"])
+            self.assertEqual([event["event"] for event in timeline], [
+                "execution", "loop_processing_skipped", "execution"])
+            self.assertEqual([event["video_time"] for event in timeline], [
+                1.0, 3.0, 5.0])
+            with open(os.path.join(merged["session_dir"], "commands.log"),
+                      "r", encoding="utf-8") as stream:
+                self.assertIn("長いループ処理の中間 約120秒分を省略", stream.read())
 
     def test_devstudio_hides_execution_events_outside_saved_video(self):
         with tempfile.TemporaryDirectory() as root:
@@ -5395,6 +16473,59 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         self.assertIn("次の実行行 ▶", source)
         self.assertIn("◀ 前の関数", source)
         self.assertIn("次の関数 ▶", source)
+        self.assertIn("Commandsソース内のみ", source)
+        self.assertTrue(all(
+            any(isinstance(node, ast.Attribute)
+                and node.attr == "source_scope_events"
+                for node in ast.walk(method))
+            for method in methods.values()))
+
+    def test_command_recording_programmatic_seek_does_not_reselect_forever(self):
+        from CommandRecordingStudio import CommandRecordingWorkspace
+
+        workspace = CommandRecordingWorkspace.__new__(
+            CommandRecordingWorkspace)
+        event = {"index": 1, "video_time": 0.0}
+        workspace.current_event = None
+        workspace.filtered_events = [event]
+        workspace.event_by_iid = {"event-1": event}
+        workspace.page = 0
+        workspace._selection_from_video = False
+        workspace._programmatic_selection_iid = ""
+        workspace._source_refresh_job = None
+        workspace.refresh_timeline = mock.Mock()
+        workspace._cancel_source_refresh = mock.Mock()
+        workspace.show_event_source = mock.Mock()
+        workspace.seek_current_event = mock.Mock()
+
+        class ImmediateSelectTree:
+            def __init__(self):
+                self.selected = ()
+                self.select_calls = 0
+
+            def exists(self, iid):
+                return iid == "event-1"
+
+            def selection(self):
+                return self.selected
+
+            def selection_set(self, iid):
+                self.selected = (iid,)
+                self.select_calls += 1
+                if self.select_calls > 2:
+                    raise AssertionError("TreeviewSelect feedback loop")
+                workspace.on_event_selected()
+
+            def see(self, _iid):
+                return None
+
+        workspace.timeline_tree = ImmediateSelectTree()
+        workspace.select_event(event, seek=True)
+
+        self.assertEqual(workspace.timeline_tree.select_calls, 1)
+        workspace.show_event_source.assert_called_once_with(event)
+        workspace.seek_current_event.assert_called_once_with()
+        self.assertEqual(workspace._programmatic_selection_iid, "")
 
     def test_runtime_snapshot_includes_story_and_za_infi_states(self):
         command = type("Story", (), {})()
@@ -5421,21 +16552,65 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             result = timeline.add({"STATE": value}, now)
         self.assertTrue(result["loop_started"])
         self.assertEqual(timeline.active_loop["period"], 2)
+        self.assertEqual(timeline.loop_progress(), {
+            "period": 2, "completed_cycles": 3, "phase": 0,
+            "at_boundary": True,
+        })
         self.assertEqual(timeline.recent_unique_cutoff(5), 0.0)
         self.assertEqual(timeline.recent_loop_cutoff(3), 0.0)
+        timeline.add({"STATE": "A"}, 6.0)
+        self.assertEqual(timeline.loop_progress()["completed_cycles"], 3)
+        self.assertEqual(timeline.loop_progress()["phase"], 1)
 
-    def test_unescaped_loop_keeps_five_preceding_steps_and_only_three_cycles(self):
+    def test_short_unescaped_loop_keeps_preceding_steps_without_a_gap(self):
         timeline = CommandStateTimeline(loop_cycles=3)
         values = ("P1", "P2", "P3", "P4", "P5",
                   "A", "B", "A", "B", "A", "B", "A", "B")
         for now, value in enumerate(values):
             timeline.add({"STATE": value}, now)
         retention = timeline.retention(
-            120, keep_unique_steps=5, long_step_seconds=180, loop_cycles=3)
+            120, keep_unique_steps=5, long_step_seconds=180, loop_cycles=3,
+            loop_edge_seconds=60)
         self.assertEqual(retention["mode"], "loop")
         self.assertEqual(retention["keep_after"], 0.0)
-        self.assertEqual(retention["keep_before"], 10.0)
+        self.assertIsNone(retention["keep_before"])
+        self.assertEqual(retention["keep_ranges"], [(0.0, None)])
+        self.assertFalse(retention["loop_compacted"])
         self.assertEqual(timeline.active_loop["period"], 2)
+
+    def test_long_loop_keeps_start_and_tail_until_fifteen_later_steps(self):
+        timeline = CommandStateTimeline(loop_cycles=3)
+        for now in range(15):
+            timeline.add({"STATE": "P{}".format(now)}, float(now))
+        for now in range(15, 201):
+            timeline.add({"STATE": "A" if now % 2 else "B"}, float(now))
+
+        active = timeline.retention(
+            200.0, keep_unique_steps=15, long_step_seconds=180,
+            loop_cycles=3, loop_edge_seconds=60)
+        self.assertEqual(active["mode"], "loop")
+        self.assertEqual(active["keep_ranges"], [
+            (0.0, 75.0), (140.0, None)])
+        self.assertEqual(active["loop_skip_ranges"], [(75.0, 140.0)])
+        self.assertTrue(active["loop_compacted"])
+
+        timeline.add({"STATE": "AFTER_0"}, 201.0)
+        for index in range(1, 14):
+            timeline.add({"STATE": "AFTER_{}".format(index)}, 201.0 + index)
+        before_fifteen = timeline.retention(
+            214.0, keep_unique_steps=15, long_step_seconds=180,
+            loop_cycles=3, loop_edge_seconds=60)
+        self.assertTrue(before_fifteen["preserve_loop_start"])
+        self.assertEqual(before_fifteen["keep_ranges"], [
+            (0.0, 75.0), (140.0, None)])
+
+        timeline.add({"STATE": "AFTER_14"}, 215.0)
+        after_fifteen = timeline.retention(
+            215.0, keep_unique_steps=15, long_step_seconds=180,
+            loop_cycles=3, loop_edge_seconds=60)
+        self.assertFalse(after_fifteen["preserve_loop_start"])
+        self.assertFalse(after_fifteen["loop_compacted"])
+        self.assertEqual(after_fifteen["keep_ranges"], [(201.0, None)])
 
     def test_dark_still_failure_keeps_five_steps_before_the_problem_step(self):
         timeline = CommandStateTimeline(loop_cycles=3)
@@ -5770,6 +16945,7 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             _write_command_monitor_metadata=lambda *args, **kwargs: None,
             _sync_audio_device_usage=lambda: None,
             _refresh_command_monitor_tree=lambda: None,
+            _mark_command_monitor_prune_candidates=mock.Mock(),
             _start_command_monitor_chunk=lambda *args, **kwargs: None,
         )
 
@@ -5795,6 +16971,7 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         callback()
         self.assertFalse(app._command_monitor_stop_in_progress)
         self.assertIsNone(app._command_monitor_current_chunk)
+        app._mark_command_monitor_prune_candidates.assert_called_once()
 
     def test_template_segment_stop_returns_before_avi_drain_finishes(self):
         from Window import PokeControllerApp
@@ -5869,12 +17046,67 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         self.assertEqual(retention["mode"], "normal")
         self.assertIsNone(retention["keep_before"])
 
+    def test_retained_loop_gap_is_marked_once_for_merge(self):
+        from Window import PokeControllerApp
+
+        chunks = []
+        for index, (started, ended) in enumerate(
+                ((0.0, 30.0), (30.0, 60.0), (60.0, 90.0),
+                 (270.0, 300.0), (300.0, 330.0))):
+            chunks.append({
+                "id": str(index),
+                "started": started,
+                "ended": ended,
+                "command_session_id": "run-1",
+                "historical": False,
+                "delete_pending": False,
+                "loop_anchor": False,
+            })
+        app = types.SimpleNamespace(
+            _command_monitor_session_id="run-1",
+            _command_monitor_chunks=chunks,
+            _write_command_monitor_metadata=mock.Mock(),
+        )
+        retention = {
+            "preserve_loop_start": True,
+            "loop_anchors": [(0.0, 75.0), (270.0, None)],
+            "loop_skip_ranges": [(75.0, 270.0)],
+        }
+
+        PokeControllerApp._update_command_monitor_loop_segments(
+            app, retention, now=330.0)
+
+        self.assertTrue(all(chunk["loop_anchor"] for chunk in chunks[:3]))
+        self.assertFalse(any(chunk["loop_anchor"] for chunk in chunks[3:]))
+        self.assertTrue(chunks[3]["loop_gap_before"])
+        self.assertEqual(chunks[3]["loop_gap_seconds"], 180.0)
+        self.assertFalse(chunks[4]["loop_gap_before"])
+        self.assertEqual(app._write_command_monitor_metadata.call_count, 5)
+
+        app._write_command_monitor_metadata.reset_mock()
+        PokeControllerApp._update_command_monitor_loop_segments(
+            app, retention, now=330.0)
+        app._write_command_monitor_metadata.assert_not_called()
+
     def test_long_same_step_keeps_time_window_even_without_transitions(self):
         timeline = CommandStateTimeline(loop_cycles=3)
         timeline.add({"STATE": "LONG"}, 0)
         retention = timeline.retention(
             600, keep_unique_steps=5, long_step_seconds=180, loop_cycles=3)
         self.assertEqual(retention["keep_after"], 420.0)
+
+    def test_old_unique_steps_do_not_keep_entire_long_unchanged_run(self):
+        timeline = CommandStateTimeline(loop_cycles=3)
+        for now in range(15):
+            timeline.add({"STATE": "STEP_{}".format(now)}, float(now))
+        timeline.add({"STATE": "LONG"}, 15.0)
+
+        retention = timeline.retention(
+            600.0, keep_unique_steps=15, long_step_seconds=180,
+            loop_cycles=3)
+
+        self.assertEqual(retention["mode"], "normal")
+        self.assertEqual(retention["keep_ranges"], [(420.0, None)])
 
     def test_relevant_path_hides_idle_sibling_state_machines(self):
         snapshot = {
@@ -5914,6 +17146,30 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             temporary_chunk_ids_for_session(chunks, "run-2"), {"current"})
         self.assertEqual(temporary_chunk_ids_for_session(chunks, ""), set())
 
+    def test_explicit_stop_keeps_latest_chunk_when_retention_removed_run(self):
+        chunks = [
+            {"id": "older", "command_session_id": "run-2",
+             "started": 10.0, "ended": 20.0, "historical": False,
+             "delete_pending": True},
+            {"id": "latest", "command_session_id": "run-2",
+             "started": 20.0, "ended": 30.0, "historical": False,
+             "delete_pending": True},
+            {"id": "other-run", "command_session_id": "run-1",
+             "started": 40.0, "ended": 50.0, "historical": False,
+             "delete_pending": True},
+        ]
+
+        restored = ensure_stopped_session_recording_candidate(
+            chunks, "run-2")
+
+        self.assertEqual(restored, "latest")
+        self.assertTrue(chunks[0]["delete_pending"])
+        self.assertFalse(chunks[1]["delete_pending"])
+        self.assertTrue(chunks[1]["stop_confirmation_fallback"])
+        self.assertTrue(chunks[2]["delete_pending"])
+        self.assertEqual(
+            temporary_chunk_ids_for_session(chunks, "run-2"), {"latest"})
+
     def test_stop_save_choice_protects_only_the_current_run(self):
         chunks = [
             {"id": "current", "command_session_id": "run-2",
@@ -5945,6 +17201,134 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         self.assertFalse(chunks[0]["pinned"])
         self.assertTrue(chunks[0]["delete_pending"])
         self.assertFalse(chunks[2]["delete_pending"])
+
+
+class CommandRunComparisonTests(unittest.TestCase):
+    @staticmethod
+    def _events(steps):
+        return [{
+            "index": index + 1, "video_time": index * 0.5,
+            "step_text": step, "location": {"function": step.lower()},
+        } for index, step in enumerate(steps)]
+
+    def test_repeated_step_visits_align_recovery_pass_and_detect_regression(self):
+        baseline = step_visits(self._events(("A", "B", "C", "D")))
+        current = step_visits(self._events(("A", "B", "R", "B", "C")))
+        rows, summary = align_step_visits(baseline, current)
+        self.assertEqual([item["occurrence"] for item in current
+                          if item["step"] == "B"], [1, 2])
+        self.assertTrue(summary["regressed"])
+        self.assertEqual(summary["not_reached"], 1)
+        self.assertGreaterEqual(summary["extra_or_retry"], 1)
+        self.assertTrue(any(
+            row["status"] == "baseline_only"
+            and row["baseline"]["step"] == "D" for row in rows))
+
+    def test_identical_step_visits_remain_fully_matched(self):
+        baseline = step_visits(self._events(("A", "B", "A", "C")))
+        rows, summary = align_step_visits(baseline, list(baseline))
+        self.assertEqual([row["status"] for row in rows], ["match"] * 4)
+        self.assertFalse(summary["regressed"])
+        self.assertIsNone(summary["first_divergence"])
+
+    def test_step_frame_prefers_clean_still_and_labels_legacy_video_fallback(self):
+        with tempfile.TemporaryDirectory() as root:
+            os.makedirs(os.path.join(root, "step_frames"))
+            still = numpy.full((20, 24, 3), 90, dtype=numpy.uint8)
+            still_path = os.path.join(root, "step_frames", "step.jpg")
+            self.assertTrue(cv2.imwrite(still_path, still))
+            loaded = load_visit_frame(
+                root, {"step_frame": "step_frames/step.jpg", "video_time": 0.0})
+            self.assertEqual(loaded["kind"], "clean_step_frame")
+            self.assertEqual(loaded["warning"], "")
+
+            os.remove(still_path)
+            video = os.path.join(root, "recording.avi")
+            writer = cv2.VideoWriter(
+                video, cv2.VideoWriter_fourcc(*"MJPG"), 5.0, (24, 20))
+            self.assertTrue(writer.isOpened())
+            writer.write(numpy.full((20, 24, 3), 150, dtype=numpy.uint8))
+            writer.release()
+            loaded = load_visit_frame(
+                root, {"step_frame": "step_frames/missing.jpg", "video_time": 0.0})
+            self.assertEqual(loaded["kind"], "legacy_video_frame")
+            self.assertIn("検知枠", loaded["warning"])
+
+    def test_function_restore_creates_backup_and_preserves_other_methods(self):
+        with tempfile.TemporaryDirectory() as root:
+            baseline = os.path.join(root, "recorded.py")
+            target = os.path.join(root, "live.py")
+            baseline_source = (
+                "class Demo:\n"
+                "    def step(self):\n"
+                "        return 'recorded'\n"
+                "    def untouched(self):\n"
+                "        return 7\n")
+            live_source = baseline_source.replace("'recorded'", "'live'")
+            with open(baseline, "w", encoding="utf-8", newline="\n") as stream:
+                stream.write(baseline_source)
+            with open(target, "w", encoding="utf-8", newline="\n") as stream:
+                stream.write(live_source)
+            plan = prepare_function_restore(baseline, target, "step")
+            self.assertTrue(plan["different"])
+            result = apply_function_restore(
+                plan, timestamp=datetime.datetime(2026, 8, 22, 12, 0, 0))
+            self.assertTrue(result["changed"])
+            self.assertTrue(os.path.isfile(result["backup"]))
+            self.assertTrue(os.path.isfile(result["manifest"]))
+            with tokenize.open(target) as stream:
+                restored = stream.read()
+            with tokenize.open(result["backup"]) as stream:
+                backup = stream.read()
+            self.assertIn("return 'recorded'", restored)
+            self.assertIn("return 7", restored)
+            self.assertIn("return 'live'", backup)
+
+    def test_restore_aborts_if_live_source_changed_after_confirmation_plan(self):
+        with tempfile.TemporaryDirectory() as root:
+            baseline = os.path.join(root, "recorded.py")
+            target = os.path.join(root, "live.py")
+            template = "class Demo:\n    def step(self):\n        return {!r}\n"
+            with open(baseline, "w", encoding="utf-8") as stream:
+                stream.write(template.format("recorded"))
+            with open(target, "w", encoding="utf-8") as stream:
+                stream.write(template.format("live"))
+            plan = prepare_function_restore(baseline, target, "step")
+            with open(target, "w", encoding="utf-8") as stream:
+                stream.write(template.format("edited-after-plan"))
+            with self.assertRaises(RuntimeError):
+                apply_function_restore(plan)
+
+    def test_clean_step_frame_queue_is_bounded_and_keeps_raw_frame_reference(self):
+        from Window import PokeControllerApp
+
+        app = PokeControllerApp.__new__(PokeControllerApp)
+        app._command_step_frame_queue = queue.Queue(maxsize=1)
+        app._logger = mock.Mock()
+        chunk = {"session_dir": os.getcwd()}
+        frame = numpy.zeros((4, 5, 3), dtype=numpy.uint8)
+        relative = app._queue_command_monitor_step_frame(chunk, frame)
+        self.assertEqual(relative, "step_frames/step_000001.jpg")
+        _path, queued = app._command_step_frame_queue.get_nowait()
+        self.assertIs(queued, frame)
+        app._command_step_frame_queue.task_done()
+        app._command_step_frame_queue.put_nowait(("occupied", frame))
+        self.assertEqual(app._queue_command_monitor_step_frame(chunk, frame), "")
+
+    def test_comparison_studio_is_non_modal_bounded_and_openable(self):
+        studio_path = os.path.join(DEV_STUDIO, "CommandRunComparisonStudio.py")
+        with tokenize.open(studio_path) as stream:
+            source = stream.read()
+        self.assertIn("daemon=True", source)
+        self.assertIn("start + 200", source)
+        self.assertIn("基準録画の関数へ戻す", source)
+        for forbidden in ("grab_set(", "focus_force(", "attributes(\"-topmost\"", ".lift("):
+            self.assertNotIn(forbidden, source)
+        recording_path = os.path.join(DEV_STUDIO, "CommandRecordingStudio.py")
+        with tokenize.open(recording_path) as stream:
+            recording_source = stream.read()
+        self.assertIn("過去実行と比較…", recording_source)
+        self.assertIn("open_command_run_comparison", recording_source)
 
 
 class CommandDevelopmentToolsTests(unittest.TestCase):
@@ -6185,6 +17569,49 @@ class ProcessShutdownTests(unittest.TestCase):
             FinalizeProgressWindow.BACKGROUND_POLL_MS,
             FinalizeProgressWindow.FOREGROUND_POLL_MS)
 
+    def test_mp4_waits_only_for_an_explicit_main_pokecon(self):
+        from RecordingFinalizeWorker import mp4_headroom_decision
+
+        main = [{"resource": {
+            "enabled": True, "target_percent": 90,
+            "main_effective": True, "protected": False}}]
+        decision = mp4_headroom_decision(
+            main, cpu_percent=10, logical_cpus=8)
+        self.assertFalse(decision["ready"])
+        self.assertIn("メインPokeCon", decision["reason"])
+
+        protected = [{"resource": {
+            "enabled": True, "target_percent": 90, "protected": True}}]
+        decision = mp4_headroom_decision(
+            protected, cpu_percent=100, logical_cpus=8)
+        self.assertTrue(decision["ready"])
+
+        entries = [{"resource": {
+            "enabled": True, "target_percent": 90, "protected": False}}]
+        self.assertTrue(mp4_headroom_decision(
+            entries, cpu_percent=None, logical_cpus=8)["ready"])
+
+    def test_mp4_batch_window_pid_is_reported_only_while_live(self):
+        with tempfile.TemporaryDirectory() as folder:
+            os.makedirs(folder, exist_ok=True)
+            registry = os.path.join(folder, "worker.json")
+            with open(registry, "w", encoding="utf-8") as stream:
+                json.dump({"pid": 4567, "accepting": True}, stream)
+
+            with mock.patch(
+                    "ProcessShutdown.process_is_alive", return_value=True):
+                self.assertEqual(
+                    active_recording_finalize_worker_pid(folder), 4567)
+
+            with mock.patch(
+                    "ProcessShutdown.process_is_alive", return_value=False):
+                self.assertIsNone(
+                    active_recording_finalize_worker_pid(folder))
+
+            with open(registry, "w", encoding="utf-8") as stream:
+                json.dump({"pid": 4567, "accepting": False}, stream)
+            self.assertIsNone(active_recording_finalize_worker_pid(folder))
+
     def test_deferred_mp4_launcher_uses_separate_low_priority_process(self):
         with tempfile.TemporaryDirectory() as folder:
             manifest = os.path.join(folder, "mp4_finalize_job.json")
@@ -6214,7 +17641,7 @@ class ProcessShutdownTests(unittest.TestCase):
             self.assertEqual(request["wait_pid"], 4321)
             if os.name == "nt":
                 flags = popen.call_args.kwargs["creationflags"]
-                self.assertTrue(flags & 0x00004000)
+                self.assertTrue(flags & 0x00000040)
                 self.assertTrue(flags & 0x00000008)
 
     def test_additional_mp4_jobs_join_existing_worker_without_new_window(self):
@@ -6298,6 +17725,8 @@ class ProcessShutdownTests(unittest.TestCase):
             worker.queue_dir = folder
             worker.events = queue.Queue()
             worker.stop_event = threading.Event()
+            worker.load_guard = types.SimpleNamespace(
+                decision=lambda: {"ready": True})
             thread = threading.Thread(target=worker._run_jobs)
 
             def add_request(name, jobs):
@@ -6329,6 +17758,121 @@ class ProcessShutdownTests(unittest.TestCase):
                 event_kinds.append(worker.events.get_nowait()[0])
             self.assertEqual(event_kinds.count("added"), 2)
             self.assertEqual(event_kinds.count("completed"), 2)
+
+    def test_mp4_wait_override_processes_exactly_one_file(self):
+        from RecordingFinalizeWorker import FinalizeProgressWindow
+
+        with tempfile.TemporaryDirectory() as folder:
+            manifests = []
+            for index in range(2):
+                recording = os.path.join(folder, "recording_{}".format(index))
+                os.makedirs(recording)
+                manifest = os.path.join(recording, "mp4_finalize_job.json")
+                with open(manifest, "w", encoding="utf-8") as stream:
+                    json.dump({"version": 1, "status": "pending"}, stream)
+                manifests.append(os.path.abspath(manifest))
+            with open(os.path.join(folder, "request_001.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump({"jobs": manifests, "wait_pid": 0}, stream)
+
+            worker = object.__new__(FinalizeProgressWindow)
+            worker.queue_dir = folder
+            worker.events = queue.Queue()
+            worker.stop_event = threading.Event()
+            worker.force_next_job = threading.Event()
+            worker.force_all_jobs = threading.Event()
+            worker.force_next_job.set()
+            worker.load_guard = types.SimpleNamespace(
+                decision=lambda: {
+                    "ready": False, "reason": "PokeConを優先して待機中",
+                })
+            thread = threading.Thread(target=worker._run_jobs)
+
+            with mock.patch(
+                    "RecordingFinalizeWorker.finalize_recording_manifest",
+                    return_value="recording.mp4") as finalize:
+                thread.start()
+                deadline = time.monotonic() + 3.0
+                while finalize.call_count < 1 and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                time.sleep(1.1)
+                worker.stop_event.set()
+                thread.join(timeout=2.0)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(finalize.call_count, 1)
+            self.assertEqual(finalize.call_args.args[0], manifests[0])
+            self.assertFalse(worker.force_next_job.is_set())
+            event_kinds = []
+            started = []
+            while not worker.events.empty():
+                event = worker.events.get_nowait()
+                event_kinds.append(event[0])
+                if event[0] == "started":
+                    started.append(event)
+            self.assertEqual(started, [("started", os.path.dirname(
+                manifests[0]), "next")])
+            self.assertIn("load_wait", event_kinds)
+
+    def test_mp4_wait_override_can_process_the_whole_pending_batch(self):
+        from RecordingFinalizeWorker import FinalizeProgressWindow
+
+        with tempfile.TemporaryDirectory() as folder:
+            manifests = []
+            for index in range(3):
+                recording = os.path.join(folder, "recording_{}".format(index))
+                os.makedirs(recording)
+                manifest = os.path.join(recording, "mp4_finalize_job.json")
+                with open(manifest, "w", encoding="utf-8") as stream:
+                    json.dump({"version": 1, "status": "pending"}, stream)
+                manifests.append(os.path.abspath(manifest))
+            with open(os.path.join(folder, "request_001.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump({"jobs": manifests, "wait_pid": 0}, stream)
+
+            worker = object.__new__(FinalizeProgressWindow)
+            worker.queue_dir = folder
+            worker.events = queue.Queue()
+            worker.stop_event = threading.Event()
+            worker.force_next_job = threading.Event()
+            worker.force_all_jobs = threading.Event()
+            worker.force_all_jobs.set()
+            worker.load_guard = types.SimpleNamespace(
+                decision=lambda: {
+                    "ready": False, "reason": "PokeConを優先して待機中",
+                })
+            thread = threading.Thread(target=worker._run_jobs)
+
+            with mock.patch(
+                    "RecordingFinalizeWorker.finalize_recording_manifest",
+                    return_value="recording.mp4") as finalize:
+                thread.start()
+                deadline = time.monotonic() + 3.0
+                while finalize.call_count < 3 and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                worker.stop_event.set()
+                thread.join(timeout=2.0)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(
+                [call.args[0] for call in finalize.call_args_list], manifests)
+            self.assertFalse(worker.force_all_jobs.is_set())
+            started = []
+            while not worker.events.empty():
+                event = worker.events.get_nowait()
+                if event[0] == "started":
+                    started.append(event)
+            self.assertEqual(
+                [event[2] for event in started], ["all", "all", "all"])
+
+    def test_mp4_batch_window_exposes_one_file_wait_override(self):
+        path = os.path.join(SERIAL_CONTROLLER, "RecordingFinalizeWorker.py")
+        with tokenize.open(path) as stream:
+            source = stream.read()
+        self.assertIn("待機を解除して次の1本を作成", source)
+        self.assertIn("待機を解除してすべて作成", source)
+        self.assertIn("def force_next_finalize(self):", source)
+        self.assertIn("def force_all_finalize(self):", source)
 
     def test_controlled_shutdown_flushes_then_terminates_current_process(self):
         events = []
@@ -6402,6 +17946,66 @@ class ProcessShutdownTests(unittest.TestCase):
 
 
 class MultiInstanceResponsivenessTests(unittest.TestCase):
+    def test_windows_user_object_pressure_uses_recovery_hysteresis(self):
+        self.assertFalse(gui_resource_pressure(False, 7999))
+        self.assertTrue(gui_resource_pressure(False, 8000))
+        self.assertTrue(gui_resource_pressure(True, 6001))
+        self.assertFalse(gui_resource_pressure(True, 6000))
+        self.assertTrue(gui_resource_pressure(True, None))
+
+    def test_preview_memory_error_enters_backoff_without_escaping(self):
+        class ExhaustedPhoto:
+            def paste(self, _image):
+                raise MemoryError("USER object quota")
+
+        logger = mock.Mock()
+        preview = types.SimpleNamespace(
+            camera=types.SimpleNamespace(frameSequence=lambda: 42),
+            show_size=(3, 2), _requested_fps=60,
+            _gui_resource_next_check_at=float("inf"),
+            _gui_resource_pressure=False, _gui_resource_user_count=10000,
+            _preview_memory_error_until=0.0,
+            _preview_memory_error_logged=False,
+            _last_rendered_frame_sequence=41,
+            _live_preview_tk=ExhaustedPhoto(),
+            _live_preview_size=(3, 2), _displaying_live_preview=True,
+            im_=7, _logger=logger)
+        prepared = (
+            42, (3, 2), Image.new("RGB", (3, 2)),
+            numpy.zeros((2, 3, 3), dtype=numpy.uint8), 10.0)
+
+        with mock.patch("GuiAssets.time.monotonic", return_value=10.0):
+            self.assertFalse(
+                CaptureArea._install_prepared_preview(preview, prepared))
+
+        self.assertEqual(preview._preview_memory_error_until, 11.0)
+        self.assertTrue(preview._preview_memory_error_logged)
+        logger.error.assert_called_once()
+
+    def test_temporary_detection_overlays_are_bounded_by_one_cleanup_loop(self):
+        scheduled = []
+        deleted = []
+        preview = types.SimpleNamespace(
+            _temporary_overlay_expirations=deque(),
+            _temporary_overlay_cleanup_scheduled=False,
+            _temporary_overlay_lock=threading.RLock(),
+            _temporary_overlay_limit=2,
+            _cleanup_temporary_overlays=lambda: None,
+            after=lambda delay, callback: scheduled.append((delay, callback)),
+            delete=lambda tag: deleted.append(tag))
+
+        with mock.patch("GuiAssets.time.monotonic", return_value=10.0):
+            CaptureArea._track_temporary_overlay(preview, "first", 2000)
+            CaptureArea._track_temporary_overlay(preview, "second", 2000)
+            CaptureArea._track_temporary_overlay(preview, "third", 2000)
+
+        self.assertEqual(len(scheduled), 1)
+        self.assertEqual(deleted, ["first"])
+        self.assertEqual(
+            [tag for _expires_at, tag
+             in preview._temporary_overlay_expirations],
+            ["second", "third"])
+
     def test_confirmation_audio_belongs_to_one_runtime_main(self):
         self.assertEqual(confirmation_audio_action(
             requested=True, runtime_owner=True), "start")
@@ -6696,12 +18300,55 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
         self.assertFalse(foreground_process_matches(
             pid=123, foreground_pid_provider=lambda: 456))
 
+    def test_activity_monitor_persists_each_real_foreground_transition(self):
+        from Window import PokeControllerApp
+
+        app = PokeControllerApp.__new__(PokeControllerApp)
+        app._windows_foreground_active = False
+        app._logger = mock.Mock()
+        registry = mock.Mock()
+        with mock.patch("Window.os.getpid", return_value=123):
+            self.assertTrue(
+                app._record_foreground_focus_transition(registry, 123))
+            self.assertFalse(
+                app._record_foreground_focus_transition(registry, 123))
+            self.assertFalse(
+                app._record_foreground_focus_transition(registry, 456))
+            self.assertTrue(
+                app._record_foreground_focus_transition(registry, 123))
+        self.assertEqual(registry.mark_focused.call_count, 2)
+
+        registry.mark_focused.reset_mock()
+        registry.mark_focused.side_effect = TimeoutError("busy")
+        app._windows_foreground_active = False
+        with mock.patch("Window.os.getpid", return_value=123):
+            self.assertFalse(
+                app._record_foreground_focus_transition(registry, 123))
+        self.assertFalse(app._windows_foreground_active)
+        app._logger.warning.assert_called()
+
+    def test_gamepad_forwarding_gate_switches_without_waiting_for_tk(self):
+        from Window import PokeControllerApp
+
+        app = PokeControllerApp.__new__(PokeControllerApp)
+        app.pc_gamepad_input_event = threading.Event()
+        app._pc_gamepad_input_requested = True
+        self.assertTrue(app._apply_manual_input_owner_signal(True))
+        self.assertTrue(app.pc_gamepad_input_event.is_set())
+        self.assertFalse(app._apply_manual_input_owner_signal(False))
+        self.assertFalse(app.pc_gamepad_input_event.is_set())
+
+        app._pc_gamepad_input_requested = False
+        self.assertFalse(app._apply_manual_input_owner_signal(True))
+        self.assertFalse(app.pc_gamepad_input_event.is_set())
+
     def test_multi_pokecon_ownership_monitor_never_raises_a_window(self):
         window_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
         with open(window_path, "r", encoding="utf-8-sig") as stream:
             tree = ast.parse(stream.read())
         monitored_methods = {
             "_publish_window_focus",
+            "_record_foreground_focus_transition",
             "_window_activity_monitor_loop",
             "_sync_manual_input_owner",
             "_sync_pc_gamepad_input_for_owner",
@@ -6859,13 +18506,125 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
             _measured_preview_fps=0.0,
             _preview_fps_measure_started=0.0,
             _preview_fps_measure_frames=0,
-            _last_preview_frame_at=0.0)
+            _last_preview_frame_at=0.0,
+            _preview_frame_intervals=deque(maxlen=360),
+            _preview_fps_lock=threading.Lock())
         for timestamp in (20.0, 20.25, 20.50, 20.75):
             CaptureArea._note_preview_frame(preview, timestamp)
         self.assertAlmostEqual(
             CaptureArea.measuredPreviewFps(preview, 20.80), 4.0)
+        pacing = CaptureArea.measuredPreviewPacing(preview, 20.80)
+        self.assertEqual(pacing["sample_count"], 3)
+        self.assertAlmostEqual(pacing["p95_gap_ms"], 250.0)
         self.assertEqual(
             CaptureArea.measuredPreviewFps(preview, 22.30), 0.0)
+        self.assertEqual(
+            CaptureArea.measuredPreviewPacing(preview, 22.30)["sample_count"],
+            0)
+
+    def test_preview_header_fps_status_reports_rate_and_pacing_instability(self):
+        stable_text, stable_warning = preview_fps_status(
+            60, 60, 59.4, 59.1, 18.0, 120, 22.0)
+        self.assertEqual(stable_warning, "")
+        self.assertIn("FPS 入力59.4 / 表示59.1（目標60）", stable_text)
+        self.assertIn("描画間隔95% 18ms・最大22ms", stable_text)
+
+        unstable_text, unstable_warning = preview_fps_status(
+            60, 60, 49.1, 59.3, 42.0, 120, 120.0)
+        self.assertEqual(unstable_warning, "入力低下・表示不安定")
+        self.assertIn("⚠入力低下・表示不安定", unstable_text)
+
+        burst_text, burst_warning = preview_fps_status(
+            60, 60, 59.4, 59.1, 18.0, 120, 180.0)
+        self.assertEqual(burst_warning, "表示不安定")
+        self.assertIn("最大180ms", burst_text)
+
+        low_power_text, low_power_warning = preview_fps_status(
+            60, 5, 59.2, 4.8, 220.0, 15, 300.0)
+        self.assertEqual(low_power_warning, "")
+        self.assertIn("（目標5）", low_power_text)
+
+    def test_preview_header_updates_fixed_mode_and_fps_labels(self):
+        from Window import PokeControllerApp
+
+        app = PokeControllerApp.__new__(PokeControllerApp)
+        app.fps = types.SimpleNamespace(get=lambda: 60)
+        app.root = types.SimpleNamespace(focus_displayof=lambda: None)
+        app._preview_full_rate_suspended = lambda: False
+        app._resource_main_effective = True
+        app._newest_pokecon_instance = False
+        app._other_main_preview_owner = False
+        app._mp4_finalize_foreground = False
+        app.camera = types.SimpleNamespace(measuredFps=lambda: 59.3)
+        app.preview = types.SimpleNamespace(
+            measuredPreviewFps=lambda: 59.1,
+            measuredPreviewPacing=lambda: {
+                "sample_count": 120,
+                "p95_gap_ms": 18.0,
+                "max_gap_ms": 22.0,
+            })
+        app._last_preview_mode_status_value = None
+        app._last_preview_fps_header_status_value = None
+        app._last_preview_fps_header_update_at = 0.0
+        app._last_preview_fps_warning_value = None
+        app.preview_mode_status = mock.Mock()
+        app.preview_fps_header_status = mock.Mock()
+        app.preview_fps_live_label = mock.Mock()
+
+        with mock.patch("Window.foreground_process_matches",
+                        return_value=False), \
+                mock.patch("Window.time.monotonic", return_value=10.0):
+            PokeControllerApp._refresh_preview_priority_status(app)
+        self.assertIn(
+            "メイン表示：60fps",
+            app.preview_mode_status.set.call_args.args[0])
+        self.assertIn(
+            "FPS 入力59.3 / 表示59.1（目標60）",
+            app.preview_fps_header_status.set.call_args.args[0])
+        app.preview_fps_live_label.configure.assert_called_with(
+            foreground="#174a7e")
+
+        app._resource_main_effective = False
+        app.preview.measuredPreviewFps = lambda: 1.8
+        app.preview.measuredPreviewPacing = lambda: {
+            "sample_count": 10,
+            "p95_gap_ms": 600.0,
+            "max_gap_ms": 700.0,
+        }
+        with mock.patch("Window.foreground_process_matches",
+                        return_value=False), \
+                mock.patch("Window.time.monotonic", return_value=11.1):
+            PokeControllerApp._refresh_preview_priority_status(app)
+        self.assertIn(
+            "省負荷表示：5fps",
+            app.preview_mode_status.set.call_args.args[0])
+        self.assertIn(
+            "表示1.8（目標5）",
+            app.preview_fps_header_status.set.call_args.args[0])
+        app.preview_fps_live_label.configure.assert_called_with(
+            foreground="#b42318")
+
+        # Frequent ownership/status polls must not redraw changing FPS text.
+        app.preview_fps_header_status.reset_mock()
+        with mock.patch("Window.foreground_process_matches",
+                        return_value=False), \
+                mock.patch("Window.time.monotonic", return_value=11.5):
+            PokeControllerApp._refresh_preview_priority_status(app)
+        app.preview_fps_header_status.set.assert_not_called()
+
+    def test_switch2_feature_limited_ui_keeps_fps_header_outside_hidden_buttons(self):
+        window_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with open(window_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+        self.assertIn(
+            "self.main_panel_header_f = ttk.Frame(self.camera_lf)", source)
+        self.assertIn(
+            "self.top_command_f = ttk.Frame(self.main_panel_header_f)", source)
+        self.assertIn(
+            "self.preview_status_f = ttk.Frame(self.main_panel_header_f)",
+            source)
+        self.assertIn("self.top_command_f.grid_remove()", source)
+        self.assertNotIn("self.main_panel_header_f.grid_remove()", source)
 
     def test_resize_temporarily_yields_time_to_tk(self):
         capture, render = resize_safe_preview_intervals(
@@ -6999,6 +18758,42 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
             preview_rate_permissions(True, True, False, False), (True, False))
         self.assertEqual(
             preview_rate_permissions(True, False, True, True), (False, False))
+
+    def test_inactive_non_main_and_mp4_batch_foreground_use_low_spec_preview(self):
+        from Window import PokeControllerApp
+
+        app = PokeControllerApp.__new__(PokeControllerApp)
+        app._resource_main_effective = False
+        app._other_pokecon_foreground = False
+        app._newest_pokecon_instance = True
+        app._other_main_preview_owner = True
+        app._mp4_finalize_foreground = False
+        app._preview_shutdown_mode = False
+
+        roles = PokeControllerApp._preview_render_priority(app)
+        self.assertEqual(roles, (False, False, False))
+        self.assertEqual(preview_priority(
+            focused=False, main_tool=roles[0],
+            allow_foreground_full_rate=roles[1], keep_warm=roles[2]),
+            (False, False))
+        self.assertEqual(preview_priority(
+            focused=True, main_tool=roles[0],
+            allow_foreground_full_rate=roles[1], keep_warm=roles[2]),
+            (True, False))
+
+        app._other_main_preview_owner = False
+        self.assertEqual(
+            PokeControllerApp._preview_render_priority(app),
+            (True, False, False))
+        app._mp4_finalize_foreground = True
+        self.assertEqual(
+            PokeControllerApp._preview_render_priority(app),
+            (False, False, False))
+
+        app._resource_main_effective = True
+        self.assertEqual(
+            PokeControllerApp._preview_render_priority(app),
+            (True, False, False))
 
     def test_preview_timer_subtracts_frame_conversion_work(self):
         self.assertEqual(compensated_after_delay(
@@ -7202,6 +18997,113 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
         gap, frames, payload = recorder.audio_queue.get_nowait()
         self.assertEqual((gap, frames), (0, 2))
         self.assertEqual(payload, packet.tobytes())
+
+    def test_async_audio_start_keeps_video_recorder_available(self):
+        recorder = CaptureRecorder(start_finalize_worker=False)
+        entered = threading.Event()
+        release = threading.Event()
+        writer = mock.Mock()
+
+        def slow_audio(*_args, **_kwargs):
+            entered.set()
+            release.wait(2.0)
+
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(
+                recorder, "_open_video_writer",
+                return_value=(writer, "mp4v")), mock.patch.object(
+                    recorder, "_video_writer_loop", return_value=None), \
+                mock.patch.object(recorder, "_start_audio",
+                                  side_effect=slow_audio):
+            recorder.output_dir = folder
+            frame = numpy.zeros((8, 12, 3), dtype=numpy.uint8)
+            started = time.monotonic()
+            recorder.start(
+                frame, 60.0, "2: test audio",
+                async_audio_start=True)
+            self.assertLess(time.monotonic() - started, 0.5)
+            self.assertTrue(entered.wait(0.5))
+            self.assertTrue(recorder.active)
+            self.assertTrue(recorder.audio_start_in_progress)
+
+            recorder.add_frame(
+                frame, presented_at=recorder.started_at + 0.1,
+                presentation_mode="preview_presented")
+            self.assertEqual(len(recorder.video_frame_queue), 1)
+
+            release.set()
+            recorder._join_audio_start()
+            self.assertFalse(recorder.audio_start_in_progress)
+            recorder.active = False
+            if recorder.video is not None:
+                recorder.video.release()
+                recorder.video = None
+
+    def test_command_monitor_uses_nonblocking_audio_for_every_chunk(self):
+        path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(path) as stream:
+            source = stream.read()
+        method = source[source.index(
+            "    def _start_command_monitor_chunk"):
+            source.index("    def _ensure_command_monitor_source_snapshot")]
+        self.assertIn("async_audio_start=bool(audio_device)", method)
+        process = source[source.index(
+            "    def _process_command_monitor_frame"):
+            source.index("    def _apply_record_output_dir")]
+        self.assertGreaterEqual(process.count("audio_start_in_progress"), 3)
+
+    def test_disabled_input_set_audio_cannot_select_or_open_stale_device(self):
+        from Window import PokeControllerApp
+
+        class Variable:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        app = types.SimpleNamespace(
+            input_set_include_audio=Variable(False),
+            audio_input=Variable("2: stale audio device"),
+            audio_input_cb=mock.Mock(),
+            _audio_display_to_name={},
+            _other_device_usage_entries=lambda: [],
+            _device_usage_suffix=lambda *_args: "",
+        )
+        app._audio_capture_enabled = types.MethodType(
+            PokeControllerApp._audio_capture_enabled, app)
+
+        self.assertEqual(
+            PokeControllerApp._selected_audio_device_name(app), "")
+        PokeControllerApp._configure_audio_input_values(
+            app, ["2: stale audio device"], selected="2: stale audio device")
+        self.assertEqual(app.audio_input.get(), "")
+
+        app.input_set_include_audio.set(True)
+        PokeControllerApp._configure_audio_input_values(
+            app, ["2: selected audio device"],
+            selected="2: selected audio device")
+        self.assertEqual(
+            PokeControllerApp._selected_audio_device_name(app),
+            "2: selected audio device")
+
+    def test_audio_device_refresh_skips_portaudio_when_input_set_disables_audio(self):
+        from Window import PokeControllerApp
+
+        app = types.SimpleNamespace(
+            all_audio_inputs=["old"],
+            _audio_capture_enabled=lambda: False,
+            _configure_audio_input_values=mock.Mock(),
+        )
+        with mock.patch("Window.AudioMonitor.devices") as devices:
+            PokeControllerApp.refresh_audio_devices(app)
+
+        devices.assert_not_called()
+        self.assertEqual(app.all_audio_inputs, [])
+        app._configure_audio_input_values.assert_called_once_with(
+            [], selected="")
 
     def test_audio_queue_drop_is_replaced_once_by_confirmed_silence(self):
         recorder = CaptureRecorder()
@@ -7803,14 +19705,15 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
         self.assertEqual(command[rate_index + 1], "60.000000")
         self.assertEqual(command[command.index("-crf") + 1], "18")
         self.assertEqual(command[command.index("-preset") + 1], "veryfast")
-        self.assertEqual(command[command.index("-threads") + 1], "2")
+        self.assertEqual(command[command.index("-threads") + 1], "1")
+        self.assertEqual(command[command.index("-filter_threads") + 1], "1")
         self.assertEqual(command[command.index("-brand") + 1], "mp42")
         self.assertEqual(command[command.index("-tag:v") + 1], "avc1")
         self.assertEqual(
             command[command.index("-video_track_timescale") + 1], "60000")
         if os.name == "nt":
             flags = run.call_args.kwargs["creationflags"]
-            self.assertTrue(flags & 0x00004000)  # below-normal process
+            self.assertTrue(flags & 0x00000040)  # idle-priority process
             self.assertTrue(flags & 0x08000000)  # no console window
         self.assertEqual(result, "recording.mp4")
 
@@ -8243,6 +20146,2224 @@ def sample_function(self):
 
 
 class PythonSourceSafetyTests(unittest.TestCase):
+    @staticmethod
+    def _za_karasuba46_recovery_functions():
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+        namespace = {
+            "Button": Button,
+            "Direction": Direction,
+            "Stick": Stick,
+        }
+        for name in (
+                "_5_story_karasuba_46_recovery_reset",
+                "_5_story_karasuba_46_recovery"):
+            exec(compile(records[name], source_path, "exec"), namespace)
+        return namespace
+
+    def test_za_karasuba46_recovery_is_start_selectable_and_bounded(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+        options = discover_command_run_options(source, "ZA_story")
+        recovery_locations = [
+            row for row in options["locations"]
+            if row.get("value") == "5_STORY_KARASUBA_46_RECOVERY"
+        ]
+        self.assertEqual(len(recovery_locations), 1)
+        self.assertEqual(
+            recovery_locations[0]["variable"],
+            "STATE_5_STORY_FUNCTION")
+        for expected_log in (
+                "phase=34",
+                "delegated_step=5_STORY_KARASUBA_34",
+                "phase=35",
+                "delegated_step=5_STORY_KARASUBA_35",
+                "phase=36",
+                "delegated_step=5_STORY_KARASUBA_36",
+                "phase=SEARCH",
+                "attempt={attempt}/10",
+                "phase=COMMENT",
+                "action=advance_conversation_until_FIELD"):
+            self.assertIn(expected_log, source)
+
+        source_tree = ast.parse(source)
+        functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        expected_transitions = {
+            "_5_story_karasuba_34": {
+                "5_STORY_KARASUBA_34", "5_STORY_KARASUBA_35"},
+            "_5_story_karasuba_35": {
+                "5_STORY_KARASUBA_35", "5_STORY_KARASUBA_36"},
+            "_5_story_karasuba_36": {
+                "5_STORY_KARASUBA_36", "5_STORY_KARASUBA_37"},
+            "_5_story_karasuba_43": {
+                "5_STORY_KARASUBA_43", "5_STORY_KARASUBA_44"},
+            "_5_story_karasuba_46": {
+                "5_STORY_KARASUBA_46", "5_STORY_KARASUBA_47"},
+        }
+        for name, expected in expected_transitions.items():
+            actual = {
+                node.value.value
+                for node in ast.walk(functions[name])
+                if isinstance(node, ast.Return)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, str)
+            }
+            self.assertEqual(actual, expected, name)
+
+        namespace = self._za_karasuba46_recovery_functions()
+        recover = namespace["_5_story_karasuba_46_recovery"]
+        reset = namespace["_5_story_karasuba_46_recovery_reset"]
+
+        class Command:
+            def __init__(self, marker_visible):
+                self._5_story_karasuba_46_recovery_phase = "34"
+                self._5_story_karasuba_46_recovery_attempt = 0
+                self._5_story_karasuba_46_recovery_active = False
+                self.marker_visible = marker_visible
+                self.steps = []
+                self.moves = []
+                self.buttons = []
+                self.renda_calls = []
+
+            def _5_story_karasuba_34(self):
+                self.steps.append("34")
+                return "5_STORY_KARASUBA_35"
+
+            def _5_story_karasuba_35(self):
+                self.steps.append("35")
+                return "5_STORY_KARASUBA_36"
+
+            def _5_story_karasuba_36(self):
+                self.steps.append("36")
+                return "5_STORY_KARASUBA_37"
+
+            def checkIfAlive(self):
+                return None
+
+            def press(self, direction, duration=0.0, wait=0.0):
+                self.moves.append((direction, duration, wait))
+
+            def image_check(self, target):
+                self.assert_target = target
+                return self.marker_visible
+
+            def pressRep(self, button, **kwargs):
+                self.buttons.append((button, kwargs))
+
+            def ZA_renda_button(self, **kwargs):
+                self.renda_calls.append(kwargs)
+                return True
+
+        found = Command(True)
+        found._5_story_karasuba_46_recovery_reset = types.MethodType(
+            reset, found)
+        for phase in ("35", "36", "SEARCH"):
+            self.assertEqual(
+                recover(found), "5_STORY_KARASUBA_46_RECOVERY")
+            self.assertEqual(
+                found._5_story_karasuba_46_recovery_phase, phase)
+        self.assertEqual(
+            recover(found), "5_STORY_KARASUBA_46_RECOVERY")
+        self.assertEqual(
+            found._5_story_karasuba_46_recovery_phase, "COMMENT")
+        self.assertEqual(found.renda_calls, [])
+        self.assertEqual(recover(found), "5_STORY_KARASUBA_43")
+        self.assertEqual(found.steps, ["34", "35", "36"])
+        self.assertEqual(found.assert_target,
+                         "POKEMON_ZA_INVESTIGATE_MARKER")
+        self.assertEqual(len(found.moves), 1)
+        self.assertEqual(found.moves[0][1:], (0.1, 0.5))
+        self.assertEqual(found.buttons[0][0], Button.A)
+        self.assertEqual(len(found.renda_calls), 1)
+        self.assertEqual(found.renda_calls[0], {
+            "rendabutton": "B",
+            "endpicture": "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+            "sub_button": "A",
+            "sub_picture": "POKEMON_ZA_TEXT_BLACK_COMMENT",
+            "sub2_button": "A",
+            "sub2_picture": "POKEMON_ZA_2_SELECT",
+            "sub3_button": "A",
+            "sub3_picture": "POKEMON_ZA_3_SELECT",
+            "sub4_button": "A",
+            "sub4_picture": "POKEMON_ZA_HELP_MARKER",
+            "sleeptime": 0.5,
+        })
+        self.assertEqual(
+            found._5_story_karasuba_46_recovery_phase, "34")
+        self.assertEqual(found._5_story_karasuba_46_recovery_attempt, 0)
+        self.assertFalse(found._5_story_karasuba_46_recovery_active)
+
+        missing = Command(False)
+        missing._5_story_karasuba_46_recovery_phase = "SEARCH"
+        missing._5_story_karasuba_46_recovery_active = True
+        missing._5_story_karasuba_46_recovery_reset = types.MethodType(
+            reset, missing)
+        for _ in range(9):
+            self.assertEqual(
+                recover(missing), "5_STORY_KARASUBA_46_RECOVERY")
+        self.assertEqual(recover(missing), "5_STORY_KARASUBA_34")
+        self.assertEqual(len(missing.moves), 10)
+        self.assertEqual(missing.buttons, [])
+        self.assertEqual(
+            missing._5_story_karasuba_46_recovery_phase, "34")
+        self.assertEqual(missing._5_story_karasuba_46_recovery_attempt, 0)
+        self.assertFalse(missing._5_story_karasuba_46_recovery_active)
+
+    def test_za_investigate_marker_uses_current_center_vertical_capture(self):
+        profile_path = os.path.join(
+            SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
+        with open(profile_path, "r", encoding="utf-8") as stream:
+            profile = json.load(stream)
+        variants = profile["targets"][
+            "POKEMON_ZA_INVESTIGATE_MARKER"]["variants"]
+        self.assertEqual(len(variants), 1)
+        self.assertEqual(variants[0]["crop"], [500, 0, 850, 720])
+        self.assertEqual(variants[0]["threshold"], 0.8)
+        self.assertTrue(variants[0]["use_gray"])
+
+        template_path = os.path.join(
+            SERIAL_CONTROLLER,
+            variants[0]["template_path"].replace("/", os.sep))
+        template = cv2.imread(template_path, cv2.IMREAD_GRAYSCALE)
+        self.assertIsNotNone(template)
+        self.assertEqual(template.shape, (23, 84))
+
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            tree = ast.parse(stream.read())
+        embedded = None
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Assign)
+                    and any(isinstance(target, ast.Name)
+                            and target.id == "IMAGE_DETECTION_TARGETS"
+                            for target in node.targets)):
+                targets = ast.literal_eval(node.value)
+                embedded = targets.get("POKEMON_ZA_INVESTIGATE_MARKER")
+                if embedded is not None:
+                    break
+        self.assertEqual(embedded, variants)
+
+    def test_za_karasuba69_recovers_a_stalled_goto_with_b_until_field(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+        namespace = {"Button": Button}
+        for name in (
+                "_5_story_karasuba_69_field_recovery",
+                "_5_story_karasuba_69"):
+            exec(compile(records[name], source_path, "exec"), namespace)
+        recover_field = namespace[
+            "_5_story_karasuba_69_field_recovery"]
+        step69 = namespace["_5_story_karasuba_69"]
+
+        class Command:
+            def __init__(self, goto_results, field_after=None):
+                self.goto_results = list(goto_results)
+                self.Common_current_state = "COMMON_START"
+                self.field_after = field_after
+                self.buttons = []
+                self.alive_checks = 0
+
+            def ZA_Common_goto(self, *_args, **_kwargs):
+                result, state = self.goto_results.pop(0)
+                self.Common_current_state = state
+                return result
+
+            def checkIfAlive(self):
+                self.alive_checks += 1
+
+            def image_check(self, target):
+                self.assert_target = target
+                return (self.field_after is not None
+                        and len(self.buttons) >= self.field_after)
+
+            def pressRep(self, button, **kwargs):
+                self.buttons.append((button, kwargs))
+
+        progressing = Command([
+            ("EXEC", "COMMON_MAP_OPEN"),
+            ("EXEC", "COMMON_GOTO_SELECT1"),
+            ("EXEC", "COMMON_GOTO_SELECT2"),
+            ("START", "COMMON_START"),
+        ])
+        progressing._5_story_karasuba_69_field_recovery = (
+            types.MethodType(recover_field, progressing))
+        for _ in range(3):
+            self.assertEqual(step69(progressing), "5_STORY_KARASUBA_69")
+        self.assertEqual(step69(progressing), "5_STORY_KARASUBA_70")
+        self.assertEqual(progressing.buttons, [])
+
+        recovered = Command(
+            [("EXEC", "STUCK")] * 10, field_after=1)
+        recovered._5_story_karasuba_69_field_recovery = (
+            types.MethodType(recover_field, recovered))
+        for _ in range(9):
+            self.assertEqual(step69(recovered), "5_STORY_KARASUBA_69")
+        self.assertEqual(step69(recovered), "5_STORY_KARASUBA_70")
+        self.assertEqual(len(recovered.buttons), 1)
+        self.assertEqual(recovered.buttons[0][0], Button.B)
+        self.assertEqual(recovered.Common_current_state, "COMMON_START")
+        self.assertEqual(recovered.assert_target,
+                         "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")
+
+        missing = Command([("EXEC", "STUCK")] * 10)
+        missing._5_story_karasuba_69_field_recovery = types.MethodType(
+            recover_field, missing)
+        for _ in range(10):
+            self.assertEqual(step69(missing), "5_STORY_KARASUBA_69")
+        self.assertEqual(len(missing.buttons), 20)
+        self.assertEqual(missing._5_story_karasuba_69_loop_count, 0)
+
+    def test_za_guri54_accepts_indoor_field_and_retries_missed_talk(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+        namespace = {"Button": Button}
+        for name in ("ZA_story_Template_Comment_Out", "_7_story_guri_54"):
+            exec(compile(records[name], source_path, "exec"), namespace)
+        comment_out = namespace["ZA_story_Template_Comment_Out"]
+        step54 = namespace["_7_story_guri_54"]
+
+        class IndoorComment:
+            def __init__(self):
+                self.renda_calls = 0
+                self.waits = []
+
+            def image_check(self, target):
+                if target == "POKEMON_ZA_TEXT_WHITE_COMMENT":
+                    return self.renda_calls == 0
+                if target == "POKEMON_ZA_FILED_HARD_CHECK_1":
+                    return self.renda_calls == 1
+                return False
+
+            def ZA_renda_button(self, **kwargs):
+                self.renda_calls += 1
+                if self.renda_calls > 1:
+                    raise AssertionError(
+                        "indoor FIELD must finish the first renda cycle")
+                self.renda_options = kwargs
+                return True
+
+            def wait(self, seconds):
+                self.waits.append(seconds)
+
+            @staticmethod
+            def checkIfAlive():
+                return None
+
+        indoor = IndoorComment()
+        self.assertTrue(comment_out(indoor, mode=1))
+        self.assertEqual(indoor.renda_calls, 1)
+        self.assertEqual(
+            indoor.renda_options["endpicture4"],
+            "POKEMON_ZA_FILED_HARD_CHECK_1")
+
+        class Guri54:
+            def __init__(self, comment_complete, field_visible):
+                self.comment_complete = comment_complete
+                self.field_visible = field_visible
+                self.buttons = []
+
+            def ZA_story_Template_Comment_Out(self, **kwargs):
+                self.comment_options = kwargs
+                return self.comment_complete
+
+            def image_check(self, target):
+                self.image_target = target
+                return self.field_visible
+
+            def pressRep(self, button, **kwargs):
+                self.buttons.append((button, kwargs))
+
+        completed = Guri54(True, False)
+        self.assertEqual(step54(completed), "7_STORY_GURI_55")
+        self.assertEqual(completed.comment_options, {"mode": 1})
+        self.assertEqual(completed.buttons, [])
+
+        retry = Guri54(False, True)
+        self.assertEqual(step54(retry), "7_STORY_GURI_54")
+        self.assertEqual(
+            retry.image_target, "POKEMON_ZA_FILED_HARD_CHECK_0")
+        self.assertEqual(len(retry.buttons), 1)
+        self.assertEqual(retry.buttons[0][0], Button.A)
+        self.assertEqual(retry._7_story_guri_54_talk_retry_count, 1)
+
+    def test_za_comment_out_handles_elevator_and_guri86_uses_goto(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+        namespace = {
+            "Button": Button,
+            "Direction": Direction,
+            "Stick": Stick,
+        }
+        for name in (
+                "ZA_story_Template_Comment_Out", "_7_story_guri_85",
+                "_7_story_guri_86"):
+            exec(compile(records[name], source_path, "exec"), namespace)
+        comment_out = namespace["ZA_story_Template_Comment_Out"]
+        step85 = namespace["_7_story_guri_85"]
+        step86 = namespace["_7_story_guri_86"]
+
+        class ElevatorComment:
+            def __init__(self):
+                self.phase = "ELEVATOR"
+                self.buttons = []
+                self.renda_calls = 0
+
+            def image_check(self, target):
+                if target == "POKEMON_ZA_FILED_HARD_CHECK_0":
+                    return self.phase in ("ELEVATOR", "FIELD")
+                if target == "POKEMON_ZA_ELEVATOR_ICON":
+                    return self.phase == "ELEVATOR"
+                if target == "POKEMON_ZA_TEXT_WHITE_COMMENT":
+                    return self.phase == "COMMENT"
+                return False
+
+            def pressRep(self, button, **kwargs):
+                self.buttons.append((button, kwargs))
+                self.phase = "COMMENT"
+
+            def ZA_renda_button(self, **kwargs):
+                self.renda_calls += 1
+                if self.renda_calls > 1:
+                    raise AssertionError(
+                        "FIELD must finish the first elevator renda cycle")
+                self.renda_options = kwargs
+                self.phase = "FIELD"
+                return True
+
+            @staticmethod
+            def wait(_seconds):
+                return None
+
+            @staticmethod
+            def checkIfAlive():
+                return None
+
+        elevator = ElevatorComment()
+        self.assertTrue(comment_out(
+            elevator,
+            sub9_button="A",
+            sub9_picture="POKEMON_ZA_ELEVATOR_ICON"))
+        self.assertEqual(len(elevator.buttons), 1)
+        self.assertEqual(elevator.buttons[0][0], Button.A)
+        self.assertEqual(elevator.renda_calls, 1)
+        self.assertEqual(
+            elevator.renda_options["sub9_picture"],
+            "POKEMON_ZA_ELEVATOR_ICON")
+
+        class Guri85:
+            def __init__(self, field_visible):
+                self.field_visible = field_visible
+                self.moves = []
+
+            def image_check(self, target):
+                return (
+                    target == "POKEMON_ZA_FILED_HARD_CHECK_0"
+                    and self.field_visible)
+
+            def press(self, direction, **kwargs):
+                self.moves.append((direction, kwargs))
+
+        field = Guri85(True)
+        self.assertEqual(step85(field), "7_STORY_GURI_86")
+        self.assertEqual(len(field.moves), 1)
+        self.assertEqual(field.moves[0][0].angle_for_show, 90)
+        self.assertEqual(field.moves[0][1], {
+            "duration": 3.0,
+            "wait": 1.0,
+        })
+        self.assertEqual(step85(Guri85(False)), "7_STORY_GURI_85")
+
+        class Guri86:
+            def __init__(self, goto_result):
+                self.goto_result = goto_result
+                self.goto_calls = []
+
+            def ZA_Common_goto(self, *args, **kwargs):
+                self.goto_calls.append((args, kwargs))
+                return self.goto_result
+
+        completed = Guri86("START")
+        self.assertEqual(step86(completed), "7_STORY_GURI_87")
+        self.assertEqual(completed.goto_calls, [(
+            (0, 0, 0), {
+                "othermap": "POKEMON_ZA_FURADARI_MAP",
+                "battle_recovery_mode": 1,
+            })])
+        self.assertEqual(step86(Guri86("EXEC")), "7_STORY_GURI_86")
+
+    def test_za_guri93_power_black_recovery_returns_to_second_map_goto(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+        namespace = {"Button": Button}
+        for name in (
+                "_7_story_guri_89", "_7_story_guri_91",
+                "_7_story_guri_93"):
+            exec(compile(records[name], source_path, "exec"), namespace)
+        step89 = namespace["_7_story_guri_89"]
+        step91 = namespace["_7_story_guri_91"]
+        step93 = namespace["_7_story_guri_93"]
+
+        class Command:
+            def __init__(
+                    self, goto_result="EXEC", field_visible=True,
+                    black_comment=False, comment_complete=False,
+                    field_after_b=None):
+                self.goto_result = goto_result
+                self.field_visible = field_visible
+                self.black_comment = black_comment
+                self.comment_complete = comment_complete
+                self.goto_calls = []
+                self.glides = []
+                self.comment_options = []
+                self.field_after_b = field_after_b
+                self.buttons = []
+                self.waits = []
+                self.alive_checks = 0
+
+            def ZA_Common_goto(self, *args, **kwargs):
+                self.goto_calls.append((args, kwargs))
+                return self.goto_result
+
+            def image_check(self, target):
+                self.field_target = target
+                if target == "POKEMON_ZA_TEXT_BLACK_COMMENT":
+                    return self.black_comment
+                if target in {
+                        "POKEMON_ZA_FILED_HARD_CHECK_0",
+                        "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"}:
+                    if self.field_after_b is not None:
+                        sent_b = sum(
+                            button == Button.B for button, _ in self.buttons)
+                        return sent_b >= self.field_after_b
+                    return self.field_visible
+                return False
+
+            def ZA_ROTOM_GLIDE(self, **kwargs):
+                self.glides.append(kwargs)
+
+            def ZA_story_Template_Comment_Out(self, **kwargs):
+                self.comment_options.append(kwargs)
+                return self.comment_complete
+
+            def pressRep(self, button, **kwargs):
+                self.buttons.append((button, kwargs))
+
+            def checkIfAlive(self):
+                self.alive_checks += 1
+
+            def wait(self, seconds):
+                self.waits.append(seconds)
+
+        normal = Command()
+        self.assertEqual(step89(normal), "7_STORY_GURI_90")
+        self.assertEqual(normal.glides, [{"dir": 290, "a_count": 20}])
+
+        transferred = Command(goto_result="START", field_visible=False)
+        self.assertEqual(step91(transferred), "7_STORY_GURI_92")
+        self.assertEqual(transferred.goto_calls, [(
+            (0, 0, 0), {
+                "othermap": "POKEMON_ZA_FURADARI_MAP",
+                "battle_recovery_mode": 1,
+            })])
+        self.assertFalse(hasattr(
+            transferred, "_7_story_guri_93_return_to_87"))
+
+        incomplete = Command(
+            field_visible=False, black_comment=True,
+            comment_complete=False)
+        self.assertEqual(step93(incomplete), "7_STORY_GURI_93")
+        self.assertTrue(incomplete._7_story_guri_93_black_recovery_pending)
+        self.assertEqual(
+            [button for button, _ in incomplete.buttons].count(Button.B), 30)
+
+        # 30回後にFIELDがまだ戻らなければ、次周もBを追加送信しない。
+        incomplete.black_comment = False
+        button_count_at_limit = len(incomplete.buttons)
+        self.assertEqual(step93(incomplete), "7_STORY_GURI_93")
+        self.assertEqual(len(incomplete.buttons), button_count_at_limit)
+
+        # FIELDが遅れて戻った場合も、Step数ではなく2つ前の
+        # FURADARI_MAP goto（GURI_86）へ戻す。
+        incomplete.field_visible = True
+        self.assertEqual(step93(incomplete), "7_STORY_GURI_86")
+        self.assertFalse(incomplete._7_story_guri_93_black_recovery_pending)
+        self.assertEqual(len(incomplete.buttons), button_count_at_limit)
+        self.assertEqual(incomplete.Common_current_state, "COMMON_START")
+        self.assertEqual(incomplete.map_cursor_reset, 0)
+
+        # Bの途中でFIELDへ戻れば、30回を待たず直ちにGURI_86へ戻す。
+        field_after_b = Command(
+            field_visible=False, black_comment=True,
+            comment_complete=False, field_after_b=4)
+        self.assertEqual(step93(field_after_b), "7_STORY_GURI_86")
+        self.assertEqual(
+            [button for button, _ in field_after_b.buttons].count(Button.B), 4)
+
+        # 黒Commentと背景FIELDが同時一致しても、Bを最低1回送る。
+        black_over_field = Command(
+            field_visible=True, black_comment=True,
+            comment_complete=False)
+        self.assertEqual(step93(black_over_field), "7_STORY_GURI_86")
+        self.assertEqual(
+            [button for button, _ in black_over_field.buttons], [Button.B])
+
+        normal_comment = Command(
+            field_visible=False, black_comment=False,
+            comment_complete=True)
+        self.assertEqual(step93(normal_comment), "7_STORY_GURI_94")
+        self.assertFalse(hasattr(
+            normal_comment, "_7_story_guri_93_return_to_87"))
+
+        # 実録画の電源装置成功は、Commentではなく
+        # アイテム取得トーストとFIELDだけなので10回連続
+        # FIELDを確認したら94へ進む。
+        item_toast_field = Command(
+            field_visible=True, black_comment=False,
+            comment_complete=False)
+        for _ in range(9):
+            self.assertEqual(step93(item_toast_field), "7_STORY_GURI_93")
+        self.assertEqual(step93(item_toast_field), "7_STORY_GURI_94")
+        self.assertEqual(item_toast_field._7_story_guri_93_field_count, 0)
+
+        staying = Command(goto_result="EXEC")
+        self.assertEqual(step91(staying), "7_STORY_GURI_91")
+        self.assertFalse(hasattr(staying, "_7_story_guri_93_return_to_87"))
+
+    def test_za_furadari_section_dark_recovery_covers_guri110(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_text = stream.read()
+        records = {
+            item["name"]: item["text"]
+            for item in source_function_records(source_text)
+        }
+
+        module = ast.parse(source_text)
+        base_class = next(
+            node for node in module.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ZA_story_Base")
+        recovery_assignment = next(
+            node for node in base_class.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id
+                == "ZA_STORY_FURADARI_SECTION_RECOVERY_TARGETS"
+                for target in node.targets))
+        recovery_targets = ast.literal_eval(recovery_assignment.value)
+        self.assertEqual(recovery_targets, {
+            "7_STORY_GURI_86": "7_STORY_GURI_86",
+            "7_STORY_GURI_91": "7_STORY_GURI_86",
+            "7_STORY_GURI_94": "7_STORY_GURI_86",
+            "7_STORY_GURI_97": "7_STORY_GURI_91",
+            "7_STORY_GURI_101": "7_STORY_GURI_94",
+            "7_STORY_GURI_105": "7_STORY_GURI_97",
+            "7_STORY_GURI_108": "7_STORY_GURI_101",
+            "7_STORY_GURI_118": "7_STORY_GURI_105",
+            "7_STORY_GURI_123": "7_STORY_GURI_108",
+            "7_STORY_GURI_87": "7_STORY_GURI_86",
+            "7_STORY_GURI_89": "7_STORY_GURI_86",
+            "7_STORY_GURI_90": "7_STORY_GURI_86",
+            "7_STORY_GURI_92": "7_STORY_GURI_86",
+            "7_STORY_GURI_95": "7_STORY_GURI_91",
+            "7_STORY_GURI_98": "7_STORY_GURI_94",
+            "7_STORY_GURI_99": "7_STORY_GURI_94",
+            "7_STORY_GURI_100": "7_STORY_GURI_94",
+            "7_STORY_GURI_102": "7_STORY_GURI_97",
+            "7_STORY_GURI_104": "7_STORY_GURI_97",
+            "7_STORY_GURI_106": "7_STORY_GURI_101",
+            "7_STORY_GURI_109": "7_STORY_GURI_105",
+            "7_STORY_GURI_110": "7_STORY_GURI_105",
+            "7_STORY_GURI_111": "7_STORY_GURI_105",
+            "7_STORY_GURI_113": "7_STORY_GURI_105",
+            "7_STORY_GURI_117": "7_STORY_GURI_105",
+            "7_STORY_GURI_119": "7_STORY_GURI_108",
+            "7_STORY_GURI_121": "7_STORY_GURI_108",
+            "7_STORY_GURI_124": "7_STORY_GURI_118",
+            "7_STORY_GURI_125": "7_STORY_GURI_118",
+            "7_STORY_GURI_126": "7_STORY_GURI_118",
+            "7_STORY_GURI_127": "7_STORY_GURI_118",
+        })
+        comment_skip_assignment = next(
+            node for node in base_class.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id
+                == "ZA_STORY_FURADARI_COMMENT_SKIP_TARGETS"
+                for target in node.targets))
+        self.assertEqual(ast.literal_eval(comment_skip_assignment.value), {
+            "7_STORY_GURI_88": "7_STORY_GURI_89",
+            "7_STORY_GURI_96": "7_STORY_GURI_97",
+            "7_STORY_GURI_103": "7_STORY_GURI_104",
+            "7_STORY_GURI_107": "7_STORY_GURI_108",
+            "7_STORY_GURI_112": "7_STORY_GURI_113",
+            "7_STORY_GURI_120": "7_STORY_GURI_121",
+            "7_STORY_GURI_122": "7_STORY_GURI_123",
+            "7_STORY_GURI_128": "7_STORY_GURI_129",
+        })
+        self.assertIn(
+            "ZA_story_furadari_section_recovery_step",
+            records["ZA_story_event_entry_recovery_step"])
+
+        namespace = {
+            "Button": Button,
+            "Direction": Direction,
+            "Stick": Stick,
+            "time": time,
+        }
+        for name in (
+                "ZA_story_furadari_section_recovery_step",
+                "_7_story_guri_110"):
+            exec(compile(records[name], source_path, "exec"), namespace)
+        recovery_step = namespace[
+            "ZA_story_furadari_section_recovery_step"]
+        step110 = namespace["_7_story_guri_110"]
+
+        class Command:
+            ZA_STORY_FURADARI_SECTION_RECOVERY_TARGETS = recovery_targets
+            ZA_STORY_FURADARI_DARK_RECOVERY_SECONDS = 0.0
+
+            def __init__(self, dark=True, field_after_b=None):
+                self.dark = dark
+                self.field_after_b = field_after_b
+                self.field_visible = False
+                self.buttons = []
+                self.waits = []
+                self.dark_checks = 0
+                self.alive_checks = 0
+                self.Common_current_state = "COMMON_GOTO_SELECT2"
+                self.map_cursor_reset = 1
+
+            def _ZA_furadari_screen_is_dark(self, *_args, **_kwargs):
+                self.dark_checks += 1
+                return self.dark
+
+            def image_check(self, target):
+                if target not in {
+                        "POKEMON_ZA_FILED_HARD_CHECK_0",
+                        "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_0",
+                        "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"}:
+                    return False
+                if target == "POKEMON_ZA_FILED_HARD_CHECK_0":
+                    return False
+                if self.field_visible:
+                    return True
+                if self.field_after_b is None:
+                    return False
+                return len(self.buttons) >= self.field_after_b
+
+            def pressRep(self, button, **kwargs):
+                self.buttons.append((button, kwargs))
+
+            def checkIfAlive(self):
+                self.alive_checks += 1
+
+            def wait(self, seconds):
+                self.waits.append(seconds)
+
+        # 110自体はFIELDがない間に自己ループするため、共通ラッパー側の
+        # 暗転復帰が必要になる。
+        self.assertEqual(step110(Command()), "7_STORY_GURI_110")
+
+        not_dark = Command(dark=False)
+        self.assertEqual(
+            recovery_step(
+                not_dark, "7_STORY_GURI_110", "7_STORY_GURI_110"),
+            "7_STORY_GURI_110")
+        self.assertEqual(not_dark.buttons, [])
+
+        # GURI100付近の通常ロード暗転では94へ巻き戻さない。暗転が
+        # 同じStepで5秒継続した場合だけ、B/FIELD復旧を開始する。
+        debounced = Command(field_after_b=1)
+        debounced.ZA_STORY_FURADARI_DARK_RECOVERY_SECONDS = 5.0
+        with mock.patch.object(
+                time, "monotonic", side_effect=[100.0, 104.9, 105.0]):
+            self.assertEqual(
+                recovery_step(
+                    debounced,
+                    "7_STORY_GURI_100", "7_STORY_GURI_100"),
+                "7_STORY_GURI_100")
+            self.assertEqual(
+                recovery_step(
+                    debounced,
+                    "7_STORY_GURI_100", "7_STORY_GURI_100"),
+                "7_STORY_GURI_100")
+            self.assertEqual(
+                recovery_step(
+                    debounced,
+                    "7_STORY_GURI_100", "7_STORY_GURI_100"),
+                "7_STORY_GURI_94")
+        self.assertEqual(
+            [button for button, _ in debounced.buttons], [Button.B])
+
+        # 実機で開始位置に指定されていたGURI_91はgoto Step自体なので、
+        # ここで暗転してもB復帰後にGURI_86へ戻せることを確認する。
+        goto91_dark = Command(field_after_b=3)
+        self.assertEqual(
+            recovery_step(
+                goto91_dark,
+                "7_STORY_GURI_91", "7_STORY_GURI_91"),
+            "7_STORY_GURI_86")
+        self.assertEqual(
+            [button for button, _ in goto91_dark.buttons],
+            [Button.B] * 3)
+        self.assertEqual(goto91_dark.Common_current_state, "COMMON_START")
+        self.assertEqual(goto91_dark.map_cursor_reset, 0)
+
+        # Bの途中でFIELDへ戻れば、110から数えて2つ前にある
+        # FURADARI_MAP goto（105）へ戻る。
+        field_after_four = Command(field_after_b=4)
+        self.assertEqual(
+            recovery_step(
+                field_after_four,
+                "7_STORY_GURI_110", "7_STORY_GURI_110"),
+            "7_STORY_GURI_105")
+        self.assertEqual(
+            [button for button, _ in field_after_four.buttons],
+            [Button.B] * 4)
+        self.assertEqual(field_after_four.Common_current_state, "COMMON_START")
+        self.assertEqual(field_after_four.map_cursor_reset, 0)
+
+        # 30回でFIELDが戻らない場合は追加入力せず待ち、遅れて復帰した
+        # FIELDを確認した時点で同じgotoへ戻る。
+        delayed_field = Command()
+        self.assertEqual(
+            recovery_step(
+                delayed_field,
+                "7_STORY_GURI_110", "7_STORY_GURI_110"),
+            "7_STORY_GURI_110")
+        self.assertEqual(len(delayed_field.buttons), 30)
+        self.assertEqual(
+            recovery_step(
+                delayed_field,
+                "7_STORY_GURI_110", "7_STORY_GURI_110"),
+            "7_STORY_GURI_110")
+        self.assertEqual(len(delayed_field.buttons), 30)
+        delayed_field.field_visible = True
+        self.assertEqual(
+            recovery_step(
+                delayed_field,
+                "7_STORY_GURI_110", "7_STORY_GURI_110"),
+            "7_STORY_GURI_105")
+        self.assertEqual(len(delayed_field.buttons), 30)
+
+        # 正常遷移を返した周回では、暗転判定も復帰も割り込ませない。
+        normal_transition = Command()
+        self.assertEqual(
+            recovery_step(
+                normal_transition,
+                "7_STORY_GURI_110", "7_STORY_GURI_111"),
+            "7_STORY_GURI_111")
+        self.assertEqual(normal_transition.dark_checks, 0)
+        self.assertEqual(normal_transition.buttons, [])
+
+    def test_za_common_goto_selects_filter_zero_without_cursor_move(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+        namespace = {"Button": Button}
+        exec(compile(
+            records["ZA_Common_goto_select1"], source_path, "exec"),
+            namespace)
+        select1 = namespace["ZA_Common_goto_select1"]
+
+        class Command:
+            def __init__(self):
+                self.map_cursor_reset = 0
+                self.phase = "filter"
+                self.buttons = []
+                self.cursor_moves = []
+                self.waits = []
+
+            def wait(self, seconds):
+                self.waits.append(seconds)
+
+            def image_check(self, target):
+                if target in (
+                        "POKEMON_ZA_MAP2",
+                        "POKEMON_ZA_MOVESPOT_TAB"):
+                    return True
+                if target == "POKEMON_ZA_TAB_FILTER":
+                    return self.phase == "filter"
+                if target == "POKEMON_ZA_SELECT_ALL":
+                    return self.phase == "select"
+                return False
+
+            def pressRep(self, button, **kwargs):
+                self.buttons.append((button, kwargs))
+
+            def etc_sendCommand(self, command):
+                self.cursor_moves.append(command)
+
+        command = Command()
+        self.assertEqual(
+            select1(
+                command, 0, othermap="POKEMON_ZA_FURADARI_MAP"),
+            "COMMON_GOTO_SELECT1")
+        self.assertEqual([item[0] for item in command.buttons], [Button.MINUS])
+        self.assertEqual(command.buttons[0][1]["duration"], 0.2)
+        self.assertEqual(command.buttons[0][1]["wait"], 0.5)
+        self.assertIn(0.3, command.waits)
+        self.assertEqual(command.cursor_moves, [])
+
+        # TAB_FILTERの検知を取りこぼしても、SELECT_ALLが未表示なら
+        # MINUS自体は必ず送る。
+        command.phase = "filter_unmatched"
+        command.buttons.clear()
+        self.assertEqual(
+            select1(
+                command, 0, othermap="POKEMON_ZA_FURADARI_MAP"),
+            "COMMON_GOTO_SELECT1")
+        self.assertEqual([item[0] for item in command.buttons], [Button.MINUS])
+        self.assertEqual(command.cursor_moves, [])
+
+        command.phase = "select"
+        command.buttons.clear()
+        self.assertEqual(
+            select1(
+                command, 0, othermap="POKEMON_ZA_FURADARI_MAP"),
+            "COMMON_GOTO_SELECT2")
+        self.assertEqual([item[0] for item in command.buttons], [Button.A])
+        self.assertEqual(command.buttons[0][1]["wait"], 0.3)
+        self.assertEqual(command.cursor_moves, [])
+
+        # フィルターを開いた画面で背景のTAB_FILTERも一致しても、
+        # MINUSで閉じずSELECT_ALLを優先してAを送る。
+        command.phase = "both"
+        command.buttons.clear()
+        original_image_check = command.image_check
+        command.image_check = lambda target: (
+            True if target in (
+                "POKEMON_ZA_TAB_FILTER", "POKEMON_ZA_SELECT_ALL")
+            else original_image_check(target))
+        self.assertEqual(
+            select1(
+                command, 0, othermap="POKEMON_ZA_FURADARI_MAP"),
+            "COMMON_GOTO_SELECT2")
+        self.assertEqual([item[0] for item in command.buttons], [Button.A])
+        self.assertEqual(command.cursor_moves, [])
+
+        for step_name in ("_5_story_karasuba_69", "_5_story_karasuba_96"):
+            self.assertIn("select1_position0_direct=1", records[step_name])
+
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_CommonNavigation", "ZA_CommonNavigation.pyfrag")
+        with open(fragment_path, "r", encoding="utf-8-sig") as stream:
+            fragment_records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+        def direct_zero_branch(function_text):
+            return next(
+                node for node in ast.walk(ast.parse(function_text))
+                if isinstance(node, ast.If)
+                and ast.unparse(node.test).replace(" ", "") == "position==0")
+
+        self.assertEqual(
+            ast.dump(direct_zero_branch(records["ZA_Common_goto_select1"]),
+                     include_attributes=False),
+            ast.dump(direct_zero_branch(
+                fragment_records["ZA_Common_goto_select1"]),
+                include_attributes=False))
+        for function_records in (records, fragment_records):
+            goto_text = function_records["ZA_Common_goto"]
+            self.assertIn("select1_position0_direct=0", goto_text)
+            self.assertIn(
+                "select_position0_direct=select1_position0_direct", goto_text)
+
+    def test_za_furadari_map_battle_warning_clears_eye_and_retries(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_CommonNavigation", "ZA_CommonNavigation.pyfrag")
+
+        function_names = (
+            "ZA_Common_goto_select2",
+            "_ZA_furadari_screen_is_dark",
+            "ZA_Common_goto_jump",
+            "ZA_Common_furadari_map_dark_recovery",
+            "ZA_Common_furadari_map_battle_recovery",
+            "ZA_Common_goto",
+        )
+        function_sets = []
+        for path in (source_path, fragment_path):
+            with open(path, "r", encoding="utf-8-sig") as stream:
+                records = {
+                    item["name"]: item["text"]
+                    for item in source_function_records(stream.read())
+                }
+            function_sets.append(records)
+        source_records, fragment_records = function_sets
+        for function_name in function_names:
+            self.assertEqual(
+                ast.dump(
+                    ast.parse(source_records[function_name]),
+                    include_attributes=False),
+                ast.dump(
+                    ast.parse(fragment_records[function_name]),
+                    include_attributes=False),
+                function_name)
+
+        namespace = {
+            "Button": Button,
+            "Direction": Direction,
+            "Stick": Stick,
+            "cv2": cv2,
+        }
+        for function_name in function_names:
+            exec(compile(
+                source_records[function_name], source_path, "exec"),
+                namespace)
+        jump = namespace["ZA_Common_goto_jump"]
+        dark_check = namespace["_ZA_furadari_screen_is_dark"]
+        dark_recovery = namespace[
+            "ZA_Common_furadari_map_dark_recovery"]
+        recovery = namespace["ZA_Common_furadari_map_battle_recovery"]
+        goto = namespace["ZA_Common_goto"]
+
+        class Command:
+            def __init__(self):
+                self.visible = set()
+                self.buttons = []
+                self.commands = []
+                self.waits = []
+                self.moves = []
+                self.route_calls = []
+                self.view_actions = []
+                self.zl_actions = []
+                self.held = []
+                self.released = []
+                self.alive_checks = 0
+                self.Rstick_state = 0
+                self.inactioncount = 0
+                self.battle_step_return = 0
+                self.battlecheck = 0
+                self.sleepcount = 0
+                self.map_cursor_reset = 1
+                self.marker_direction = "LOCKON_SIDE"
+                self.attack_ready = True
+                self.field_after_b = None
+                self.dark_screen = False
+                self.Common_current_state = (
+                    "COMMON_FURADARI_MAP_BATTLE_RECOVERY")
+                self.recovery_calls = 0
+                self.STATE_COMMON_FUNCTION = {}
+
+            def wait(self, seconds):
+                self.waits.append(seconds)
+
+            def image_check(self, target):
+                if (target == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_0"
+                        and self.field_after_b is not None):
+                    sent_b = sum(
+                        button == Button.B for button, _ in self.buttons)
+                    return sent_b >= self.field_after_b
+                return target in self.visible
+
+            def pressRep(self, button, **kwargs):
+                self.buttons.append((button, kwargs))
+
+            def press(self, direction, **kwargs):
+                self.moves.append((direction, kwargs))
+
+            def etc_sendCommand(self, command):
+                self.commands.append(command)
+
+            def checkIfAlive(self):
+                self.alive_checks += 1
+
+            def ZA_MOVE_SEE(self, action="RELOAD", in_see_r=0.0):
+                self.view_actions.append((action, in_see_r))
+
+            def ZA_ZL_ACTION(self, action="RELOAD"):
+                self.zl_actions.append(action)
+
+            def ZA_infi_target_marker_direction(self):
+                return self.marker_direction
+
+            def ZA_infi_attack_ready(self):
+                return self.attack_ready
+
+            def hold(self, direction):
+                self.held.append(direction)
+
+            def holdEnd(self, direction):
+                self.released.append(direction)
+
+            def _ZA_furadari_screen_is_dark(self):
+                return self.dark_screen
+
+            def ZA_Common_map_open(self, **kwargs):
+                self.route_calls.append(("map_open", (), kwargs))
+                return "COMMON_GOTO_SELECT1"
+
+            def ZA_Common_goto_select1(self, *args, **kwargs):
+                self.route_calls.append(("select1", args, kwargs))
+                return "COMMON_GOTO_SELECT2"
+
+            def ZA_Common_goto_select2(self, *args, **kwargs):
+                self.route_calls.append(("select2", args, kwargs))
+                return "COMMON_CHANGE_TIME"
+
+            ZA_Common_furadari_map_dark_recovery = dark_recovery
+
+            def ZA_Common_furadari_map_battle_recovery(self):
+                self.recovery_calls += 1
+                return "COMMON_MAP_OPEN"
+
+        blocked = Command()
+        blocked.visible.update({
+            "POKEMON_ZA_MOVE_COMMENT",
+            "POKEMON_ZA_MOVE_COMMENT_BATTLE",
+        })
+        self.assertEqual(
+            jump(
+                blocked, othermap="POKEMON_ZA_FURADARI_MAP",
+                battle_recovery_mode=1),
+            "COMMON_FURADARI_MAP_BATTLE_RECOVERY")
+        self.assertEqual([item[0] for item in blocked.buttons], [Button.A, Button.B])
+        self.assertEqual(blocked.buttons[-1][1]["repeat"], 1)
+        self.assertEqual(blocked._za_furadari_map_b_count, 1)
+        self.assertEqual(blocked.inactioncount, 1)
+        self.assertEqual(blocked.battle_step_return, 0)
+
+        # 実録画と同様に両方の移動確認を取り逃がしても、補助モード1は
+        # A5回で成功扱いにせずFIELD復帰へ入る。
+        timed_out = Command()
+        self.assertEqual(
+            jump(
+                timed_out, othermap="POKEMON_ZA_FURADARI_MAP",
+                battle_recovery_mode=1),
+            "COMMON_FURADARI_MAP_BATTLE_RECOVERY")
+        self.assertEqual(timed_out.buttons[-1][0], Button.B)
+        self.assertEqual(timed_out._za_furadari_map_b_count, 1)
+        self.assertNotIn(
+            5, [kwargs.get("repeat") for _, kwargs in timed_out.buttons])
+
+        dark_timed_out = Command()
+        dark_timed_out.dark_screen = True
+        self.assertEqual(
+            jump(
+                dark_timed_out, othermap="POKEMON_ZA_FURADARI_MAP",
+                battle_recovery_mode=1),
+            "COMMON_FURADARI_MAP_BATTLE_RECOVERY")
+        self.assertEqual(
+            dark_timed_out._za_furadari_map_recovery_kind, "dark")
+
+        class FrameCommand:
+            def __init__(self, frames):
+                self.frames = list(frames)
+                self.waits = []
+
+            def _read_camera_frame(self):
+                return self.frames.pop(0) if self.frames else None
+
+            def wait(self, seconds):
+                self.waits.append(seconds)
+
+        dark_frame = numpy.zeros((720, 1280, 3), dtype=numpy.uint8)
+        self.assertTrue(dark_check(FrameCommand([dark_frame] * 3)))
+        # 正面が黒くHUDだけ明るい実画面も、Window側のbrightness=28と
+        # 同じ基準で暗転として扱う。
+        dark_with_hud = dark_frame.copy()
+        dark_with_hud[72:180, 128:1152] = 64
+        self.assertTrue(dark_check(FrameCommand([dark_with_hud] * 3)))
+        # Previewに最後の黒画面が残ったまま入力だけ停止した場合も、
+        # stale frameを再利用せず、限定されたB/FIELD復旧へ渡す。
+        no_live_frame = FrameCommand([None] * 3)
+        self.assertTrue(dark_check(no_live_frame))
+        self.assertEqual(
+            no_live_frame._za_furadari_dark_detection_reason,
+            "camera_stalled")
+        light_frame = numpy.full((720, 1280, 3), 64, dtype=numpy.uint8)
+        self.assertFalse(dark_check(FrameCommand([light_frame])))
+
+        # FURADARI_MAPでも補助モード未指定なら従来のB10回経路。
+        legacy = Command()
+        legacy.visible.add("POKEMON_ZA_MOVE_COMMENT_BATTLE")
+        self.assertEqual(
+            jump(legacy, othermap="POKEMON_ZA_FURADARI_MAP"),
+            "COMMON_BATTLE_RETURN")
+        self.assertEqual([item[0] for item in legacy.buttons], [Button.A, Button.B])
+        self.assertEqual(legacy.buttons[-1][1]["repeat"], 10)
+        self.assertEqual(legacy.battle_step_return, 1)
+
+        # FIELDへ戻らない場合も、Bは合計30回で止まり、攻撃しない。
+        b_limited = Command()
+        b_limited._za_furadari_map_b_count = 1
+        b_limited.buttons.append((Button.B, {"repeat": 1}))
+        self.assertEqual(
+            recovery(b_limited),
+            "COMMON_FURADARI_MAP_BATTLE_RECOVERY")
+        self.assertEqual(
+            [item[0] for item in b_limited.buttons].count(Button.B), 30)
+        button_count_at_limit = len(b_limited.buttons)
+        self.assertEqual(
+            recovery(b_limited),
+            "COMMON_FURADARI_MAP_BATTLE_RECOVERY")
+        self.assertEqual(len(b_limited.buttons), button_count_at_limit)
+        self.assertEqual(b_limited.held, [])
+        self.assertEqual(b_limited.zl_actions, [])
+
+        # Bの途中でFIELDへ戻った場合は、30回まで送らず即座に停止する。
+        field_after_b = Command()
+        field_after_b._za_furadari_map_b_count = 1
+        field_after_b.buttons.append((Button.B, {"repeat": 1}))
+        field_after_b.field_after_b = 4
+        field_after_b.visible.add("POKEMON_ZA_EYE_CHECK_HIGH")
+        field_after_b.attack_ready = False
+        field_after_b.marker_direction = None
+        self.assertEqual(
+            recovery(field_after_b),
+            "COMMON_FURADARI_MAP_BATTLE_RECOVERY")
+        self.assertEqual(
+            [item[0] for item in field_after_b.buttons].count(Button.B), 4)
+        self.assertTrue(field_after_b._za_furadari_map_field_started)
+
+        # FIELDでは視点回転とZLを先に開始し、EYE表示中だけ攻撃する。
+        recovering = Command()
+        recovering._za_furadari_map_b_count = 4
+        recovering.visible = {
+            "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_0",
+            "POKEMON_ZA_EYE_CHECK_HIGH",
+            "POKEMON_ZA_FIELD_W",
+        }
+        self.assertEqual(
+            recovery(recovering),
+            "COMMON_FURADARI_MAP_BATTLE_RECOVERY")
+        view_direction = recovering.held[0]
+        self.assertEqual(view_direction.stick, Stick.RIGHT)
+        self.assertEqual(view_direction.angle_for_show, 180)
+        self.assertAlmostEqual(view_direction.mag, 0.6)
+        self.assertEqual(recovering.Rstick_state, 1)
+        self.assertEqual(recovering.commands, ["Lbutton_up"])
+        self.assertEqual(recovering.zl_actions[-1], "")
+        self.assertEqual(recovering.held[1], "LOCKON_SIDE")
+        self.assertEqual(recovering.released[-1], "LOCKON_SIDE")
+        self.assertEqual(
+            [item[0] for item in recovering.buttons],
+            [Button.X, Button.A, Button.B])
+
+        # 一度確認したEYEが3回連続で消えたら入力を解除して同じgotoへ戻す。
+        recovering.visible.clear()
+        attack_button_count = len(recovering.buttons)
+        recovering.inactioncount = 4
+        recovering.battlecheck = 1
+        recovering.battle_step_return = 1
+        for _ in range(2):
+            self.assertEqual(
+                recovery(recovering),
+                "COMMON_FURADARI_MAP_BATTLE_RECOVERY")
+        self.assertEqual(recovery(recovering), "COMMON_MAP_OPEN")
+        self.assertEqual(len(recovering.buttons), attack_button_count)
+        self.assertEqual(recovering.zl_actions[-1], "END")
+        self.assertEqual(recovering.Rstick_state, 0)
+        released_view = recovering.released[-1]
+        self.assertEqual(released_view.stick, Stick.RIGHT)
+        self.assertEqual(released_view.angle_for_show, 180)
+        self.assertEqual(recovering.inactioncount, 0)
+        self.assertEqual(recovering.battlecheck, 0)
+        self.assertEqual(recovering.battle_step_return, 0)
+        self.assertEqual(recovering.map_cursor_reset, 0)
+
+        # FIELD直後にEYEが取れなくても、10周期は回転と攻撃機会を維持する。
+        grace = Command()
+        grace.visible.add("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_0")
+        grace.attack_ready = False
+        grace.marker_direction = None
+        for _ in range(9):
+            self.assertEqual(
+                recovery(grace),
+                "COMMON_FURADARI_MAP_BATTLE_RECOVERY")
+        self.assertEqual(recovery(grace), "COMMON_MAP_OPEN")
+        self.assertEqual(grace.zl_actions[-1], "END")
+
+        dark_route = Command()
+        dark_route.visible.add("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_0")
+        dark_route._za_furadari_map_recovery_kind = "dark"
+        self.assertEqual(
+            recovery(dark_route),
+            "COMMON_FURADARI_MAP_BATTLE_RECOVERY")
+        self.assertEqual(
+            recovery(dark_route),
+            "COMMON_FURADARI_MAP_BATTLE_RECOVERY")
+        self.assertEqual(
+            recovery(dark_route),
+            "COMMON_FURADARI_MAP_BATTLE_RECOVERY")
+        self.assertEqual(dark_route.route_calls, [
+            ("map_open", (), {"othermap": "POKEMON_ZA_FURADARI_MAP"}),
+            ("select1", (1,), {
+                "othermap": "POKEMON_ZA_FURADARI_MAP",
+            }),
+            ("select2", (1, 1, 0), {
+                "othermap": "POKEMON_ZA_FURADARI_MAP",
+                "battle_recovery_mode": 0,
+            }),
+        ])
+        self.assertEqual(
+            recovery(dark_route),
+            "COMMON_FURADARI_MAP_BATTLE_RECOVERY")
+        dark_route.visible.add("POKEMON_ZA_IN_ICON")
+        self.assertEqual(
+            recovery(dark_route),
+            "COMMON_FURADARI_MAP_BATTLE_RECOVERY")
+        dark_route.visible.remove("POKEMON_ZA_IN_ICON")
+        self.assertEqual(recovery(dark_route), "COMMON_MAP_OPEN")
+        self.assertEqual(
+            [(move.angle_for_show, kwargs["duration"])
+             for move, kwargs in dark_route.moves],
+            [(90, 0.5), (90, 1.5)])
+        self.assertEqual(
+            [button for button, _ in dark_route.buttons], [Button.A])
+        self.assertEqual(dark_route._za_furadari_map_recovery_kind, "")
+
+        routed = Command()
+        self.assertEqual(
+            goto(routed, 0, 0, 0, battle_recovery_mode=1),
+            "EXEC")
+        self.assertEqual(routed.recovery_calls, 1)
+        self.assertEqual(routed.Common_current_state, "COMMON_MAP_OPEN")
+
+        for step_name in (
+                "_7_story_guri_91", "_7_story_guri_94",
+                "_7_story_guri_97", "_7_story_guri_101",
+                "_7_story_guri_105", "_7_story_guri_108",
+                "_7_story_guri_118", "_7_story_guri_123"):
+            self.assertIn(
+                "battle_recovery_mode=1", source_records[step_name])
+
+    def test_za_out_hotel_z45_uses_in_icon_or_hotel_z_text(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        step_node = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_1_story_out_hotel_z_45")
+        namespace = {
+            "Button": Button,
+            "Direction": Direction,
+            "Stick": Stick,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[step_node], type_ignores=[])),
+            source_path, "exec"), namespace)
+
+        class Command:
+            def __init__(self):
+                self.visible = {
+                    "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+                    "POKEMON_ZA_IN_ICON",
+                }
+                self.moves = []
+
+            def image_check(self, picture):
+                return picture in self.visible
+
+            def press(self, direction, **kwargs):
+                self.moves.append((direction, kwargs))
+
+        command = Command()
+        self.assertEqual(
+            namespace["_1_story_out_hotel_z_45"](command),
+            "1_STORY_OUT_HOTEL_Z_46")
+        self.assertEqual(
+            namespace["_1_story_out_hotel_z_45"](command),
+            "1_STORY_OUT_HOTEL_Z_46")
+        self.assertEqual(
+            [(move.angle_for_show, kwargs)
+             for move, kwargs in command.moves],
+            [(220, {"duration": 1.0, "wait": 0.5}),
+             (90, {"duration": 6.5, "wait": 0.5}),
+             (320, {"duration": 1.0, "wait": 0.5}),
+             (90, {"duration": 6.5, "wait": 0.5})])
+        self.assertEqual(
+            command._za_out_hotel_z45_door_offset_angle, 220)
+
+        # IN_ICONが外れても「ホテルZ」の文字で同じ交互処理へ入る。
+        command.visible.remove("POKEMON_ZA_IN_ICON")
+        command.visible.add("POKEMON_ZA_OUT_HOTEL_Z45_HOTEL_Z_TEXT")
+        command.moves.clear()
+        self.assertEqual(
+            namespace["_1_story_out_hotel_z_45"](command),
+            "1_STORY_OUT_HOTEL_Z_46")
+        self.assertEqual(
+            [(move.angle_for_show, kwargs)
+             for move, kwargs in command.moves],
+            [(220, {"duration": 1.0, "wait": 0.5}),
+             (90, {"duration": 6.5, "wait": 0.5})])
+
+        # どちらも見えない場合だけ従来の固定300度を使う。
+        command.visible.remove("POKEMON_ZA_OUT_HOTEL_Z45_HOTEL_Z_TEXT")
+        command.moves.clear()
+        self.assertEqual(
+            namespace["_1_story_out_hotel_z_45"](command),
+            "1_STORY_OUT_HOTEL_Z_46")
+        self.assertEqual(
+            [(move.angle_for_show, kwargs)
+             for move, kwargs in command.moves],
+            [(300, {"duration": 0.5, "wait": 0.5}),
+             (90, {"duration": 6.5, "wait": 0.5})])
+
+    def test_za_out_hotel_z20_rechecks_lockon_from_bounded_left_offsets(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+
+        namespace = {
+            "Button": types.SimpleNamespace(L="L"),
+            "Direction": lambda stick, angle: (stick, angle),
+            "Stick": types.SimpleNamespace(RIGHT="RIGHT", LEFT="LEFT"),
+        }
+        for function_name in (
+                "_1_story_out_hotel_z_20_lockon_recheck",
+                "_1_story_out_hotel_z_20"):
+            exec(compile(
+                records[function_name], source_path, "exec"), namespace)
+        recheck = namespace[
+            "_1_story_out_hotel_z_20_lockon_recheck"]
+        step20 = namespace["_1_story_out_hotel_z_20"]
+
+        class Command:
+            def __init__(self, lockon_after=None):
+                self._1_story_out_hotel_z_20_not_eyecheck_count = 0
+                self.lockon_after = lockon_after
+                self.attack_calls = 0
+                self.marker_calls = []
+                self.moves = []
+                self.buttons = []
+                self.zl_actions = []
+
+            def image_check(self, target):
+                if target == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK":
+                    return True
+                if target == "POKEMON_ZA_EYE_CHECK":
+                    return (self.lockon_after is not None
+                            and self.attack_calls >= self.lockon_after)
+                return False
+
+            def ZA_markerdir(self, marker_type):
+                self.marker_calls.append(marker_type)
+                return marker_type == "EVENT"
+
+            def ZA_ZL_ACTION(self, action):
+                self.zl_actions.append(action)
+
+            def checkIfAlive(self):
+                return None
+
+            def press(self, direction, **kwargs):
+                self.moves.append((direction, kwargs))
+
+            def pressRep(self, button, **kwargs):
+                self.buttons.append((button, kwargs))
+
+            def ZA_battle_coCp_noloop(self, **_kwargs):
+                self.attack_calls += 1
+
+            def wait(self, _seconds):
+                return None
+
+            def etc_sendCommand(self, _command):
+                return None
+
+            def ZA_get_pokemon(self):
+                return None
+
+        success = Command(lockon_after=2)
+        self.assertTrue(recheck(success))
+        self.assertEqual(success.marker_calls, ["EVENT"] * 2)
+        self.assertEqual(
+            [kwargs["duration"] for direction, kwargs in success.moves
+             if direction[0] == "RIGHT"],
+            [0.80, 1.50])
+        self.assertEqual(success.attack_calls, 2)
+
+        failed = Command()
+        self.assertFalse(recheck(failed))
+        self.assertEqual(failed.marker_calls, ["EVENT"] * 3)
+        self.assertEqual(
+            [kwargs["duration"] for direction, kwargs in failed.moves
+             if direction[0] == "RIGHT"],
+            [0.80, 1.50])
+        self.assertEqual(failed.attack_calls, 2)
+
+        repeated_failure = Command()
+        repeated_failure._1_story_out_hotel_z_20_lockon_recheck = (
+            types.MethodType(recheck, repeated_failure))
+        for _ in range(9):
+            self.assertEqual(
+                step20(repeated_failure), "1_STORY_OUT_HOTEL_Z_20")
+        self.assertEqual(repeated_failure.marker_calls, [])
+        self.assertEqual(repeated_failure.attack_calls, 9)
+        self.assertEqual(
+            step20(repeated_failure), "1_STORY_OUT_HOTEL_Z_20")
+        self.assertEqual(repeated_failure.marker_calls, ["EVENT"] * 3)
+        self.assertEqual(
+            repeated_failure._1_story_out_hotel_z_20_not_eyecheck_count, 0)
+
+    def test_za_out_hotel_z23_uses_grouped_search_before_fixed_move(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+
+        namespace = {
+            "Direction": lambda stick, angle: (stick, angle),
+            "Stick": types.SimpleNamespace(LEFT="LEFT"),
+        }
+        exec(compile(
+            records["_1_story_out_hotel_z_23"],
+            source_path, "exec"), namespace)
+        step = namespace["_1_story_out_hotel_z_23"]
+
+        class Command:
+            def __init__(self, marker_result=True,
+                         white_comment=False, field=True):
+                self.moves = []
+                self.marker_calls = []
+                self.marker_result = marker_result
+                self.white_comment = white_comment
+                self.field = field
+
+            def image_check(self, target):
+                if target == "POKEMON_ZA_TEXT_WHITE_COMMENT":
+                    return self.white_comment
+                return (
+                    target == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"
+                    and self.field)
+
+            def ZA_markerdir(self, marker_type, search_mode=0):
+                self.marker_calls.append((marker_type, search_mode))
+                return self.marker_result
+
+            def press(self, direction, **kwargs):
+                self.moves.append((direction, kwargs))
+
+        command = Command()
+        self.assertEqual(
+            step(command), "1_STORY_OUT_HOTEL_Z_23")
+        self.assertEqual(command.marker_calls, [("EVENT", 2)])
+        self.assertEqual(command.moves, [
+            (("LEFT", 90), {"duration": 2.0, "wait": 1.0}),
+        ])
+
+        missing = Command(marker_result=False)
+        self.assertEqual(step(missing), "1_STORY_OUT_HOTEL_Z_23")
+        self.assertEqual(missing.marker_calls, [("EVENT", 2)])
+        self.assertEqual(missing.moves, [])
+
+        actual_comment = Command(white_comment=True, field=False)
+        self.assertEqual(
+            step(actual_comment), "1_STORY_OUT_HOTEL_Z_24")
+        self.assertEqual(actual_comment.marker_calls, [])
+        self.assertEqual(actual_comment.moves, [])
+
+    def test_za_karasuba121_talks_only_when_chat_marker_is_visible(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+
+        namespace = {
+            "Button": types.SimpleNamespace(A="A"),
+            "Direction": lambda stick, angle: (stick, angle),
+            "Stick": types.SimpleNamespace(LEFT="LEFT"),
+        }
+        for function_name in (
+                "_5_story_karasuba_121",
+                "_5_story_karasuba_122",
+                "_5_story_karasuba_123"):
+            exec(compile(
+                records[function_name],
+                source_path, "exec"), namespace)
+        step = namespace["_5_story_karasuba_121"]
+
+        class Command:
+            def __init__(self, chat_after_moves=None):
+                self.chat_after_moves = chat_after_moves
+                self.buttons = []
+                self.marker_types = []
+                self.moves = []
+                self.alive_checks = 0
+
+            def image_check(self, target):
+                if target == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK":
+                    return True
+                if target == "POKEMON_ZA_CHAT_MARKER":
+                    return (
+                        self.chat_after_moves is not None
+                        and len(self.moves) >= self.chat_after_moves)
+                return False
+
+            def pressRep(self, button, **kwargs):
+                self.buttons.append((button, kwargs))
+
+            def ZA_markerdir(self, marker_type, search_mode=0):
+                self.marker_types.append((marker_type, search_mode))
+                return True
+
+            def press(self, direction, **kwargs):
+                self.moves.append((direction, kwargs))
+
+            def checkIfAlive(self):
+                self.alive_checks += 1
+
+        talking = Command(chat_after_moves=0)
+        self.assertEqual(step(talking), "5_STORY_KARASUBA_122")
+        self.assertEqual(talking.buttons, [("A", {
+            "repeat": 1, "duration": 0.15,
+            "wait": 0.5, "interval": 0.1,
+        })])
+        self.assertEqual(talking.marker_types, [])
+        self.assertEqual(talking.moves, [])
+
+        searching = Command()
+        self.assertEqual(step(searching), "5_STORY_KARASUBA_121")
+        self.assertEqual(searching.buttons, [])
+        self.assertEqual(searching.marker_types, [("EVENT", 1)])
+        self.assertEqual(len(searching.moves), 10)
+        self.assertTrue(all(
+            move == (("LEFT", 90), {"duration": 0.1, "wait": 0.2})
+            for move in searching.moves))
+        self.assertEqual(searching.alive_checks, 10)
+
+        found_after_three = Command(chat_after_moves=3)
+        self.assertEqual(
+            step(found_after_three), "5_STORY_KARASUBA_122")
+        self.assertEqual(found_after_three.marker_types, [("EVENT", 1)])
+        self.assertEqual(len(found_after_three.moves), 3)
+        self.assertEqual(found_after_three.buttons, [("A", {
+            "repeat": 1, "duration": 0.15,
+            "wait": 0.5, "interval": 0.1,
+        })])
+
+        step122_options = namespace["_5_story_karasuba_122"](
+            types.SimpleNamespace(
+                ZA_story_Template_battle_before_renda_route=
+                lambda **kwargs: kwargs))
+        self.assertEqual(step122_options["event_move_duration"], 0.1)
+        self.assertEqual(step122_options["event_move_attempts"], 10)
+
+        step123_options = namespace["_5_story_karasuba_123"](
+            types.SimpleNamespace(
+                ZA_story_Template_battle_function_renda_route=
+                lambda **kwargs: kwargs))
+        self.assertEqual(step123_options["lockon_attack_wait"], 0.3)
+        self.assertEqual(step123_options["lockon_attack_checks"], 3)
+
+        renda_node = ast.parse(records[
+            "ZA_story_Template_battle_function_renda_route"]).body[0]
+        active_call = next(
+            node for node in ast.walk(renda_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr
+            == "ZA_story_Template_battle_function_active_level")
+        active_keywords = {
+            keyword.arg: keyword.value for keyword in active_call.keywords}
+        self.assertEqual(
+            active_keywords["lockon_attack_wait"].id,
+            "lockon_attack_wait")
+        self.assertEqual(
+            active_keywords["lockon_attack_checks"].id,
+            "lockon_attack_checks")
+
+        active_node = ast.parse(records[
+            "ZA_story_Template_battle_function_active_level"]).body[0]
+        cp_call = next(
+            node for node in ast.walk(active_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ZA_battle_Cp_loop")
+        cp_keywords = {
+            keyword.arg: keyword.value for keyword in cp_call.keywords}
+        self.assertEqual(
+            cp_keywords["lockon_attack_wait"].id,
+            "lockon_attack_wait")
+        self.assertEqual(
+            cp_keywords["lockon_attack_checks"].id,
+            "lockon_attack_checks")
+
+    def test_za_karasuba_battle_steps_route_black_comment_to_95(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_BattleAndRoyale", "ZA_BattleAndRoyale.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+
+        helper_name = "_ZA_karasuba_69_95_battle_noloop"
+        battle_steps = tuple(
+            f"_5_story_karasuba_{number}"
+            for number in range(72, 95, 2))
+        namespace = {}
+        for name in (helper_name, *battle_steps):
+            exec(compile(source_records[name], source_path, "exec"), namespace)
+
+        class Command:
+            def __init__(self, black=False):
+                self.black = black
+                self.attack_calls = 0
+                self.attack_options = []
+
+            def image_check(self, target):
+                if target == "POKEMON_ZA_TEXT_BLACK_COMMENT":
+                    return self.black
+                if target == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK":
+                    return True
+                if target == "POKEMON_ZA_EYE_CHECK_HIGH_POKE":
+                    return True
+                return False
+
+            def ZA_battle_Cp_loop(self, **kwargs):
+                self.attack_calls += 1
+                self.attack_options.append(kwargs)
+                self.black = True
+
+            @staticmethod
+            def wait(_seconds):
+                return None
+
+        for step_name in battle_steps:
+            with self.subTest(step=step_name, black_after_attack=True):
+                command = Command()
+                command._ZA_karasuba_69_95_battle_noloop = types.MethodType(
+                    namespace[helper_name], command)
+                self.assertEqual(
+                    namespace[step_name](command), "5_STORY_KARASUBA_95")
+                self.assertEqual(command.attack_calls, 1)
+                self.assertEqual(command.attack_options, [{
+                    "Xaction": 1,
+                    "Aaction": 0,
+                    "Yaction": 1,
+                    "Baction": 0,
+                    "mode": 1,
+                    "battle_mode": 1,
+                    "lockon_attack_wait": 0.3,
+                }])
+            with self.subTest(step=step_name, black_at_entry=True):
+                command = Command(black=True)
+                command._ZA_karasuba_69_95_battle_noloop = types.MethodType(
+                    namespace[helper_name], command)
+                self.assertEqual(
+                    namespace[step_name](command), "5_STORY_KARASUBA_95")
+                self.assertEqual(command.attack_calls, 0)
+
+        function_name = "ZA_battle_coCp_noloop"
+        source_node = ast.parse(source_records[function_name]).body[0]
+        fragment_node = ast.parse(fragment_records[function_name]).body[0]
+        self.assertEqual(
+            ast.dump(source_node, include_attributes=False),
+            ast.dump(fragment_node, include_attributes=False))
+        waits = [
+            node for node in ast.walk(source_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "wait"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+        ]
+        self.assertIn(0.1, [node.args[0].value for node in waits])
+        self.assertNotIn(0.05, [node.args[0].value for node in waits])
+
+        cp_loop_name = "ZA_battle_Cp_loop"
+        cp_source = source_records[cp_loop_name]
+        cp_source_node = ast.parse(cp_source).body[0]
+        cp_fragment_node = ast.parse(fragment_records[cp_loop_name]).body[0]
+        self.assertEqual(
+            ast.dump(cp_source_node, include_attributes=False),
+            ast.dump(cp_fragment_node, include_attributes=False))
+        self.assertIn('self.image_check("POKEMON_ZA_C+")', cp_source)
+        self.assertIn("for i in range(5):", cp_source)
+        self.assertIn("self.wait(lockon_attack_wait)", cp_source)
+        self.assertLess(
+            cp_source.index('self.ZA_ZL_ACTION("")'),
+            cp_source.index("self.wait(lockon_attack_wait)"))
+        self.assertLess(
+            cp_source.index("self.wait(lockon_attack_wait)"),
+            cp_source.index("for i in range(5):"))
+        cp_defaults = {
+            argument.arg: default.value
+            for argument, default in zip(
+                cp_source_node.args.args[-len(cp_source_node.args.defaults):],
+                cp_source_node.args.defaults)
+            if isinstance(default, ast.Constant)
+        }
+        self.assertEqual(cp_defaults["lockon_attack_wait"], 0.0)
+        self.assertEqual(cp_defaults["lockon_attack_checks"], 1)
+
+    def test_za_karasuba70_moves_field_slot1_before_step71(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+        function_source = records["_5_story_karasuba_70"]
+        namespace = {}
+        exec(compile(function_source, source_path, "exec"), namespace)
+        step70 = namespace["_5_story_karasuba_70"]
+
+        class Command:
+            def __init__(self, matched):
+                self.matched = set(matched)
+                self.commands = []
+                self.waits = []
+
+            def image_check(self, target):
+                return target in self.matched
+
+            def etc_sendCommand(self, command):
+                self.commands.append(command)
+
+            def wait(self, seconds):
+                self.waits.append(seconds)
+
+        hard_field = "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"
+        first = Command({hard_field, "POKEMON_ZA_FIELD1"})
+        self.assertEqual(step70(first), "5_STORY_KARASUBA_71")
+        self.assertEqual(first.commands, ["Lbutton_up"])
+        self.assertEqual(first.waits, [1.0])
+
+        second = Command({hard_field, "POKEMON_ZA_FIELD2"})
+        self.assertEqual(step70(second), "5_STORY_KARASUBA_70")
+        self.assertEqual(second.commands, ["Lbutton_left"])
+        self.assertEqual(second.waits, [1.0])
+
+        unknown = Command({hard_field})
+        self.assertEqual(step70(unknown), "5_STORY_KARASUBA_70")
+        self.assertEqual(unknown.commands, ["Lbutton_left"])
+        self.assertNotIn("POKEMON_ZA_FIELD_BACK_W", function_source)
+
+    @staticmethod
+    def _za_shiro50_51_functions():
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+        namespace = {}
+        for name in ("_4_story_shiro_50", "_4_story_shiro_51"):
+            exec(compile(records[name], source_path, "exec"), namespace)
+        return namespace
+
+    def test_za_shiro50_routes_through_box_move_step_51(self):
+        functions = self._za_shiro50_51_functions()
+        command = types.SimpleNamespace(
+            image_check=lambda target: (
+                target == "POKEMON_ZA_TEXT_WHITE_COMMENT"),
+            ZA_renda_button=lambda **_kwargs: True,
+        )
+
+        self.assertEqual(
+            functions["_4_story_shiro_50"](command),
+            "4_STORY_SHIRO_51")
+
+    def test_za_shiro51_moves_party_fifth_to_the_empty_box_slot(self):
+        functions = self._za_shiro50_51_functions()
+        calls = []
+        command = types.SimpleNamespace(
+            common_box_change_current_state="COMMON_BOX_CHANGE_START",
+            ZA_common_box_change_function=lambda **kwargs: (
+                calls.append(kwargs) or "COMMON_BOX_CHANGE_BOX_OPEN"),
+        )
+
+        self.assertEqual(
+            functions["_4_story_shiro_51"](command),
+            "4_STORY_SHIRO_51")
+        self.assertEqual(calls, [{
+            "target1": 4,
+            "target2": 1,
+            "target1_high": -1,
+            "target2_high": 0,
+        }])
+        self.assertEqual(
+            command.common_box_change_current_state,
+            "COMMON_BOX_CHANGE_BOX_OPEN")
+
+        command.ZA_common_box_change_function = lambda **kwargs: (
+            calls.append(kwargs) or "COMMON_BOX_CHANGE_START")
+        self.assertEqual(
+            functions["_4_story_shiro_51"](command),
+            "4_STORY_SHIRO_52")
+        self.assertEqual(len(calls), 2)
+
+    @staticmethod
+    def _za_shiro42_function(now):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+        namespace = {
+            "Button": Button,
+            "time": types.SimpleNamespace(monotonic=lambda: now[0]),
+        }
+        for name in (
+                "ZA_story_shiro42_renda_once",
+                "_4_story_shiro_42"):
+            exec(compile(records[name], source_path, "exec"), namespace)
+
+        def call(command):
+            command.ZA_story_shiro42_renda_once = types.MethodType(
+                namespace["ZA_story_shiro42_renda_once"], command)
+            return namespace["_4_story_shiro_42"](command)
+
+        return call
+
+    def test_za_shiro42_logs_an_exception_before_command_stops(self):
+        now = [0.0]
+        function = self._za_shiro42_function(now)
+        errors = []
+        command = types.SimpleNamespace(
+            image_check=lambda _target: (_ for _ in ()).throw(
+                RuntimeError("image check failed")),
+            _logger=types.SimpleNamespace(exception=errors.append),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "image check failed"):
+            function(command)
+        self.assertEqual(len(errors), 1)
+        self.assertIn("[STEP_ERROR] step=4_STORY_SHIRO_42", errors[0])
+        self.assertIn("exception=RuntimeError", errors[0])
+        self.assertIn("detail=image check failed", errors[0])
+
+    def test_za_shiro42_white_comment_uses_b_and_reports_a_stall_reason(self):
+        now = [0.0]
+        function = self._za_shiro42_function(now)
+        buttons = []
+        warnings = []
+
+        command = types.SimpleNamespace(
+            image_check=lambda target: (
+                target == "POKEMON_ZA_TEXT_WHITE_COMMENT"),
+            pressRep=lambda button, **kwargs: buttons.append(
+                (button, kwargs)),
+            wait=lambda _seconds: None,
+            last_image_detection={"score": 0.86, "threshold": 0.85},
+            _logger=types.SimpleNamespace(
+                warning=warnings.append, info=lambda _message: None),
+        )
+
+        self.assertEqual(function(command), "4_STORY_SHIRO_42")
+        self.assertEqual(buttons[0][0], Button.B)
+        self.assertEqual(buttons[0][1], {
+            "repeat": 1, "duration": 0.04,
+            "wait": 0.0, "interval": 0.1,
+        })
+        self.assertEqual(warnings, [])
+
+        now[0] = 10.1
+        self.assertEqual(function(command), "4_STORY_SHIRO_42")
+        self.assertEqual(len(buttons), 2)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("[STEP_STALL] step=4_STORY_SHIRO_42", warnings[0])
+        self.assertIn("screen=white_comment", warnings[0])
+        self.assertIn("action=B", warnings[0])
+        self.assertIn("last_score=0.860000", warnings[0])
+
+    def test_za_shiro42_field_advances_and_clears_diagnostics(self):
+        now = [3.0]
+        function = self._za_shiro42_function(now)
+        visible = {"POKEMON_ZA_TEXT_WHITE_COMMENT"}
+        buttons = []
+        recovery_logs = []
+        command = types.SimpleNamespace(
+            image_check=lambda target: target in visible,
+            pressRep=lambda button, **kwargs: buttons.append(
+                (button, kwargs)),
+            wait=lambda _seconds: None,
+            _logger=types.SimpleNamespace(
+                warning=lambda _message: None,
+                info=recovery_logs.append),
+        )
+
+        self.assertEqual(function(command), "4_STORY_SHIRO_42")
+        self.assertEqual([item[0] for item in buttons], [Button.B])
+        visible.clear()
+        visible.add("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")
+        self.assertEqual(function(command), "4_STORY_SHIRO_43")
+        self.assertEqual([item[0] for item in buttons], [Button.B])
+        self.assertIsNone(command._za_shiro42_diagnostic)
+        self.assertEqual(len(recovery_logs), 1)
+        self.assertIn("cause=field_detected", recovery_logs[0])
+
+    def test_za_shiro42_white_comment_hands_off_to_select_without_repeating(self):
+        now = [0.0]
+        function = self._za_shiro42_function(now)
+        visible = {"POKEMON_ZA_TEXT_WHITE_COMMENT"}
+        buttons = []
+        commands = []
+        command = types.SimpleNamespace(
+            image_check=lambda target: target in visible,
+            pressRep=lambda button, **kwargs: buttons.append(
+                (button, kwargs)),
+            etc_sendCommand=commands.append,
+            wait=lambda _seconds: None,
+        )
+
+        self.assertEqual(function(command), "4_STORY_SHIRO_42")
+        self.assertEqual(commands, [])
+        self.assertEqual([item[0] for item in buttons], [Button.B])
+
+        visible.clear()
+        visible.update({
+            "POKEMON_ZA_3_SELECT",
+            "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+        })
+        self.assertEqual(function(command), "4_STORY_SHIRO_42")
+        self.assertEqual(commands, ["Lbutton_down", "Lbutton_down"])
+        self.assertEqual([item[0] for item in buttons], [Button.B, Button.A])
+
+        self.assertEqual(function(command), "4_STORY_SHIRO_42")
+        self.assertEqual(commands, ["Lbutton_down", "Lbutton_down"])
+        self.assertEqual([item[0] for item in buttons], [Button.B, Button.A])
+
+        visible.clear()
+        visible.add("POKEMON_ZA_TEXT_WHITE_COMMENT")
+        self.assertEqual(function(command), "4_STORY_SHIRO_42")
+        visible.clear()
+        visible.add("POKEMON_ZA_3_SELECT")
+        self.assertEqual(function(command), "4_STORY_SHIRO_42")
+        self.assertEqual(commands, [
+            "Lbutton_down", "Lbutton_down",
+            "Lbutton_down", "Lbutton_down",
+        ])
+        self.assertEqual(
+            [item[0] for item in buttons],
+            [Button.B, Button.A, Button.B, Button.A])
+
+    @staticmethod
+    def _za_common_skill_change_functions(now):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+        namespace = {
+            "Button": types.SimpleNamespace(A="A", B="B", Y="Y", ZR="ZR"),
+            "time": types.SimpleNamespace(monotonic=lambda: now[0]),
+        }
+        for name in (
+                "ZA_common_skill_change_function",
+                "ZA_common_skill_change_skill_window_chtarget1"):
+            exec(compile(records[name], source_path, "exec"), namespace)
+        return namespace
+
+    def test_za_common_skill_change_selects_the_requested_machine_picture(self):
+        now = [0.0]
+        functions = self._za_common_skill_change_functions(now)
+        visible = {
+            "POKEMON_ZA_SKILL_PAGE_WINDOW",
+            "POKEMON_ZA_SIDE_SELECT_X_MENU_W",
+        }
+        buttons = []
+        commands = []
+
+        class Command:
+            pass
+
+        command = Command()
+        command.common_skill_change_current_state = (
+            "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET1")
+        command.image_check = lambda name: name in visible
+        command.pressRep = lambda button, **_kwargs: buttons.append(button)
+        command.etc_sendCommand = commands.append
+        command.wait = lambda _seconds: None
+        command.ZA_common_skill_change_skill_window_chtarget1 = types.MethodType(
+            functions["ZA_common_skill_change_skill_window_chtarget1"], command)
+        change_skill = types.MethodType(
+            functions["ZA_common_skill_change_function"], command)
+
+        first = change_skill(
+            1, 1, "X", 1,
+            targetskill_pic="POKEMON_ZA_REIBI_SKILL")
+        self.assertEqual(
+            first, "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET1")
+        self.assertEqual(buttons, ["ZR"])
+        self.assertEqual(commands, [])
+
+        now[0] = 1.0
+        visible.clear()
+        visible.update({
+            "POKEMON_ZA_SKILL_PAGE_WINDOW",
+            "POKEMON_ZA_REIBI_SKILL",
+        })
+        second = change_skill(
+            1, 1, "X", 1,
+            targetskill_pic="POKEMON_ZA_REIBI_SKILL")
+        self.assertEqual(
+            second, "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET2")
+        self.assertEqual(buttons, ["ZR", "A"])
+        self.assertFalse(command._za_common_skill_target_search_active)
+
+    def test_za_common_skill_change_returns_false_after_picture_timeout(self):
+        now = [0.0]
+        functions = self._za_common_skill_change_functions(now)
+        visible = {
+            "POKEMON_ZA_SKILL_PAGE_WINDOW",
+            "POKEMON_ZA_SIDE_SELECT_X_MENU_W",
+        }
+        buttons = []
+        commands = []
+
+        class Command:
+            pass
+
+        command = Command()
+        command.common_skill_change_current_state = (
+            "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET1")
+        command.image_check = lambda name: name in visible
+        command.pressRep = lambda button, **_kwargs: buttons.append(button)
+        command.etc_sendCommand = commands.append
+        command.wait = lambda _seconds: None
+        command.ZA_common_skill_change_skill_window_chtarget1 = types.MethodType(
+            functions["ZA_common_skill_change_skill_window_chtarget1"], command)
+        change_skill = types.MethodType(
+            functions["ZA_common_skill_change_function"], command)
+
+        change_skill(
+            1, 1, "X", 1,
+            targetskill_pic="POKEMON_ZA_REIBI_SKILL")
+        now[0] = 1.0
+        visible.clear()
+        visible.add("POKEMON_ZA_SKILL_PAGE_WINDOW")
+        searching = change_skill(
+            1, 1, "X", 1,
+            targetskill_pic="POKEMON_ZA_REIBI_SKILL")
+        self.assertEqual(
+            searching, "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET1")
+        self.assertEqual(commands, ["Lbutton_down"])
+
+        now[0] = 60.0
+        result = change_skill(
+            1, 1, "X", 1,
+            targetskill_pic="POKEMON_ZA_REIBI_SKILL")
+
+        self.assertEqual(result, "COMMON_SKILL_CHANGE_FALSE")
+        self.assertEqual(command.common_skill_change_current_state,
+                         "COMMON_SKILL_CHANGE_FALSE")
+        self.assertEqual(buttons, ["ZR"] + ["B"] * 10)
+        self.assertEqual(commands, ["Lbutton_down"])
+
+    def test_za_common_skill_change_keeps_legacy_number_selection(self):
+        now = [0.0]
+        functions = self._za_common_skill_change_functions(now)
+        buttons = []
+        commands = []
+
+        class Command:
+            pass
+
+        command = Command()
+        command.common_skill_change_current_state = (
+            "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET1")
+        command.image_check = lambda name: name in {
+            "POKEMON_ZA_SKILL_PAGE_WINDOW",
+            "POKEMON_ZA_SIDE_SELECT_X_MENU_W",
+        }
+        command.pressRep = lambda button, **_kwargs: buttons.append(button)
+        command.etc_sendCommand = commands.append
+        command.wait = lambda _seconds: None
+        command.ZA_common_skill_change_skill_window_chtarget1 = types.MethodType(
+            functions["ZA_common_skill_change_skill_window_chtarget1"], command)
+        change_skill = types.MethodType(
+            functions["ZA_common_skill_change_function"], command)
+
+        result = change_skill(1, 1, "X", 1)
+
+        self.assertEqual(
+            result, "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET2")
+        self.assertEqual(buttons, ["ZR", "A"])
+        self.assertEqual(commands, ["Lbutton_down"])
+
     def test_za_story_status_shows_only_the_active_story_and_common_states(self):
         source_path = os.path.join(
             SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
@@ -8284,6 +22405,28 @@ class PythonSourceSafetyTests(unittest.TestCase):
         self.assertNotIn("2_STORY_START_CHECK", status)
         self.assertNotIn("BATTLE_COUNT", status)
         self.assertNotIn("WHITE_CHECK", status)
+        command._za_mega_last_battle_mode = True
+        command._za_mega_mode5_start_flag = 4
+        command._za_mega_mode5_phase = "TARGET_ATTACK"
+        command._za_mega_mode5_last_detection = "POKEMON_ZA_C+"
+        command._za_mega_mode5_last_action = "A attack"
+        command._za_mega_testmode1_enabled = True
+        command._za_mega_testmode1_resume_hp = "OTHER"
+        command._za_mega_testmode1_hp_color = "YELLOW"
+        command._za_mega_testmode1_hp_fill_ratio = 0.355
+        command._za_mega_testmode1_phase = "COVER_ATTACK"
+        mode5_status = namespace["ZA_story_status_text"](command)
+        self.assertIn("MEGA_MODE5_TESTMODE1  :: 1", mode5_status)
+        self.assertIn(
+            "MEGA_MODE5_RESUME_HP  :: OTHER :: YELLOW :: ratio=0.355",
+            mode5_status)
+        self.assertIn(
+            "MEGA_MODE5_TEST_PHASE :: COVER_ATTACK", mode5_status)
+        self.assertIn(
+            "MEGA_MODE5_START_FLAG :: 4 :: TARGET_ATTACK", mode5_status)
+        self.assertIn(
+            "MEGA_MODE5_DETECTION  :: POKEMON_ZA_C+", mode5_status)
+        self.assertIn("MEGA_MODE5_ACTION     :: A attack", mode5_status)
 
     def test_mixed_leading_tabs_are_normalized_without_changing_string_data(self):
         source = ("def sample():\n"

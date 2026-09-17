@@ -301,6 +301,38 @@ def temporary_chunk_ids_for_session(chunks, session_id):
     }
 
 
+def ensure_stopped_session_recording_candidate(chunks, session_id):
+    """Keep at least the newest chunk available for the Stop save dialog.
+
+    Retention ranges are allowed to remove unneeded chunks, but an explicit
+    Commands Stop must not prune every chunk from the current run before the
+    user can choose whether to save it.
+    """
+    session_id = str(session_id or "")
+    if not session_id:
+        return ""
+    candidates = [
+        chunk for chunk in chunks
+        if (str(chunk.get("command_session_id", "")) == session_id
+            and not chunk.get("historical")
+            and chunk.get("id") not in (None, ""))
+    ]
+    if not candidates or any(
+            not chunk.get("delete_pending") for chunk in candidates):
+        return ""
+
+    def latest_time(chunk):
+        try:
+            return float(chunk.get("ended") or chunk.get("started") or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    latest = max(candidates, key=latest_time)
+    latest["delete_pending"] = False
+    latest["stop_confirmation_fallback"] = True
+    return str(latest.get("id", ""))
+
+
 def apply_stopped_session_recording_choice(chunks, session_id, save):
     """Apply the explicit Stop dialog choice to this Commands run only.
 
@@ -487,12 +519,14 @@ class CommandStateTimeline:
         self.max_events = max(50, int(max_events))
         self.events = []
         self.active_loop = None
+        self.completed_loop = None
 
     def reset(self, loop_cycles=None):
         if loop_cycles is not None:
             self.loop_cycles = max(2, int(loop_cycles))
         self.events = []
         self.active_loop = None
+        self.completed_loop = None
 
     def add(self, snapshot, now):
         key = snapshot_key(snapshot)
@@ -504,6 +538,13 @@ class CommandStateTimeline:
             offset = len(self.events) - self.active_loop["anchor_index"]
             expected = self.active_loop["signature"][offset % self.active_loop["period"]]
             if key != expected:
+                self.completed_loop = dict(self.active_loop)
+                self.completed_loop["loop_end"] = float(
+                    self.events[-1]["time"] if self.events else now)
+                # The mismatching event appended below is the first Step after
+                # the loop.  Keep its index so the loop-start evidence can be
+                # released after the configured number of later Steps.
+                self.completed_loop["exit_event_index"] = len(self.events)
                 self.active_loop = None
                 loop_ended = True
         event = {"time": float(now), "snapshot": dict(snapshot), "key": key}
@@ -514,11 +555,18 @@ class CommandStateTimeline:
             if self.active_loop:
                 self.active_loop["anchor_index"] = max(
                     0, self.active_loop["anchor_index"] - removed)
+            if self.completed_loop:
+                self.completed_loop["anchor_index"] = max(
+                    0, int(self.completed_loop.get("anchor_index", 0)) - removed)
+                self.completed_loop["exit_event_index"] = max(
+                    0, int(self.completed_loop.get(
+                        "exit_event_index", 0)) - removed)
         loop_started = False
         if self.active_loop is None:
             detected = self._detect_loop()
             if detected:
                 self.active_loop = detected
+                self.completed_loop = None
                 loop_started = True
         return {"changed": True, "loop_started": loop_started,
                 "loop_ended": loop_ended, "event": event,
@@ -542,6 +590,21 @@ class CommandStateTimeline:
                     "anchor_end": self.events[-1]["time"],
                 }
         return None
+
+    def loop_progress(self):
+        """Return completed cycles and phase for the currently active loop."""
+        if not self.active_loop:
+            return None
+        period = max(1, int(self.active_loop.get("period", 1) or 1))
+        anchor_index = max(0, int(
+            self.active_loop.get("anchor_index", len(self.events)) or 0))
+        transitions = max(0, len(self.events) - anchor_index)
+        return {
+            "period": period,
+            "completed_cycles": transitions // period,
+            "phase": transitions % period,
+            "at_boundary": transitions > 0 and transitions % period == 0,
+        }
 
     def recent_unique_cutoff(self, count):
         """A/B/A/B counts as two Steps, while returning the oldest kept time."""
@@ -567,6 +630,36 @@ class CommandStateTimeline:
                 break
         return cutoff
 
+    def _loop_preceding_cutoff(self, loop, keep_unique_steps):
+        """Freeze the pre-loop Step cutoff before a very long loop trims it."""
+        keep_unique_steps = max(1, int(keep_unique_steps))
+        if (int(loop.get("retention_keep_steps", 0) or 0)
+                == keep_unique_steps
+                and loop.get("retention_keep_after") is not None):
+            return float(loop["retention_keep_after"])
+        anchor_index = max(0, int(loop.get("anchor_index", 0) or 0))
+        cutoff = self._unique_cutoff(
+            self.events[:anchor_index], keep_unique_steps)
+        if cutoff is None:
+            cutoff = float(loop.get("anchor_start", 0.0) or 0.0)
+        loop["retention_keep_steps"] = keep_unique_steps
+        loop["retention_keep_after"] = float(cutoff)
+        return float(cutoff)
+
+    def _loop_edge_ranges(self, loop, loop_end, keep_unique_steps,
+                          edge_seconds, tail_end=None):
+        """Return pre/start and final loop ranges with a bounded middle gap."""
+        loop_start = float(loop.get("anchor_start", loop_end) or loop_end)
+        loop_end = max(loop_start, float(loop_end))
+        edge_seconds = max(10.0, float(edge_seconds))
+        keep_after = self._loop_preceding_cutoff(loop, keep_unique_steps)
+        start_finish = min(loop_end, loop_start + edge_seconds)
+        tail_start = max(loop_start, loop_end - edge_seconds)
+        if tail_start <= start_finish:
+            return [(keep_after, tail_end)], []
+        return ([(keep_after, start_finish), (tail_start, tail_end)],
+                [(start_finish, tail_start)])
+
     def failure_window(self, keep_unique_steps=15, terminal_time=None,
                        terminal_mode="dark_still", terminal_started_at=None):
         """Return the useful evidence window ending at a detected failure.
@@ -578,17 +671,6 @@ class CommandStateTimeline:
         evidence cutoff (normally 60 seconds).  The configured number of
         distinct Steps before the problem is retained with that failure tail.
         """
-        if self.active_loop:
-            anchor_index = max(0, int(self.active_loop.get("anchor_index", 0)))
-            preceding = self.events[:anchor_index]
-            keep_after = self._unique_cutoff(preceding, keep_unique_steps)
-            if keep_after is None:
-                keep_after = float(self.active_loop["anchor_start"])
-            return {
-                "keep_after": float(keep_after),
-                "keep_before": float(self.active_loop["anchor_end"]),
-                "mode": "loop",
-            }
         if terminal_time is not None:
             terminal_time = float(terminal_time)
             if terminal_started_at is None:
@@ -630,31 +712,94 @@ class CommandStateTimeline:
 
     def retention(self, now, keep_unique_steps=15, long_step_seconds=180.0,
                    loop_cycles=None, terminal_time=None,
-                   terminal_mode="dark_still", terminal_started_at=None):
+                   terminal_mode="dark_still", terminal_started_at=None,
+                   loop_edge_seconds=60.0):
+        now = float(now)
+        keep_unique_steps = max(1, int(keep_unique_steps))
+        loop_edge_seconds = max(10.0, float(loop_edge_seconds))
+        if self.active_loop:
+            ranges, skipped = self._loop_edge_ranges(
+                self.active_loop, now, keep_unique_steps,
+                loop_edge_seconds)
+            return {
+                "keep_after": min(start for start, _finish in ranges),
+                "keep_before": None,
+                "keep_ranges": ranges,
+                "loop_anchors": ranges,
+                "loop_skip_ranges": skipped,
+                "preserve_loop_start": True,
+                "loop_compacted": bool(skipped),
+                "mode": "loop",
+            }
+
         failure = self.failure_window(
             keep_unique_steps=keep_unique_steps, terminal_time=terminal_time,
             terminal_mode=terminal_mode,
             terminal_started_at=terminal_started_at)
         if failure is not None:
-            return {
+            result = {
                 "keep_after": failure["keep_after"],
                 "keep_before": failure["keep_before"],
-                "loop_anchors": [(failure["keep_after"], failure["keep_before"])],
+                "keep_ranges": [(
+                    failure["keep_after"], failure["keep_before"])],
+                "loop_anchors": [],
+                "loop_skip_ranges": [],
+                "preserve_loop_start": False,
+                "loop_compacted": False,
                 "mode": failure["mode"],
             }
-        cutoffs = [float(now) - max(1.0, float(long_step_seconds))]
-        unique_cutoff = self.recent_unique_cutoff(keep_unique_steps)
-        # With fewer than the requested number of distinct Steps, a single
-        # very long Step must still be bounded by the time window.
-        distinct_count = len({event["key"] for event in self.events})
-        if unique_cutoff is not None and distinct_count >= max(1, int(keep_unique_steps)):
-            cutoffs.append(unique_cutoff)
-        loop_cutoff = self.recent_loop_cutoff(loop_cycles)
-        if loop_cutoff is not None:
-            cutoffs.append(loop_cutoff)
-        anchors = []
-        if self.active_loop:
-            anchors.append((self.active_loop["anchor_start"],
-                            self.active_loop["anchor_end"]))
-        return {"keep_after": min(cutoffs), "keep_before": None,
-                "loop_anchors": anchors, "mode": "normal"}
+        else:
+            cutoffs = [now - max(1.0, float(long_step_seconds))]
+            unique_cutoff = self.recent_unique_cutoff(keep_unique_steps)
+            # Both values are upper bounds for temporary recording retention.
+            # Choosing the older value made a long unchanged Step retain the
+            # whole run once enough distinct Steps had appeared in its past.
+            distinct_count = len({event["key"] for event in self.events})
+            if (unique_cutoff is not None
+                    and distinct_count >= keep_unique_steps):
+                cutoffs.append(unique_cutoff)
+            keep_after = max(cutoffs)
+            result = {
+                "keep_after": keep_after,
+                "keep_before": None,
+                "keep_ranges": [(keep_after, None)],
+                "loop_anchors": [],
+                "loop_skip_ranges": [],
+                "preserve_loop_start": False,
+                "loop_compacted": False,
+                "mode": "normal",
+            }
+
+        completed = self.completed_loop
+        if completed:
+            exit_index = max(0, int(
+                completed.get("exit_event_index", len(self.events)) or 0))
+            post_events = self.events[exit_index:]
+            post_unique = {event["key"] for event in post_events}
+            if len(post_unique) >= keep_unique_steps:
+                # Fifteen later Steps supersede the old loop-start evidence.
+                # Clamp the ordinary time window so it cannot keep that old
+                # start segment merely because 180 seconds have not elapsed.
+                post_cutoff = self._unique_cutoff(
+                    post_events, keep_unique_steps)
+                if post_cutoff is not None:
+                    result["keep_after"] = max(
+                        float(result["keep_after"]), float(post_cutoff))
+                    result["keep_ranges"] = [(
+                        result["keep_after"], result.get("keep_before"))]
+                return result
+
+            loop_end = float(completed.get(
+                "loop_end", completed.get("anchor_end", now)) or now)
+            ranges, skipped = self._loop_edge_ranges(
+                completed, loop_end, keep_unique_steps,
+                loop_edge_seconds, tail_end=result.get("keep_before"))
+            result.update({
+                "keep_after": min(start for start, _finish in ranges),
+                "keep_ranges": ranges,
+                "loop_anchors": ranges,
+                "loop_skip_ranges": skipped,
+                "preserve_loop_start": True,
+                "loop_compacted": bool(skipped),
+            })
+        return result

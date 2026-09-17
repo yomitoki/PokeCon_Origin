@@ -98,42 +98,6 @@ def hold_last_preview_on_missing_frame(displaying_live_preview,
     return float(now) - float(missing_since) < max(0.0, float(grace_seconds))
 
 
-# Windows normally limits each process to 10,000 USER objects.  Leave enough
-# headroom for Tk to service buttons, menus and cross-thread notifications
-# instead of waiting until PhotoImage raises MemoryError at the hard limit.
-WINDOWS_USER_OBJECT_PRESSURE_HIGH = 8000
-WINDOWS_USER_OBJECT_PRESSURE_LOW = 6000
-TEMPORARY_OVERLAY_LIMIT = 256
-
-
-def windows_user_object_count():
-    """Return this process' Windows USER-object count, if available."""
-    if os.name != "nt" or ctypes is None or wintypes is None:
-        return None
-    try:
-        kernel32 = ctypes.windll.kernel32
-        user32 = ctypes.windll.user32
-        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-        user32.GetGuiResources.argtypes = [wintypes.HANDLE, wintypes.DWORD]
-        user32.GetGuiResources.restype = wintypes.DWORD
-        count = int(user32.GetGuiResources(
-            kernel32.GetCurrentProcess(), 1))  # GR_USEROBJECTS
-        return count if count > 0 else None
-    except (AttributeError, OSError, TypeError, ValueError):
-        return None
-
-
-def gui_resource_pressure(previously_active, user_count,
-                          high=WINDOWS_USER_OBJECT_PRESSURE_HIGH,
-                          low=WINDOWS_USER_OBJECT_PRESSURE_LOW):
-    """Apply hysteresis so preview/overlay work does not flap near a limit."""
-    if user_count is None:
-        return bool(previously_active)
-    if previously_active:
-        return int(user_count) > int(low)
-    return int(user_count) >= int(high)
-
-
 if ctypes is not None:
     class _BitmapInfoHeader(ctypes.Structure):
         _fields_ = [
@@ -344,8 +308,6 @@ class CaptureArea(tk.Canvas):
         self._preview_fps_measure_started = 0.0
         self._preview_fps_measure_frames = 0
         self._last_preview_frame_at = 0.0
-        self._preview_frame_intervals = deque(maxlen=360)
-        self._preview_fps_lock = threading.Lock()
         self._last_submitted_frame_sequence = -1
         self._last_consumed_frame_sequence = -1
         self._layout_busy_until = 0.0
@@ -357,15 +319,6 @@ class CaptureArea(tk.Canvas):
         self._live_preview_tk = None
         self._live_preview_size = None
         self._displaying_live_preview = False
-        self._preview_memory_error_until = 0.0
-        self._preview_memory_error_logged = False
-        self._gui_resource_next_check_at = 0.0
-        self._gui_resource_user_count = None
-        self._gui_resource_pressure = False
-        self._temporary_overlay_expirations = deque()
-        self._temporary_overlay_cleanup_scheduled = False
-        self._temporary_overlay_lock = threading.RLock()
-        self._temporary_overlay_limit = TEMPORARY_OVERLAY_LIMIT
         self._missing_frame_started_at = None
         self._native_preview = None
         self._native_preview_active = False
@@ -1216,10 +1169,6 @@ class CaptureArea(tk.Canvas):
         # At 60 FPS, 0.25 seconds is enough headroom for a 5-FPS background
         # render without allowing a previous command's final image through.
         now = time.monotonic()
-        if now < getattr(self, "_preview_memory_error_until", 0.0):
-            return False
-        if CaptureArea._gui_resource_pressure_active(self, now):
-            return False
         if now - float(submitted_at) > 0.25:
             return False
         current_sequence = self.camera.frameSequence() \
@@ -1231,37 +1180,18 @@ class CaptureArea(tk.Canvas):
         if frame_sequence is not None \
                 and frame_sequence == self._last_rendered_frame_sequence:
             return False
-        try:
-            if self._live_preview_tk is None \
-                    or self._live_preview_size != tuple(prepared_size):
-                self._live_preview_tk = ImageTk.PhotoImage(
-                    image_pil, master=self)
-                self._live_preview_size = tuple(prepared_size)
+        if self._live_preview_tk is None \
+                or self._live_preview_size != tuple(prepared_size):
+            self._live_preview_tk = ImageTk.PhotoImage(image_pil, master=self)
+            self._live_preview_size = tuple(prepared_size)
+            self.itemconfig(self.im_, image=self._live_preview_tk)
+        else:
+            # Reusing the Tcl image avoids allocating and deleting a 720p
+            # PhotoImage every frame. On the target machine this reduces Tk
+            # work from about 18 ms to about 11 ms per frame.
+            self._live_preview_tk.paste(image_pil)
+            if not self._displaying_live_preview:
                 self.itemconfig(self.im_, image=self._live_preview_tk)
-            else:
-                # Reusing the Tcl image avoids allocating and deleting a 720p
-                # PhotoImage every frame. On the target machine this reduces
-                # Tk work from about 18 ms to about 11 ms per frame.
-                self._live_preview_tk.paste(image_pil)
-                if not self._displaying_live_preview:
-                    self.itemconfig(self.im_, image=self._live_preview_tk)
-        except MemoryError:
-            # Do not let one exhausted-frame callback permanently terminate
-            # capture(). Keep the last valid Tcl image and retry after the
-            # queued Windows/Tk resources have had time to drain.
-            self._preview_memory_error_until = now + 1.0
-            self._gui_resource_pressure = True
-            self._gui_resource_next_check_at = 0.0
-            if not getattr(self, "_preview_memory_error_logged", False):
-                self._logger.error(
-                    "Preview update paused after MemoryError (Windows USER "
-                    "objects=%s); capture and image detection continue.",
-                    getattr(self, "_gui_resource_user_count", None))
-                self._preview_memory_error_logged = True
-            return False
-        if getattr(self, "_preview_memory_error_logged", False):
-            self._logger.info("Preview update recovered after MemoryError.")
-            self._preview_memory_error_logged = False
         self.im = self._live_preview_tk
         self._displaying_live_preview = True
         self._last_rendered_frame_sequence = frame_sequence
@@ -1271,32 +1201,6 @@ class CaptureArea(tk.Canvas):
             self, image_bgr, frame_sequence,
             self._last_preview_render_time)
         return True
-
-    def _gui_resource_pressure_active(self, now=None):
-        """Pause only optional Tk drawing while Windows USER quota is high."""
-        now = time.monotonic() if now is None else float(now)
-        if now < getattr(self, "_gui_resource_next_check_at", 0.0):
-            return bool(getattr(self, "_gui_resource_pressure", False))
-        self._gui_resource_next_check_at = now + 0.5
-        count = windows_user_object_count()
-        if count is None:
-            return bool(getattr(self, "_gui_resource_pressure", False))
-        self._gui_resource_user_count = count
-        previous = bool(getattr(self, "_gui_resource_pressure", False))
-        active = gui_resource_pressure(previous, count)
-        self._gui_resource_pressure = active
-        if active != previous:
-            if active:
-                self._logger.warning(
-                    "Windows USER-object pressure detected (%d). Temporary "
-                    "detection overlays and preview installation are paused; "
-                    "camera capture and image detection remain active.", count)
-                CaptureArea._clear_temporary_overlays(self)
-            else:
-                self._logger.info(
-                    "Windows USER-object pressure recovered (%d). Preview "
-                    "and temporary detection overlays resumed.", count)
-        return active
 
     def _native_preview_available(self, image_bgr):
         if self._native_preview is None or image_bgr is None:
@@ -1438,16 +1342,6 @@ class CaptureArea(tk.Canvas):
                     # black canvas or the final frame of a previous command.
                     self.itemconfig(self.im_, image=self._live_preview_tk)
                     self.im = self._live_preview_tk
-            except MemoryError:
-                self._preview_memory_error_until = time.monotonic() + 1.0
-                self._gui_resource_pressure = True
-                self._gui_resource_next_check_at = 0.0
-                if not self._preview_memory_error_logged:
-                    self._logger.error(
-                        "Native/Tk preview hand-off paused after MemoryError; "
-                        "capture and image detection continue.")
-                    self._preview_memory_error_logged = True
-                replacement_ready = False
             except (AttributeError, OSError, tk.TclError):
                 replacement_ready = False
         self._disable_threaded_native_preview(clear=True)
@@ -1469,63 +1363,26 @@ class CaptureArea(tk.Canvas):
 
     def _note_preview_frame(self, now=None):
         now = time.monotonic() if now is None else float(now)
-        with self._preview_fps_lock:
-            previous = self._last_preview_frame_at
-            self._last_preview_frame_at = now
-            if previous > 0.0 and now >= previous:
-                self._preview_frame_intervals.append((now, now - previous))
-            cutoff = now - 5.0
-            while self._preview_frame_intervals \
-                    and self._preview_frame_intervals[0][0] < cutoff:
-                self._preview_frame_intervals.popleft()
-            if self._preview_fps_measure_started <= 0.0:
-                self._preview_fps_measure_started = now
-                self._preview_fps_measure_frames = 0
-                return
-            self._preview_fps_measure_frames += 1
-            elapsed = now - self._preview_fps_measure_started
-            if elapsed >= 0.75:
-                self._measured_preview_fps = \
-                    self._preview_fps_measure_frames / elapsed
-                self._preview_fps_measure_started = now
-                self._preview_fps_measure_frames = 0
+        self._last_preview_frame_at = now
+        if self._preview_fps_measure_started <= 0.0:
+            self._preview_fps_measure_started = now
+            self._preview_fps_measure_frames = 0
+            return
+        self._preview_fps_measure_frames += 1
+        elapsed = now - self._preview_fps_measure_started
+        if elapsed >= 0.75:
+            self._measured_preview_fps = \
+                self._preview_fps_measure_frames / elapsed
+            self._preview_fps_measure_started = now
+            self._preview_fps_measure_frames = 0
 
     def measuredPreviewFps(self, now=None):
         """Return recently measured successful preview draws."""
         now = time.monotonic() if now is None else float(now)
-        with self._preview_fps_lock:
-            if self._last_preview_frame_at <= 0.0 \
-                    or now - self._last_preview_frame_at > 1.5:
-                return 0.0
-            return max(0.0, float(self._measured_preview_fps))
-
-    def measuredPreviewPacing(self, now=None, window_seconds=3.0):
-        """Return recent successful-draw spacing without claiming vsync."""
-        now = time.monotonic() if now is None else float(now)
-        try:
-            window_seconds = max(0.5, float(window_seconds))
-        except (TypeError, ValueError):
-            window_seconds = 3.0
-        with self._preview_fps_lock:
-            if self._last_preview_frame_at <= 0.0 \
-                    or now - self._last_preview_frame_at > 1.5:
-                return {"sample_count": 0, "p95_gap_ms": 0.0,
-                        "max_gap_ms": 0.0}
-            cutoff = now - window_seconds
-            intervals = sorted(
-                gap for recorded_at, gap in self._preview_frame_intervals
-                if recorded_at >= cutoff and gap >= 0.0)
-        if not intervals:
-            return {"sample_count": 0, "p95_gap_ms": 0.0,
-                    "max_gap_ms": 0.0}
-        percentile_index = max(
-            0, min(len(intervals) - 1,
-                   int(np.ceil(len(intervals) * 0.95)) - 1))
-        return {
-            "sample_count": len(intervals),
-            "p95_gap_ms": intervals[percentile_index] * 1000.0,
-            "max_gap_ms": intervals[-1] * 1000.0,
-        }
+        if self._last_preview_frame_at <= 0.0 \
+                or now - self._last_preview_frame_at > 1.5:
+            return 0.0
+        return max(0.0, float(self._measured_preview_fps))
 
     def capture(self):
         cycle_started = time.monotonic()
@@ -1665,15 +1522,6 @@ class CaptureArea(tk.Canvas):
                 capture_interval, cycle_started,
                 high_precision=bool(full_rate and prioritized))
             return
-        # Image detection and recording already consumed the fresh camera
-        # frame above. During USER pressure (or the short MemoryError
-        # backoff), avoid preparing another 720p Tk image only to reject it.
-        # Keeping capture() scheduled is what lets this path recover by itself.
-        if CaptureArea._gui_resource_pressure_active(self, now) \
-                or now < getattr(self, "_preview_memory_error_until", 0.0):
-            self._discard_prepared_preview()
-            self._schedule_next_capture(capture_interval, cycle_started)
-            return
         self._leave_native_preview(image_bgr, frame_sequence)
         if layout_busy or interaction_busy:
             # Rendering a 720p PhotoImage while Tk is recalculating every tab
@@ -1754,34 +1602,24 @@ class CaptureArea(tk.Canvas):
         self.camera.saveCapture()
 
     def ImgRect(self, x1, y1, x2, y2, outline, tag, ms, flag=True):
-        if self._feature_limited \
-                or CaptureArea._gui_resource_pressure_active(self):
+        if self._feature_limited:
             return None
         ratio_x = float(self.show_size[0] / self.camera.capture_size[0])
         ratio_y = float(self.show_size[1] / self.camera.capture_size[1])
-        try:
-            self.create_rectangle(
-                (x1 - 1.0) * ratio_x,
-                (y1 - 1.0) * ratio_y,
-                (x2 + 1.0) * ratio_x,
-                (y2 + 1.0) * ratio_y,
-                width=4.5,
-                outline="white",
-                tag=tag,
-            )
-            self.create_rectangle(
-                x1 * ratio_x, y1 * ratio_y, x2 * ratio_x, y2 * ratio_y,
-                width=2.5, outline=outline, tag=tag)
-        except MemoryError:
-            CaptureArea._pause_optional_gui_after_memory_error(
-                self, "temporary detection rectangle")
-            try:
-                self.delete(tag)
-            except (MemoryError, tk.TclError):
-                pass
-            return None
+        self.create_rectangle(
+            (x1 - 1.0) * ratio_x,
+            (y1 - 1.0) * ratio_y,
+            (x2 + 1.0) * ratio_x,
+            (y2 + 1.0) * ratio_y,
+            width=4.5,
+            outline="white",
+            tag=tag,
+        )
+        self.create_rectangle(
+            x1 * ratio_x, y1 * ratio_y, x2 * ratio_x, y2 * ratio_y, width=2.5, outline=outline, tag=tag
+        )
         if flag:
-            CaptureArea._track_temporary_overlay(self, tag, ms)
+            self.after(ms, self.deleteImageRect, tag)
 
     def deleteImageRect(self, tag):
         self.delete(tag)
@@ -1789,123 +1627,14 @@ class CaptureArea(tk.Canvas):
     def ImgText(
         self, x1, y1, txt, tag, ms, ft=("UD デジタル 教科書体 NP-B", 20), color: str = "black", flag: bool = True
     ):
-        if self._feature_limited \
-                or CaptureArea._gui_resource_pressure_active(self):
+        if self._feature_limited:
             return None
         ratio_x = float(self.show_size[0] / self.camera.capture_size[0])
         ratio_y = float(self.show_size[1] / self.camera.capture_size[1])
         str_len = 0.3528 * ft[1] * len(txt)  # 1[pt] = 0.3528[mm]
-        try:
-            self.create_text(
-                ((x1 - 1.0) * ratio_x) + str_len,
-                (y1 - 1.0) * ratio_y,
-                text=txt, font=ft, tag=tag, fill=color)
-        except MemoryError:
-            CaptureArea._pause_optional_gui_after_memory_error(
-                self, "temporary detection text")
-            return None
+        self.create_text(((x1 - 1.0) * ratio_x) + str_len, (y1 - 1.0) * ratio_y, text=txt, font=ft, tag=tag, fill=color)
         if flag:
-            CaptureArea._track_temporary_overlay(self, tag, ms)
-
-    def _pause_optional_gui_after_memory_error(self, context):
-        self._preview_memory_error_until = time.monotonic() + 1.0
-        self._gui_resource_pressure = True
-        self._gui_resource_next_check_at = 0.0
-        if not getattr(self, "_preview_memory_error_logged", False):
-            self._logger.error(
-                "Optional GUI update paused after MemoryError in %s "
-                "(Windows USER objects=%s); capture and image detection "
-                "continue.", context,
-                getattr(self, "_gui_resource_user_count", None))
-            self._preview_memory_error_logged = True
-
-    def _track_temporary_overlay(self, tag, ms):
-        """Use one bounded cleanup loop instead of one Tk timer per match."""
-        try:
-            lifetime = max(0.0, float(ms) / 1000.0)
-        except (TypeError, ValueError):
-            lifetime = 0.0
-        now = time.monotonic()
-        delete_now = []
-        schedule = False
-        lock = getattr(self, "_temporary_overlay_lock", None)
-        if lock is None:
-            self._temporary_overlay_lock = threading.RLock()
-            lock = self._temporary_overlay_lock
-        with lock:
-            expirations = getattr(
-                self, "_temporary_overlay_expirations", None)
-            if expirations is None:
-                expirations = deque()
-                self._temporary_overlay_expirations = expirations
-            expirations.append((now + lifetime, tag))
-            limit = max(1, int(getattr(
-                self, "_temporary_overlay_limit", TEMPORARY_OVERLAY_LIMIT)))
-            while len(expirations) > limit:
-                _expires_at, oldest_tag = expirations.popleft()
-                delete_now.append(oldest_tag)
-            if not getattr(
-                    self, "_temporary_overlay_cleanup_scheduled", False):
-                self._temporary_overlay_cleanup_scheduled = True
-                schedule = True
-        for old_tag in set(delete_now):
-            try:
-                self.delete(old_tag)
-            except (MemoryError, tk.TclError):
-                pass
-        if schedule:
-            try:
-                self.after(50, self._cleanup_temporary_overlays)
-            except (MemoryError, tk.TclError):
-                with lock:
-                    self._temporary_overlay_cleanup_scheduled = False
-
-    def _cleanup_temporary_overlays(self):
-        now = time.monotonic()
-        expired = []
-        delay_ms = None
-        with self._temporary_overlay_lock:
-            remaining = deque()
-            while self._temporary_overlay_expirations:
-                expires_at, tag = self._temporary_overlay_expirations.popleft()
-                if expires_at <= now:
-                    expired.append(tag)
-                else:
-                    remaining.append((expires_at, tag))
-            self._temporary_overlay_expirations = remaining
-            if remaining:
-                next_expiration = min(expires_at for expires_at, _tag in remaining)
-                delay_ms = max(10, min(
-                    250, int((next_expiration - now) * 1000.0)))
-            else:
-                self._temporary_overlay_cleanup_scheduled = False
-        for tag in set(expired):
-            try:
-                self.delete(tag)
-            except (MemoryError, tk.TclError):
-                pass
-        if delay_ms is not None:
-            try:
-                self.after(delay_ms, self._cleanup_temporary_overlays)
-            except (MemoryError, tk.TclError):
-                with self._temporary_overlay_lock:
-                    self._temporary_overlay_cleanup_scheduled = False
-
-    def _clear_temporary_overlays(self):
-        tags = []
-        lock = getattr(self, "_temporary_overlay_lock", None)
-        if lock is None:
-            return
-        with lock:
-            expirations = getattr(
-                self, "_temporary_overlay_expirations", deque())
-            tags = [tag for _expires_at, tag in expirations]
-            expirations.clear()
-        for tag in set(tags):
-            try:
-                self.delete(tag)
-            except (MemoryError, tk.TclError):
-                pass
+            self.after(ms, self.deleteImageText, tag)
 
     def deleteImageText(self, tag):
         self.delete(tag)

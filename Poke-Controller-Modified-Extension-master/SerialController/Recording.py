@@ -176,6 +176,10 @@ class CaptureRecorder:
         self.audio_stream = None
         self.audio_queue = None
         self.audio_writer_thread = None
+        self.audio_start_thread = None
+        self.audio_start_started_at = 0.0
+        self.audio_start_finished_at = 0.0
+        self.audio_start_error = ""
         self.audio_sample_rate = 0
         self.audio_channels = 0
         self.audio_gain = 1.0
@@ -278,7 +282,7 @@ class CaptureRecorder:
 
     def start(self, frame, fps, audio_device="", audio_gain_percent=100,
               cleanup_rules=None, minimum_duration=0,
-              audio_level_options=None):
+              audio_level_options=None, async_audio_start=False):
         if self.active or frame is None:
             return
         # Sub-second suffix prevents a rotating Commands monitor from reusing
@@ -348,6 +352,10 @@ class CaptureRecorder:
         self.audio_stop_overrun_frames = 0
         self.audio_monitor_counter_start = {}
         self.audio_monitor_counter_end = {}
+        self.audio_start_thread = None
+        self.audio_start_started_at = 0.0
+        self.audio_start_finished_at = 0.0
+        self.audio_start_error = ""
         self.video_first_presentation_at = 0.0
         self.video_last_presentation_at = 0.0
         self.video_presentation_frames = 0
@@ -369,8 +377,55 @@ class CaptureRecorder:
         self.writer_thread = threading.Thread(target=self._video_writer_loop, daemon=True)
         self.writer_thread.start()
         if audio_device:
-            self._start_audio(
-                audio_device, audio_gain_percent, self.audio_level_options)
+            if async_audio_start:
+                # Reopening some Windows/PortAudio devices can block for
+                # close to a minute. Commands monitoring must keep feeding
+                # real preview frames and observing Step changes meanwhile;
+                # otherwise the exact loop/failure interval is replaced by
+                # one repeated frame. Stop joins this worker before touching
+                # any audio resources, so the recorder is never reused while
+                # a late device-open attempt can still mutate it.
+                self.audio_start_started_at = time.monotonic()
+
+                def start_audio():
+                    try:
+                        self._start_audio(
+                            audio_device, audio_gain_percent,
+                            self.audio_level_options)
+                    except Exception as error:
+                        self.audio_start_error = str(error)
+                        print("[RECORDING] Async audio capture failed: {}".format(
+                            error))
+                    finally:
+                        self.audio_start_finished_at = time.monotonic()
+
+                self.audio_start_thread = threading.Thread(
+                    target=start_audio, daemon=True,
+                    name="CaptureAudioStarter")
+                self.audio_start_thread.start()
+            else:
+                self.audio_start_started_at = time.monotonic()
+                try:
+                    self._start_audio(
+                        audio_device, audio_gain_percent,
+                        self.audio_level_options)
+                finally:
+                    self.audio_start_finished_at = time.monotonic()
+
+    @property
+    def audio_start_in_progress(self):
+        thread = self.audio_start_thread
+        return bool(thread is not None and thread.is_alive())
+
+    def _join_audio_start(self):
+        """Wait for one asynchronous device-open before closing its state."""
+        thread = self.audio_start_thread
+        if thread is None:
+            return
+        if thread is threading.current_thread():
+            return
+        thread.join()
+        self.audio_start_thread = None
 
     @staticmethod
     def _open_video_writer(path, fps, size):
@@ -1088,6 +1143,7 @@ class CaptureRecorder:
                     300.0,
                     10.0 + self.video_stop_pending_presentations
                     / max(1.0, self.requested_fps * 0.5)))
+        self._join_audio_start()
         self._stop_monitored_audio_listener()
         if self.audio_stream:
             self.audio_stream.stop()
@@ -1325,6 +1381,8 @@ class CaptureRecorder:
         # Re-encode the AVI intermediate and explicitly map both tracks. CRF
         # 18 avoids compounding visible artefacts from the real-time MPEG-4
         # intermediate while ``veryfast`` keeps background finalization short.
+        # One encoder/filter thread makes the offline job yield predictable
+        # CPU headroom without changing the source CFR, CRF, or audio timing.
         command = [
             # The AVI timeline has already been filled from presentation
             # timestamps at the configured CFR.  Keep that exact rate in MP4;
@@ -1332,7 +1390,8 @@ class CaptureRecorder:
             ffmpeg, "-y", "-r", "{:.6f}".format(output_fps),
             "-i", video_path, "-i", mux_wav_path,
             "-map", "0:v:0", "-map", "1:a:0", "-c:v", "libx264",
-            "-threads", "2", "-preset", "veryfast", "-crf", "18",
+            "-threads", "1", "-filter_threads", "1",
+            "-preset", "veryfast", "-crf", "18",
             "-pix_fmt", "yuv420p",
         ]
         if abs(float(process_audio_gain) - 1.0) > 0.001:
@@ -1353,10 +1412,11 @@ class CaptureRecorder:
         if os.name == "nt":
             # The main PokeCon intentionally runs above normal priority.  Do
             # not let its ffmpeg child inherit that class and pre-empt Camera,
-            # preview, and Tk while an MP4 is being finalized.
+            # preview, and Tk while an MP4 is being finalized. Idle priority
+            # lets Windows take CPU back immediately when PokeCon needs it.
             run_options["creationflags"] = (
                 getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-                | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)
+                | getattr(subprocess, "IDLE_PRIORITY_CLASS", 0x00000040)
             )
         completed = subprocess.run(command, **run_options)
         if (completed.returncode == 0 and os.path.isfile(mp4_path)

@@ -21,11 +21,11 @@ try:
 except ImportError:
     Image = ImageTk = None
 
-from CommandRecordingModel import (filtered_timeline, load_command_recording,
+from CommandRecordingModel import (command_source_file, filtered_timeline,
+                                   load_command_recording,
                                    load_command_timeline, resolve_event_source,
                                    observed_source_lines, source_function_block,
-                                   timeline_page,
-                                   video_candidates)
+                                   timeline_page, video_candidates)
 from OperationSessionStudio import FrameCaptureDialog
 
 
@@ -50,16 +50,22 @@ class CommandRecordingWorkspace(ttk.Frame):
     """Timeline, recorded video, and the executed source in one tab."""
 
     def __init__(self, parent, initial_recording="", open_source_callback=None,
-                 open_image_callback=None, template_root_provider=None):
+                 open_image_callback=None, template_root_provider=None,
+                 open_focus_callback=None):
         ttk.Frame.__init__(self, parent)
         self.open_source_callback = open_source_callback
         self.open_image_callback = open_image_callback
         self.template_root_provider = template_root_provider
+        self.open_focus_callback = open_focus_callback
         self.command_development_window = None
+        self.command_run_comparison_window = None
         self.folder = ""
         self.metadata = {}
         self.events = []
         self.event_times = []
+        self.source_scope_events = []
+        self.source_scope_event_times = []
+        self.primary_source_path = ""
         self.filtered_events = []
         self.event_by_iid = {}
         self.page = 0
@@ -83,6 +89,7 @@ class CommandRecordingWorkspace(ttk.Frame):
         self._source_cache = {}
         self._load_generation = 0
         self._loading = False
+        self._pending_seek_after_load = None
         self._build()
         if initial_recording:
             self.after_idle(lambda: self.load_folder(initial_recording))
@@ -93,6 +100,7 @@ class CommandRecordingWorkspace(ttk.Frame):
         self.status = tk.StringVar(value="① 録画を読込 → ② Step/関数を選択 → ③ 動画とソースを比較")
         self.search = tk.StringVar()
         self.stops_only = tk.BooleanVar(value=False)
+        self.source_only = tk.BooleanVar(value=False)
         self.page_text = tk.StringVar(value="0件")
         self.video_choice = tk.StringVar()
         self.video_time_text = tk.StringVar(value="00:00.000 / 00:00.000")
@@ -120,6 +128,12 @@ class CommandRecordingWorkspace(ttk.Frame):
         ttk.Button(
             opener, text="Commands開発解析…",
             command=self.open_command_development).pack(side="left", padx=(3, 0))
+        ttk.Button(
+            opener, text="過去実行と比較…",
+            command=self.open_command_run_comparison).pack(side="left", padx=(3, 0))
+        ttk.Button(
+            opener, text="集中修正…",
+            command=self.open_focus_repair).pack(side="left", padx=(3, 0))
         ttk.Label(self, textvariable=self.summary, anchor="w").pack(
             fill="x", padx=10, pady=(0, 4))
 
@@ -146,6 +160,10 @@ class CommandRecordingWorkspace(ttk.Frame):
         entry.pack(side="left", fill="x", expand=True)
         ttk.Checkbutton(filters, text="停止Stepのみ", variable=self.stops_only,
                         command=self.on_filter_changed).pack(side="left", padx=4)
+        ttk.Checkbutton(
+            filters, text="Commandsソース内のみ",
+            variable=self.source_only,
+            command=self.on_source_scope_changed).pack(side="left", padx=4)
         self.search.trace_add("write", lambda *_args: self.on_filter_changed())
 
         tree_frame = ttk.Frame(parent)
@@ -329,6 +347,10 @@ class CommandRecordingWorkspace(ttk.Frame):
         self.metadata = metadata
         self.events = events
         self.event_times = [float(event["video_time"]) for event in events]
+        self.primary_source_path = command_source_file(metadata)
+        if "source_only_default" in metadata:
+            self.source_only.set(bool(metadata.get("source_only_default")))
+        self._refresh_source_scope()
         self._source_cache = {}
         self.video_sync.set(float(metadata.get("video_sync_offset", 0.0) or 0.0))
         self.page = 0
@@ -338,10 +360,24 @@ class CommandRecordingWorkspace(ttk.Frame):
                 len(events), " / ".join(metadata.get("states", [])[-4:]) or "-"))
         self.refresh_timeline()
         self.refresh_videos()
-        if events:
-            self.select_event(events[0], seek=True)
+        initial_events = self.source_scope_events or events
+        if initial_events:
+            self.select_event(initial_events[0], seek=True)
+        pending_seek, self._pending_seek_after_load = \
+            self._pending_seek_after_load, None
+        if pending_seek is not None:
+            self.seek_video(float(pending_seek))
         self.status.set("読込完了。Stepまたは関数を選ぶと同時刻の動画と記録時ソースを表示します。")
         return True
+
+    def load_folder_and_seek(self, folder, video_time):
+        folder = os.path.abspath(str(folder or ""))
+        target = max(0.0, float(video_time or 0.0))
+        if self.folder == folder and not self._loading:
+            self.seek_video(target)
+            return True
+        self._pending_seek_after_load = target
+        return self.load_folder(folder)
 
     def open_folder(self):
         if self.folder and os.path.isdir(self.folder):
@@ -354,10 +390,44 @@ class CommandRecordingWorkspace(ttk.Frame):
         self.page = 0
         self.refresh_timeline()
 
+    def _refresh_source_scope(self):
+        source_file = self.primary_source_path if self.source_only.get() else ""
+        self.source_scope_events = filtered_timeline(
+            self.events, source_file=source_file)
+        self.source_scope_event_times = [
+            float(event.get("video_time", 0.0) or 0.0)
+            for event in self.source_scope_events]
+
+    def on_source_scope_changed(self):
+        """Apply source-only scope to the list, playback, and path buttons."""
+        previous = self.current_event
+        self.page = 0
+        self._refresh_source_scope()
+        self.refresh_timeline()
+        if self.source_only.get() and not self.primary_source_path:
+            scope_status = (
+                "録画にCommandsソース情報がないため、すべての実行行を表示します。")
+        elif self.source_only.get():
+            scope_status = "Commandsソース内の実行行だけを表示しています。"
+        else:
+            scope_status = "共通基盤を含むすべての実行行を表示しています。"
+        if previous in self.source_scope_events or not self.source_scope_events:
+            self.status.set(scope_status)
+            return
+        try:
+            video_time = float(previous.get("video_time", 0.0) or 0.0)
+        except (AttributeError, TypeError, ValueError):
+            video_time = 0.0
+        position = bisect.bisect_right(
+            self.source_scope_event_times, video_time) - 1
+        target = self.source_scope_events[max(0, position)]
+        self.select_event(target, seek=False)
+        self.status.set(scope_status)
+
     def refresh_timeline(self):
         selected_index = int(self.current_event.get("index", 0)) if self.current_event else 0
         self.filtered_events = filtered_timeline(
-            self.events, self.search.get(), self.stops_only.get())
+            self.source_scope_events, self.search.get(), self.stops_only.get())
         visible, self.page, page_count = timeline_page(
             self.filtered_events, self.page, PAGE_SIZE)
         self.timeline_tree.delete(*self.timeline_tree.get_children())
@@ -408,8 +478,12 @@ class CommandRecordingWorkspace(ttk.Frame):
         iid = "event-{}".format(event["index"])
         if self.timeline_tree.exists(iid):
             self._selection_from_video = not seek
-            if not seek:
-                self._programmatic_selection_iid = iid
+            # selection_set() raises <<TreeviewSelect>> even when this row is
+            # already selected.  Mark every programmatic selection, including
+            # seek=True navigation, so on_event_selected() consumes the
+            # synthetic event instead of recursively selecting, rendering and
+            # seeking the same recording row forever.
+            self._programmatic_selection_iid = iid
             try:
                 self.timeline_tree.selection_set(iid)
                 self.timeline_tree.see(iid)
@@ -444,7 +518,8 @@ class CommandRecordingWorkspace(ttk.Frame):
         self._source_refresh_job = self.after(150, refresh)
 
     def select_stop(self, forward):
-        stops = [event for event in self.events if event.get("event") == "step_debug_stop"]
+        stops = [event for event in self.source_scope_events
+                 if event.get("event") == "step_debug_stop"]
         if not stops:
             self.status.set("この録画にはStepデバッグ停止イベントがありません。")
             return
@@ -456,7 +531,8 @@ class CommandRecordingWorkspace(ttk.Frame):
                           if int(item["index"]) < current), stops[-1])
         if self.stops_only.get() or not self.search.get().strip():
             self.filtered_events = filtered_timeline(
-                self.events, self.search.get(), self.stops_only.get())
+                self.source_scope_events,
+                self.search.get(), self.stops_only.get())
         self.select_event(event, seek=True)
 
     def show_event_source(self, event):
@@ -501,7 +577,7 @@ class CommandRecordingWorkspace(ttk.Frame):
             rendered.append("{:6d} | {}".format(number, text))
         self.source_text.insert("1.0", "".join(rendered))
         original = str(location.get("file", "") or self.current_source_path or path)
-        visited = observed_source_lines(self.events, original)
+        visited = observed_source_lines(self.source_scope_events, original)
         visible_visited = 0
         for line in sorted(visited):
             if block["start_line"] <= line <= block["end_line"]:
@@ -531,7 +607,7 @@ class CommandRecordingWorkspace(ttk.Frame):
         """Jump between distinct source lines that were observed in the trace."""
         distinct = []
         seen = set()
-        for event in self.events:
+        for event in self.source_scope_events:
             location = event.get("location", {}) if isinstance(event, dict) else {}
             if not isinstance(location, dict):
                 continue
@@ -563,7 +639,7 @@ class CommandRecordingWorkspace(ttk.Frame):
     def select_path_event(self, forward):
         """Move one recorded execution event and seek the linked video."""
         candidates = []
-        for event in self.events:
+        for event in self.source_scope_events:
             location = event.get("location", {}) if isinstance(event, dict) else {}
             if not isinstance(location, dict):
                 continue
@@ -591,7 +667,7 @@ class CommandRecordingWorkspace(ttk.Frame):
         """Move to the previous/next function transition and seek the video."""
         transitions = []
         previous_key = None
-        for event in self.events:
+        for event in self.source_scope_events:
             location = event.get("location", {}) if isinstance(event, dict) else {}
             if not isinstance(location, dict):
                 continue
@@ -665,6 +741,41 @@ class CommandRecordingWorkspace(ttk.Frame):
         except Exception as error:
             self.command_development_window = None
             messagebox.showerror("Commands開発解析", str(error), parent=self)
+
+    def open_command_run_comparison(self):
+        """Open a non-modal repeated-Step / frame / source comparison."""
+        if not self.folder:
+            messagebox.showinfo(
+                "Commands実行比較", "今回分のCommands録画を先に読み込んでください。",
+                parent=self)
+            return
+        window = self.command_run_comparison_window
+        try:
+            if window is not None and window.winfo_exists():
+                window.update_context(self.folder)
+                return
+        except tk.TclError:
+            pass
+        try:
+            from CommandRunComparisonStudio import CommandRunComparisonWindow
+            self.command_run_comparison_window = CommandRunComparisonWindow(
+                self, current_folder=self.folder,
+                seek_callback=self.seek_comparison_event_time)
+        except Exception as error:
+            self.command_run_comparison_window = None
+            messagebox.showerror("Commands実行比較", str(error), parent=self)
+
+    def open_focus_repair(self):
+        if not self.folder:
+            messagebox.showinfo(
+                "集中修正", "Commands録画を先に読み込んでください。", parent=self)
+            return
+        if callable(self.open_focus_callback):
+            self.open_focus_callback(self.folder)
+
+    def seek_comparison_event_time(self, value):
+        """Seek a comparison event using this recording's saved link offset."""
+        self.seek_video(float(value or 0.0) + float(self.video_sync.get()))
 
     def seek_current_event(self):
         if self.current_event:
@@ -798,13 +909,14 @@ class CommandRecordingWorkspace(ttk.Frame):
             self._play_job = None
 
     def highlight_event_at_time(self, video_time):
-        if not self.events:
+        if not self.source_scope_events:
             return
         event_time = float(video_time) - float(self.video_sync.get())
-        position = bisect.bisect_right(self.event_times, event_time) - 1
+        position = bisect.bisect_right(
+            self.source_scope_event_times, event_time) - 1
         if position < 0:
             return
-        event = self.events[position]
+        event = self.source_scope_events[position]
         if int(event["index"]) != self._last_event_index:
             self._last_event_index = int(event["index"])
             # Playback must remain useful even when a search hides the event.
@@ -844,6 +956,13 @@ class CommandRecordingWorkspace(ttk.Frame):
     def destroy(self):
         self._load_generation += 1
         window, self.command_development_window = self.command_development_window, None
+        try:
+            if window is not None and window.winfo_exists():
+                window.close()
+        except tk.TclError:
+            pass
+        window, self.command_run_comparison_window = \
+            self.command_run_comparison_window, None
         try:
             if window is not None and window.winfo_exists():
                 window.close()

@@ -14,7 +14,8 @@ class CommandRecoveryWindow:
     """One non-modal recovery editor owned by one PokeCon process."""
 
     def __init__(self, root, favorites_provider, save_favorite,
-                 delete_favorite, execute, stop, pause, resume, closed):
+                 delete_favorite, execute, stop, pause, resume, closed,
+                 pause_next_loop=None):
         self.root = root
         self.favorites_provider = favorites_provider
         self.save_favorite_callback = save_favorite
@@ -23,6 +24,7 @@ class CommandRecoveryWindow:
         self.stop_callback = stop
         self.pause_callback = pause
         self.resume_callback = resume
+        self.pause_next_loop_callback = pause_next_loop
         self.closed_callback = closed
         self.running = False
         self.favorite_names = []
@@ -146,6 +148,10 @@ class CommandRecoveryWindow:
             action_frame, text="復旧コードだけ停止", command=self.stop_callback,
             state="disabled")
         self.stop_button.pack(side="left", padx=2)
+        self.pause_next_loop_button = ttk.Button(
+            action_frame, text="ループ検出後に使用できます",
+            command=self._pause_next_loop, state="disabled")
+        self.pause_next_loop_button.pack(side="left", padx=2)
         ttk.Button(
             action_frame, text="Commandsを一時停止",
             command=self.pause_callback).pack(side="left", padx=2)
@@ -169,6 +175,24 @@ class CommandRecoveryWindow:
     def set_context(self, reason, context):
         self.reason.set(str(reason or ""))
         self.context.set(str(context or ""))
+
+    def set_loop_control(self, enabled=False, text="", waiting=False):
+        """Expose the non-modal loop pause confirmation after detection."""
+        if waiting:
+            label = str(text or "次のループ終了で一時停止を予約中")
+            state = "disabled"
+        elif enabled and callable(self.pause_next_loop_callback):
+            label = str(text or "はい（次のループ終了で一時停止）")
+            state = "normal"
+        else:
+            label = str(text or "ループ検出後に使用できます")
+            state = "disabled"
+        self.pause_next_loop_button.configure(text=label, state=state)
+
+    def _pause_next_loop(self):
+        if not callable(self.pause_next_loop_callback):
+            return False
+        return bool(self.pause_next_loop_callback())
 
     def refresh_favorites(self, select_name=""):
         current = str(select_name or self.selected_name() or "")

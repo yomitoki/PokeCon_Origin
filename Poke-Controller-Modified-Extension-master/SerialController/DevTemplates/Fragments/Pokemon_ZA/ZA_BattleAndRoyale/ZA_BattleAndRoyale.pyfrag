@@ -60,13 +60,28 @@ def ZA_load_sleeps(self):
             changed2.append(key)
     except Exception as e:
         print(f"SLEEPLISTの読み込みエラー: {e}")
+def ZA_battle_reword_recovery(self, max_press_count=10):
+    press_count = 0
+    while press_count < max_press_count:
+        if not self.image_check("POKEMON_ZA_REWORD"):
+            break
+        self.checkIfAlive()
+        self.pressRep(
+            Button.B, repeat=1, duration=0.15,
+            wait=0.5, interval=0.1)
+        press_count += 1
+    return press_count > 0
+
 def ZA_battle_missing_field_recovery(
         self, counter_key="battle", enabled=True,
         attack_ready=False, before_recovery=None):
     count_name = (
         "_za_battle_missing_field_count_" + str(counter_key))
-    # Xメニューが開いている場合は、FIELD消失回数や攻撃可否より先に
-    # Bで閉じる。復帰以外で誤って開いた場合も同じ共通入口で処理する。
+    # X復帰の報酬表示とXメニューは、FIELD消失回数や
+    # 攻撃可否より先に共通入口で処理する。
+    if self.ZA_battle_reword_recovery():
+        setattr(self, count_name, 0)
+        return True
     if self.image_check("POKEMON_ZA_X_MENU_OPEN"):
         setattr(self, count_name, 0)
         self.pressRep(
@@ -79,7 +94,8 @@ def ZA_battle_missing_field_recovery(
 
     battle_without_field = (
         (not bool(self.ZA_story_Template_Field_HardGaurd()))
-        and bool(self.ZA_story_Template_Field_HardGaurd(mode=1)))
+        and bool(self.ZA_story_Template_Field_HardGaurd(mode=1))
+        and not self.image_check("POKEMON_ZA_BATTLE_ACTIVE_LEVEL"))
     if not battle_without_field:
         setattr(self, count_name, 0)
         return False
@@ -101,6 +117,10 @@ def ZA_battle_missing_field_recovery(
     help_press_count = 0
     b_press_count = 0
     while b_press_count < 20:
+        # 復帰用Xで報酬が開いた場合は、HELPと同様に
+        # 画像を確認しながら、消えるまでBで進める。
+        if self.ZA_battle_reword_recovery():
+            return True
         # 復帰用XによってXメニューが開いた場合は、背後のFIELD表示で
         # 復帰済みと誤判定する前にBで閉じる。
         if self.image_check("POKEMON_ZA_X_MENU_OPEN"):
@@ -129,11 +149,34 @@ def ZA_battle_missing_field_recovery(
         b_press_count += 1
     return True
 
-def ZA_battle_coCp_noloop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endskip=0,battle_mode=0):
-    if battle_mode==0 and self.image_check("POKEMON_ZA_SELECT"):
-        self.etc_sendCommand("Lbutton_up")
-    if battle_mode==1 and self.image_check("POKEMON_ZA_FIELD_W"):
-        self.etc_sendCommand("Lbutton_up")
+def ZA_battle_coCp_noloop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endskip=0,battle_mode=0,selection_up_handled=False):
+    select_pictures = (
+        "POKEMON_ZA_1_SELECT",
+        "POKEMON_ZA_2_SELECT",
+        "POKEMON_ZA_3_SELECT",
+        "POKEMON_ZA_4_SELECT",
+    )
+
+    def advance_selection():
+        for picture in select_pictures:
+            if self.image_check(picture):
+                # 再戦／交代などの選択肢では攻撃用Bを送らず、
+                # 決定用Aだけを入力する。
+                print(
+                    f"[BATTLE_SELECT] {picture} detected -> press A")
+                self.pressRep(
+                    Button.A, repeat=1, duration=0.15,
+                    wait=0.5, interval=0.1)
+                return True
+        return False
+
+    if advance_selection():
+        return
+    if not selection_up_handled:
+        if battle_mode==0 and self.image_check("POKEMON_ZA_SELECT"):
+            self.etc_sendCommand("Lbutton_up")
+        elif battle_mode==1 and self.image_check("POKEMON_ZA_FIELD_W"):
+            self.etc_sendCommand("Lbutton_up")
     recovery_enabled = not (
         self.image_check("POKEMON_ZA_2_SELECT")
         or self.image_check("POKEMON_ZA_3_SELECT")
@@ -142,22 +185,40 @@ def ZA_battle_coCp_noloop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_en
             "cocp", enabled=recovery_enabled):
         return
     self.ZA_ZL_ACTION("")
-    self.wait(0.05)#TODO
+    # ロックオンがゲーム側へ反映されてから攻撃を開始する。
+    self.wait(0.1)
     for i in range(3):
+        # 攻撃中に選択肢へ切り替わった場合も、以降のX/A/Y/Bを
+        # 中断してA決定へ切り替える。
+        if advance_selection():
+            return
         if Xaction==1:
             self.pressRep(Button.X, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+        if advance_selection():
+            return
         if Aaction==1:
             self.pressRep(Button.A, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+        if advance_selection():
+            return
         if Yaction==1:
             self.pressRep(Button.Y, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+        if advance_selection():
+            return
         if Baction==1:
             self.pressRep(Button.B, repeat=1, duration=0.04, wait=0.0, interval=0.1)
     if lockon_endskip==0:
         self.ZA_ZL_ACTION("END")
-def ZA_battle_Cp_loop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endskip=0,get_chanceicon4=0,mode=0,battle_mode=0,Cp_low_check=0,usenum=1):
+def ZA_battle_Cp_loop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endskip=0,get_chanceicon4=0,mode=0,battle_mode=0,Cp_low_check=0,usenum=1,R_Push_enable=1,view_lockon_mode=0,lockon_attack_wait=0.0,lockon_attack_checks=1):
     noCp_count=0
     target_marker=1
     nofiled=1
+
+    def cplus_ready():
+        # 通常閾値で取りこぼした場合はLOWへフォールバックする。
+        return (
+            self.image_check("POKEMON_ZA_C+")
+            or self.image_check("POKEMON_ZA_C+_LOW"))
+
     while True:
         print(f'noCp_count = {noCp_count} mode = {mode} battle_mode = {battle_mode}')
         self.checkIfAlive()
@@ -166,7 +227,7 @@ def ZA_battle_Cp_loop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endski
             self.image_check("POKEMON_ZA_2_SELECT")
             or self.image_check("POKEMON_ZA_3_SELECT")
             or self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT"))
-        cp_attack_ready = self.image_check("POKEMON_ZA_C+")
+        cp_attack_ready = cplus_ready()
         if self.ZA_battle_missing_field_recovery(
                 "cp_loop", enabled=recovery_enabled,
                 attack_ready=cp_attack_ready):
@@ -207,18 +268,42 @@ def ZA_battle_Cp_loop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endski
         elif battle_mode==1 and self.image_check("POKEMON_ZA_FIELD_W"):
             self.etc_sendCommand("Lbutton_up")
             
-        if self.image_check("POKEMON_ZA_R_push"):
+        if ((R_Push_enable == 1) and self.image_check("POKEMON_ZA_R_push")):
             self.press(Button.RCLICK,0.05,0.1) 
-            
+
+        # 指定時はnoCp_countを待たず、既存の視点回転を開始してから
+        # ZLを再入力する。既定OFFなので既存呼出しの動作は変えない。
+        if view_lockon_mode == 1:
+            self.ZA_MOVE_SEE(action="", in_see_r=0.6)
         self.ZA_ZL_ACTION("")
+        lockon_cplus_ready = False
+        attack_checks = max(1, int(lockon_attack_checks))
+        if attack_checks > 1:
+            # ZLを保持したままC+を複数回確認する。最初は待たずに
+            # 判定し、一致した時点で残りの待機を行わず攻撃へ進む。
+            check_interval = (
+                max(0.0, float(lockon_attack_wait))
+                / float(attack_checks - 1))
+            for check_index in range(attack_checks):
+                if cplus_ready():
+                    lockon_cplus_ready = True
+                    break
+                if check_index + 1 < attack_checks:
+                    self.wait(check_interval)
+        elif lockon_attack_wait > 0:
+            # 既定1回確認の呼出しは従来どおり指定時間後に判定する。
+            self.wait(lockon_attack_wait)
         
         for i in range(5):
+            current_cplus_ready = (
+                lockon_cplus_ready or cplus_ready())
             #バトル中チェック チェックできない場合は、一旦抜ける
-            if mode==0 and (self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") or self.image_check("POKEMON_ZA_ESCAPE") or self.image_check("POKEMON_ZA_C+")):
+            if mode==0 and (self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") or self.image_check("POKEMON_ZA_ESCAPE") or current_cplus_ready):
                 
                 if get_chanceicon4==1 and self.image_check("POKEMON_ZA_GETCHANCE_ICON4"):
                     self.ZA_get_pokemon()
-                if self.image_check("POKEMON_ZA_C+"):
+                if current_cplus_ready:
+                    lockon_cplus_ready = False
                     noCp_count=0
                     if Xaction==1:
                         self.pressRep(Button.X, repeat=1, duration=0.04, wait=0.0, interval=0.1)
@@ -247,13 +332,14 @@ def ZA_battle_Cp_loop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endski
                     print(f'noCp_count = {noCp_count} 2')
                     if self.image_check("POKEMON_ZA_ESCAPE"):
                         noCp_count+=1
-            elif mode==1 and (self.image_check("POKEMON_ZA_EYE_CHECK_HIGH_POKE") or self.image_check("POKEMON_ZA_C+")):
+            elif mode==1 and (self.image_check("POKEMON_ZA_EYE_CHECK_HIGH_POKE") or current_cplus_ready):
                 if self.image_check("POKEMON_ZA_FIELD_W"):
                     self.etc_sendCommand("Lbutton_up")
                     
                 if get_chanceicon4==1 and self.image_check("POKEMON_ZA_GETCHANCE_ICON4"):
                     self.ZA_get_pokemon()
-                if self.image_check("POKEMON_ZA_C+"):
+                if current_cplus_ready:
+                    lockon_cplus_ready = False
                     noCp_count=0
                     if Xaction==1:
                         self.pressRep(Button.X, repeat=1, duration=0.04, wait=0.0, interval=0.1)
@@ -297,6 +383,13 @@ def ZA_battle_Cp_loop_move(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_e
     target_marker=1
     nofiled=1
     see_r=0.3
+
+    def cplus_ready():
+        # 移動型も通常型と同じC+検知条件に揃える。
+        return (
+            self.image_check("POKEMON_ZA_C+")
+            or self.image_check("POKEMON_ZA_C+_LOW"))
+
     while True:
         print(f'noCp_count = {noCp_count} mode = {mode} battle_mode = {battle_mode}')
         self.checkIfAlive()
@@ -305,7 +398,7 @@ def ZA_battle_Cp_loop_move(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_e
             self.image_check("POKEMON_ZA_2_SELECT")
             or self.image_check("POKEMON_ZA_3_SELECT")
             or self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT"))
-        cp_attack_ready = self.image_check("POKEMON_ZA_C+")
+        cp_attack_ready = cplus_ready()
         if self.ZA_battle_missing_field_recovery(
                 "cp_loop_move", enabled=recovery_enabled,
                 attack_ready=cp_attack_ready,
@@ -330,11 +423,11 @@ def ZA_battle_Cp_loop_move(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_e
         
         for i in range(5):
             #バトル中チェック チェックできない場合は、一旦抜ける
-            if mode==0 and (self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") or self.image_check("POKEMON_ZA_ESCAPE") or self.image_check("POKEMON_ZA_C+")):
+            if mode==0 and (self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") or self.image_check("POKEMON_ZA_ESCAPE") or cplus_ready()):
                 
                 if get_chanceicon4==1 and self.image_check("POKEMON_ZA_GETCHANCE_ICON4"):
                     self.ZA_get_pokemon()
-                if self.image_check("POKEMON_ZA_C+"):
+                if cplus_ready():
                     noCp_count=0
                     if Xaction==1:
                         self.pressRep(Button.X, repeat=1, duration=0.04, wait=0.0, interval=0.1)
@@ -363,13 +456,13 @@ def ZA_battle_Cp_loop_move(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_e
                     print(f'noCp_count = {noCp_count} 2')
                     if self.image_check("POKEMON_ZA_ESCAPE"):
                         noCp_count+=1
-            elif mode==1 and (self.image_check("POKEMON_ZA_EYE_CHECK_HIGH_POKE") or self.image_check("POKEMON_ZA_C+")):
+            elif mode==1 and (self.image_check("POKEMON_ZA_EYE_CHECK_HIGH_POKE") or cplus_ready()):
                 if self.image_check("POKEMON_ZA_FIELD_W"):
                     self.etc_sendCommand("Lbutton_up")
                     
                 if get_chanceicon4==1 and self.image_check("POKEMON_ZA_GETCHANCE_ICON4"):
                     self.ZA_get_pokemon()
-                if self.image_check("POKEMON_ZA_C+"):
+                if cplus_ready():
                     noCp_count=0
                     if Xaction==1:
                         self.pressRep(Button.X, repeat=1, duration=0.04, wait=0.0, interval=0.1)
@@ -860,6 +953,7 @@ def ZA_battle_return(self):
 ######################################################
 def ZA_battle_start(self):
     self.battlecount=0
+    self.infi_area_failure_count=0
     return "BATTLE_MAP_OPEN"
 def ZA_battle_map_open(self):
     self.wait(self.SLEEPLIST[8][2])
@@ -957,22 +1051,36 @@ def ZA_battle_goto_battle_zone2(self):
                 for i in range(0,(self.battlecount + 1)):
                     self.etc_sendCommand("Lbutton_up")
                     
-                for i in range(0,self.battle_zone_loop_num):
-                    if not self.battlecount > (self.battle_zone_loop_num - 1):
-                        self.targetzone=self.ZA_zone_check()
-                    if self.battlecount > (self.battle_zone_loop_num - 1):
-                        break
-                    elif (self.testcode==0 and(not self.ZONELIST[self.targetzone][2]) or (self.testcode==2 and (not (self.targetzone == self.testtarget)))):
+                for i in range(0,self.battle_zone_loop_num + 1):
+                    self.targetzone=self.ZA_zone_check()
+                    previous_targetzone = getattr(
+                        self, "infi_previous_targetzone", None)
+                    same_zone = (
+                        previous_targetzone is not None
+                        and self.targetzone == previous_targetzone)
+                    unavailable = (
+                        (self.testcode==0 and
+                         (not self.ZONELIST[self.targetzone][2]))
+                        or (self.testcode==2 and
+                            (not (self.targetzone == self.testtarget))))
+                    if same_zone or unavailable:
                         print(str(self.targetzone) + ": " + self.ZONELIST[self.targetzone][1])
                         self.battlecount=self.battlecount+1
                         self.etc_sendCommand("Lbutton_up")
-                        self.zonemisscount[self.targetzone-1]+=1
-                        print("SKIP")
+                        if unavailable:
+                            self.zonemisscount[self.targetzone-1]+=1
+                        print("SKIP_SAME" if same_zone else "SKIP")
                         print("==================================")
                         self.wait(self.SLEEPLIST[1][2])
+                        if self.battlecount > (self.battle_zone_loop_num - 1):
+                            # Move once to the next highlighted area, then the
+                            # existing post-teleport limit sends us to BENCH.
+                            self.targetzone=self.ZA_zone_check()
+                            break
                     else:
                         print(str(self.targetzone) + ": " + self.ZONELIST[self.targetzone][1])
                         break
+                self.infi_previous_targetzone = self.targetzone
                 self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.1, interval=0.1)
 
                 for i in range(1,10):
@@ -1047,16 +1155,147 @@ def ZA_battle_move(self):
             return "BATTLE_START"
      
   #TEST
+    battlecount_before = self.battlecount
+    self._za_infi_area_end_reason = ""
     if self.battle_step_return == 0:
-        return self.ZA_battle_move_test()
+        result = self.ZA_battle_move_test()
     else:
         self.battle_step_return = 0
-        return self.ZA_battle_move_test(1)
+        result = self.ZA_battle_move_test(1)
+
+    if result == "BATTLE_MAP_OPEN":
+        if self._za_infi_area_end_reason == "reward":
+            self.infi_area_failure_count = 0
+        else:
+            if self.battlecount <= battlecount_before:
+                self.battlecount = battlecount_before + 1
+            self.infi_area_failure_count = (
+                int(getattr(self, "infi_area_failure_count", 0)) + 1)
+            failure_limit = max(
+                1, int(getattr(self, "infi_area_failure_limit", 3)))
+            if (self.infi_area_failure_count >= failure_limit
+                    or self.battlecount >
+                       (self.battle_zone_loop_num - 1)):
+                return "BATTLE_START"
+    return result
 def ZA_infi_attack_ready(self):
     # 通常閾値を優先し、取りこぼした場合だけ0.60のLOWを確認する。
     return (
         self.image_check("POKEMON_ZA_C+")
         or self.image_check("POKEMON_ZA_C+_LOW"))
+
+def ZA_infi_guarded_ladder_climb(self):
+    """Send ladder input in slices, yielding as soon as combat resumes."""
+    moved = False
+    for _ in range(20):
+        if (self.image_check("POKEMON_ZA_ESCAPE")
+                or self.ZA_infi_attack_ready()
+                or self.image_check("POKEMON_ZA_SELECT")
+                or self.image_check("POKEMON_ZA_2_SELECT")
+                or self.image_check("POKEMON_ZA_3_SELECT")
+                or self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT")
+                or self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT")):
+            return moved, False
+        self.press(
+            Direction(Stick.LEFT, 90), duration=0.5, wait=0.0)
+        moved = True
+    return moved, True
+
+def ZA_infi_stalled_ladder_recovery(
+        self, attack_ready=False, now=None, frame=None):
+    """Climb out of a stalled ladder without overriding live combat."""
+    reset_names = (
+        "_za_infi_ladder_previous_frame",
+        "_za_infi_ladder_still_since",
+    )
+
+    def reset_candidate():
+        for name in reset_names:
+            setattr(self, name, None)
+
+    if (self.battle_current_state != "BATTLE_MOVE"
+            or self.battle_step not in (0, 1)):
+        reset_candidate()
+        return False
+    if attack_ready or self.image_check("POKEMON_ZA_ESCAPE"):
+        reset_candidate()
+        return False
+    if (self.image_check("POKEMON_ZA_SELECT")
+            or self.image_check("POKEMON_ZA_2_SELECT")
+            or self.image_check("POKEMON_ZA_3_SELECT")
+            or self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT")
+            or self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT")):
+        reset_candidate()
+        return False
+
+    if frame is None:
+        camera = getattr(self, "camera", None)
+        if camera is None:
+            reset_candidate()
+            return False
+        if hasattr(camera, "readFreshFrame"):
+            frame = camera.readFreshFrame(timeout=0.75)
+        else:
+            frame = camera.readFrame() if hasattr(
+                camera, "readFrame") else None
+    if frame is None or getattr(frame, "size", 0) == 0:
+        reset_candidate()
+        return False
+
+    height, width = frame.shape[:2]
+    region = frame[
+        int(height * 0.12):max(int(height * 0.12) + 1,
+                               int(height * 0.82)),
+        int(width * 0.15):max(int(width * 0.15) + 1,
+                              int(width * 0.85))]
+    if region.size == 0:
+        reset_candidate()
+        return False
+    fingerprint = cv2.resize(
+        cv2.cvtColor(region, cv2.COLOR_BGR2GRAY), (32, 18))
+    current_time = time.monotonic() if now is None else float(now)
+    previous = getattr(
+        self, "_za_infi_ladder_previous_frame", None)
+    self._za_infi_ladder_previous_frame = fingerprint
+    if previous is None:
+        self._za_infi_ladder_still_since = current_time
+        return False
+
+    frame_difference = cv2.mean(
+        cv2.absdiff(fingerprint, previous))[0]
+    if frame_difference > 1.5:
+        self._za_infi_ladder_still_since = current_time
+        return False
+    still_since = getattr(
+        self, "_za_infi_ladder_still_since", None)
+    if still_since is None:
+        self._za_infi_ladder_still_since = current_time
+        return False
+    if current_time - float(still_since) < 3.0:
+        return False
+    last_attempt = float(getattr(
+        self, "_za_infi_ladder_last_attempt", -1000000.0))
+    if current_time - last_attempt < 30.0:
+        return False
+
+    # C+ is checked here even when this story Step normally uses
+    # no_Cplus=1.  A visible attack opportunity always takes priority over
+    # ladder recovery.
+    if self.ZA_infi_attack_ready():
+        reset_candidate()
+        return False
+
+    self._za_infi_ladder_last_attempt = current_time
+    reset_candidate()
+    self.ZA_MOVE_SEE("END")
+    self.ZA_ZL_ACTION("END")
+    # A long uninterrupted hold can suppress combat for ten seconds.
+    # Send 0.5-second slices and stop before the next slice as soon as the
+    # normal battle UI or an attack opportunity returns.
+    moved, _ = self.ZA_infi_guarded_ladder_climb()
+    if moved:
+        print("[INFI_LADDER_RECOVERY] 静止を検出したため上入力で復帰")
+    return moved
 
 def ZA_infi_target_marker_direction(self):
     # Mega戦と同じく、左上マップを除外した全画面座標から
@@ -1230,6 +1469,9 @@ def ZA_battle_move_test(self,fast=0):
                 "infi", enabled=recovery_enabled,
                 attack_ready=infi_attack_ready):
             continue
+        if self.ZA_infi_stalled_ladder_recovery(
+                attack_ready=infi_attack_ready):
+            continue
         self.out_str = (
             f'----------------------------'
             f'\n STATE_MAIN_FUNCTION   :: {self.main_current_state}'
@@ -1333,7 +1575,10 @@ def ZA_battle_move_test(self,fast=0):
             if noescapeflg==0 and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
                 self.ZA_MOVE_SEE("END")
                 self.ZA_ZL_ACTION("END")
-                self.press(Direction(Stick.LEFT, 90), duration=10.0, wait=0.1)
+                _, ladder_climb_completed = \
+                    self.ZA_infi_guarded_ladder_climb()
+                if not ladder_climb_completed:
+                    continue
 
                 self.wait(0.3)
                 
@@ -1465,7 +1710,10 @@ def ZA_battle_move_test(self,fast=0):
                 if noescapeflg==0 and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
                     self.ZA_MOVE_SEE("END")
                     self.ZA_ZL_ACTION("END")
-                    self.press(Direction(Stick.LEFT, 90), duration=10.0, wait=0.1)
+                    _, ladder_climb_completed = \
+                        self.ZA_infi_guarded_ladder_climb()
+                    if not ladder_climb_completed:
+                        continue
 
                     self.wait(0.3)
                     
@@ -1514,7 +1762,10 @@ def ZA_battle_move_test(self,fast=0):
                     if noescapeflg==0 and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
                         self.ZA_MOVE_SEE("END")
                         self.ZA_ZL_ACTION("END")
-                        self.press(Direction(Stick.LEFT, 90), duration=10.0, wait=0.1)
+                        _, ladder_climb_completed = \
+                            self.ZA_infi_guarded_ladder_climb()
+                        if not ladder_climb_completed:
+                            continue
 
                         self.wait(0.3)
                         
@@ -1636,6 +1887,8 @@ def ZA_battle_move_test(self,fast=0):
             return "BATTLE_START"
             
         if (self.battle_step==1 and self.battle_current_state=="BATTLE_MOVE" and self.image_check("POKEMON_ZA_REWARD_RESULT")) or self.battle_step==2:
+            self._za_infi_area_end_reason = "reward"
+            self.infi_area_failure_count = 0
             lastescape = time.perf_counter() 
             endbk = end
             end = time.perf_counter()
@@ -1682,7 +1935,8 @@ def ZA_battle_move_test(self,fast=0):
             self.ZA_ZL_ACTION("END")
             return "QUASAR_START"
 
-        elif self.image_check("POKEMON_ZA_ESCAPE") or self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK"):
+        elif (self.image_check("POKEMON_ZA_ESCAPE")
+                or self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK")):
             
             endbk = end
             end = time.perf_counter()
@@ -1740,7 +1994,10 @@ def ZA_battle_move_test(self,fast=0):
                     if noescapeflg==0 and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
                         self.ZA_MOVE_SEE("END")
                         self.ZA_ZL_ACTION("END")
-                        self.press(Direction(Stick.LEFT, 90), duration=10.0, wait=0.1)
+                        _, ladder_climb_completed = \
+                            self.ZA_infi_guarded_ladder_climb()
+                        if not ladder_climb_completed:
+                            continue
 
                         self.wait(0.3)
                         
@@ -1795,7 +2052,10 @@ def ZA_battle_move_test(self,fast=0):
                         if noescapeflg==0 and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
                             self.ZA_MOVE_SEE("END")
                             self.ZA_ZL_ACTION("END")
-                            self.press(Direction(Stick.LEFT, 90), duration=10.0, wait=0.1)
+                            _, ladder_climb_completed = \
+                                self.ZA_infi_guarded_ladder_climb()
+                            if not ladder_climb_completed:
+                                continue
 
                             self.wait(0.3)
                             
@@ -1826,7 +2086,10 @@ def ZA_battle_move_test(self,fast=0):
                             if noescapeflg==0 and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
                                 self.ZA_MOVE_SEE("END")
                                 self.ZA_ZL_ACTION("END")
-                                self.press(Direction(Stick.LEFT, 90), duration=10.0, wait=0.1)
+                                _, ladder_climb_completed = \
+                                    self.ZA_infi_guarded_ladder_climb()
+                                if not ladder_climb_completed:
+                                    continue
 
                                 self.wait(0.3)
                                 
@@ -1918,7 +2181,10 @@ def ZA_battle_move_test(self,fast=0):
                                 if noescapeflg==0 and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
                                     self.ZA_MOVE_SEE("END")
                                     self.ZA_ZL_ACTION("END")
-                                    self.press(Direction(Stick.LEFT, 90), duration=10.0, wait=0.1)
+                                    _, ladder_climb_completed = \
+                                        self.ZA_infi_guarded_ladder_climb()
+                                    if not ladder_climb_completed:
+                                        continue
 
                                     self.wait(0.3)
                                     
@@ -1950,7 +2216,10 @@ def ZA_battle_move_test(self,fast=0):
                                     if noescapeflg==0 and self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") and (not self.image_check("POKEMON_ZA_ESCAPE")):
                                         self.ZA_MOVE_SEE("END")
                                         self.ZA_ZL_ACTION("END")
-                                        self.press(Direction(Stick.LEFT, 90), duration=10.0, wait=0.1)
+                                        _, ladder_climb_completed = \
+                                            self.ZA_infi_guarded_ladder_climb()
+                                        if not ladder_climb_completed:
+                                            continue
 
                                         self.wait(0.3)
                                         

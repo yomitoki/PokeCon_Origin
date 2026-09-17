@@ -493,6 +493,25 @@ def profile_recorded_video(video_path, library, template_root, target_names,
             if template is None:
                 missing.append("{}: {}".format(name, path or "<画像なし>"))
                 continue
+            template_crop = variant.get("template_crop", [0, 0, 0, 0])
+            try:
+                tx1, ty1, tx2, ty2 = [
+                    int(value) for value in template_crop]
+            except (TypeError, ValueError):
+                tx1, ty1, tx2, ty2 = 0, 0, 0, 0
+            if any((tx1, ty1, tx2, ty2)):
+                template_height, template_width = template.shape[:2]
+                tx1, ty1 = max(0, tx1), max(0, ty1)
+                tx2 = template_width if tx2 <= 0 else min(
+                    template_width, tx2)
+                ty2 = template_height if ty2 <= 0 else min(
+                    template_height, ty2)
+                if tx2 <= tx1 or ty2 <= ty1:
+                    missing.append(
+                        "{}: invalid template_crop {}".format(
+                            name, template_crop))
+                    continue
+                template = template[ty1:ty2, tx1:tx2]
             variants.append((dict(variant), template))
         prepared[name] = {
             "operator": str(item.get("operator", "OR") or "OR").upper(),
@@ -581,6 +600,17 @@ def profile_recorded_video(video_path, library, template_root, target_names,
                     score = min(scores) if scores else -1.0
                     matched = bool(variant_results) and all(
                         value >= threshold for value, threshold in variant_results)
+                elif operator.startswith("AT_LEAST_"):
+                    try:
+                        minimum_matches = int(operator.rsplit("_", 1)[1])
+                    except (TypeError, ValueError):
+                        minimum_matches = len(variant_results) + 1
+                    passed = [
+                        value >= threshold
+                        for value, threshold in variant_results]
+                    matched = sum(passed) >= minimum_matches
+                    score = (sorted(scores, reverse=True)[minimum_matches - 1]
+                             if len(scores) >= minimum_matches else -1.0)
                 else:
                     score = max(scores) if scores else -1.0
                     matched = any(value >= threshold

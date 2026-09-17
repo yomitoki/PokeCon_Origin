@@ -1,4 +1,4 @@
-def ZA_markerdir(self,type,nofiled=False):
+def ZA_markerdir(self,type,search_mode=0,nofiled=False):
     if type == "EVENT":
         marker = "POKEMON_ZA_EVENT_MARKER"
     elif type == "PIN":
@@ -25,6 +25,57 @@ def ZA_markerdir(self,type,nofiled=False):
     left = marker + "_LEFT_WIDE"
     right = marker + "_RIGHT_WIDE"
     last_movement_name = "_za_markerdir_last_movement_" + marker
+
+    def record_centered_event_approach():
+        if type != "EVENT" or search_mode not in (1, 2):
+            return
+        story_state_attributes = {
+            "MAIN_1_Z_LANK": "_1_story_current_state",
+            "MAIN_2_Y_V_LANK": "_2_story_current_state",
+            "MAIN_3_F_LANK": "_3_story_current_state",
+            "MAIN_4_E_LANK": "_4_story_current_state",
+            "MAIN_5_D_LANK": "_5_story_current_state",
+            "MAIN_6_C_LANK": "_6_story_current_state",
+            "MAIN_7_B_LANK": "_7_story_current_state",
+            "MAIN_8_STORY_LAST": "_8_story_current_state",
+        }
+        main_state = getattr(self, "main_current_state", None)
+        state_attribute = story_state_attributes.get(main_state)
+        current_step = (
+            getattr(self, state_attribute, None)
+            if state_attribute else None)
+        if current_step is None:
+            return
+
+        step_key = (main_state, current_step)
+        step_name = "_za_markerdir_event_approach_step"
+        count_name = "_za_markerdir_event_approach_count"
+        side_name = "_za_markerdir_event_approach_side_index"
+        if getattr(self, step_name, None) != step_key:
+            setattr(self, step_name, step_key)
+            setattr(self, count_name, 0)
+            setattr(self, side_name, 0)
+
+        # このTrueを受けた呼出元がEVENT方向へ1回移動する前提で、
+        # 直前までに同じStepで完了した接近回数を保持する。
+        approach_count = int(getattr(self, count_name, 0))
+        if approach_count >= 10:
+            side_index = int(getattr(self, side_name, 0))
+            move_right = side_index % 2 == 0
+            self.press(
+                Direction(
+                    Stick.LEFT, 0 if move_right else 180, 1.0),
+                duration=0.3, wait=0.0)
+            self.wait(0.1)
+            print(
+                "[MARKER_APPROACH_RECOVERY] step={} "
+                "EVENT approach_count=10 move={} stick=LEFT "
+                "duration=0.3".format(
+                    current_step,
+                    "right" if move_right else "left"))
+            setattr(self, side_name, side_index + 1)
+            approach_count = 0
+        setattr(self, count_name, approach_count + 1)
 
     def is_detected_in(target, detail):
         if not detail or not detail.get("matched"):
@@ -130,56 +181,137 @@ def ZA_markerdir(self,type,nofiled=False):
                 pass
         return detail
     
-    if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or nofiled: #FIELDから変更
-        variants = self.IMAGE_DETECTION_TARGETS.get(center, [])
-        detail = None
-        if variants:
-            detail = detect_marker_position(variants[0])
-            self.last_image_detection = detail
+    field_visible = self.image_check(
+        "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")
+    if field_visible or nofiled: #FIELDから変更
+        # search_mode=2はOUT_HOTEL_Z_23専用。FIELD上のNPC白吹き出しを
+        # Switch_No3から取得した画像で検知し、現在の列から横へ外れて
+        # からEVENTの方向合わせを続行する。同じ検知中に横移動を
+        # 重ねず、一度白Commentが消えた後の再検知で反対側を試す。
+        if type == "EVENT" and search_mode == 2 and field_visible:
+            escape_active_name = (
+                "_za_markerdir_field_white_escape_active_" + marker)
+            escape_side_name = (
+                "_za_markerdir_field_white_escape_side_" + marker)
+            field_white_visible = self.image_check(
+                "POKEMON_ZA_OUT_HOTEL_Z23_FIELD_WHITE_COMMENT")
+            escape_active = bool(getattr(
+                self, escape_active_name, False))
+            if field_white_visible and not escape_active:
+                side_index = int(getattr(self, escape_side_name, 0))
+                move_right = side_index % 2 == 0
+                self.press(
+                    Direction(
+                        Stick.LEFT, 0 if move_right else 180, 1.0),
+                    duration=0.5, wait=0.0)
+                self.wait(0.1)
+                setattr(self, escape_active_name, True)
+                setattr(self, escape_side_name, side_index + 1)
+                print(
+                    "[MARKER_FIELD_WHITE_ESCAPE] EVENT move={} "
+                    "duration=0.5; realign marker".format(
+                        "right" if move_right else "left"))
+            elif not field_white_visible:
+                setattr(self, escape_active_name, False)
 
-        if is_detected_in(center, detail):
-            setattr(self, last_movement_name, None)
-            return True
-        elif is_detected_in(wide_downer, detail):
-            movement = (270, 1.0, 0.0)
-        elif is_detected_in(wide_upper, detail):
-            movement = (90, 1.0, 0.0)
-        elif is_detected_in(wide_downer_left_near, detail):
-            movement = (180, 0.2, 0.0)
-        elif is_detected_in(wide_downer_right_near, detail):
-            movement = (0, 0.2, 0.0)
-        elif is_detected_in(wide_upper_left_near, detail):
-            movement = (180, 0.2, 0.0)
-        elif is_detected_in(wide_upper_right_near, detail):
-            movement = (0, 0.2, 0.0)
-        elif is_detected_in(wide_downer_left, detail):
-            movement = (180, 1.0, 0.03)
-        elif is_detected_in(wide_downer_right, detail):
-            movement = (0, 1.0, 0.03)
-        elif is_detected_in(wide_upper_left, detail):
-            movement = (180, 1.0, 0.03)
-        elif is_detected_in(wide_upper_right, detail):
-            movement = (0, 1.0, 0.03)
-        elif is_detected_in(left_side, detail):
-            movement = (180, 1.0, 0.03)
-        elif is_detected_in(right_side, detail):
-            movement = (0, 1.0, 0.03)
-        elif is_detected_in(left, detail):
-            if is_detected_in(center_wide, detail):
+        # EVENTは1回の呼び出し内で最新フレームを取り直し、中央になるまで
+        # 最大10回だけ方向補正する。PIN／SIDE_MARKERは従来どおり1回。
+        alignment_attempts = 10 if type == "EVENT" else 1
+        delayed_event_search = (
+            type == "EVENT" and search_mode in (1, 2))
+        undetected_search_attempts = 30 if delayed_event_search else 1
+        marker_seen_this_call = False
+        for alignment_index in range(alignment_attempts):
+            movement_stick = Stick.RIGHT
+            variants = self.IMAGE_DETECTION_TARGETS.get(center, [])
+            detail = None
+            if variants:
+                detail = detect_marker_position(variants[0])
+                self.last_image_detection = detail
+
+            # search_mode=1は、1回の不一致ですぐ視点を動かさない。
+            # EVENTが見えない間だけfresh frameを最大30回確認し、途中で
+            # 見つかれば直ちに既存の中央化処理へ引き継ぐ。
+            for search_index in range(1, undetected_search_attempts):
+                if detail and detail.get("matched"):
+                    break
+                self.wait(0.1)
+                detail = None
+                if variants:
+                    detail = detect_marker_position(variants[0])
+                    self.last_image_detection = detail
+
+            if detail and detail.get("matched"):
+                marker_seen_this_call = True
+
+            if is_detected_in(center, detail):
+                setattr(self, last_movement_name, None)
+                record_centered_event_approach()
+                return True
+            elif is_detected_in(wide_downer, detail):
+                movement = (270, 1.0, 0.0)
+            elif is_detected_in(wide_upper, detail):
+                movement = (90, 1.0, 0.0)
+            elif is_detected_in(wide_downer_left_near, detail):
                 movement = (180, 0.2, 0.0)
-            else:
-                movement = (180, 1.0, 0.03)
-        elif is_detected_in(right, detail):
-            if is_detected_in(center_wide, detail):
+            elif is_detected_in(wide_downer_right_near, detail):
                 movement = (0, 0.2, 0.0)
-            else:
+            elif is_detected_in(wide_upper_left_near, detail):
+                movement = (180, 0.2, 0.0)
+            elif is_detected_in(wide_upper_right_near, detail):
+                movement = (0, 0.2, 0.0)
+            elif is_detected_in(wide_downer_left, detail):
+                movement = (180, 1.0, 0.03)
+            elif is_detected_in(wide_downer_right, detail):
                 movement = (0, 1.0, 0.03)
-        else:
-            movement = getattr(self, last_movement_name, None)
-            if movement is None:
-                movement = (180, 1.0, 0.0)
-        angle, magnitude, duration = movement
-        self.press(Direction(Stick.RIGHT,angle,magnitude), duration=duration, wait=0.0)
-        setattr(self, last_movement_name, movement)
-        self.wait(0.1)
+            elif is_detected_in(wide_upper_left, detail):
+                movement = (180, 1.0, 0.03)
+            elif is_detected_in(wide_upper_right, detail):
+                movement = (0, 1.0, 0.03)
+            elif is_detected_in(left_side, detail):
+                movement = (180, 1.0, 0.03)
+            elif is_detected_in(right_side, detail):
+                movement = (0, 1.0, 0.03)
+            elif is_detected_in(left, detail):
+                if is_detected_in(center_wide, detail):
+                    movement = (180, 0.2, 0.0)
+                else:
+                    movement = (180, 1.0, 0.03)
+            elif is_detected_in(right, detail):
+                if is_detected_in(center_wide, detail):
+                    movement = (0, 0.2, 0.0)
+                else:
+                    movement = (0, 1.0, 0.03)
+            else:
+                if (type == "EVENT"
+                        and (delayed_event_search
+                             or not marker_seen_this_call)):
+                    # 通常は従来どおり右スティックの視点移動を切り替える。
+                    # search_mode=1だけは30回連続不一致後、左スティックで
+                    # キャラクターを右／左へ1回移動する。
+                    scan_right = alignment_index % 2 == 0
+                    scan_duration = 0.3 if delayed_event_search else (
+                        0.03 if alignment_index == 0 else 0.06)
+                    if delayed_event_search:
+                        movement_stick = Stick.LEFT
+                    movement = (
+                        0 if scan_right else 180,
+                        1.0,
+                        scan_duration)
+                    print(
+                        "[MARKER_SEARCH] EVENT not found: scan {} "
+                        "checks={} stick={} movement={}/{}".format(
+                            "right" if scan_right else "left",
+                            undetected_search_attempts,
+                            "LEFT" if delayed_event_search else "RIGHT",
+                            alignment_index + 1,
+                            alignment_attempts))
+                else:
+                    movement = getattr(self, last_movement_name, None)
+                    if movement is None:
+                        movement = (180, 1.0, 0.0)
+            angle, magnitude, duration = movement
+            self.press(Direction(movement_stick,angle,magnitude), duration=duration, wait=0.0)
+            setattr(self, last_movement_name, movement)
+            self.wait(0.1)
     return False

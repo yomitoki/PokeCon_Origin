@@ -1,8 +1,18 @@
-def ZA_common_skill_change_function(self,selectpokemonnum,target1,target2,machine=0):
+def ZA_common_skill_change_function(self,selectpokemonnum,target1,target2,machine=0,targetskill_pic="",targetskill_timeout=60.0):
+    if self.common_skill_change_current_state == "COMMON_SKILL_CHANGE_START":
+        self._za_common_skill_target_search_picture = ""
+        self._za_common_skill_target_search_active = False
+        self._za_common_skill_target_search_count = 0
+        self._za_common_skill_target_search_started_at = None
     if self.common_skill_change_current_state == "COMMON_SKILL_CHANGE_POKEMON_SELECT":
         self.common_skill_change_current_state = self.ZA_common_skill_change_pokemon_select(selectnum=selectpokemonnum)
     elif self.common_skill_change_current_state == "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET1":
-        self.common_skill_change_current_state = self.ZA_common_skill_change_skill_window_chtarget1(target1=target1,machine=machine)
+        self.common_skill_change_current_state = self.ZA_common_skill_change_skill_window_chtarget1(
+            target1=target1,
+            machine=machine,
+            targetskill_pic=targetskill_pic,
+            targetskill_timeout=targetskill_timeout,
+        )
     elif self.common_skill_change_current_state == "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET2":
         self.common_skill_change_current_state = self.ZA_common_skill_change_skill_window_chtarget2(target2=target2)
     else:
@@ -73,10 +83,73 @@ def ZA_common_skill_change_skill_window_open(self):
             self.wait(0.5)
             return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET1"
     return "COMMON_SKILL_CHANGE_SKILL_WINDOW_OPEN"
-def ZA_common_skill_change_skill_window_chtarget1(self,target1,machine):
+def ZA_common_skill_change_skill_window_chtarget1(self,target1,machine,targetskill_pic="",targetskill_timeout=60.0):
+    targetskill_pic = str(targetskill_pic or "").strip()
+    picture_search = machine == 1 and bool(targetskill_pic)
+
+    if not picture_search:
+        self._za_common_skill_target_search_picture = ""
+        self._za_common_skill_target_search_active = False
+        self._za_common_skill_target_search_count = 0
+        self._za_common_skill_target_search_started_at = None
+    elif getattr(self, "_za_common_skill_target_search_picture", "") != targetskill_pic:
+        self._za_common_skill_target_search_picture = targetskill_pic
+        self._za_common_skill_target_search_active = False
+        self._za_common_skill_target_search_count = 0
+        self._za_common_skill_target_search_started_at = None
+
+    if picture_search and getattr(self, "_za_common_skill_target_search_active", False):
+        skill_page_visible = self.image_check("POKEMON_ZA_SKILL_PAGE_WINDOW")
+        if skill_page_visible and self.image_check(targetskill_pic):
+            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+            self.wait(0.5)
+            self._za_common_skill_target_search_picture = ""
+            self._za_common_skill_target_search_active = False
+            self._za_common_skill_target_search_count = 0
+            self._za_common_skill_target_search_started_at = None
+            return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET2"
+
+        now = time.monotonic()
+        started_at = getattr(self, "_za_common_skill_target_search_started_at", None)
+        if started_at is None:
+            started_at = now
+            self._za_common_skill_target_search_started_at = started_at
+        try:
+            timeout_seconds = max(0.0, float(targetskill_timeout))
+        except (TypeError, ValueError):
+            timeout_seconds = 60.0
+        search_count = int(getattr(self, "_za_common_skill_target_search_count", 0))
+        if now - started_at >= timeout_seconds or search_count >= 200:
+            print("targetskill_pic not found: " + targetskill_pic)
+            self._za_common_skill_target_search_picture = ""
+            self._za_common_skill_target_search_active = False
+            self._za_common_skill_target_search_count = 0
+            self._za_common_skill_target_search_started_at = None
+            # 指定技が未所持の場合。技マシン画面を残したまま再試行Stepへ
+            # 戻さないよう、Bでメニューを閉じてから失敗状態を返す。
+            for _ in range(10):
+                if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"):
+                    break
+                self.pressRep(Button.B, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+                self.wait(0.3)
+            return "COMMON_SKILL_CHANGE_FALSE"
+
+        if skill_page_visible:
+            self.etc_sendCommand("Lbutton_down")
+            self._za_common_skill_target_search_count = search_count + 1
+        self.wait(0.3)
+        return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET1"
+
     if self.image_check("POKEMON_ZA_SKILL_PAGE_WINDOW"):
         if self.image_check("POKEMON_ZA_SIDE_SELECT_X_MENU_W"):
-            if target1 == "X":
+            if picture_search:
+                self.pressRep(Button.ZR, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                self.wait(0.5)
+                self._za_common_skill_target_search_active = True
+                self._za_common_skill_target_search_count = 0
+                self._za_common_skill_target_search_started_at = time.monotonic()
+                return "COMMON_SKILL_CHANGE_SKILL_WINDOW_CHTARGET1"
+            elif target1 == "X":
                 self.etc_sendCommand("Lbutton_right")
                 self.wait(0.5)
                 self.etc_sendCommand("Lbutton_up")
@@ -430,24 +503,71 @@ def ZA_common_evolution_function(self,selectnum):
 
     return self.common_evolution_current_state
 def ZA_common_evolution_exec(self):
-    if self.image_check("POKEMON_ZA_X_MENU_OPEN"):
-        if self.ZA_renda_button(rendabutton="B",
-                             endpicture="POKEMON_ZA_TEXT_BLACK_COMMENT",
-                             not_endpicture="POKEMON_ZA_ZA_ROYALE",
-                             sub_button="A",sub_picture="POKEMON_ZA_TEXT_BLACK_COMMENT",
-                             sub2_button="A",sub2_picture="POKEMON_ZA_2_SELECT",
-                             sub3_button="A",sub3_picture="POKEMON_ZA_3_SELECT",
-                             sub4_button="A",sub4_picture="POKEMON_ZA_4_SELECT",
-                             sub5_button="A",sub5_picture="POKEMON_ZA_HELP_MARKER",
-                             sub6_button="A",sub6_picture="POKEMON_ZA_MORNING",
-                             sub7_button="A",sub7_picture="POKEMON_ZA_NIGHT"):
+    # 3_SELECTはステータス／Xメニューの白枠を拾う場合がある。
+    # 専用画面を先に処理し、誤検知したAでメニューへ入り直さない。
+    if self.image_check("POKEMON_ZA_EVOLUTION_CONFIRM"):
+        # 「そのまま見守る／やめる」は汎用2_SELECTより形が異なる。
+        button = Button.A
+    elif self.image_check("POKEMON_ZA_X_MENU_EVO_MENU"):
+        # 先頭の「進化する」を選択する画面だけはAで進める。
+        button = Button.A
+    elif self.image_check("POKEMON_ZA_2_SELECT"):
+        # 「進化する」の次の確認は背後のXメニューより優先する。
+        button = Button.A
+    elif (self.image_check("POKEMON_ZA_SKILL_PAGE_WINDOW")
+            or self.image_check(
+                "POKEMON_ZA_POKEMON_MENU_X_MENU_W_SELECT_SKILL")
+            or self.image_check("POKEMON_ZA_POKEMON_MENU_X_MENU_W")
+            or self.image_check("POKEMON_ZA_X_MENU_OPEN")):
+        button = Button.B
+        # 確認画面の表示アニメーション中は、背後のXメニューだけが
+        # 先に一致することがある。すぐBを送らず短時間だけ再確認し、
+        # 進化画面または2_SELECTが現れたらAを優先する。
+        # Xメニューで誤一致する3_SELECTは再確認対象にしない。
+        for _ in range(3):
+            self.wait(0.1)
+            if (self.image_check("POKEMON_ZA_EVOLUTION_CONFIRM")
+                    or self.image_check("POKEMON_ZA_X_MENU_EVO_MENU")
+                    or self.image_check("POKEMON_ZA_2_SELECT")):
+                button = Button.A
+                break
+    elif self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT"):
+        if not self.image_check("POKEMON_ZA_ZA_ROYALE"):
             return "COMMON_EVOLUTION_LOOP"
+        button = Button.A
+    elif (self.image_check("POKEMON_ZA_HELP_MARKER")
+            or self.image_check("POKEMON_ZA_3_SELECT")
+            or self.image_check("POKEMON_ZA_4_SELECT")
+            or self.image_check("POKEMON_ZA_MORNING")
+            or self.image_check("POKEMON_ZA_NIGHT")):
+        button = Button.A
+    else:
+        button = Button.B
+    self.pressRep(
+        button, repeat=1, duration=0.04,
+        wait=0.0, interval=0.1)
+    self.wait(0.5)
     return "COMMON_EVOLUTION_EXEC"
 def ZA_common_evolution_loop(self):
-    if self.ZA_renda_button(rendabutton="B",
-                        endpicture="POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK", #FIELDから変更
-                        not_endpicture="POKEMON_ZA_ZA_ROYALE"):
+    # mode=1のFIELD判定は、ステータス画面やXメニューの背後にある
+    # パーティー表示だけでも成立する。メニューを閉じる前に終了扱いに
+    # するとEVO2へ進んでも画面が残るため、各メニューをBで1階層ずつ
+    # 閉じてからフィールド復帰を確定する。
+    if (self.image_check("POKEMON_ZA_X_MENU_OPEN")
+            or self.image_check("POKEMON_ZA_SKILL_PAGE_WINDOW")
+            or self.image_check(
+                "POKEMON_ZA_POKEMON_MENU_X_MENU_W_SELECT_SKILL")
+            or self.image_check("POKEMON_ZA_POKEMON_MENU_X_MENU_W")
+            or self.image_check("POKEMON_ZA_X_MENU_EVO_MENU")):
+        self.pressRep(
+            Button.B, repeat=1, duration=0.15,
+            wait=0.5, interval=0.1)
+        return "COMMON_EVOLUTION_LOOP"
+    if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_1"):
         return "COMMON_EVOLUTION_END"
+    self.pressRep(
+        Button.B, repeat=1, duration=0.15,
+        wait=0.5, interval=0.1)
     return "COMMON_EVOLUTION_LOOP"
 def ZA_common_evolution_end(self):
     return "COMMON_EVOLUTION_START"

@@ -17,9 +17,45 @@ from ProcessShutdown import (FINALIZE_WORKER_REGISTRY,
                              FINALIZE_WORKER_STARTING,
                              process_is_alive)
 from Recording import finalize_recording_manifest
+from InputSetRuntimeRegistry import (default_window_activity_registry_path,
+                                     read_active_input_sets)
 
 
 REQUEST_PREFIX = "request_"
+
+
+def mp4_headroom_decision(entries, cpu_percent=None, logical_cpus=None):
+    """Allow offline encoding whenever no explicit main PokeCon is open."""
+    resources = [
+        entry.get("resource", {}) for entry in entries or []
+        if isinstance(entry, dict)
+        and isinstance(entry.get("resource", {}), dict)
+    ]
+    if any(bool(resource.get("main_effective", False))
+           for resource in resources):
+        return {
+            "ready": False,
+            "reason": "メインPokeConが開いているためMP4作成を待機中です。",
+        }
+    return {
+        "ready": True,
+        "reason": "",
+    }
+
+
+class Mp4LoadGuard:
+    """Read shared PokeCon state and total CPU without touching any GUI."""
+
+    def __init__(self, registry_path=None, sampler=None):
+        self.registry_path = (
+            registry_path or default_window_activity_registry_path())
+
+    def decision(self):
+        try:
+            entries = read_active_input_sets(self.registry_path)
+        except (OSError, TimeoutError, ValueError):
+            entries = []
+        return mp4_headroom_decision(entries, None)
 
 
 def _write_json_atomic(path, payload):
@@ -127,6 +163,9 @@ class FinalizeProgressWindow:
         self.total = 0
         self.completed = 0
         self.failed = 0
+        self.load_guard = Mp4LoadGuard()
+        self.force_next_job = threading.Event()
+        self.force_all_jobs = threading.Event()
 
         self.root = tk.Tk()
         self.root.title("PokeCon MP4一括作成")
@@ -163,6 +202,14 @@ class FinalizeProgressWindow:
 
         buttons = ttk.Frame(self.root)
         buttons.pack(fill="x", padx=12, pady=(2, 10))
+        self.force_next_button = ttk.Button(
+            buttons, text="待機を解除して次の1本を作成",
+            command=self.force_next_finalize, state="disabled")
+        self.force_next_button.pack(side="left")
+        self.force_all_button = ttk.Button(
+            buttons, text="待機を解除してすべて作成",
+            command=self.force_all_finalize, state="disabled")
+        self.force_all_button.pack(side="left", padx=(8, 0))
         self.close_button = ttk.Button(
             buttons, text="閉じる", command=self.close)
         self.close_button.pack(side="right")
@@ -196,18 +243,49 @@ class FinalizeProgressWindow:
                     if not job["wait_pid"] or
                     not process_is_alive(job["wait_pid"])), None)
                 if ready_index is not None:
+                    force_next = getattr(self, "force_next_job", None)
+                    force_all = getattr(self, "force_all_jobs", None)
+                    force_all_active = bool(
+                        force_all is not None and force_all.is_set())
+                    force_next_active = bool(
+                        force_next is not None and force_next.is_set())
+                    forced = bool(force_all_active or force_next_active)
+                    load = ({"ready": True, "forced": True}
+                            if forced else self.load_guard.decision())
+                    if not load.get("ready", False):
+                        state = ("load_wait", str(load.get("reason", "")))
+                        if state != last_state:
+                            self.events.put(state)
+                            last_state = state
+                        self.stop_event.wait(1.0)
+                        continue
+                    if forced:
+                        # The one-file override is consumed immediately. The
+                        # all-files override stays set until pending is empty.
+                        if force_next_active and not force_all_active:
+                            force_next.clear()
                     job = pending.pop(ready_index)
                     manifest = job["manifest"]
                     folder = os.path.dirname(manifest)
-                    self.events.put(("started", folder))
+                    override_mode = "all" if force_all_active else (
+                        "next" if force_next_active else "")
+                    self.events.put(("started", folder, override_mode))
                     try:
                         result = finalize_recording_manifest(manifest)
                         self.events.put(("completed", folder, result))
                     except Exception as error:
                         self.events.put(("failed", folder, str(error)))
+                    if force_all_active and not pending:
+                        # The override covers the batch already collected when
+                        # the button was pressed. Later additions wait normally.
+                        force_all.clear()
                     last_state = None
                     continue
 
+                if not pending:
+                    force_all = getattr(self, "force_all_jobs", None)
+                    if force_all is not None:
+                        force_all.clear()
                 state = "waiting_parent" if pending else "idle"
                 if state != last_state:
                     self.events.put((state, len(pending)))
@@ -229,6 +307,26 @@ class FinalizeProgressWindow:
             "完了 {} / {}　失敗 {}".format(
                 self.completed, self.total, self.failed))
 
+    def force_next_finalize(self):
+        """Allow exactly one pending MP4 despite the current load guard."""
+        if self.closed or not self.busy:
+            return
+        self.force_next_job.set()
+        self.force_next_button.configure(state="disabled")
+        self.status.set(
+            "次の1本だけ待機条件を解除しました。MP4作成開始を待っています。")
+
+    def force_all_finalize(self):
+        """Process the current pending batch despite the current load guard."""
+        if self.closed or not self.busy:
+            return
+        self.force_next_job.clear()
+        self.force_all_jobs.set()
+        self.force_next_button.configure(state="disabled")
+        self.force_all_button.configure(state="disabled")
+        self.status.set(
+            "現在の待機分をすべて作成します。MP4作成開始を待っています。")
+
     def _drain_events(self):
         try:
             while True:
@@ -237,14 +335,24 @@ class FinalizeProgressWindow:
                 if kind == "added":
                     self.total += event[1]
                     self.busy = True
+                    self.force_next_button.configure(state="disabled")
+                    self.force_all_button.configure(state="disabled")
                     self.close_button.configure(state="disabled")
                     self.status.set(
                         "録画を{}件追加しました。未処理分を続けます。".format(
                             event[1]))
                 elif kind == "started":
                     self.busy = True
+                    self.force_next_button.configure(state="disabled")
+                    self.force_all_button.configure(state="disabled")
                     self.close_button.configure(state="disabled")
-                    self.status.set("MP4作成中: {}".format(event[1]))
+                    if len(event) > 2 and event[2] == "all":
+                        prefix = "全件待機解除・MP4作成中"
+                    elif len(event) > 2 and event[2] == "next":
+                        prefix = "1本待機解除・MP4作成中"
+                    else:
+                        prefix = "MP4作成中"
+                    self.status.set("{}: {}".format(prefix, event[1]))
                 elif kind == "completed":
                     self.completed += 1
                     self._append_output("完了: {}".format(event[1]))
@@ -254,12 +362,22 @@ class FinalizeProgressWindow:
                         "失敗: {}\n  {}".format(event[1], event[2]))
                 elif kind == "waiting_parent":
                     self.busy = True
+                    self.force_next_button.configure(state="disabled")
+                    self.force_all_button.configure(state="disabled")
                     self.close_button.configure(state="disabled")
                     self.status.set(
                         "PokeCon本体の終了を待っています（{}件）。".format(
                             event[1]))
+                elif kind == "load_wait":
+                    self.busy = True
+                    self.force_next_button.configure(state="normal")
+                    self.force_all_button.configure(state="normal")
+                    self.close_button.configure(state="disabled")
+                    self.status.set(event[1])
                 elif kind == "idle":
                     self.busy = False
+                    self.force_next_button.configure(state="disabled")
+                    self.force_all_button.configure(state="disabled")
                     self.close_button.configure(state="normal")
                     if self.total:
                         self.status.set(

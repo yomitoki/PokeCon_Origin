@@ -21,7 +21,20 @@ def ZA_story_Template_Comment_Out(self,substitute=0,green_check=1,black_check=1,
         elif self.image_check("POKEMON_ZA_BATTLE_BALL_CHECK") or self.image_check("POKEMON_ZA_ESCAPE"):
             return True
         elif self.image_check(selected_pic):
-            break                
+            break
+        elif sub9_button == "A" and self.image_check(sub9_picture):
+            # sub9は従来renda開始後にしか処理されず、FIELD上の操作を
+            # 起点として会話を始めるStepではrendaまで到達できなかった。
+            # 指定画像が見えている間だけAを送り、実際にFIELDを離れた後は
+            # 従来のコメント検知・終了判定へ引き継ぐ。
+            print(
+                "[COMMENT_OUT] initial action: A picture={}".format(
+                    sub9_picture))
+            self.pressRep(
+                Button.A, repeat=1, duration=0.04,
+                wait=0.0, interval=0.1)
+            self.wait(max(0.1, float(sleeptime)))
+            continue
         elif (nofiled_check==1 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")):
             return True
         elif (nofiled_check==1 and self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0")):

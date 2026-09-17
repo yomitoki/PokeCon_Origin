@@ -98,8 +98,10 @@ from SourceDependencyTools import (analyze_source_dependencies,
                                    suggest_state_dictionary)
 from OperationSessionStudio import OperationSessionWorkspace
 from CommandRecordingStudio import CommandRecordingWorkspace
+from CommandFocusRepairStudio import CommandFocusRepairWorkspace
 from PythonSourceSafety import (normalize_and_compile_python,
                                 normalize_python_indentation)
+from StepMetadata import read_step_metadata, update_step_metadata
 
 
 PYTHON_SUFFIXES = (".py", ".pyfrag")
@@ -263,7 +265,8 @@ class TagPicker(ttk.Frame):
 
 
 class DevStudio(tk.Tk):
-    def __init__(self, initial_root, operation_session="", command_recording=""):
+    def __init__(self, initial_root, operation_session="", command_recording="",
+                 focus_repair=False):
         tk.Tk.__init__(self)
         self.code_font = tkfont.Font(self, family="Consolas", size=10)
         self.code_tabs = (self.code_font.measure("    "),)
@@ -309,6 +312,7 @@ class DevStudio(tk.Tk):
             if operation_session else ""
         self.initial_command_recording = os.path.abspath(command_recording) \
             if command_recording else ""
+        self.initial_focus_repair = bool(focus_repair)
         self._build()
         self._build_menu()
         self.apply_language()
@@ -443,6 +447,7 @@ class DevStudio(tk.Tk):
                 titles = ((self.source_workspace, "🟦 ソース編集"),
                           (self.operation_workspace, "🟥 操作記録→Commands"),
                           (self.command_recording_workspace, "🟪 動画・ソース比較"),
+                          (self.focus_repair_workspace, "🟧 集中修正"),
                           (self.sample_functions_workspace, "🟩 サンプル関数"),
                           (self.sample_lists_workspace, "🟨 サンプルリスト"),
                           (self.sample_program_workspace, "🟦 サンプルプログラム"),
@@ -451,6 +456,7 @@ class DevStudio(tk.Tk):
                 titles = ((self.source_workspace, "🟦 Source edit"),
                           (self.operation_workspace, "🟥 Operation → Commands"),
                           (self.command_recording_workspace, "🟪 Video / source compare"),
+                          (self.focus_repair_workspace, "🟧 Focused repair"),
                           (self.sample_functions_workspace, "🟩 Sample functions"),
                           (self.sample_lists_workspace, "🟨 Sample lists"),
                           (self.sample_program_workspace, "🟦 Sample program"),
@@ -612,6 +618,7 @@ class DevStudio(tk.Tk):
         source_workspace = ttk.Frame(self.workspace_tabs)
         operation_workspace = ttk.Frame(self.workspace_tabs)
         command_recording_workspace = ttk.Frame(self.workspace_tabs)
+        focus_repair_workspace = ttk.Frame(self.workspace_tabs)
         sample_functions_workspace = ttk.Frame(self.workspace_tabs)
         sample_lists_workspace = ttk.Frame(self.workspace_tabs)
         sample_program_workspace = ttk.Frame(self.workspace_tabs)
@@ -619,6 +626,7 @@ class DevStudio(tk.Tk):
         self.source_workspace = source_workspace
         self.operation_workspace = operation_workspace
         self.command_recording_workspace = command_recording_workspace
+        self.focus_repair_workspace = focus_repair_workspace
         self.sample_functions_workspace = sample_functions_workspace
         self.sample_lists_workspace = sample_lists_workspace
         self.sample_program_workspace = sample_program_workspace
@@ -637,6 +645,10 @@ class DevStudio(tk.Tk):
         self.workspace_tabs.tab(sample_program_workspace, padding=(10, 4))
         self.workspace_tabs.add(image_library_workspace, text="画像検知")
         self.workspace_tabs.tab(image_library_workspace, padding=(10, 4))
+        # Append this workspace so existing saved numeric tab positions keep
+        # referring to the same legacy tools.
+        self.workspace_tabs.add(focus_repair_workspace, text="🟧 集中修正")
+        self.workspace_tabs.tab(focus_repair_workspace, padding=(10, 4))
         style = ttk.Style(self)
         style.configure("Workspace.TNotebook.Tab", padding=(12, 5))
         self.workspace_tabs.configure(style="Workspace.TNotebook")
@@ -860,8 +872,15 @@ class DevStudio(tk.Tk):
             initial_recording=self.initial_command_recording,
             open_image_callback=self.open_operation_image_in_library,
             open_source_callback=self.show_file,
-            template_root_provider=lambda: self.template_root())
+            template_root_provider=lambda: self.template_root(),
+            open_focus_callback=self.open_focus_repair_recording)
         self.command_recording_studio.pack(fill="both", expand=True)
+        self.focus_repair_studio = CommandFocusRepairWorkspace(
+            focus_repair_workspace,
+            initial_recording=self.initial_command_recording,
+            open_recording_callback=self.open_focus_segment_in_recording,
+            open_source_callback=self.show_file)
+        self.focus_repair_studio.pack(fill="both", expand=True)
         for widget, label, replace in (
                 (self.operation_session_workspace.intermediate_text,
                  "操作記録: 中間ファイル", True),
@@ -874,7 +893,13 @@ class DevStudio(tk.Tk):
                 (self.operation_session_workspace.intermediate_history_diff_text,
                  "操作記録: 中間コード差分", False),
                 (self.command_recording_studio.source_text,
-                 "動画・ソース比較: ソース", False)):
+                  "動画・ソース比較: ソース", False),
+                (self.focus_repair_studio.source_text,
+                  "集中修正: 関数ソース", False),
+                (self.focus_repair_studio.issue_text,
+                  "集中修正: 区間メモ", True),
+                (self.focus_repair_studio.global_text,
+                  "集中修正: 解析依頼", True)):
             self._register_find_editor(widget, label, replace=replace)
         self.operation_session_workspace.code_tabs.bind(
             "<<NotebookTabChanged>>",
@@ -885,7 +910,9 @@ class DevStudio(tk.Tk):
         self.workspace_tabs.bind(
             "<<NotebookTabChanged>>", self._workspace_tab_changed, add="+")
         self.bind("<Control-f>", self.focus_current_tab_find, add="+")
-        if self.initial_command_recording:
+        if self.initial_command_recording and self.initial_focus_repair:
+            self.workspace_tabs.select(focus_repair_workspace)
+        elif self.initial_command_recording:
             self.workspace_tabs.select(command_recording_workspace)
         elif self.initial_operation_session:
             self.workspace_tabs.select(operation_workspace)
@@ -905,6 +932,23 @@ class DevStudio(tk.Tk):
         self.workspace_tabs.select(self.image_library_workspace)
         self._show_image_library_preview(path)
         self.status.set("操作記録の画像と1280x720検知範囲を引き渡しました。設定確認後に保存してください。")
+
+    def open_focus_repair_recording(self, folder):
+        """Open the focused-repair workspace for the current recording."""
+        studio = getattr(self, "focus_repair_studio", None)
+        if studio is None:
+            return
+        self.workspace_tabs.select(self.focus_repair_workspace)
+        if os.path.abspath(str(folder or "")) != studio.folder:
+            studio.load_folder(folder)
+
+    def open_focus_segment_in_recording(self, folder, video_time):
+        """Return from a focused interval to the exact video/source time."""
+        studio = getattr(self, "command_recording_studio", None)
+        if studio is None:
+            return
+        self.workspace_tabs.select(self.command_recording_workspace)
+        studio.load_folder_and_seek(folder, video_time)
 
     def _workspace_tab_changed(self, _event=None):
         """Do not decode operation video while another DevStudio tab is used."""
@@ -1232,8 +1276,12 @@ class DevStudio(tk.Tk):
         self.step_state_locations = {}
         self.step_state_original_names = {}
         self.step_state_dictionary_names = {}
+        self.step_item_keys = {}
+        self.step_item_display_names = {}
+        self.step_item_descriptions = {}
         self._step_load_in_progress = False
         self.step_entry = tk.StringVar()
+        self.step_display_name = tk.StringVar()
         self.step_loop = tk.BooleanVar(value=True)
         self.step_template_mode = tk.StringVar(value="Step (state transition / 状態遷移)")
         self.step_start = tk.StringVar(value="0 (_step_0)")
@@ -1251,14 +1299,51 @@ class DevStudio(tk.Tk):
         ttk.Button(step_actions, text="変更をソースへ反映", command=self.apply_steps_to_editor).pack(side="right", padx=2)
         step_tree_frame = ttk.Frame(parent)
         step_tree_frame.grid(column=0, columnspan=4, row=3, padx=7, pady=4, sticky="nsew")
-        self.step_tree = ttk.Treeview(step_tree_frame, show="tree", height=10)
+        self.step_tree = ttk.Treeview(
+            step_tree_frame, columns=("display", "description"),
+            show="tree headings", height=10)
+        self.step_tree.heading("#0", text="Step / 対応処理")
+        self.step_tree.heading("display", text="Start表示名")
+        self.step_tree.heading("description", text="説明")
+        self.step_tree.column("#0", width=250, stretch=True)
+        self.step_tree.column("display", width=180, stretch=True)
+        self.step_tree.column("description", width=320, stretch=True)
         pack_scrollable_widget(self.step_tree, horizontal=True)
-        ttk.Checkbutton(parent, text="Use loop to advance steps", variable=self.step_loop).grid(column=0, columnspan=2, row=4, padx=7, pady=3, sticky="w")
-        ttk.Combobox(parent, state="readonly", width=34, textvariable=self.step_template_mode, values=("Step (state transition / 状態遷移)", "Step (nested chapters / 階層チャプター)")).grid(column=2, columnspan=2, row=4, padx=3, pady=3, sticky="e")
-        ttk.Label(parent, text="First step:").grid(column=0, row=5, padx=7, pady=3, sticky="w")
-        ttk.Combobox(parent, state="readonly", width=12, textvariable=self.step_start, values=("0 (_step_0)", "1 (_step_1)")).grid(column=1, row=5, padx=3, pady=3, sticky="w")
+        self.step_tree.bind("<<TreeviewSelect>>", self.on_step_item_selected)
+
+        metadata_box = ttk.Labelframe(
+            parent, text="選択StepのStart表示（後から変更できます）")
+        metadata_box.grid(
+            column=0, columnspan=4, row=4, padx=7, pady=4, sticky="ew")
+        ttk.Label(metadata_box, text="表示名:").grid(
+            column=0, row=0, padx=5, pady=4, sticky="e")
+        ttk.Entry(metadata_box, textvariable=self.step_display_name).grid(
+            column=1, row=0, padx=5, pady=4, sticky="ew")
+        ttk.Label(metadata_box, text="説明:").grid(
+            column=0, row=1, padx=5, pady=4, sticky="ne")
+        description_frame = ttk.Frame(metadata_box)
+        description_frame.grid(
+            column=1, row=1, padx=5, pady=4, sticky="nsew")
+        self.step_description_editor = tk.Text(
+            description_frame, height=3, wrap="word", undo=True)
+        pack_scrollable_widget(self.step_description_editor)
+        metadata_actions = ttk.Frame(metadata_box)
+        metadata_actions.grid(
+            column=2, row=0, rowspan=2, padx=5, pady=4, sticky="ns")
+        ttk.Button(
+            metadata_actions, text="表示名・説明を設定",
+            command=self.update_selected_step_metadata).pack(fill="x", pady=2)
+        ttk.Button(
+            metadata_actions, text="説明をクリア",
+            command=self.clear_selected_step_description).pack(fill="x", pady=2)
+        metadata_box.columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(parent, text="Use loop to advance steps", variable=self.step_loop).grid(column=0, columnspan=2, row=5, padx=7, pady=3, sticky="w")
+        ttk.Combobox(parent, state="readonly", width=34, textvariable=self.step_template_mode, values=("Step (state transition / 状態遷移)", "Step (nested chapters / 階層チャプター)")).grid(column=2, columnspan=2, row=5, padx=3, pady=3, sticky="e")
+        ttk.Label(parent, text="First step:").grid(column=0, row=6, padx=7, pady=3, sticky="w")
+        ttk.Combobox(parent, state="readonly", width=12, textvariable=self.step_start, values=("0 (_step_0)", "1 (_step_1)")).grid(column=1, row=6, padx=3, pady=3, sticky="w")
         special_box = ttk.Labelframe(parent, text="Special steps (called explicitly, not in normal order)")
-        special_box.grid(column=0, columnspan=4, row=6, padx=7, pady=(5, 7), sticky="nsew")
+        special_box.grid(column=0, columnspan=4, row=7, padx=7, pady=(5, 7), sticky="nsew")
         ttk.Entry(special_box, textvariable=self.special_step_entry, width=24).pack(side="left", padx=4, pady=4)
         special_step_frame = ttk.Frame(special_box)
         special_step_frame.pack(
@@ -2024,6 +2109,82 @@ class DevStudio(tk.Tk):
         elif self.right_tabs.select() == str(self.source_functions_tab):
             self.refresh_source_functions()
 
+    def _step_metadata_item(self):
+        selected = self.step_tree.selection()
+        if not selected:
+            return ""
+        item = selected[0]
+        if item in getattr(self, "step_state_dictionary_names", {}):
+            return ""
+        return item
+
+    def _refresh_step_tree_metadata(self, item):
+        if not item or not self.step_tree.exists(item):
+            return
+        display = str(self.step_item_display_names.get(item, "") or "")
+        description = str(self.step_item_descriptions.get(item, "") or "")
+        self.step_tree.item(item, values=(display, description))
+
+    def on_step_item_selected(self, _event=None):
+        selected = self.step_tree.selection()
+        if not selected:
+            return
+        item = selected[0]
+        raw = self.step_tree.item(item, "text").strip()
+        if item in getattr(self, "step_state_dictionary_names", {}):
+            self.step_entry.set(raw)
+            self.step_display_name.set("")
+            self.step_description_editor.delete("1.0", "end")
+            return
+        if self.step_source_mode == "state_machine":
+            match = re.match(r"^([^\s]+)\s*->\s*([A-Za-z_]\w*)$", raw)
+            self.step_entry.set(match.group(1) if match else raw)
+        else:
+            self.step_entry.set(raw)
+        self.step_display_name.set(
+            self.step_item_display_names.get(item, raw))
+        self.step_description_editor.delete("1.0", "end")
+        description = self.step_item_descriptions.get(item, "")
+        if description:
+            self.step_description_editor.insert("1.0", description)
+
+    def update_selected_step_metadata(self):
+        item = self._step_metadata_item()
+        if not item:
+            messagebox.showinfo(
+                "Step表示", "説明を設定するStepを選択してください。", parent=self)
+            return
+        raw = self.step_tree.item(item, "text").strip()
+        if self.step_source_mode == "state_machine":
+            match = re.match(r"^([^\s]+)\s*->\s*([A-Za-z_]\w*)$", raw)
+            internal_name = match.group(1) if match else raw
+        else:
+            internal_name = raw
+        display = self.step_display_name.get().strip() or internal_name
+        description = self.step_description_editor.get(
+            "1.0", "end-1c").strip()
+        self.step_item_display_names[item] = display
+        self.step_item_descriptions[item] = description
+        if self.step_source_mode != "state_machine":
+            # Generated Step commands use STEP_LABELS as their display names.
+            self.step_tree.item(item, text=display)
+            self.step_entry.set(display)
+        self._refresh_step_tree_metadata(item)
+        self.status.set(
+            "Step表示を更新しました。［変更をソースへ反映］後に保存してください。")
+
+    def clear_selected_step_description(self):
+        item = self._step_metadata_item()
+        if not item:
+            messagebox.showinfo(
+                "Step表示", "説明をクリアするStepを選択してください。", parent=self)
+            return
+        self.step_description_editor.delete("1.0", "end")
+        self.step_item_descriptions[item] = ""
+        self._refresh_step_tree_metadata(item)
+        self.status.set(
+            "Step説明をクリアしました。［変更をソースへ反映］後に保存してください。")
+
     def add_step_item(self, parent):
         label = self.step_entry.get().strip()
         if not label:
@@ -2038,6 +2199,12 @@ class DevStudio(tk.Tk):
         item = self.step_tree.insert(parent, "end", text=label, open=True)
         if self.step_source_mode == "state_machine" and label.startswith("STATE_") and label.endswith("_FUNCTION"):
             self.step_state_dictionary_names[item] = label
+        else:
+            display = label.split("->", 1)[0].strip() \
+                if self.step_source_mode == "state_machine" else label
+            self.step_item_display_names[item] = display
+            self.step_item_descriptions[item] = ""
+            self._refresh_step_tree_metadata(item)
         self.step_tree.selection_set(item)
         self.step_tree.focus(item)
         self.step_entry.set("")
@@ -2065,14 +2232,44 @@ class DevStudio(tk.Tk):
         if not label:
             messagebox.showinfo("Step hierarchy", "Enter a new name above, then press Rename.", parent=self)
             return
-        self.step_tree.item(selected[0], text=label)
-        if selected[0] in getattr(self, "step_state_dictionary_names", {}):
-            self.step_state_dictionary_names[selected[0]] = label
+        item = selected[0]
+        if (self.step_source_mode == "state_machine"
+                and item not in getattr(self, "step_state_dictionary_names", {})
+                and "->" not in label):
+            current = self.step_tree.item(item, "text").strip()
+            match = re.match(r"^([^\s]+)\s*->\s*([A-Za-z_]\w*)$", current)
+            if match:
+                label = "{} -> {}".format(label, match.group(2))
+        self.step_tree.item(item, text=label)
+        if item in getattr(self, "step_state_dictionary_names", {}):
+            self.step_state_dictionary_names[item] = label
+        elif self.step_source_mode == "state_machine":
+            match = re.match(r"^([^\s]+)\s*->\s*([A-Za-z_]\w*)$", label)
+            if match:
+                old_key = self.step_item_keys.get(item, "")
+                self.step_item_keys[item] = match.group(1)
+                if self.step_item_display_names.get(item, "") in ("", old_key):
+                    self.step_item_display_names[item] = match.group(1)
+        else:
+            self.step_item_display_names[item] = label
+        self._refresh_step_tree_metadata(item)
         self.step_entry.set("")
 
     def remove_step_item(self):
         selected = self.step_tree.selection()
         if selected:
+            def descendants(item):
+                found = [item]
+                for child in self.step_tree.get_children(item):
+                    found.extend(descendants(child))
+                return found
+            for item in descendants(selected[0]):
+                self.step_item_keys.pop(item, None)
+                self.step_item_display_names.pop(item, None)
+                self.step_item_descriptions.pop(item, None)
+                self.step_state_locations.pop(item, None)
+                self.step_state_original_names.pop(item, None)
+                self.step_state_dictionary_names.pop(item, None)
             self.step_tree.delete(selected[0])
 
     def add_special_step(self):
@@ -2092,7 +2289,12 @@ class DevStudio(tk.Tk):
         except ValueError:
             start = 0
         def flatten(item, key):
-            values = [{"key": key, "label": self.step_tree.item(item, "text")}]
+            key = str(self.step_item_keys.get(item, key))
+            label = self.step_item_display_names.get(
+                item, self.step_tree.item(item, "text"))
+            values = [{
+                "key": key, "label": label,
+                "description": self.step_item_descriptions.get(item, "")}]
             for number, child in enumerate(self.step_tree.get_children(item), 1):
                 values.extend(flatten(child, key + "_" + str(number)))
             return values
@@ -2116,6 +2318,7 @@ class DevStudio(tk.Tk):
             special_steps = ast.literal_eval(special_assignment.value) if special_assignment is not None else []
             if not isinstance(steps, list):
                 raise ValueError
+            metadata = read_step_metadata(source, command.name)
         except (SyntaxError, StopIteration, ValueError, TypeError):
             if self._load_state_machine_steps(source):
                 return
@@ -2126,12 +2329,30 @@ class DevStudio(tk.Tk):
         self.step_state_locations = {}
         self.step_state_original_names = {}
         self.step_state_dictionary_names = {}
+        self.step_item_keys = {}
+        self.step_item_display_names = {}
+        self.step_item_descriptions = {}
         self.step_tree.delete(*self.step_tree.get_children())
         inserted = {}
         for key, label in zip(step_keys, steps):
+            key = str(key)
+            source_label = str(label)
+            display = metadata["labels"].get(
+                key, metadata["labels"].get(source_label, source_label))
+            description = metadata["descriptions"].get(
+                key, metadata["descriptions"].get(source_label, ""))
             parent_key = key.rsplit("_", 1)[0] if "_" in key else ""
-            inserted[key] = self.step_tree.insert(inserted.get(parent_key, ""), "end", text=str(label), open=True)
-        self.step_start.set((str(step_keys[0]).split("_")[0] if step_keys else "0") + " (_step_" + (str(step_keys[0]).split("_")[0] if step_keys else "0") + ")")
+            item = self.step_tree.insert(
+                inserted.get(parent_key, ""), "end", text=display,
+                values=(display, description), open=True)
+            inserted[key] = item
+            self.step_item_keys[item] = key
+            self.step_item_display_names[item] = display
+            self.step_item_descriptions[item] = description
+        first_root = str(step_keys[0]).split("_")[0] if step_keys else "0"
+        if not first_root.isdigit():
+            first_root = "0"
+        self.step_start.set(first_root + " (_step_" + first_root + ")")
         self.step_loop.set("while self.alive" in self.editor.get("1.0", "end-1c"))
         self.special_step_list.delete(0, "end")
         for value in special_steps:
@@ -2142,7 +2363,8 @@ class DevStudio(tk.Tk):
         """Read self.STATE_*_FUNCTION dictionaries without rewriting the command."""
         try:
             tree = ast.parse(source)
-        except SyntaxError:
+            metadata = read_step_metadata(source)
+        except (SyntaxError, ValueError):
             return False
         methods = {}
         method_dictionary_refs = {}
@@ -2180,6 +2402,9 @@ class DevStudio(tk.Tk):
         self.step_state_locations = {}
         self.step_state_original_names = {}
         self.step_state_dictionary_names = {}
+        self.step_item_keys = {}
+        self.step_item_display_names = {}
+        self.step_item_descriptions = {}
         state_items_by_method = {}
         count = 0
         self._step_load_in_progress = True
@@ -2194,9 +2419,17 @@ class DevStudio(tk.Tk):
                 root = self.step_tree.insert(parent, "end", text=dictionary_name, open=False)
                 self.step_state_dictionary_names[root] = dictionary_name
                 for state_name, method_name, line_number in members:
-                    item = self.step_tree.insert(root, "end", text="{} -> {}".format(state_name, method_name))
+                    display = metadata["labels"].get(state_name, state_name)
+                    description = metadata["descriptions"].get(state_name, "")
+                    item = self.step_tree.insert(
+                        root, "end", text="{} -> {}".format(
+                            state_name, method_name),
+                        values=(display, description))
                     self.step_state_locations[item] = (method_name, line_number)
                     self.step_state_original_names[item] = state_name
+                    self.step_item_keys[item] = state_name
+                    self.step_item_display_names[item] = display
+                    self.step_item_descriptions[item] = description
                     state_items_by_method.setdefault(method_name, item)
                     count += 1
                     if count % 100 == 0:
@@ -2206,7 +2439,9 @@ class DevStudio(tk.Tk):
             self._step_load_in_progress = False
         self.step_source_mode = "state_machine"
         self.special_step_list.delete(0, "end")
-        self.status.set("Loaded {} state-machine transition(s), read-only hierarchy".format(count))
+        self.status.set(
+            "Loaded {} state-machine transition(s); names/descriptions are editable".format(
+                count))
         return True
 
     def open_selected_state_method(self):
@@ -2249,7 +2484,11 @@ class DevStudio(tk.Tk):
         if not messagebox.askyesno("Apply Step hierarchy", "Rebuild the Step skeleton and keep marked user code for unchanged Step keys?", parent=self):
             return
         special_steps = list(self.special_step_list.get(0, "end"))
-        source = template_source(self.step_template_mode.get(), command.name, name, tags, steps, self.step_loop.get(), step_start=int(self.step_start.get().split()[0]), special_steps=special_steps, step_custom_bodies=custom_bodies)
+        try:
+            step_start = int(self.step_start.get().split()[0])
+        except (ValueError, IndexError):
+            step_start = 0
+        source = template_source(self.step_template_mode.get(), command.name, name, tags, steps, self.step_loop.get(), step_start=step_start, special_steps=special_steps, step_custom_bodies=custom_bodies)
         self.set_editor_content(source, self.current_path)
         self.editor_dirty = True
         self.update_editor_view()
@@ -2258,6 +2497,8 @@ class DevStudio(tk.Tk):
     def _state_machine_tree_values(self):
         definitions = []
         renames = {}
+        labels = {}
+        descriptions = {}
         dictionary_names = getattr(self, "step_state_dictionary_names", {})
         roots = []
         def collect_dictionaries(parent=""):
@@ -2280,11 +2521,19 @@ class DevStudio(tk.Tk):
                     raise ValueError("Use STATE_NAME -> method_name: " + label)
                 state_name, method_name = match.groups()
                 members.append((state_name, method_name))
+                display = str(self.step_item_display_names.get(
+                    item, state_name) or state_name).strip()
+                description = str(self.step_item_descriptions.get(
+                    item, "") or "").strip()
+                if display and display != state_name:
+                    labels[state_name] = display
+                if description:
+                    descriptions[state_name] = description
                 old_name = self.step_state_original_names.get(item)
                 if old_name and old_name != state_name:
                     renames[old_name] = state_name
             definitions.append((dictionary_name, members))
-        return definitions, renames
+        return definitions, renames, labels, descriptions
 
     @staticmethod
     def _rename_state_literals(source, renames):
@@ -2320,7 +2569,8 @@ class DevStudio(tk.Tk):
 
     def apply_state_machine_steps_to_editor(self):
         try:
-            definitions, renames = self._state_machine_tree_values()
+            definitions, renames, labels, descriptions = \
+                self._state_machine_tree_values()
             source = self.editor.get("1.0", "end-1c")
             tree = ast.parse(source)
         except (SyntaxError, ValueError) as error:
@@ -2385,6 +2635,8 @@ class DevStudio(tk.Tk):
             source = "".join(source_lines)
         source = self._rename_state_literals(source, renames)
         try:
+            source = update_step_metadata(
+                source, labels=labels, descriptions=descriptions)
             ast.parse(source)
         except SyntaxError as error:
             messagebox.showerror("Step hierarchy", "Generated state dictionaries are invalid: {}".format(error), parent=self)
@@ -3432,6 +3684,7 @@ class DevStudio(tk.Tk):
         self.image_library_path = tk.StringVar()
         self.image_library_threshold = tk.DoubleVar(value=0.80)
         self.image_library_crop = tk.StringVar(value="0,0,0,0")
+        self.image_library_template_crop = tk.StringVar(value="0,0,0,0")
         self.image_library_gray = tk.BooleanVar(value=True)
         self.image_library_show_value = tk.BooleanVar(value=False)
         self.image_library_match_color = tk.StringVar(value="blue")
@@ -3484,18 +3737,21 @@ class DevStudio(tk.Tk):
         ttk.Spinbox(form, from_=0.0, to=1.0, increment=0.01, textvariable=self.image_library_threshold, width=8).grid(column=1, row=3, padx=4, sticky="w")
         ttk.Label(form, text="範囲 x1,y1,x2,y2:").grid(column=0, row=4, padx=4, pady=3, sticky="w")
         ttk.Entry(form, textvariable=self.image_library_crop).grid(column=1, row=4, padx=4, sticky="ew")
-        flags = ttk.Frame(form); flags.grid(column=1, row=5, sticky="w")
+        ttk.Label(form, text="画像内範囲 x1,y1,x2,y2:").grid(column=0, row=5, padx=4, pady=3, sticky="w")
+        ttk.Entry(form, textvariable=self.image_library_template_crop).grid(column=1, row=5, padx=4, sticky="ew")
+        flags = ttk.Frame(form); flags.grid(column=1, row=6, sticky="w")
         ttk.Checkbutton(flags, text="グレースケール", variable=self.image_library_gray).pack(side="left")
         ttk.Checkbutton(flags, text="類似度をログ出力", variable=self.image_library_show_value).pack(side="left", padx=8)
-        colors = ttk.Frame(form); colors.grid(column=1, columnspan=2, row=6, sticky="w")
+        colors = ttk.Frame(form); colors.grid(column=1, columnspan=2, row=7, sticky="w")
         ttk.Label(colors, text="一致色:").pack(side="left")
         ttk.Entry(colors, textvariable=self.image_library_match_color, width=10).pack(side="left", padx=2)
         ttk.Label(colors, text="不一致色:").pack(side="left", padx=(8, 0))
         ttk.Entry(colors, textvariable=self.image_library_no_match_color, width=10).pack(side="left", padx=2)
-        ttk.Label(form, text="複数画像の判定:").grid(column=0, row=7, padx=4, pady=3, sticky="w")
+        ttk.Label(form, text="複数画像の判定:").grid(column=0, row=8, padx=4, pady=3, sticky="w")
         ttk.Combobox(form, textvariable=self.image_library_target_operator, state="readonly",
-                     values=("OR", "AND"), width=8).grid(column=1, row=7, padx=4, sticky="w")
-        buttons = ttk.Frame(form); buttons.grid(column=1, columnspan=2, row=8, sticky="e", pady=4)
+                     values=("OR", "AND", "AT_LEAST_2", "AT_LEAST_3", "AT_LEAST_4"),
+                     width=12).grid(column=1, row=8, padx=4, sticky="w")
+        buttons = ttk.Frame(form); buttons.grid(column=1, columnspan=2, row=9, sticky="e", pady=4)
         ttk.Button(buttons, text="＋別パターンとして保存", command=self.save_image_library_variant).pack(side="left", padx=2)
         ttk.Button(buttons, text="選択パターンを上書き", command=self.overwrite_image_library_variant).pack(side="left", padx=2)
         ttk.Button(buttons, text="選択パターンを削除", command=self.delete_image_library_variant).pack(side="left", padx=2)
@@ -7731,11 +7987,17 @@ class DevStudio(tk.Tk):
             raise ValueError("検知名と存在する画像を指定してください。")
         try:
             crop = [int(part.strip()) for part in self.image_library_crop.get().split(",")]
+            template_crop = [
+                int(part.strip())
+                for part in self.image_library_template_crop.get().split(",")]
             threshold = float(self.image_library_threshold.get())
-            if len(crop) != 4 or not 0.0 <= threshold <= 1.0:
+            if (len(crop) != 4 or len(template_crop) != 4
+                    or not 0.0 <= threshold <= 1.0):
                 raise ValueError
         except (ValueError, tk.TclError):
-            raise ValueError("閾値は0～1、範囲はx1,y1,x2,y2で指定してください。")
+            raise ValueError(
+                "閾値は0～1、範囲と画像内範囲は"
+                "x1,y1,x2,y2で指定してください。")
         portable = self._portable_template_path(path)
         tags = image_folder_tags(self.template_root(), os.path.abspath(path))
         return name, {"template_path": portable, "threshold": threshold, "use_gray": bool(self.image_library_gray.get()),
@@ -7743,7 +8005,7 @@ class DevStudio(tk.Tk):
                       "show_only_true_rect": False, "ms": 2000,
                       "match_color": self.image_library_match_color.get().strip() or "blue",
                       "no_match_color": self.image_library_no_match_color.get().strip() or "red",
-                      "crop": crop}, tags
+                      "crop": crop, "template_crop": template_crop}, tags
 
     def save_image_library_variant(self):
         try:
@@ -7877,6 +8139,8 @@ class DevStudio(tk.Tk):
         self.image_library_description.set(target.get("description", ""))
         self.image_library_target_operator.set(target.get("operator", "OR"))
         self.image_library_threshold.set(variant.get("threshold", 0.8)); self.image_library_crop.set(",".join(map(str, variant.get("crop", [0,0,0,0]))))
+        self.image_library_template_crop.set(",".join(map(
+            str, variant.get("template_crop", [0, 0, 0, 0]))))
         self.image_library_gray.set(bool(variant.get("use_gray", True))); self.image_library_show_value.set(bool(variant.get("show_value", False)))
         self.image_library_match_color.set(variant.get("match_color", "blue"))
         self.image_library_no_match_color.set(variant.get("no_match_color", "red"))
@@ -8885,6 +9149,12 @@ class DevStudio(tk.Tk):
         if workspace == str(getattr(self, "command_recording_workspace", "")):
             studio = getattr(self, "command_recording_studio", None)
             return [studio.source_text] if studio is not None else []
+        if workspace == str(getattr(self, "focus_repair_workspace", "")):
+            studio = getattr(self, "focus_repair_studio", None)
+            return [widget for widget in (
+                getattr(studio, "source_text", None),
+                getattr(studio, "issue_text", None),
+                getattr(studio, "global_text", None)) if widget is not None]
         if workspace == str(getattr(self, "sample_functions_workspace", "")):
             return [widget for widget in (
                 getattr(self, "fragment_imports", None),
@@ -9520,6 +9790,7 @@ class DevStudio(tk.Tk):
 def startup_arguments(arguments):
     default_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     root, operation_session, command_recording = default_root, "", ""
+    focus_repair = False
     index = 0
     while index < len(arguments):
         value = arguments[index]
@@ -9531,15 +9802,22 @@ def startup_arguments(arguments):
             command_recording = arguments[index + 1]
             index += 2
             continue
+        if value == "--focus-repair":
+            focus_repair = True
+            index += 1
+            continue
         if not value.startswith("--"):
             root = value
         index += 1
     return (os.path.abspath(root),
             os.path.abspath(operation_session) if operation_session else "",
-            os.path.abspath(command_recording) if command_recording else "")
+            os.path.abspath(command_recording) if command_recording else "",
+            focus_repair)
 
 
 if __name__ == "__main__":
-    startup_root, startup_session, startup_recording = startup_arguments(sys.argv[1:])
+    startup_root, startup_session, startup_recording, startup_focus = \
+        startup_arguments(sys.argv[1:])
     DevStudio(startup_root, operation_session=startup_session,
-              command_recording=startup_recording).mainloop()
+              command_recording=startup_recording,
+              focus_repair=startup_focus).mainloop()

@@ -42,7 +42,7 @@ def command_path(commands_root, tags, filename):
 
 def template_source(kind, class_name, display_name, tags, steps, step_loop=True,
                     detection_targets=None, step_start=0, special_steps=None,
-                    step_custom_bodies=None):
+                    step_custom_bodies=None, step_descriptions=None):
     class_name = python_identifier(class_name)
     display_name = display_name.replace("'", "\\'")
     tag_repr = repr(list(tags))
@@ -94,20 +94,35 @@ class {class_name}(PythonCommand):
         special_steps = list(special_steps or [])
         raw_steps = steps or ([{"key": "1", "label": "Chapter 1: preparation"}, {"key": "1_1", "label": "Child 1: check"}, {"key": "1_2", "label": "Child 2: action"}, {"key": "2", "label": "Chapter 2: finish"}] if nested else ["Chapter 1: preparation", "Chapter 2: action", "Chapter 3: finish"])
         step_items = []
+        supplied_descriptions = dict(step_descriptions or {})
         for index, item in enumerate(raw_steps):
             if isinstance(item, dict):
-                step_items.append((str(item["key"]), str(item["label"])))
+                key = str(item["key"])
+                step_items.append((
+                    key, str(item["label"]),
+                    str(item.get("description", supplied_descriptions.get(
+                        key, "")) or "").strip()))
             else:
-                step_items.append((str(index + int(step_start)), str(item)))
+                key = str(index + int(step_start))
+                step_items.append((
+                    key, str(item),
+                    str(supplied_descriptions.get(key, "") or "").strip()))
         step_lines = [item[1] for item in step_items]
         step_keys = [item[0] for item in step_items]
+        description_map = {key: description
+                           for key, _label, description in step_items
+                           if description}
         special_keys = [python_identifier(item).lower() for item in special_steps]
+        step_metadata = (
+            ("    COMMAND_RUN_SETTINGS = True\n" if not nested else "") +
+            "    COMMAND_STEP_DESCRIPTIONS = {}\n\n".format(
+                repr(description_map)))
         if nested:
             children = {key: [] for key in step_keys}
             for key in step_keys:
                 if "_" in key:
                     children.setdefault(key.rsplit("_", 1)[0], []).append(key)
-            labels = dict(step_items)
+            labels = {key: label for key, label, _description in step_items}
             nested_methods = []
             for key in step_keys:
                 user_body = step_custom_bodies.get(key, "        # Write this step's command here / このStepの処理をここへ書きます。\n")
@@ -144,9 +159,9 @@ class {class_name}(PythonCommand):
         self.current_substep = ""
 
 """
-            return header + "    STEP_LABELS = {}\n    STEP_KEYS = {}\n    SPECIAL_STEP_KEYS = {}\n\n".format(repr(step_lines), repr(step_keys), repr(special_keys)) + initializer + "    def stop_checkpoint(self):\n        self.checkIfAlive()\n\n" + runner + "\n" + "".join(nested_methods)
+            return header + step_metadata + "    STEP_LABELS = {}\n    STEP_KEYS = {}\n    SPECIAL_STEP_KEYS = {}\n\n".format(repr(step_lines), repr(step_keys), repr(special_keys)) + initializer + "    def stop_checkpoint(self):\n        self.checkIfAlive()\n\n" + runner + "\n" + "".join(nested_methods)
         methods = []
-        for number, (step_key, label) in enumerate(step_items):
+        for number, (step_key, label, _description) in enumerate(step_items):
             safe_label = label.replace("'", "\\'")
             user_body = step_custom_bodies.get(step_key, "        # Write this step's command here / このStepの処理をここへ書きます。\n")
             if not user_body.endswith("\n"):
@@ -211,7 +226,7 @@ class {class_name}(PythonCommand):
         return None
 
 """.format(key=key, label=label) for key, label in zip(special_keys, special_steps))
-        return header + "    STEP_LABELS = {}\n    STEP_KEYS = {}\n    SPECIAL_STEP_KEYS = {}\n\n".format(repr(step_lines), repr(step_keys), repr(special_keys)) + initializer + helper + runner + "".join(methods) + special_methods
+        return header + step_metadata + "    STEP_LABELS = {}\n    STEP_KEYS = {}\n    SPECIAL_STEP_KEYS = {}\n\n".format(repr(step_lines), repr(step_keys), repr(special_keys)) + initializer + helper + runner + "".join(methods) + special_methods
     # One shot deliberately implements only the command entry point.
     return header + """    def do(self):
         self.checkIfAlive()

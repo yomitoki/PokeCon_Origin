@@ -149,10 +149,43 @@ def observed_source_lines(events, source_file):
     return lines
 
 
-def filtered_timeline(events, query="", stops_only=False):
+def command_source_file(metadata):
+    """Return the original Commands source recorded for one session."""
+    source = metadata.get("source", {}) if isinstance(metadata, dict) else {}
+    if not isinstance(source, dict):
+        return ""
+    return str(source.get("file", "") or "").strip()
+
+
+def event_is_in_source(event, source_file):
+    """True only when the executed frame itself belongs to source_file.
+
+    Stack frames are intentionally ignored.  An internal PythonCommandBase
+    event can contain the user's Commands source in its outer stack, but it is
+    still framework processing and must disappear in source-only mode.
+    """
+    source_file = str(source_file or "").strip()
+    if not source_file:
+        return True
+    location = event.get("location", {}) if isinstance(event, dict) else {}
+    if not isinstance(location, dict):
+        return False
+    event_file = str(location.get("file", "") or "").strip()
+    if not event_file:
+        return False
+    try:
+        return os.path.normcase(os.path.abspath(event_file)) == \
+            os.path.normcase(os.path.abspath(source_file))
+    except (OSError, ValueError):
+        return False
+
+
+def filtered_timeline(events, query="", stops_only=False, source_file=""):
     query = str(query or "").strip().lower()
     result = []
     for event in events:
+        if source_file and not event_is_in_source(event, source_file):
+            continue
         if stops_only and event.get("event") != "step_debug_stop":
             continue
         if query and query not in event_search_text(event):
