@@ -208,16 +208,45 @@ def ZA_battle_coCp_noloop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_en
             self.pressRep(Button.B, repeat=1, duration=0.04, wait=0.0, interval=0.1)
     if lockon_endskip==0:
         self.ZA_ZL_ACTION("END")
-def ZA_battle_Cp_loop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endskip=0,get_chanceicon4=0,mode=0,battle_mode=0,Cp_low_check=0,usenum=1,R_Push_enable=1,view_lockon_mode=0,lockon_attack_wait=0.0,lockon_attack_checks=1):
+def ZA_battle_Cp_loop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endskip=0,get_chanceicon4=0,mode=0,battle_mode=0,Cp_low_check=0,usenum=1,R_Push_enable=1,view_lockon_mode=0,lockon_attack_wait=0.0,lockon_attack_checks=1,y_first_attack=0,a_repeat=1):
     noCp_count=0
     target_marker=1
     nofiled=1
+    a_repeat_count = max(1, int(a_repeat))
+    y_first_pending = (y_first_attack == 1 and Yaction == 1)
 
     def cplus_ready():
         # 通常閾値で取りこぼした場合はLOWへフォールバックする。
         return (
             self.image_check("POKEMON_ZA_C+")
             or self.image_check("POKEMON_ZA_C+_LOW"))
+
+    def execute_attack_buttons():
+        nonlocal y_first_pending
+        # 既定のX→A→Y→Bは保持する。指定時はYを1回だけ
+        # 先頭で送り、以後のC+成立ではX→Aだけを繰り返す。
+        if y_first_attack == 1:
+            attack_order = []
+            if y_first_pending:
+                attack_order.append((Yaction, Button.Y, 1))
+                y_first_pending = False
+            attack_order.extend((
+                (Xaction, Button.X, 1),
+                (Aaction, Button.A, a_repeat_count),
+                (Baction, Button.B, 1),
+            ))
+        else:
+            attack_order = (
+                (Xaction, Button.X, 1),
+                (Aaction, Button.A, a_repeat_count),
+                (Yaction, Button.Y, 1),
+                (Baction, Button.B, 1),
+            )
+        for enabled, button, repeat_count in attack_order:
+            if enabled == 1:
+                self.pressRep(
+                    button, repeat=repeat_count, duration=0.04,
+                    wait=0.0, interval=0.1)
 
     while True:
         print(f'noCp_count = {noCp_count} mode = {mode} battle_mode = {battle_mode}')
@@ -305,14 +334,7 @@ def ZA_battle_Cp_loop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endski
                 if current_cplus_ready:
                     lockon_cplus_ready = False
                     noCp_count=0
-                    if Xaction==1:
-                        self.pressRep(Button.X, repeat=1, duration=0.04, wait=0.0, interval=0.1)
-                    if Aaction==1:
-                        self.pressRep(Button.A, repeat=1, duration=0.04, wait=0.0, interval=0.1)
-                    if Yaction==1:
-                        self.pressRep(Button.Y, repeat=1, duration=0.04, wait=0.0, interval=0.1)
-                    if Baction==1:
-                        self.pressRep(Button.B, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    execute_attack_buttons()
                     self.ZA_MOVE_SEE(action = "END",in_see_r=0.6)
                 elif (self.image_check("POKEMON_ZA_TARGET_LEFT_MID") or self.image_check("POKEMON_ZA_TARGET_RIGHT_MID") or self.image_check("POKEMON_ZA_TARGET_RIGHT_RIHGT_CHECK_MID") or self.image_check("POKEMON_ZA_TARGET_LEFT_RIHGT_CHECK_MID")):
                     if target_marker>=1:
@@ -341,14 +363,7 @@ def ZA_battle_Cp_loop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endski
                 if current_cplus_ready:
                     lockon_cplus_ready = False
                     noCp_count=0
-                    if Xaction==1:
-                        self.pressRep(Button.X, repeat=1, duration=0.04, wait=0.0, interval=0.1)
-                    if Aaction==1:
-                        self.pressRep(Button.A, repeat=1, duration=0.04, wait=0.0, interval=0.1)
-                    if Yaction==1:
-                        self.pressRep(Button.Y, repeat=1, duration=0.04, wait=0.0, interval=0.1)
-                    if Baction==1:
-                        self.pressRep(Button.B, repeat=1, duration=0.04, wait=0.0, interval=0.1)
+                    execute_attack_buttons()
                     self.ZA_MOVE_SEE(action = "END",in_see_r=0.6)
                 elif (self.image_check("POKEMON_ZA_TARGET_LEFT_MID") or self.image_check("POKEMON_ZA_TARGET_RIGHT_MID") or self.image_check("POKEMON_ZA_TARGET_RIGHT_RIHGT_CHECK_MID") or self.image_check("POKEMON_ZA_TARGET_LEFT_RIHGT_CHECK_MID")):
                     if target_marker>=1:
@@ -847,16 +862,23 @@ def ZA_bench_check_time(self):
         self.sleepcount=1
         self.timecount=0
         while True:
+            if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or self.image_check("POKEMON_ZA_DEAD"): #FIELDから変更
+                self.timecount=0
+                self.changetimecount+=1
+                return "BENCH_CHANGE_TIME"
+            # BATTLEZONEからベンチへ戻る途中で梯子に止まった場合、
+            # この内側ループから通常の戦闘用復旧へ戻れないため、
+            # 静止を確認した場合だけ上入力で梯子を上り切る。
+            if self.ZA_infi_stalled_ladder_recovery(
+                    allow_bench=True):
+                print("[BATTLEZONE_BENCH_RECOVERY] 梯子復旧後にフィールドを再確認")
+                continue
             #ジャスティス会への話しかけが発生する可能性があるので、ループしてしまう場合はBボタンが必要になる場合がある                
             self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
             # 画像認識のずれで処理前に抜ける可能性があるので削除
             #if not self.image_check("MORNING") or self.timecount > 150:
             #    self.timecount=0
             #    return "BENCH_CHANGE_TIME"
-            if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or self.image_check("POKEMON_ZA_DEAD"): #FIELDから変更
-                self.timecount=0
-                self.changetimecount+=1
-                return "BENCH_CHANGE_TIME"
             #抜けミス用カウント
             #self.timecount+=1
     elif self.image_check("POKEMON_ZA_NIGHT"):
@@ -864,15 +886,19 @@ def ZA_bench_check_time(self):
         self.inactioncount=0
         print("夜")
         while True:
+            if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or self.image_check("POKEMON_ZA_DEAD"): #FIELDから変更
+                self.timecount=0
+                self.changetimecount+=1
+                return "BENCH_START"
+            if self.ZA_infi_stalled_ladder_recovery(
+                    allow_bench=True):
+                print("[BATTLEZONE_BENCH_RECOVERY] 梯子復旧後にフィールドを再確認")
+                continue
             self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
             # 画像認識のずれで処理前に抜ける可能性があるので削除
             #if not self.image_check("NIGHT"):#解決後完全に削除 or self.timecount > 150:
             #    self.timecount=0
             #    return "BENCH_START"
-            if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or self.image_check("POKEMON_ZA_DEAD"): #FIELDから変更
-                self.timecount=0
-                self.changetimecount+=1
-                return "BENCH_START"
             #抜けミス用カウント
             #self.timecount+=1
     
@@ -1184,11 +1210,13 @@ def ZA_infi_attack_ready(self):
         self.image_check("POKEMON_ZA_C+")
         or self.image_check("POKEMON_ZA_C+_LOW"))
 
-def ZA_infi_guarded_ladder_climb(self):
+def ZA_infi_guarded_ladder_climb(self, stop_on_field=False):
     """Send ladder input in slices, yielding as soon as combat resumes."""
     moved = False
     for _ in range(20):
-        if (self.image_check("POKEMON_ZA_ESCAPE")
+        if ((stop_on_field and self.image_check(
+                "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"))
+                or self.image_check("POKEMON_ZA_ESCAPE")
                 or self.ZA_infi_attack_ready()
                 or self.image_check("POKEMON_ZA_SELECT")
                 or self.image_check("POKEMON_ZA_2_SELECT")
@@ -1202,19 +1230,22 @@ def ZA_infi_guarded_ladder_climb(self):
     return moved, True
 
 def ZA_infi_stalled_ladder_recovery(
-        self, attack_ready=False, now=None, frame=None):
+        self, attack_ready=False, now=None, frame=None,
+        allow_bench=False):
     """Climb out of a stalled ladder without overriding live combat."""
+    state_suffix = "_bench" if allow_bench else ""
     reset_names = (
-        "_za_infi_ladder_previous_frame",
-        "_za_infi_ladder_still_since",
+        "_za_infi_ladder_previous_frame" + state_suffix,
+        "_za_infi_ladder_still_since" + state_suffix,
     )
 
     def reset_candidate():
         for name in reset_names:
             setattr(self, name, None)
 
-    if (self.battle_current_state != "BATTLE_MOVE"
-            or self.battle_step not in (0, 1)):
+    if (not allow_bench
+            and (self.battle_current_state != "BATTLE_MOVE"
+                 or self.battle_step not in (0, 1))):
         reset_candidate()
         return False
     if attack_ready or self.image_check("POKEMON_ZA_ESCAPE"):
@@ -1254,27 +1285,28 @@ def ZA_infi_stalled_ladder_recovery(
     fingerprint = cv2.resize(
         cv2.cvtColor(region, cv2.COLOR_BGR2GRAY), (32, 18))
     current_time = time.monotonic() if now is None else float(now)
-    previous = getattr(
-        self, "_za_infi_ladder_previous_frame", None)
-    self._za_infi_ladder_previous_frame = fingerprint
+    previous_name = "_za_infi_ladder_previous_frame" + state_suffix
+    still_since_name = "_za_infi_ladder_still_since" + state_suffix
+    previous = getattr(self, previous_name, None)
+    setattr(self, previous_name, fingerprint)
     if previous is None:
-        self._za_infi_ladder_still_since = current_time
+        setattr(self, still_since_name, current_time)
         return False
 
     frame_difference = cv2.mean(
         cv2.absdiff(fingerprint, previous))[0]
     if frame_difference > 1.5:
-        self._za_infi_ladder_still_since = current_time
+        setattr(self, still_since_name, current_time)
         return False
-    still_since = getattr(
-        self, "_za_infi_ladder_still_since", None)
+    still_since = getattr(self, still_since_name, None)
     if still_since is None:
-        self._za_infi_ladder_still_since = current_time
+        setattr(self, still_since_name, current_time)
         return False
     if current_time - float(still_since) < 3.0:
         return False
+    last_attempt_name = "_za_infi_ladder_last_attempt" + state_suffix
     last_attempt = float(getattr(
-        self, "_za_infi_ladder_last_attempt", -1000000.0))
+        self, last_attempt_name, -1000000.0))
     if current_time - last_attempt < 30.0:
         return False
 
@@ -1285,16 +1317,20 @@ def ZA_infi_stalled_ladder_recovery(
         reset_candidate()
         return False
 
-    self._za_infi_ladder_last_attempt = current_time
+    setattr(self, last_attempt_name, current_time)
     reset_candidate()
     self.ZA_MOVE_SEE("END")
     self.ZA_ZL_ACTION("END")
     # A long uninterrupted hold can suppress combat for ten seconds.
     # Send 0.5-second slices and stop before the next slice as soon as the
     # normal battle UI or an attack opportunity returns.
-    moved, _ = self.ZA_infi_guarded_ladder_climb()
+    moved, _ = self.ZA_infi_guarded_ladder_climb(
+        stop_on_field=allow_bench)
     if moved:
-        print("[INFI_LADDER_RECOVERY] 静止を検出したため上入力で復帰")
+        recovery_context = "BENCH_CHECK_TIME" if allow_bench else "BATTLE_MOVE"
+        print(
+            f"[INFI_LADDER_RECOVERY] context={recovery_context} "
+            "静止を検出したため上入力で復帰")
     return moved
 
 def ZA_infi_target_marker_direction(self):

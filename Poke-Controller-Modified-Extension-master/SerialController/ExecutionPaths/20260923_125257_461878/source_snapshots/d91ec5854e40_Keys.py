@@ -79,31 +79,6 @@ conversion_3ds_controller_button = {
 }
 
 
-SERIAL_FORMAT_3DS_LEGACY = "3DS Controller(FW:-x.3)"
-SERIAL_FORMAT_3DS_CURRENT = "3DS Controller(FW:x.4-)"
-_SERIAL_FORMAT_3DS_017 = "3DS Controller"
-
-
-def normalize_serial_data_format_name(name):
-    """Keep saved 0.1.7 3DS settings on the legacy FW protocol."""
-    name = str(name or "Default")
-    if name == _SERIAL_FORMAT_3DS_017:
-        return SERIAL_FORMAT_3DS_LEGACY
-    return name
-
-
-def controller_3ds_mode(name):
-    """Return 0 for FW <=x.3, 1 for FW x.4+, or None for other formats."""
-    name = normalize_serial_data_format_name(name)
-    if "3DS Controller" not in name:
-        return None
-    return 0 if "x.3" in name else 1
-
-
-def is_3ds_controller_format(name):
-    return controller_3ds_mode(name) is not None
-
-
 class Hat(IntEnum):
     TOP = 0  # 8
     TOP_RIGHT = 1
@@ -313,27 +288,17 @@ class SendFormat:
 
         return state
 
-    def convert2list2(self, mode=0):
+    def convert2list2(self):
         """
         For 3DS Controller
-        mode: 0(FW:-x.3), 1(FW:x.4-)
         """
         header = 0xA1  # fixed value
         send_btn = int(self.format["btn"])
         send_hat = convert_hat_3ds_controller[int(self.format["hat"])]
 
         header2 = 0xA2  # fixed value
-        if mode == 0:
-            send_lx = self.format["lx"] if self.format["lx"] >= 128 else 127 - self.format["lx"]
-            send_ly = self.format["ly"] if self.format["ly"] >= 128 else 127 - self.format["ly"]
-        else:
-            send_lx = 255 - self.format["lx"]
-            send_ly = 255 - self.format["ly"]
-
-        header3 = 0xB2
-        send_touch_x = int(self.format["sx"])
-        send_touch_y = int(self.format["sy"])
-        touchon = int(send_touch_x != 0 or send_touch_y != 0)
+        send_lx = self.format["lx"] if self.format["lx"] >= 128 else 127 - self.format["lx"]
+        send_ly = self.format["ly"] if self.format["ly"] >= 128 else 127 - self.format["ly"]
 
         state = [
             header,
@@ -342,11 +307,6 @@ class SendFormat:
             header2,
             send_lx,
             send_ly,
-            header3,
-            touchon,
-            (send_touch_x >> 8) & 0xFF,
-            send_touch_x & 0xFF,
-            send_touch_y,
         ]
 
         return state
@@ -508,16 +468,13 @@ class KeyPress:
         for btn in self.holdButton:
             if not any(type(active) is type(btn) and active == btn for active in btns):
                 btns.append(btn)
-        mode = controller_3ds_mode(self.serial_data_format_name)
-        if mode is not None:
+        if self.serial_data_format_name == "3DS Controller":
             self.format.setButton(
                 [btn for btn in btns if type(btn) is Button], convert=conversion_3ds_controller_button
             )
             self.format.setHat([btn for btn in btns if type(btn) is Hat])
             self.format.setAnyDirection([btn for btn in btns if type(btn) is Direction])
-            self.format.setTouchscreen([btn for btn in btns if type(btn) is Touchscreen])
-            self.ser.writeList(
-                self.format.convert2list2(mode=mode), priority=self.priority)
+            self.ser.writeList(self.format.convert2list2(), priority=self.priority)
         else:
             self.format.setButton([btn for btn in btns if type(btn) is Button])
             self.format.setHat([btn for btn in btns if type(btn) is Hat])
@@ -548,19 +505,14 @@ class KeyPress:
                 tilts.append(tilting)
         # self._logger.debug(tilts)
 
-        mode = controller_3ds_mode(self.serial_data_format_name)
-        if mode is not None:
+        if self.serial_data_format_name == "3DS Controller":
             self.format.unsetButton(
                 [btn for btn in btns if type(btn) is Button], convert=conversion_3ds_controller_button
             )
             if unset_hat:
                 self.format.unsetHat()
             self.format.unsetDirection(tilts)
-            if unset_Touchscreen or any(
-                    type(btn) is Touchscreen for btn in btns):
-                self.format.unsetTouchscreen()
-            self.ser.writeList(
-                self.format.convert2list2(mode=mode), priority=self.priority)
+            self.ser.writeList(self.format.convert2list2(), priority=self.priority)
         else:
             self.format.unsetButton([btn for btn in btns if type(btn) is Button])
             if unset_hat:
@@ -642,8 +594,7 @@ class KeyPress:
         self.ser.end_manual_override()
 
     def end(self):
-        if (self.serial_data_format_name == "Qingpi"
-                or is_3ds_controller_format(self.serial_data_format_name)):
+        if self.serial_data_format_name in ["Qingpi", "3DS Controller"]:
             pass
         else:
             self.ser.writeRow("end", priority=self.priority)

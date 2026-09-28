@@ -176,12 +176,7 @@ from Menubar import PokeController_Menubar
 import PokeConLogger
 import Utility as util
 from Commands import McuCommandBase, PythonCommandBase, PythonSampleCommand, Sender
-from Commands.Keys import (KeyPress, Button, Hat, Stick, Direction,
-                           SERIAL_FORMAT_3DS_CURRENT,
-                           SERIAL_FORMAT_3DS_LEGACY,
-                           controller_3ds_mode,
-                           is_3ds_controller_format,
-                           normalize_serial_data_format_name)
+from Commands.Keys import KeyPress, Button, Hat, Stick, Direction
 from Commands.ProController import ProController
 from Commands.CommandBase import Command
 
@@ -1149,11 +1144,7 @@ class PokeControllerApp:
         self.serial_data_format_name_label = ttk.Label(self.serial_data_lf)
         self.serial_data_format_name_label.configure(anchor="center", text="Data Format: ")
         self.serial_data_format_name_label.grid(column="0", padx="5", pady="5", row="0", sticky="ew")
-        serial_data_format_list = [
-            "Default", "Qingpi",
-            SERIAL_FORMAT_3DS_LEGACY,
-            SERIAL_FORMAT_3DS_CURRENT,
-        ]
+        serial_data_format_list = ["Default", "Qingpi", "3DS Controller"]
         self.serial_data_format_name_cb = ttk.Combobox(self.serial_data_lf)
         self.serial_data_format_name = tk.StringVar(value="Default")
         self.serial_data_format_name_cb.configure(
@@ -2180,8 +2171,7 @@ class PokeControllerApp:
         self.com_port_name.set(self.settings.com_port_name.get())
         self.baud_rate.set(self.settings.baud_rate.get())
         self.camera_id.set(self.settings.camera_id.get())
-        self.serial_data_format_name.set(normalize_serial_data_format_name(
-            self.settings.serial_data_format_name.get()))
+        self.serial_data_format_name.set(self.settings.serial_data_format_name.get())
         self.touchscreen_start_x = self.settings.touchscreen_start_x
         self.touchscreen_start_y = self.settings.touchscreen_start_y
         self.touchscreen_end_x = self.settings.touchscreen_end_x
@@ -4181,11 +4171,8 @@ class PokeControllerApp:
 
     def sendLineImage(self):
         def sendMessage(src):
-            try:
-                Line = Line_Notify()
-                Line.send_message("---Manual---", src, "token")
-            except Exception:
-                pass
+            Line = Line_Notify()
+            Line.send_message("---Manual---", src, "token")
 
         src = self.camera.readFrame()
         thread = threading.Thread(target=sendMessage, args=(src,))
@@ -9352,15 +9339,11 @@ class PokeControllerApp:
             self.com_port_name.set(device)
 
     def set_serial_data_format(self, event=None):
-        selected_format = normalize_serial_data_format_name(
-            self.serial_data_format_name.get())
-        if selected_format != self.serial_data_format_name.get():
-            self.serial_data_format_name.set(selected_format)
-        KeyPress.serial_data_format_name = selected_format
+        KeyPress.serial_data_format_name = self.serial_data_format_name.get()
         self.keys_software_controller.init_hat()
-        self.preview.changeRightMouseMode(selected_format)
+        self.preview.changeRightMouseMode(self.serial_data_format_name.get())
 
-        if is_3ds_controller_format(selected_format):
+        if self.serial_data_format_name.get() == "3DS Controller":
             print("ボーレートを強制的に115200に変更します。")
             self.baud_rate.set("115200")
         else:
@@ -10536,8 +10519,7 @@ class PokeControllerApp:
             self._schedule_pc_gamepad_bridge_restart()
             return
         if self.is_use_Pro_Controller.get():  # Proconでの操作を有効化する。
-            if is_3ds_controller_format(
-                    self.serial_data_format_name.get()):
+            if self.serial_data_format_name.get() == "3DS Controller":
                 self.is_use_Pro_Controller.set(False)
                 self.pc_gamepad_input_enabled.set(False)
                 self.pc_gamepad_input_event.clear()
@@ -13987,11 +13969,8 @@ class PokeControllerApp:
                 self.inactivateSerial()
             return False
         self.baud_rate.set(str(saved.get("baud_rate", self.baud_rate.get())))
-        self.serial_data_format_name.set(normalize_serial_data_format_name(
-            saved.get("data_format", self.serial_data_format_name.get())))
-        if is_3ds_controller_format(self.serial_data_format_name.get()):
-            # 3DS Controllerの新旧FWプロトコルはいずれも115200固定。
-            self.baud_rate.set("115200")
+        self.serial_data_format_name.set(
+            saved.get("data_format", self.serial_data_format_name.get()))
         KeyPress.serial_data_format_name = self.serial_data_format_name.get()
         if hasattr(self, "keys_software_controller"):
             self.keys_software_controller.init_hat()
@@ -21512,13 +21491,9 @@ class PokeControllerApp:
         """Record the exact coalesced on-screen state, including HOME."""
         try:
             formatter = self.keys_software_controller.format
-            serial_format = (
-                self.keys_software_controller.serial_data_format_name)
-            mode = controller_3ds_mode(serial_format)
-            if mode is not None:
-                message = " ".join(map(
-                    str, formatter.convert2list2(mode=mode)))
-            elif serial_format == "Qingpi":
+            if self.keys_software_controller.serial_data_format_name == "3DS Controller":
+                message = " ".join(map(str, formatter.convert2list2()))
+            elif self.keys_software_controller.serial_data_format_name == "Qingpi":
                 message = " ".join(map(str, formatter.convert2list()))
             else:
                 message = formatter.convert2str()

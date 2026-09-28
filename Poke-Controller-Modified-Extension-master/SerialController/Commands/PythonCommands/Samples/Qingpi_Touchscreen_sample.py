@@ -14,7 +14,7 @@ class Qingpi_Touchscreen_sample(PythonCommand):
         super().__init__()
 
     def do(self):
-
+        # 3DS Controllerでも使えます。
         center_x = 160
         center_y = 120
         r = 50

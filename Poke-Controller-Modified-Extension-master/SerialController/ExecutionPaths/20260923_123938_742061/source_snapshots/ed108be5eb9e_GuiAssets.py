@@ -20,8 +20,7 @@ from PIL import Image, ImageTk
 from Commands import UnitCommand
 
 # from Commands import StickCommand
-from Commands.Keys import (Direction, Stick, Touchscreen, NEUTRAL, KeyPress,
-                           is_3ds_controller_format)
+from Commands.Keys import Direction, Stick, Touchscreen, NEUTRAL, KeyPress
 
 import logging
 from logging import StreamHandler, getLogger, DEBUG, NullHandler
@@ -998,10 +997,7 @@ class CaptureArea(tk.Canvas):
         if self.master.is_use_left_stick_mouse.get():
             self.UnbindLeftClick()
 
-        touchscreen_mode = (
-            self.RightMouseMode == "Qingpi"
-            or is_3ds_controller_format(self.RightMouseMode))
-        if touchscreen_mode:
+        if self.RightMouseMode == "Qingpi":
             if (
                 self.touchscreen_start_x < event.x
                 and event.x < self.touchscreen_end_x
@@ -1056,10 +1052,7 @@ class CaptureArea(tk.Canvas):
             self._rmag = None
 
     def mouseRightPressing(self, event, ser, angle=0):
-        touchscreen_mode = (
-            self.RightMouseMode == "Qingpi"
-            or is_3ds_controller_format(self.RightMouseMode))
-        if touchscreen_mode:
+        if self.RightMouseMode == "Qingpi":
             if (
                 self.touchscreen_start_x < event.x
                 and event.x < self.touchscreen_end_x
@@ -1133,11 +1126,8 @@ class CaptureArea(tk.Canvas):
             self._rmag = mag
 
     def mouseRightRelease(self, ser):
-        touchscreen_mode = (
-            self.RightMouseMode == "Qingpi"
-            or is_3ds_controller_format(self.RightMouseMode))
         try:
-            if touchscreen_mode:
+            if self.RightMouseMode == "Qingpi":
                 ser.inputEnd(Touchscreen(0, 0))
             else:
                 self.config(cursor="tcross")
@@ -1145,17 +1135,17 @@ class CaptureArea(tk.Canvas):
         finally:
             self.ser.end_manual_override()
             self._last_rstick_position = None
-        if not touchscreen_mode:
+        if self.RightMouseMode != "Qingpi":
             self.delete("rcircle")
             self.delete("rcircle2")
+            if self.master.is_use_left_stick_mouse.get():
+                self.BindLeftClick()
 
             # self.event_generate('<Motion>', warp=True, x=self.rx_init, y=self.ry_init)
             if isTakeLog:
                 self.dq.append([self._rangle, self._rmag, time.perf_counter() - self.calc_time])
                 for _ in self.dq:
                     self.RSTICK_logger.debug(",".join(list(map(str, _))))
-        if self.master.is_use_left_stick_mouse.get():
-            self.BindLeftClick()
 
     def startCapture(self):
         self.capture()

@@ -278,11 +278,23 @@ def ZA_ROTOM_GLIDE(self,dir,a_count,a_duration=0.15,a_wait=0.5,a_interval=0.1,mo
 ######################################################
 # ZA_battle_infi_Base_End
 ######################################################
-def ZA_renda_button(self,rendabutton="B",endpicture="",endpicture2="",endpicture3="",endpicture4="",endpicture5="",endpicture6="",endpicture7="",not_endpicture="POKEMON_ZA_FALSE_RETURN",sub_button="NULL",sub_picture="",sub2_button="NULL",sub2_picture="",sub3_button="NULL",sub3_picture="",sub4_button="NULL",sub4_picture="",sub5_button="NULL",sub5_picture="",sub6_button="NULL",sub6_picture="",sub7_button="NULL",sub7_picture="",sub8_button="NULL",sub8_picture="",sub9_button="NULL",sub9_picture="",event_picture="",sleeptime=0.5):
+def ZA_renda_button(self,rendabutton="B",endpicture="",endpicture2="",endpicture3="",endpicture4="",endpicture5="",endpicture6="",endpicture7="",not_endpicture="POKEMON_ZA_FALSE_RETURN",sub_button="NULL",sub_picture="",sub2_button="NULL",sub2_picture="",sub3_button="NULL",sub3_picture="",sub4_button="NULL",sub4_picture="",sub5_button="NULL",sub5_picture="",sub6_button="NULL",sub6_picture="",sub7_button="NULL",sub7_picture="",sub8_button="NULL",sub8_picture="",sub9_button="NULL",sub9_picture="",event_picture="",sleeptime=0.5,timeout_seconds=0.0):
+    started_at = time.monotonic()
+
+    def timed_out():
+        return (
+            float(timeout_seconds) > 0.0
+            and time.monotonic() - started_at
+            >= float(timeout_seconds))
+
     while True:
+        if timed_out():
+            return False
         self.checkIfAlive()
         
         while True:
+            if timed_out():
+                return False
             checkerflg=0
                 
             #誤判定回避用で指定画面での検知を除外する
@@ -422,21 +434,33 @@ def ZA_mega_evolution_battle_mode_select(
         Xaction=1, Aaction=1, Yaction=1, Baction=0,
         movemode=0, Z_Gaurd=0, Cplus_attack=0,
         testmode1=0,
+        battle_identity_picture="",
         red_edge_y_renda_seconds=0.0,
         attack_unavailable_y_dodge=1):
     #アブソル Bはまもるのため選ばない。
     #if mode == 0 and self.mega_evolution_battle(Xaction=1,Aaction=1,Yaction=1,Baction=0,mode=0,dir1=320,dir2=20,see_r=0.20, endpicture="TEXT_WHITE_COMMENT"):
-    if mode == 0 and self.ZA_mega_evolution_battle(usenum=usenum,Xaction=1,Aaction=1,Yaction=1,Baction=0,mode=0,dir1=20,dir2=340,dir3=40,dir4=300,see_r=0.24, escape_flag=1,target_count_threshold_arg=6,no_target_count_threshold_arg=6, endpicture="POKEMON_ZA_TEXT_WHITE_COMMENT", red_edge_y_renda_seconds=red_edge_y_renda_seconds, attack_unavailable_y_dodge=0):
-
-
-        return True
+    if mode == 0:
+        battle_result = self.ZA_mega_evolution_battle(
+            usenum=usenum, Xaction=1, Aaction=1, Yaction=1,
+            Baction=0, mode=0, dir1=20, dir2=340, dir3=40,
+            dir4=300, see_r=0.24, escape_flag=1,
+            target_count_threshold_arg=6,
+            no_target_count_threshold_arg=6,
+            endpicture="POKEMON_ZA_TEXT_WHITE_COMMENT",
+            red_edge_y_renda_seconds=red_edge_y_renda_seconds,
+            attack_unavailable_y_dodge=0,
+            battle_identity_picture=battle_identity_picture)
+        if battle_result == "BATTLE_IDENTITY_MISMATCH":
+            return battle_result
+        if battle_result:
+            return True
     elif mode == 1 and self.ZA_mega_evolution_battle(usenum=usenum,Xaction=1,Aaction=1,Yaction=1,Baction=0,mode=0,dir1=20,dir2=340,dir3=20,dir4=340,see_r=0.24, escape_flag=2, endpicture="POKEMON_ZA_TEXT_WHITE_COMMENT", red_edge_y_renda_seconds=red_edge_y_renda_seconds, attack_unavailable_y_dodge=0):
         return True
-    elif mode == 2 and self.ZA_mega_evolution_battle(usenum=usenum,Xaction=1,Aaction=1,Yaction=1,Baction=0,mode=0,dir1=20,dir2=340,dir3=40,dir4=300,see_r=0.24, escape_flag=3, endpicture="POKEMON_ZA_TEXT_WHITE_COMMENT", red_edge_y_renda_seconds=red_edge_y_renda_seconds, attack_unavailable_y_dodge=0):
+    elif mode == 2 and self.ZA_mega_evolution_battle(usenum=usenum,Xaction=1,Aaction=1,Yaction=1,Baction=0,mode=0,dir1=20,dir2=340,dir3=40,dir4=300,see_r=0.24, escape_flag=3, endpicture="POKEMON_ZA_TEXT_WHITE_COMMENT", red_edge_y_renda_seconds=(red_edge_y_renda_seconds if float(red_edge_y_renda_seconds) > 0.0 else 15.0), attack_unavailable_y_dodge=0, battle_roll_only=0, red_edge_roll_with_view=0):
         return True
-    elif mode == 3 and self.ZA_mega_evolution_battle(usenum=usenum,Xaction=0,Aaction=1,Yaction=1,Baction=0,mode=0,dir1=20,dir2=0,dir3=40,dir4=0,see_r=0.24, escape_flag=0, endpicture="POKEMON_ZA_TEXT_WHITE_COMMENT", red_edge_y_renda_seconds=red_edge_y_renda_seconds, dir5=90, field_resume_dir5_seconds=4.0, attack_unavailable_y_dodge=attack_unavailable_y_dodge):
+    elif mode == 3 and self.ZA_mega_evolution_battle(usenum=usenum,Xaction=0,Aaction=1,Yaction=1,Baction=0,mode=0,dir1=20,dir2=0,dir3=40,dir4=0,see_r=0.24, escape_flag=0, endpicture="POKEMON_ZA_TEXT_WHITE_COMMENT", red_edge_y_renda_seconds=red_edge_y_renda_seconds, dir5=90, field_resume_dir5_seconds=4.0, attack_unavailable_y_dodge=attack_unavailable_y_dodge, red_edge_roll_with_view=1):
         return True
-    elif mode == 4 and self.ZA_mega_evolution_battle(usenum=usenum,Xaction=1,Aaction=0,Yaction=0,Baction=0,mode=0,dir1=40,dir2=20,dir3=20,dir4=0,see_r=0.24, escape_flag=0, endpicture="POKEMON_ZA_TEXT_WHITE_COMMENT", red_edge_y_renda_seconds=red_edge_y_renda_seconds, dir5=90, field_resume_dir5_seconds=2.0, attack_unavailable_y_dodge=attack_unavailable_y_dodge, mode4_view_nudge=1):
+    elif mode == 4 and self.ZA_mega_evolution_battle(usenum=usenum,Xaction=1,Aaction=0,Yaction=0,Baction=0,mode=0,dir1=40,dir2=20,dir3=20,dir4=0,see_r=0.24, escape_flag=0, endpicture="POKEMON_ZA_TEXT_WHITE_COMMENT", red_edge_y_renda_seconds=15.0, dir5=90, field_resume_dir5_seconds=2.0, attack_unavailable_y_dodge=attack_unavailable_y_dodge, mode4_view_nudge=1, mode4_yellow_hp_roll_seconds=30.0, mode4_yellow_hp_attack_wait_seconds=5.0, red_edge_roll_angle=20.0):
         return True
     # mode 5はAを常時使い、通常画面のB/X/YはC+確認時だけ使用する。
     # 最終戦の専用4技UIだけはC+がないため、別経路でA/X/B/Yを送る。
@@ -444,6 +468,14 @@ def ZA_mega_evolution_battle_mode_select(
             usenum=usenum, movemode=movemode,
             Z_Gaurd=Z_Gaurd, Cplus_attack=Cplus_attack,
             testmode1=testmode1):
+        return True
+    # mode 6は戦闘状態になった後、攻撃を行わず非ロックオンYを
+    # 送り続けるローリング専用の退避用モード。
+    elif mode == 6 and self.ZA_mega_evolution_battle(usenum=usenum,Xaction=0,Aaction=0,Yaction=0,Baction=0,mode=0,dir1=20,dir2=340,dir3=40,dir4=300,see_r=0.24, escape_flag=0, endpicture="POKEMON_ZA_TEXT_WHITE_COMMENT", red_edge_y_renda_seconds=(red_edge_y_renda_seconds if float(red_edge_y_renda_seconds) > 0.0 else 15.0), attack_unavailable_y_dodge=0, battle_roll_only=1):
+        return True
+    # mode 7はmode 3の攻撃・移動構成に、赤端検知時の
+    # 15秒非ロックオンY回避を追加するGURI_35用モード。
+    elif mode == 7 and self.ZA_mega_evolution_battle(usenum=usenum,Xaction=0,Aaction=1,Yaction=1,Baction=0,mode=0,dir1=20,dir2=0,dir3=40,dir4=0,see_r=0.24, escape_flag=0, endpicture="POKEMON_ZA_TEXT_WHITE_COMMENT", red_edge_y_renda_seconds=(red_edge_y_renda_seconds if float(red_edge_y_renda_seconds) > 0.0 else 15.0), dir5=90, field_resume_dir5_seconds=4.0, attack_unavailable_y_dodge=attack_unavailable_y_dodge, battle_roll_only=0, red_edge_roll_with_view=1):
         return True
 def ZA_mega_target_marker_direction(self, include_upper=False):
     # 画面下中央をプレイヤー位置とし、検出したマーカー中心までの
@@ -2484,7 +2516,8 @@ def ZA_mega_last_battle_charge_update(
 def ZA_mega_red_edge_dodge_if_needed(
         self, seconds, dir1, dir2, dir3, dir4, see_r,
         endpicture="", end2picture="", active=True,
-        repeat_count=0):
+        repeat_count=0, forced_roll_angle=-1.0,
+        repeat_while_active=False, keep_view_rotating=False):
     """赤端を確認し、ZL解除中にY回避してから戦闘入力を復帰する。"""
     if seconds <= 0.0 or not active:
         if not active:
@@ -2513,14 +2546,26 @@ def ZA_mega_red_edge_dodge_if_needed(
                 "RED_DAMAGE_AND_GREEN_FLOOR",
                 "continue green-floor action; skip non-lockon Y")
         return "green_priority"
-    if getattr(self, "_za_mega_red_edge_latched", False):
+    if (getattr(self, "_za_mega_red_edge_latched", False)
+            and not repeat_while_active):
         return "latched"
 
     self._za_mega_red_edge_latched = True
     # Yローリング中に相手方向へ吸われないよう、入力前にZLを外す。
     self.ZA_ZL_ACTION("END")
-    self.ZA_MOVE_SEE(action="END", in_see_r=see_r)
-    if testmode1_cover:
+    # mode 3/7はローリングを優先したまま通常の右視点回転を続ける。
+    # その他のmodeは従来どおり視点を停止して回避する。
+    self.ZA_MOVE_SEE(
+        action=("" if keep_view_rotating else "END"),
+        in_see_r=see_r)
+    forced_roll_angle=float(forced_roll_angle)
+    if forced_roll_angle >= 0.0:
+        # mode 4は黄色HP回避と同じ20度・最大強度を維持する。
+        self.ZA_MOVE_LStick(
+            dir1,dir2,dir3,dir4,
+            Direction(Stick.LEFT, forced_roll_angle, 1.0),
+            "RELOAD", force_direction=True)
+    elif testmode1_cover:
         # 障害物待機中の赤端回避は、非ロックオンYを障害物方向へ送る。
         self.ZA_MOVE_LStick(
             dir1,dir2,dir3,dir4,
@@ -2534,9 +2579,18 @@ def ZA_mega_red_edge_dodge_if_needed(
         print(
             "[MEGA_RED_EDGE] unlock and Y rolling for {:.1f}s".format(
                 seconds))
-    result = self.ZA_mega_red_edge_y_renda(
-        seconds, endpicture=endpicture, end2picture=end2picture,
-        repeat_count=repeat_count)
+    while True:
+        result = self.ZA_mega_red_edge_y_renda(
+            seconds, endpicture=endpicture, end2picture=end2picture,
+            repeat_count=repeat_count)
+        if result != "complete" or not repeat_while_active:
+            break
+        if not self.ZA_mega_red_screen_edge_check():
+            break
+        # mode 2は赤端が残る間に攻撃へ復帰すると敗北につながるため、
+        # 15秒単位の非ロックオンY回避を切れ目なく継続する。
+        print(
+            "[MEGA_RED_EDGE] red edge remains; continue Y rolling")
     if result == "complete":
         # 回避完了後はロックオン、保持移動、視点処理の順に復帰する。
         self.ZA_ZL_ACTION("")
@@ -2923,6 +2977,132 @@ def ZA_mega_mode4_view_nudge(self):
         duration=0.1,
         wait=0.0)
 
+def ZA_mega_mode4_yellow_hp(self, frame=None):
+    """mode 4の上部ボスHPバーが黄色ならTrueを返す。"""
+    if frame is None:
+        camera=getattr(self, "camera", None)
+        if camera is None:
+            return False
+        frame=(camera.readFrame()
+               if hasattr(camera, "readFrame") else None)
+    if frame is None or getattr(frame, "size", 0) == 0:
+        return False
+
+    height,width=frame.shape[:2]
+    x0,x1=int(width * 0.30),int(width * 0.71)
+    y0,y1=int(height * 0.105),int(height * 0.16)
+    region=frame[y0:y1, x0:x1]
+    if region.size == 0:
+        return False
+    hsv=cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+    color_masks=(
+        ("GREEN", cv2.inRange(
+            hsv, (35, 90, 100), (100, 255, 255))),
+        ("YELLOW", cv2.inRange(
+            hsv, (18, 100, 140), (40, 255, 255))),
+    )
+    minimum_column_pixels=max(3, int(region.shape[0] * 0.08))
+    best_color="NONE"
+    best_start=-1
+    best_end=-1
+    best_width=0
+    for color_name,color_mask in color_masks:
+        columns=(color_mask > 0).sum(axis=0)
+        run_start=-1
+        for index,column_pixels in enumerate(columns):
+            if int(column_pixels) >= minimum_column_pixels:
+                if run_start < 0:
+                    run_start=index
+                continue
+            if run_start >= 0:
+                if index - run_start > best_width:
+                    best_color=color_name
+                    best_start=run_start
+                    best_end=index
+                    best_width=index - run_start
+                run_start=-1
+        if run_start >= 0 and len(columns) - run_start > best_width:
+            best_color=color_name
+            best_start=run_start
+            best_end=len(columns)
+            best_width=len(columns) - run_start
+    if best_start < 0 or best_end <= best_start:
+        return False
+
+    global_start=x0 + best_start
+    global_end=x0 + best_end - 1
+    full_bar_width=max(1.0, float(width) * 0.345)
+    fill_ratio=float(best_width) / full_bar_width
+    matched=bool(
+        best_color == "YELLOW"
+        and float(width) * 0.31 <= global_start <= float(width) * 0.36
+        and global_end <= float(width) * 0.71
+        and 0.12 <= fill_ratio <= 1.10)
+    self.last_image_detection={
+        "name": "POKEMON_ZA_MODE4_YELLOW_HP",
+        "matched": matched,
+        "hp_color": best_color,
+        "fill_ratio": fill_ratio,
+        "yellow_run": [global_start, global_end],
+        "position": (global_start, y0),
+        "template_size": (best_width, y1 - y0),
+    }
+    return matched
+
+def ZA_mega_mode4_yellow_hp_roll_ready(
+        self, wait_seconds=5.0, attack_sent=False,
+        yellow_detected=None):
+    """黄色HP確認後、X攻撃または待機期限で1度だけ回避を許可する。"""
+    if getattr(self, "_za_mega_mode4_yellow_hp_roll_done", False):
+        return False
+    now=time.monotonic()
+    if yellow_detected is None:
+        yellow_detected=self.ZA_mega_mode4_yellow_hp()
+    yellow_since=getattr(
+        self, "_za_mega_mode4_yellow_hp_since", None)
+    if yellow_detected and yellow_since is None:
+        yellow_since=now
+        self._za_mega_mode4_yellow_hp_since=yellow_since
+        print(
+            "[MEGA_MODE4_YELLOW_HP] yellow detected; "
+            "wait up to {:.1f}s for X attack".format(
+                max(0.0, float(wait_seconds))))
+    if yellow_since is None:
+        return False
+    wait_seconds=max(0.0, float(wait_seconds))
+    if not attack_sent and now - yellow_since < wait_seconds:
+        return False
+    self._za_mega_mode4_yellow_hp_roll_done=True
+    self._za_mega_mode4_yellow_hp_roll_trigger=(
+        "X attack complete" if attack_sent
+        else "{:.1f}s elapsed without X attack".format(wait_seconds))
+    return True
+
+def ZA_mega_mode4_yellow_hp_roll_after_attack(
+        self, seconds, dir1, dir2, dir3, dir4, see_r,
+        endpicture="", end2picture="", trigger="X attack complete"):
+    """黄色HP確定後、20度移動で非ロックオンY回避する。"""
+    seconds=max(0.0, float(seconds))
+    if seconds <= 0.0:
+        return "none"
+    self.ZA_ZL_ACTION("END")
+    self.ZA_MOVE_SEE(action="END", in_see_r=see_r)
+    self.ZA_MOVE_LStick(
+        dir1,dir2,dir3,dir4,
+        Direction(Stick.LEFT, 20.0, 1.0),
+        "RELOAD", force_direction=True)
+    print(
+        "[MEGA_MODE4_YELLOW_HP] {}; "
+        "unlock and Y rolling at 20deg for {:.1f}s".format(
+            str(trigger or "yellow HP trigger"), seconds))
+    result=self.ZA_mega_red_edge_y_renda(
+        seconds, endpicture=endpicture, end2picture=end2picture)
+    if result == "complete":
+        self.ZA_ZL_ACTION("")
+        self.ZA_mega_keep_left_moving(dir1,dir2,dir3,dir4)
+        self.ZA_MOVE_SEE(action="", in_see_r=see_r)
+    return result
+
 def ZA_mega_attack_unavailable_y_dodge(
         self, dir1, dir2, dir3, dir4, see_r,
         repeat=2, cooldown=0.75, post_l_view_nudge=0,
@@ -3111,7 +3291,7 @@ def _ZA_mega_field_position_matches(self, usenum):
                 or self.image_check("POKEMON_ZA_FIELD_BACK6"))
     return False
 
-def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction=0,mode=0,dir1=0,dir2=0,dir3=0,dir4=0,see_r=0, escape_flag=0,target_count_threshold_arg=15,no_target_count_threshold_arg=15,endpicture="",end2picture="",lockon_rclick=1,field_resume_dir4_seconds=10.0,red_edge_y_renda_seconds=0.0,dir5=-1,field_resume_dir5_seconds=4.0,attack_unavailable_y_dodge=0,mode4_view_nudge=0,last_battle_mode=0,movemode=0,Z_Gaurd=0,Cplus_attack=0,red_edge_y_repeat=0,testmode1=0):
+def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction=0,mode=0,dir1=0,dir2=0,dir3=0,dir4=0,see_r=0, escape_flag=0,target_count_threshold_arg=15,no_target_count_threshold_arg=15,endpicture="",end2picture="",lockon_rclick=1,field_resume_dir4_seconds=10.0,red_edge_y_renda_seconds=0.0,dir5=-1,field_resume_dir5_seconds=4.0,attack_unavailable_y_dodge=0,mode4_view_nudge=0,last_battle_mode=0,movemode=0,Z_Gaurd=0,Cplus_attack=0,red_edge_y_repeat=0,testmode1=0,battle_identity_picture="",mode4_yellow_hp_roll_seconds=0.0,mode4_yellow_hp_attack_wait_seconds=5.0,red_edge_roll_angle=-1.0,battle_roll_only=0,red_edge_roll_with_view=0):
     if last_battle_mode:
         # AはC+画像がなくても戦闘画面なら使用する。B/X/Yは呼び出し値を
         # 保持し、後段でC+画像を確認できた時だけ技入力として許可する。
@@ -3126,6 +3306,10 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
     
     nofiled=1
     battle_count=0
+    battle_identity_picture=str(battle_identity_picture or "")
+    battle_identity_confirmed=(battle_identity_picture == "")
+    self._za_mega_battle_identity_picture=battle_identity_picture
+    self._za_mega_battle_identity_confirmed=battle_identity_confirmed
     
     # Cplus_attack=1では初戦・再戦ともC+攻撃を維持する。
     Cp_mode=1 if Cplus_attack else 0
@@ -3151,6 +3335,10 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
     self._za_mega_field_w_up_attempts=0
     self._za_mega_field_w_up_retry_at=0.0
     attack_unavailable_since=None
+    self._za_mega_mode4_yellow_hp_since=None
+    self._za_mega_mode4_yellow_hp_roll_done=False
+    self._za_mega_mode4_yellow_hp_roll_trigger=""
+    self._za_mega_roll_only_logged=False
     self._za_mega_last_battle_mode=bool(last_battle_mode)
     self._za_mega_testmode1_enabled=bool(
         last_battle_mode and testmode1)
@@ -3365,6 +3553,14 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                     0, "CHOICE_OR_BLACK_COMMENT",
                     "stop movement; reset HP/test phase before retry")
 
+        if (not battle_identity_confirmed
+                and self.image_check(battle_identity_picture)):
+            battle_identity_confirmed=True
+            self._za_mega_battle_identity_confirmed=True
+            print(
+                "[MEGA_BATTLE_IDENTITY] confirmed: {}".format(
+                    battle_identity_picture))
+
         if endpicture != "" or end2picture != "":
             if self.image_check(endpicture):
                 self._za_mega_rclick_dir3_until=0.0
@@ -3373,6 +3569,12 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                 self.ZA_ZL_ACTION("END")
                 self.ZA_MOVE_LStick(dir1,dir2,dir3,dir4,1,"END")
                 self.ZA_MOVE_SEE(action = "END",in_see_r=see_r)
+                if not battle_identity_confirmed:
+                    print(
+                        "[MEGA_BATTLE_IDENTITY] reject end picture; "
+                        "not confirmed: {}".format(
+                            battle_identity_picture))
+                    return "BATTLE_IDENTITY_MISMATCH"
                 return True
             if self.image_check(end2picture):
                 self._za_mega_rclick_dir3_until=0.0
@@ -3381,6 +3583,12 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                 self.ZA_ZL_ACTION("END")
                 self.ZA_MOVE_LStick(dir1,dir2,dir3,dir4,1,"END")
                 self.ZA_MOVE_SEE(action = "END",in_see_r=see_r)
+                if not battle_identity_confirmed:
+                    print(
+                        "[MEGA_BATTLE_IDENTITY] reject end picture; "
+                        "not confirmed: {}".format(
+                            battle_identity_picture))
+                    return "BATTLE_IDENTITY_MISMATCH"
                 return True
 
         field_resume_detected = nofiled==1 and resume_screen_detected
@@ -3534,7 +3742,7 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
             self.ZA_ZL_ACTION("END")
             self.ZA_MOVE_LStick(
                 dir1,dir2,dir3,dir4,1,"END")
-            self.ZA_MOVE_SEE(action="END", in_see_r=see_r)
+            self.ZA_MOVE_SEE(action="END",in_see_r=see_r)
             return True
         if charge_result in {
                 "search", "green", "dodge", "guard", "complete"}:
@@ -3616,6 +3824,9 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
         if field_resume_detected and not last_battle_mode:
             # mode 0～4はmode 5追加前と同じ位置で開始方向を準備する。
             # 復旧・攻撃可否判定より前へ移すと既存の再ロック周期が変わる。
+            self._za_mega_mode4_yellow_hp_since=None
+            self._za_mega_mode4_yellow_hp_roll_done=False
+            self._za_mega_mode4_yellow_hp_roll_trigger=""
             if dir5 >= 0:
                 self._za_mega_field_dir5_until=(
                     time.monotonic()
@@ -3723,12 +3934,74 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
             self.wait(0.1)
             continue
 
+        if (battle_roll_only and not choice_input_guard
+                and nofiled == 0
+                and (loop_attack_ready or field_back_w_detected)):
+            # mode 6は赤端の有無に関係なく、戦闘中は攻撃せず
+            # ZLを外したYローリングだけを15秒単位で繰り返す。
+            if not self._za_mega_roll_only_logged:
+                print(
+                    "[MEGA_MODE6_ROLL_ONLY] battle active; "
+                    "non-lockon Y rolling only")
+            self._za_mega_roll_only_logged=True
+            self.ZA_ZL_ACTION("END")
+            # 通常戦闘と同じ右視点回転をローリング中も保持し、
+            # 左移動と組み合わせて同じ壁へ進み続けるのを避ける。
+            self.ZA_MOVE_SEE(action="", in_see_r=see_r)
+            self.ZA_mega_keep_left_moving(
+                dir1,dir2,dir3,dir4)
+            roll_only_result=self.ZA_mega_red_edge_y_renda(
+                max(0.1, float(red_edge_y_renda_seconds)),
+                endpicture=endpicture,
+                end2picture=end2picture)
+            if roll_only_result == "endpicture":
+                self._za_mega_rclick_dir3_until=0.0
+                self._za_mega_field_dir5_until=0.0
+                self._za_mega_field_dir4_until=0.0
+                self.ZA_MOVE_LStick(
+                    dir1,dir2,dir3,dir4,1,"END")
+                self.ZA_MOVE_SEE(
+                    action="END", in_see_r=see_r)
+                return True
+            # complete/guardのどちらでも攻撃経路へは入らず、
+            # 次周回で画面状態を確認してから再びローリングする。
+            continue
+
+        if (mode4_yellow_hp_roll_seconds > 0.0
+                and not choice_input_guard and nofiled == 0
+                and self.ZA_mega_mode4_yellow_hp_roll_ready(
+                    mode4_yellow_hp_attack_wait_seconds)):
+            mode4_roll_result=(
+                self.ZA_mega_mode4_yellow_hp_roll_after_attack(
+                    mode4_yellow_hp_roll_seconds,
+                    dir1,dir2,dir3,dir4,see_r,
+                    endpicture=endpicture,
+                    end2picture=end2picture,
+                    trigger=getattr(
+                        self,
+                        "_za_mega_mode4_yellow_hp_roll_trigger",
+                        "5.0s elapsed without X attack")))
+            if mode4_roll_result == "endpicture":
+                self._za_mega_rclick_dir3_until=0.0
+                self._za_mega_field_dir5_until=0.0
+                self._za_mega_field_dir4_until=0.0
+                self.ZA_MOVE_LStick(
+                    dir1,dir2,dir3,dir4,1,"END")
+                self.ZA_MOVE_SEE(
+                    action="END", in_see_r=see_r)
+                return True
+            # 30秒間で画面状態が変わり得るため、必ず先頭から再判定する。
+            continue
+
         red_edge_result = self.ZA_mega_red_edge_dodge_if_needed(
             red_edge_y_renda_seconds,
             dir1,dir2,dir3,dir4,see_r,
             endpicture=endpicture, end2picture=end2picture,
             active=not choice_input_guard and nofiled == 0,
-            repeat_count=red_edge_y_repeat)
+            repeat_count=red_edge_y_repeat,
+            forced_roll_angle=red_edge_roll_angle,
+            repeat_while_active=False,
+            keep_view_rotating=red_edge_roll_with_view)
         if red_edge_result == "endpicture":
             self._za_mega_rclick_dir3_until=0.0
             self._za_mega_field_dir5_until=0.0
@@ -3754,7 +4027,9 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                 now = time.monotonic()
                 if attack_unavailable_since is None:
                     attack_unavailable_since = now
-                elif (now - attack_unavailable_since >= 0.25
+                # 技入力直後の再使用待ちを攻撃不能と誤認して、
+                # すぐZL解除ローリングへ移らないよう0.75秒確認する。
+                elif (now - attack_unavailable_since >= 0.75
                         and self.ZA_mega_attack_unavailable_y_dodge(
                             dir1, dir2, dir3, dir4, see_r,
                             post_l_view_nudge=mode4_view_nudge,
@@ -3859,7 +4134,10 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                 dir1,dir2,dir3,dir4,see_r,
                 endpicture=endpicture, end2picture=end2picture,
                 active=nofiled == 0,
-                repeat_count=red_edge_y_repeat)
+                repeat_count=red_edge_y_repeat,
+                forced_roll_angle=red_edge_roll_angle,
+                repeat_while_active=False,
+                keep_view_rotating=red_edge_roll_with_view)
             if red_edge_result == "endpicture":
                 self._za_mega_rclick_dir3_until=0.0
                 self._za_mega_field_dir5_until=0.0
@@ -3934,6 +4212,32 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                 cplus_activation_ready=(
                     self.image_check("POKEMON_ZA_C+")
                     or self.image_check("POKEMON_ZA_C+_LOW"))
+            if escape_flag == 3:
+                # 最初の赤端確認後、攻撃可否画像を調べている間に
+                # 赤端へ変化する場合があるため、実入力の直前に再確認する。
+                red_edge_result = self.ZA_mega_red_edge_dodge_if_needed(
+                    red_edge_y_renda_seconds,
+                    dir1,dir2,dir3,dir4,see_r,
+                    endpicture=endpicture, end2picture=end2picture,
+                    active=nofiled == 0,
+                    repeat_count=red_edge_y_repeat,
+                    forced_roll_angle=red_edge_roll_angle,
+                    repeat_while_active=False,
+                    keep_view_rotating=red_edge_roll_with_view)
+                if red_edge_result == "endpicture":
+                    self._za_mega_rclick_dir3_until=0.0
+                    self._za_mega_field_dir5_until=0.0
+                    self._za_mega_field_dir4_until=0.0
+                    self.ZA_ZL_ACTION("END")
+                    self.ZA_MOVE_LStick(
+                        dir1,dir2,dir3,dir4,1,"END")
+                    self.ZA_MOVE_SEE(
+                        action="END", in_see_r=see_r)
+                    return True
+                if red_edge_result in {
+                        "complete", "guard", "green_priority"}:
+                    red_edge_interrupted = True
+                    break
             if (cplus_for_current_attack
                     and cplus_activation_ready
                     and self.ZA_mega_cplus_should_press(
@@ -4021,6 +4325,9 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                 continue
                 #QUICK_RETURN 回避動作間隔を狭めるため
             elif count==2 and Xaction==1 and current_attack_ready:
+                mode4_yellow_hp_before_attack=bool(
+                    mode4_yellow_hp_roll_seconds > 0.0
+                    and self.ZA_mega_mode4_yellow_hp())
                 self.ZA_MOVE_SEE(action = "END")
                 self.pressRep(Button.X, repeat=1, duration=0.04, wait=0.0, interval=0.1)
                 if last_battle_mode:
@@ -4029,6 +4336,33 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                 cplus_active=self.ZA_mega_cplus_after_skill_input(
                     cplus_active)
                 cplus_suppression_logged=False
+                if (mode4_yellow_hp_roll_seconds > 0.0
+                        and self.ZA_mega_mode4_yellow_hp_roll_ready(
+                            mode4_yellow_hp_attack_wait_seconds,
+                            attack_sent=True,
+                            yellow_detected=(
+                                mode4_yellow_hp_before_attack))):
+                    mode4_roll_result=(
+                        self.ZA_mega_mode4_yellow_hp_roll_after_attack(
+                            mode4_yellow_hp_roll_seconds,
+                            dir1,dir2,dir3,dir4,see_r,
+                            endpicture=endpicture,
+                            end2picture=end2picture,
+                            trigger=getattr(
+                                self,
+                                "_za_mega_mode4_yellow_hp_roll_trigger",
+                                "X attack complete")))
+                    if mode4_roll_result == "endpicture":
+                        self._za_mega_rclick_dir3_until=0.0
+                        self._za_mega_field_dir5_until=0.0
+                        self._za_mega_field_dir4_until=0.0
+                        self.ZA_MOVE_LStick(
+                            dir1,dir2,dir3,dir4,1,"END")
+                        self.ZA_MOVE_SEE(
+                            action="END", in_see_r=see_r)
+                        return True
+                    if mode4_roll_result == "guard":
+                        break
                 if escape_flag==1:
                     #回避行動用
                     if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"): #FIELDから変更
@@ -4213,7 +4547,11 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                                 endpicture=endpicture,
                                 end2picture=end2picture,
                                 active=nofiled == 0,
-                                repeat_count=red_edge_y_repeat))
+                                repeat_count=red_edge_y_repeat,
+                                forced_roll_angle=red_edge_roll_angle,
+                                repeat_while_active=False,
+                                keep_view_rotating=(
+                                    red_edge_roll_with_view)))
                         if red_edge_result == "endpicture":
                             self._za_mega_rclick_dir3_until=0.0
                             self._za_mega_field_dir5_until=0.0
@@ -4341,6 +4679,9 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                             count=advance_attack_count(count)
                             break
                         elif count==2 and Xaction==1 and current_attack_ready:
+                            mode4_yellow_hp_before_attack=bool(
+                                mode4_yellow_hp_roll_seconds > 0.0
+                                and self.ZA_mega_mode4_yellow_hp())
                             self.ZA_MOVE_SEE(action = "END")
                             self.pressRep(Button.X, repeat=1, duration=0.04, wait=0.0, interval=0.1)
                             if last_battle_mode:
@@ -4350,6 +4691,33 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                             cplus_active=self.ZA_mega_cplus_after_skill_input(
                                 cplus_active)
                             cplus_suppression_logged=False
+                            if (mode4_yellow_hp_roll_seconds > 0.0
+                                    and self.ZA_mega_mode4_yellow_hp_roll_ready(
+                                        mode4_yellow_hp_attack_wait_seconds,
+                                        attack_sent=True,
+                                        yellow_detected=(
+                                            mode4_yellow_hp_before_attack))):
+                                mode4_roll_result=(
+                                    self.ZA_mega_mode4_yellow_hp_roll_after_attack(
+                                        mode4_yellow_hp_roll_seconds,
+                                        dir1,dir2,dir3,dir4,see_r,
+                                        endpicture=endpicture,
+                                        end2picture=end2picture,
+                                        trigger=getattr(
+                                            self,
+                                            "_za_mega_mode4_yellow_hp_roll_trigger",
+                                            "X attack complete")))
+                                if mode4_roll_result == "endpicture":
+                                    self._za_mega_rclick_dir3_until=0.0
+                                    self._za_mega_field_dir5_until=0.0
+                                    self._za_mega_field_dir4_until=0.0
+                                    self.ZA_MOVE_LStick(
+                                        dir1,dir2,dir3,dir4,1,"END")
+                                    self.ZA_MOVE_SEE(
+                                        action="END", in_see_r=see_r)
+                                    return True
+                                if mode4_roll_result == "guard":
+                                    break
                             self.ZA_MOVE_SEE(action = "END",in_see_r=see_r)
                             self.wait(0.3)
                             if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"): #FIELDから変更

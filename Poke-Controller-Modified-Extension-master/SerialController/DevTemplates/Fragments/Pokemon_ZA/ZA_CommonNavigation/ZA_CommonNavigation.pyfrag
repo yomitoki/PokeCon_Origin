@@ -1,7 +1,10 @@
 def ZA_Common_start(self):
     #dummy
     return "COMMON_MAP_OPEN"
-def ZA_Common_map_open(self,check_pic1="POKEMON_ZA_FALSE_RETURN",check_pic2="POKEMON_ZA_FALSE_RETURN",othermap="POKEMON_ZA_FALSE_RETURN"):
+def ZA_Common_map_open(
+        self, check_pic1="POKEMON_ZA_FALSE_RETURN",
+        check_pic2="POKEMON_ZA_FALSE_RETURN",
+        othermap="POKEMON_ZA_FALSE_RETURN", use_text_box2=True):
     self.map_cursor_reset=0
     self.ZA_ZL_ACTION("END")
     self.wait(0.1)#self.wait(self.SLEEPLIST[8][2])
@@ -9,7 +12,7 @@ def ZA_Common_map_open(self,check_pic1="POKEMON_ZA_FALSE_RETURN",check_pic2="POK
     if self.image_check("POKEMON_ZA_TEXT_BOX"):
         self.pressRep(Button.B, repeat=5, duration=0.15, wait=0.01, interval=0.1)
         self.wait(0.1)
-    if self.image_check("POKEMON_ZA_TEXT_BOX2"):
+    if use_text_box2 and self.image_check("POKEMON_ZA_TEXT_BOX2"):
         self.pressRep(Button.A, repeat=5, duration=0.15, wait=0.01, interval=0.1)
         self.wait(0.1)         
     elif self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or self.image_check("POKEMON_ZA_DEAD") or self.image_check(check_pic1) or self.image_check(check_pic2): #FIELDから変更
@@ -75,17 +78,18 @@ def ZA_Common_goto_select1(self,position,othermap="POKEMON_ZA_FALSE_RETURN",sele
                 self.wait(0.5)
                 return "COMMON_GOTO_SELECT1"
             else:
-                if self.image_check("POKEMON_ZA_TAB_FILTER"):       
-                    self.pressRep(Button.MINUS, repeat=1, duration=0.15, wait=0.01, interval=0.1)
-                    
-                elif self.image_check("POKEMON_ZA_SELECT_ALL"):
+                # 開いたフィルターでも背景側のTAB_FILTERが一致するため、
+                # SELECT_ALLを先に処理しないとMINUSで閉じ直してしまう。
+                if self.image_check("POKEMON_ZA_SELECT_ALL"):
                     # SELECT
                     for i in range(position):
                         self.etc_sendCommand("Lbutton_down")
                         #self.wait(0.1)#回数が多い場合に移動が足りない場合は必要
-                        
+
                     self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.01, interval=0.1)
                     return "COMMON_GOTO_SELECT2"
+                elif self.image_check("POKEMON_ZA_TAB_FILTER"):
+                    self.pressRep(Button.MINUS, repeat=1, duration=0.15, wait=0.01, interval=0.1)
         else:
                 self.pressRep(Button.Y, repeat=1, duration=0.15, wait=0.1, interval=0.1)
     
@@ -116,11 +120,15 @@ def ZA_Common_goto_select1(self,position,othermap="POKEMON_ZA_FALSE_RETURN",sele
 def ZA_Common_goto_select2(
         self, positionright, positiondown, movepoint_check,
         othermap="POKEMON_ZA_FALSE_RETURN",
-        battle_recovery_mode=0):
+        battle_recovery_mode=0,
+        force_filter_navigation=False):
     self.wait(0.1)#self.wait(self.SLEEPLIST[7][2])
     if self.image_check("POKEMON_ZA_MAP2") or self.image_check(othermap):        
         if self.image_check("POKEMON_ZA_MOVESPOT_TAB"):         
-            if self.image_check("POKEMON_ZA_TAB_FILTER"):
+            # フィルター確定直後はTAB_FILTERを一時的に取りこぼすことが
+            # ある。SELECT1完了済みの専用経路では明示的に移動する。
+            if (force_filter_navigation
+                    or self.image_check("POKEMON_ZA_TAB_FILTER")):
                 # FILTER
                 for i in range(positionright):
                     self.etc_sendCommand("Lbutton_right")
@@ -583,14 +591,19 @@ def ZA_Common_check_time(self,check_timing):
     #抜けミス用カウント
     self.timecount+=1
     return "COMMON_CHECK_TIME"
-def ZA_Common_change_time_set(self,check_timing,check_pic1="POKEMON_ZA_FALSE_RETURN",check_pic2="POKEMON_ZA_FALSE_RETURN"):
+def ZA_Common_change_time_set(
+        self, check_timing,
+        check_pic1="POKEMON_ZA_FALSE_RETURN",
+        check_pic2="POKEMON_ZA_FALSE_RETURN", use_text_box2=True):
     #type=0:ポケセンブルーにて実施(バトルゾーンに影響あり)
     if self.Common_current_state == "COMMON_CHECK_TIME":  
         self.Common_current_state = self.ZA_Common_check_time(check_timing)
     elif self.Common_current_state == "COMMON_CHANGE_TIME":  
         self.Common_current_state = self.ZA_Common_change_time()
     else:
-        ret = self.ZA_Common_goto(2,0,1,check_pic1=check_pic1,check_pic2=check_pic2)
+        ret = self.ZA_Common_goto(
+            2, 0, 1, check_pic1=check_pic1, check_pic2=check_pic2,
+            use_text_box2=use_text_box2)
         
         if ret == "START":
             self.Common_current_state = "COMMON_CHANGE_TIME"
@@ -623,10 +636,13 @@ def ZA_Common_goto(
         check_pic2="POKEMON_ZA_FALSE_RETURN",
         othermap="POKEMON_ZA_FALSE_RETURN",
         select1_position0_direct=0,
-        battle_recovery_mode=0):
+        battle_recovery_mode=0,
+        use_text_box2=True):
     #type=0:ポケセンブルーにて実施(バトルゾーンに影響あり)
     if self.Common_current_state == "COMMON_MAP_OPEN":
-        self.Common_current_state = self.ZA_Common_map_open(check_pic1=check_pic1,check_pic2=check_pic2,othermap=othermap)
+        self.Common_current_state = self.ZA_Common_map_open(
+            check_pic1=check_pic1, check_pic2=check_pic2,
+            othermap=othermap, use_text_box2=use_text_box2)
     elif self.Common_current_state == "COMMON_GOTO_SELECT1":
         self.Common_current_state = self.ZA_Common_goto_select1(
             position1,othermap=othermap,

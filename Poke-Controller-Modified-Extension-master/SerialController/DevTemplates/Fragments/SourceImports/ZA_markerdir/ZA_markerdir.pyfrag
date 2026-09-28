@@ -25,6 +25,14 @@ def ZA_markerdir(self,type,search_mode=0,nofiled=False):
     left = marker + "_LEFT_WIDE"
     right = marker + "_RIGHT_WIDE"
     last_movement_name = "_za_markerdir_last_movement_" + marker
+    downer_repeat_name = "_za_markerdir_downer_repeat_" + marker
+    downer_stage_name = "_za_markerdir_downer_stage_" + marker
+    downer_side_name = "_za_markerdir_downer_side_" + marker
+    downer_angle_name = "_za_markerdir_downer_angle_" + marker
+    marker_seen_name = "_za_markerdir_marker_seen_" + marker
+    # 呼出元が「この1セットで一度でも見えたか」を判定できるようにし、
+    # 単なる中央化失敗と完全未検知を区別する。
+    setattr(self, marker_seen_name, False)
 
     def record_centered_event_approach():
         if type != "EVENT" or search_mode not in (1, 2):
@@ -243,12 +251,61 @@ def ZA_markerdir(self,type,search_mode=0,nofiled=False):
 
             if detail and detail.get("matched"):
                 marker_seen_this_call = True
+                setattr(self, marker_seen_name, True)
+
+            downer_detected = is_detected_in(wide_downer, detail)
+            if not downer_detected:
+                setattr(self, downer_repeat_name, 0)
+                if detail and detail.get("matched"):
+                    # 中央下以外へ位置が変わった場合は復帰段階を解除。
+                    setattr(self, downer_stage_name, 0)
+                    setattr(self, downer_angle_name, None)
 
             if is_detected_in(center, detail):
                 setattr(self, last_movement_name, None)
+                setattr(self, downer_repeat_name, 0)
+                setattr(self, downer_stage_name, 0)
+                setattr(self, downer_angle_name, None)
                 record_centered_event_approach()
                 return True
-            elif is_detected_in(wide_downer, detail):
+            elif downer_detected:
+                downer_repeat = int(getattr(
+                    self, downer_repeat_name, 0)) + 1
+                setattr(self, downer_repeat_name, downer_repeat)
+                if downer_repeat >= 3:
+                    recovery_stage = int(getattr(
+                        self, downer_stage_name, 0))
+                    if recovery_stage == 0:
+                        side_index = int(getattr(
+                            self, downer_side_name, 0))
+                        recovery_angle = 0 if side_index % 2 == 0 else 180
+                        recovery_stick = Stick.RIGHT
+                        recovery_action = "VIEW_ROTATE"
+                        setattr(self, downer_stage_name, 1)
+                        setattr(self, downer_side_name, side_index + 1)
+                        setattr(
+                            self, downer_angle_name, recovery_angle)
+                    else:
+                        # 最初の視点回転後も再び中央下で停滞する場合だけ、
+                        # 前回と同じ方向へ大きめに視点を回す。
+                        recovery_angle = int(getattr(
+                            self, downer_angle_name, 0) or 0)
+                        recovery_stick = Stick.RIGHT
+                        recovery_action = "VIEW_ROTATE"
+                        setattr(self, downer_stage_name, 0)
+                        setattr(self, downer_angle_name, None)
+                    setattr(self, downer_repeat_name, 0)
+                    setattr(self, last_movement_name, None)
+                    self.press(
+                        Direction(
+                            recovery_stick, recovery_angle, 1.0),
+                        duration=0.5, wait=0.0)
+                    self.wait(0.1)
+                    print(
+                        "[MARKER_DOWNER_RECOVERY] marker={} "
+                        "action={} angle={} duration=0.5".format(
+                            marker, recovery_action, recovery_angle))
+                    return False
                 movement = (270, 1.0, 0.0)
             elif is_detected_in(wide_upper, detail):
                 movement = (90, 1.0, 0.0)

@@ -11,6 +11,8 @@ import subprocess
 import time
 import uuid
 
+from CommandFunctionIndex import write_common_function_index
+
 
 def find_ffmpeg():
     executable = shutil.which("ffmpeg")
@@ -359,8 +361,8 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
         key=lambda chunk: (
             str(chunk.get("started_wall", "")),
             float(chunk.get("started", 0.0) or 0.0)))
-    if len(chunks) < 2:
-        raise ValueError("結合対象の分割録画が2本以上必要です。")
+    if not chunks:
+        raise ValueError("結合対象の分割録画がありません。")
     session_id = str(session_id or "").strip()
     if not session_id:
         raise ValueError("Commands実行セッションを特定できません。")
@@ -579,6 +581,20 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
         focus_trace_dropped = max(
             [int(dict(chunk.get("focus_repair", {}) or {}).get(
                 "trace_dropped", 0) or 0) for chunk in chunks] or [0])
+        common_groups = []
+        common_group_ids = set()
+        for chunk in chunks:
+            monitor = dict(chunk.get("common_function_monitor", {}) or {})
+            for group in monitor.get("groups", []):
+                if not isinstance(group, dict):
+                    continue
+                group_id = str(group.get("id", "") or "")
+                if group_id and group_id not in common_group_ids:
+                    common_group_ids.add(group_id)
+                    common_groups.append(dict(group))
+        common_index = write_common_function_index(
+            building, common_groups, duration=duration) if common_groups else {
+                "occurrence_count": 0}
         sources = []
         for chunk_index, (source_dir, chunk) in enumerate(
                 zip(source_dirs, chunks), start=1):
@@ -590,6 +606,11 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
                 if copied not in sources:
                     sources.append(copied)
         chunk_id = "merged-{}-{}".format(session_id, uuid.uuid4().hex)
+        recording_video_modes = _ordered_unique(
+            str(chunk.get("recording_video_mode", "") or "")
+            for chunk in chunks
+            if chunk.get("recording_video_mode"))
+        youtube_archive = dict(chunks[0].get("youtube_archive", {}) or {})
         runtime_chunk = {
             "id": chunk_id,
             "session_dir": destination,
@@ -608,6 +629,10 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
             "source_chunk_ids": [str(chunk.get("id", "")) for chunk in chunks],
             "duration_saved": duration,
             "source_media": source_media,
+            "recording_video_mode": recording_video_modes[0]
+            if len(recording_video_modes) == 1
+            else ("mixed" if recording_video_modes else ""),
+            "youtube_archive": youtube_archive,
             "loop_compaction": {
                 "applied": bool(loop_gaps),
                 "marker_seconds": 1.0,
@@ -628,6 +653,16 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
                 "trace_mode": "selected_function_lines",
                 "trace_dropped": focus_trace_dropped,
             },
+            "common_function_monitor": {
+                "enabled": bool(common_groups),
+                "groups": common_groups,
+                "targets": _ordered_unique(
+                    function for group in common_groups
+                    for function in group.get("functions", [])),
+                "index_file": "common_function_index.json",
+                "occurrence_count": int(
+                    common_index.get("occurrence_count", 0) or 0),
+            },
         }
         metadata = {key: value for key, value in runtime_chunk.items()
                     if key not in ("started", "ended", "session_dir")}
@@ -647,6 +682,8 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
                 "sample_interval_seconds": 0.1,
                 "focused_function_trace": "worker_local_exact_lines"
                 if focus_enabled or focus_targets else "disabled",
+                "common_function_caller_index": "common_function_index.json"
+                if common_groups else "disabled",
             },
         })
         with open(os.path.join(building, "command_monitor.json"),

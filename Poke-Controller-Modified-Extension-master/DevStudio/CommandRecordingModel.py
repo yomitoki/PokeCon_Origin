@@ -8,6 +8,7 @@ import datetime
 import json
 import os
 import tokenize
+import urllib.parse
 
 
 def _load_json(path, default):
@@ -112,6 +113,9 @@ def event_search_text(event):
         str(event.get("index", "")), str(event.get("event", "")),
         str(event.get("step_text", "")), str(event.get("stop_variable", "")),
         str(event.get("stop_state", "")), str(event.get("controller_input", "")),
+        str(event.get("focus_function", "")),
+        " ".join(str(value) for value in event.get("common_function_groups", [])
+                 if value not in (None, "")),
         str(location.get("function", "")), str(location.get("file", "")),
         str(location.get("line", "")), str(location.get("source", "")), stack_text,
     )).lower()
@@ -211,6 +215,51 @@ def video_candidates(folder):
         if os.path.isfile(path):
             result.append((label, path))
     return result
+
+
+def load_remote_video(folder, metadata=None):
+    """Load a completed/in-progress YouTube mapping without requiring media."""
+    value = _load_json(os.path.join(
+        os.path.abspath(str(folder or "")), "youtube_remote.json"), {})
+    if isinstance(value, dict) and value.get("videos"):
+        return value
+    if isinstance(metadata, dict) and isinstance(metadata.get("youtube"), dict):
+        return dict(metadata["youtube"])
+    return value if isinstance(value, dict) else {}
+
+
+def remote_video_for_time(remote, video_time):
+    when = max(0.0, float(video_time or 0.0))
+    videos = remote.get("videos", []) if isinstance(remote, dict) else []
+    for position, video in enumerate(videos):
+        if not isinstance(video, dict):
+            continue
+        start = float(video.get("start_seconds", 0.0) or 0.0)
+        duration = float(video.get("duration_seconds", 0.0) or 0.0)
+        if when >= start and (duration <= 0.0 or when < start + duration
+                              or position == len(videos) - 1):
+            return video, max(0.0, when - start)
+    if videos and isinstance(videos[-1], dict):
+        start = float(videos[-1].get("start_seconds", 0.0) or 0.0)
+        return videos[-1], max(0.0, when - start)
+    return None, when
+
+
+def youtube_url_for_time(folder, video_time, metadata=None):
+    video, relative = remote_video_for_time(
+        load_remote_video(folder, metadata), video_time)
+    video_id = str(video.get("video_id", "") or "") if video else ""
+    if not video_id:
+        return ""
+    return "https://www.youtube.com/watch?" + urllib.parse.urlencode({
+        "v": video_id, "t": "{}s".format(max(0, int(relative))),
+    })
+
+
+def load_common_function_index(folder):
+    value = _load_json(os.path.join(
+        os.path.abspath(str(folder or "")), "common_function_index.json"), {})
+    return value if isinstance(value, dict) else {}
 
 
 def resolve_event_source(folder, metadata, event):

@@ -9,6 +9,7 @@ import os
 import threading
 import time
 import uuid
+import webbrowser
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
@@ -22,10 +23,13 @@ except ImportError:
     Image = ImageTk = None
 
 from CommandRecordingModel import (command_source_file, filtered_timeline,
+                                   load_common_function_index,
                                    load_command_recording,
-                                   load_command_timeline, resolve_event_source,
+                                   load_command_timeline, load_remote_video,
+                                   resolve_event_source,
                                    observed_source_lines, source_function_block,
-                                   timeline_page, video_candidates)
+                                   timeline_page, video_candidates,
+                                   youtube_url_for_time)
 from OperationSessionStudio import FrameCaptureDialog
 
 
@@ -134,6 +138,9 @@ class CommandRecordingWorkspace(ttk.Frame):
         ttk.Button(
             opener, text="集中修正…",
             command=self.open_focus_repair).pack(side="left", padx=(3, 0))
+        ttk.Button(
+            opener, text="共通関数の呼び出し元…",
+            command=self.open_common_function_index).pack(side="left", padx=(3, 0))
         ttk.Label(self, textvariable=self.summary, anchor="w").pack(
             fill="x", padx=10, pady=(0, 4))
 
@@ -219,6 +226,8 @@ class CommandRecordingWorkspace(ttk.Frame):
                        side="left", padx=3)
         ttk.Button(actions, text="停止地点を動画で再確認",
                    command=self.seek_current_event).pack(side="left", padx=3)
+        ttk.Button(actions, text="YouTubeでこの時刻を開く",
+                   command=self.open_youtube_current_event).pack(side="left", padx=3)
         path_actions = ttk.Frame(parent)
         path_actions.pack(fill="x", padx=3, pady=(0, 3))
         ttk.Button(
@@ -354,10 +363,14 @@ class CommandRecordingWorkspace(ttk.Frame):
         self._source_cache = {}
         self.video_sync.set(float(metadata.get("video_sync_offset", 0.0) or 0.0))
         self.page = 0
+        remote_count = len(load_remote_video(folder, metadata).get("videos", []))
+        common_count = int(load_common_function_index(folder).get(
+            "occurrence_count", 0) or 0)
         self.summary.set(
-            "Command: {} / {:.1f}秒 / リンク{}件 / Step: {}".format(
+            "Command: {} / {:.1f}秒 / リンク{}件 / YouTube {}本 / 共通関数{}件 / Step: {}".format(
                 metadata.get("command", "-"), float(metadata.get("duration", 0.0) or 0.0),
-                len(events), " / ".join(metadata.get("states", [])[-4:]) or "-"))
+                len(events), remote_count, common_count,
+                " / ".join(metadata.get("states", [])[-4:]) or "-"))
         self.refresh_timeline()
         self.refresh_videos()
         initial_events = self.source_scope_events or events
@@ -773,13 +786,131 @@ class CommandRecordingWorkspace(ttk.Frame):
         if callable(self.open_focus_callback):
             self.open_focus_callback(self.folder)
 
+    def open_common_function_index(self):
+        if not self.folder:
+            messagebox.showinfo(
+                "共通関数索引", "Commands録画を先に読み込んでください。", parent=self)
+            return
+        index = load_common_function_index(self.folder)
+        occurrences = [item for item in index.get("occurrences", [])
+                       if isinstance(item, dict)]
+        if not occurrences:
+            messagebox.showinfo(
+                "共通関数索引",
+                "この録画には共通関数の呼び出し元記録がありません。\n"
+                "InputSetのCommands監視録画で共通3関数の索引化をONにしてください。",
+                parent=self)
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("共通関数 → 呼び出し元 → 録画時刻")
+        dialog.geometry("1040x620")
+        tree = ttk.Treeview(
+            dialog, columns=("time", "caller", "step"),
+            show="tree headings", selectmode="browse")
+        tree.heading("#0", text="グループ / 対象関数 / 呼び出し元 / 発生")
+        tree.heading("time", text="動画時刻")
+        tree.heading("caller", text="直接の呼び出し元")
+        tree.heading("step", text="Step")
+        tree.column("#0", width=400)
+        tree.column("time", width=100, anchor="e")
+        tree.column("caller", width=220)
+        tree.column("step", width=280)
+        scroll = ttk.Scrollbar(dialog, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=8)
+        scroll.pack(side="left", fill="y", pady=8)
+        occurrence_by_item = {}
+        by_group = {}
+        for occurrence in occurrences:
+            group = str(occurrence.get("group_name", "") or "(group)")
+            target = str(occurrence.get("target_function", "") or "(target)")
+            caller = str(occurrence.get("step_owner", "")
+                         or occurrence.get("direct_caller", "") or "(unknown)")
+            by_group.setdefault(group, {}).setdefault(target, {}).setdefault(
+                caller, []).append(occurrence)
+        for group, targets in by_group.items():
+            group_item = tree.insert("", "end", text=group, open=True)
+            for target, callers in targets.items():
+                target_item = tree.insert(group_item, "end", text=target, open=True)
+                for caller, rows in callers.items():
+                    caller_item = tree.insert(
+                        target_item, "end", text=caller,
+                        values=("", caller, ""), open=True)
+                    for occurrence in rows:
+                        when = float(occurrence.get("start_seconds", 0.0) or 0.0)
+                        item = tree.insert(
+                            caller_item, "end",
+                            text="#{}".format(occurrence.get("occurrence", "")),
+                            values=(_clock(when), occurrence.get("direct_caller", ""),
+                                    occurrence.get("step_path", "")))
+                        occurrence_by_item[item] = occurrence
+
+        actions = ttk.Frame(dialog)
+        actions.pack(side="right", fill="y", padx=8, pady=8)
+
+        def selected_occurrence():
+            selected = tree.selection()
+            return occurrence_by_item.get(selected[0]) if selected else None
+
+        def select_timeline():
+            occurrence = selected_occurrence()
+            if not occurrence:
+                return
+            when = float(occurrence.get("start_seconds", 0.0) or 0.0)
+            if self.events:
+                position = min(
+                    max(0, bisect.bisect_left(self.event_times, when)),
+                    len(self.events) - 1)
+                self.select_event(self.events[position], seek=False)
+            dialog.destroy()
+
+        def open_youtube():
+            occurrence = selected_occurrence()
+            if occurrence:
+                self.open_youtube_time(
+                    float(occurrence.get("start_seconds", 0.0) or 0.0))
+
+        ttk.Button(actions, text="タイムラインで選択", command=select_timeline).pack(
+            fill="x", pady=(0, 4))
+        ttk.Button(actions, text="YouTubeで開く", command=open_youtube).pack(
+            fill="x", pady=4)
+        ttk.Button(actions, text="閉じる", command=dialog.destroy).pack(
+            fill="x", pady=(16, 4))
+        tree.bind("<Double-1>", lambda _event: open_youtube())
+
     def seek_comparison_event_time(self, value):
         """Seek a comparison event using this recording's saved link offset."""
-        self.seek_video(float(value or 0.0) + float(self.video_sync.get()))
+        target = float(value or 0.0) + float(self.video_sync.get())
+        if self.video_capture is not None:
+            self.seek_video(target)
+        else:
+            self.open_youtube_time(target)
 
     def seek_current_event(self):
         if self.current_event:
-            self.seek_video(float(self.current_event["video_time"]) + float(self.video_sync.get()))
+            target = float(self.current_event["video_time"]) + float(self.video_sync.get())
+            if self.video_capture is not None:
+                self.seek_video(target)
+            else:
+                self.open_youtube_time(target)
+
+    def open_youtube_time(self, video_time):
+        url = youtube_url_for_time(
+            self.folder, float(video_time or 0.0), self.metadata)
+        if not url:
+            self.status.set("この録画のYouTube URLはまだ確定していません。")
+            return False
+        webbrowser.open(url)
+        self.status.set("YouTubeを録画時刻 {} で開きました。".format(
+            _clock(video_time)))
+        return True
+
+    def open_youtube_current_event(self):
+        if not self.current_event:
+            self.status.set("先にStep／関数イベントを選択してください。")
+            return False
+        return self.open_youtube_time(
+            float(self.current_event["video_time"]) + float(self.video_sync.get()))
 
     def refresh_videos(self):
         candidates = video_candidates(self.folder)
@@ -790,7 +921,17 @@ class CommandRecordingWorkspace(ttk.Frame):
         if labels:
             self.open_video()
         else:
-            self.video_label.configure(image="", text="recording.mp4 / recording.aviが見つかりません。")
+            remote = load_remote_video(self.folder, self.metadata)
+            videos = remote.get("videos", []) if isinstance(remote, dict) else []
+            if videos:
+                self.video_label.configure(
+                    image="",
+                    text=("ローカル動画は処理完了後に削除されています。\n"
+                          "Step／関数を選び［YouTubeでこの時刻を開く］を押してください。"))
+            else:
+                self.video_label.configure(
+                    image="",
+                    text="recording.mp4 / recording.avi / YouTube URLが見つかりません。")
 
     def open_video(self):
         if cv2 is None or Image is None:

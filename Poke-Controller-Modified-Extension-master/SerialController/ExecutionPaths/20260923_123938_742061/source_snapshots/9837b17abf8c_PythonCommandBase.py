@@ -99,11 +99,7 @@ class PythonCommand(CommandBase.Command):
         self._focus_trace_depths = {}
         self._focus_trace_file_cache = {}
         self._focus_trace_lock = threading.Lock()
-        try:
-            self.Line = Line_Notify()
-        except Exception:
-            # LINE Notify API終了後もCommandsを起動できるようにする。
-            self.Line = None
+        self.Line = Line_Notify()
         self.Discord = Discord_Notify()
 
     @staticmethod
