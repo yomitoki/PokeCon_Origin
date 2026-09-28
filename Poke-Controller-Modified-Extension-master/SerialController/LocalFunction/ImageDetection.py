@@ -53,22 +53,43 @@ class SimilarityHistory:
         }
 
 
-def _command_frame(command):
+def read_command_frame(command, timeout=0.75):
+    """Read one camera frame across stock 0.1.9 and extended PokeCon.
+
+    The generic 0.1.9 ``Camera`` exposes ``readFrame`` only, while the
+    extended runtime can also expose ``readFreshFrame``.  Keep that version
+    difference in this copied LocalFunction package instead of requiring a
+    modified ``Commands/PythonCommandBase.py``.
+
+    ``None`` is returned while the input is unavailable.  Callers that need a
+    hard failure can use ``_command_frame`` below.
+    """
     camera = getattr(command, "camera", None)
     if camera is None:
         raise RuntimeError("画像検知にはPokeConのCameraが必要です。")
-    if hasattr(camera, "readFreshFrame"):
+    read_fresh_frame = getattr(camera, "readFreshFrame", None)
+    read_frame = getattr(camera, "readFrame", None)
+    if callable(read_fresh_frame):
         # A momentary DirectShow/Windows scheduling gap is not an input loss.
         # Wait outside Tk for capture to resume, while still refusing the
         # cached final image if the device has genuinely stopped.
-        frame = camera.readFreshFrame(timeout=0.75)
-    elif hasattr(camera, "readFrame"):
-        frame = camera.readFrame()
+        try:
+            frame = read_fresh_frame(timeout=float(timeout))
+        except TypeError:
+            # Compatibility with an implementation that has no timeout arg.
+            frame = read_fresh_frame()
+    elif callable(read_frame):
+        frame = read_frame()
     else:
         # Compatibility for copied LocalFunction modules used with an older
         # Camera implementation.  Current PokeCon always uses readFrame(),
         # which rejects the cached final frame after input has stalled.
         frame = getattr(camera, "image_bgr", None)
+    return frame
+
+
+def _command_frame(command):
+    frame = read_command_frame(command)
     if frame is None:
         raise RuntimeError("Cameraの新しい映像を取得できません（入力停止または切替中）。")
     return frame

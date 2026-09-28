@@ -6,6 +6,7 @@ from .ImageDetection import (
     detect_image,
     format_similarity_summary,
     log_similarity_summary,
+    read_command_frame,
     render_similarity_graph,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "detect_image",
     "format_similarity_summary",
     "log_similarity_summary",
+    "read_command_frame",
     "render_similarity_graph",
 ]
