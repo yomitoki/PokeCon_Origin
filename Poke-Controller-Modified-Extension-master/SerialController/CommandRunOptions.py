@@ -82,7 +82,7 @@ def _label_map(command):
     return result
 
 
-def _state_locations(command, labels, descriptions):
+def _state_locations(command, labels, descriptions, allowed_variables=None):
     methods = {node.name: node for node in command.body
                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
     result = []
@@ -92,6 +92,8 @@ def _state_locations(command, labels, descriptions):
             continue
         name = _assigned_name(statement)
         if not (name.startswith("STATE_") and name.endswith(STATE_SUFFIX)):
+            continue
+        if allowed_variables is not None and name not in allowed_variables:
             continue
         for order, (key, value) in enumerate(zip(
                 statement.value.keys, statement.value.values)):
@@ -246,9 +248,14 @@ def discover_command_run_options(source, class_name=""):
     add_bases(command)
     descriptions = {}
     labels = {}
+    allowed_variables = None
     for node in chain:
         descriptions.update(_description_map(node))
         labels.update(_label_map(node))
+        configured = _class_literal(
+            node, "COMMAND_RUN_STATE_VARIABLES", None)
+        if isinstance(configured, (list, tuple, set, frozenset)):
+            allowed_variables = {str(item) for item in configured}
     locations = []
     for node in reversed(chain):
         locations.extend(_explicit_locations(node))
@@ -256,7 +263,8 @@ def discover_command_run_options(source, class_name=""):
         for node in chain:
             locations.extend(_step_locations(node, labels, descriptions))
             locations.extend(_numbered_route_locations(node))
-            locations.extend(_state_locations(node, labels, descriptions))
+            locations.extend(_state_locations(
+                node, labels, descriptions, allowed_variables))
     seen, unique = set(), []
     for row in locations:
         key = (row.get("mode"), row.get("variable"), row.get("value"))

@@ -6655,6 +6655,12 @@ class PokeControllerApp:
             value = getattr(command_instance, attribute, {})
             if isinstance(value, dict):
                 labels.update(value)
+        configured_variables = getattr(
+            command_instance, "COMMAND_RUN_STATE_VARIABLES", None)
+        allowed_variables = (
+            {str(item) for item in configured_variables}
+            if isinstance(configured_variables, (list, tuple, set, frozenset))
+            else None)
         locations = []
         step_labels = getattr(command_instance, "STEP_LABELS", [])
         step_keys = getattr(command_instance, "STEP_KEYS", [])
@@ -6678,7 +6684,9 @@ class PokeControllerApp:
         for variable, mapping in vars(command_instance).items():
             if (not str(variable).startswith("STATE_")
                     or not str(variable).endswith("_FUNCTION")
-                    or not isinstance(mapping, dict)):
+                    or not isinstance(mapping, dict)
+                    or (allowed_variables is not None
+                        and str(variable) not in allowed_variables)):
                 continue
             for order, state in enumerate(mapping):
                 if not isinstance(state, str):
@@ -6993,8 +7001,21 @@ class PokeControllerApp:
             filter_status.set("{} / {}件".format(len(visible), len(locations)))
             # Filtering is only for finding the next choice. Keep selections
             # made under another chapter/search even when currently hidden.
-            start_value.set(preserve_location_selection(
-                start_value.get(), visible))
+            current_start = start_value.get()
+            current_item = display_to_location.get(current_start, {})
+            if (len(visible) == 1 and
+                    (not current_start or
+                     current_item.get("value") == "MAIN_STATE_INIT")):
+                # A frequent workflow is typing an exact Step and pressing
+                # Start. MAIN_STATE_INIT used to remain selected invisibly,
+                # which saved the searched Step as the *end* and left ZA in
+                # its dispatcher loop. For an exact one-result search, replace
+                # only the untouched default; explicit non-default selections
+                # are still preserved while users search for an end Step.
+                start_value.set(visible[0])
+            else:
+                start_value.set(preserve_location_selection(
+                    current_start, visible))
             end_value.set(preserve_location_selection(
                 end_value.get(), visible, "（終了場所を指定しない）"))
             refresh_description()

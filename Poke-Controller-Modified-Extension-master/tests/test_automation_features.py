@@ -390,6 +390,20 @@ class CommandStartOverrideTests(unittest.TestCase):
              ("main_current_state_init", "MAIN_1_Z_LANK")],
         )
 
+    def test_explicit_parent_route_wins_for_shared_generated_state(self):
+        command = _StartOverrideSample()
+        command.COMMAND_RUN_STATE_PARENTS = {
+            "STATE_1_STORY_FUNCTION": (
+                "STATE_MAIN_FUNCTION", "MAIN_1_Z_LANK"),
+        }
+
+        applied = apply_command_start_override(
+            command, "STATE_1_STORY_FUNCTION", "1_STORY_B")
+
+        self.assertEqual(command._1_story_current_state_init, "1_STORY_B")
+        self.assertEqual(command.main_current_state_init, "MAIN_1_Z_LANK")
+        self.assertEqual(len(applied), 2)
+
 
 class CommandRunOptionsTests(unittest.TestCase):
     def test_filtering_end_chapter_does_not_reset_selected_start(self):
@@ -613,6 +627,27 @@ class Story(StoryBase):
         self.assertEqual(result["locations"][0]["description"],
                          "最初の町から開始")
         self.assertEqual(result["debug_options"][0]["attribute"], "DEBUG")
+
+    def test_command_can_limit_start_picker_to_safe_state_tables(self):
+        result = discover_command_run_options('''
+class Story:
+    COMMAND_RUN_SETTINGS = True
+    COMMAND_RUN_STATE_VARIABLES = (
+        "STATE_MAIN_FUNCTION", "STATE_3_STORY_FUNCTION")
+    def __init__(self):
+        self.STATE_MAIN_FUNCTION = {"MAIN_0_START": self.start}
+        self.STATE_3_STORY_FUNCTION = {"3_STORY_CANARI_6": self.canari}
+        self.STATE_ZA_INFI_MAIN_FUNCTION = {
+            "ZA_INFI_MAIN_START": self.infi}
+    def start(self): return "MAIN_0_START"
+    def canari(self): return "3_STORY_CANARI_6"
+    def infi(self): return "ZA_INFI_MAIN_START"
+''')
+        self.assertEqual(
+            [(row["variable"], row["value"])
+             for row in result["locations"]],
+            [("STATE_MAIN_FUNCTION", "MAIN_0_START"),
+             ("STATE_3_STORY_FUNCTION", "3_STORY_CANARI_6")])
 
     def test_state_display_names_and_descriptions_are_discovered_together(self):
         result = discover_command_run_options('''
@@ -4786,6 +4821,46 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                     prepare_calls[0].lineno, dispatch_calls[0].lineno)
                 self.assertGreater(
                     finish_calls[0].lineno, dispatch_calls[0].lineno)
+
+    def test_za_standalone_infi_main_resets_shared_states_before_start(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+        namespace = {}
+        exec(compile(
+            records["main_za_battle_infi"], source_path, "exec"), namespace)
+
+        class StandaloneInfiCommand:
+            main_za_battle_infi = namespace["main_za_battle_infi"]
+
+            def __init__(self):
+                self.za_infi_main_current_state = "ZA_INFI_QUASAR_LOOP"
+                self.bench_current_state = "BENCH_END"
+                self.battle_current_state = "BATTLE_END"
+                self.quasar_current_state = "QUASAR_END"
+                self.chicketmaxflag = 2
+                self.called = 0
+
+            def ZA_battle_infi_main(self):
+                self.called += 1
+
+        command = StandaloneInfiCommand()
+        self.assertEqual(
+            command.main_za_battle_infi(), "MAIN_ZA_BATTLE_INFI")
+        self.assertEqual(command.called, 1)
+        self.assertEqual(
+            (command.za_infi_main_current_state,
+             command.bench_current_state,
+             command.battle_current_state,
+             command.quasar_current_state,
+             command.chicketmaxflag),
+            ("ZA_INFI_MAIN_START", "BENCH_START", "BATTLE_START",
+             "QUASAR_START", 0))
 
     def test_za_canari6_resets_ticket_once_then_keeps_loop_progress(self):
         source_path = os.path.join(

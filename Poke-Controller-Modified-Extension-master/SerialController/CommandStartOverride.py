@@ -16,6 +16,22 @@ def _method_source(function):
 
 def _find_parent_state(command, child_variable, child_current):
     """Return (mapping name, mapping key, current attribute) for a child loop."""
+    # Large generated Commands can have several functions that reference the
+    # same shared child state table.  Prefer an explicit route when the
+    # command publishes one, so a selected Story Step always enters through
+    # its intended MAIN chapter (not whichever source match is found first).
+    configured = getattr(command, "COMMAND_RUN_STATE_PARENTS", {})
+    parent = configured.get(child_variable) if isinstance(configured, dict) else None
+    if isinstance(parent, (list, tuple)) and len(parent) >= 2:
+        parent_variable = str(parent[0])
+        parent_state = str(parent[1])
+        found, _value, parent_current = resolve_command_value(
+            command, parent_variable)
+        parent_mapping = getattr(command, parent_variable, None)
+        if (found and parent_current and isinstance(parent_mapping, dict)
+                and parent_state in parent_mapping):
+            return parent_variable, parent_state, str(parent_current)
+
     for variable, mapping in vars(command).items():
         if variable == child_variable or not isinstance(mapping, dict):
             continue
