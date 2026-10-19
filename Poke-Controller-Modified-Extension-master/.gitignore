@@ -16,6 +16,7 @@
 !ExecutePokeConModified-Extension.bat
 !SetupPokeConPythonEnvironments.bat
 !UpdatePokeConModified-Extension.bat
+!PokeConStudio.bat
 !PokeCon_固まり復旧.bat
 !PokeCon_録画同期修復.bat
 .idea/

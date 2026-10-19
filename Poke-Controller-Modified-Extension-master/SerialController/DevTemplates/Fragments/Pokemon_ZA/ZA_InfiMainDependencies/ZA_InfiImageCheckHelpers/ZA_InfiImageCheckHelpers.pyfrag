@@ -76,6 +76,32 @@ def image_check(self, targetimage, nocheckflag=1):
     return matched
 
 
+def image_check_confirmation(self, targetimage, first_match=False):
+    """Reject numbered SELECT matches on FIELD, battle-level, or RPush screens."""
+    del first_match  # image_check hook compatibility
+    select_targets = {
+        "POKEMON_ZA_1_SELECT",
+        "POKEMON_ZA_2_SELECT",
+        "POKEMON_ZA_2_SELECT_TUTORIAL",
+        "POKEMON_ZA_3_SELECT",
+        "POKEMON_ZA_3_SELECT_SELECT",
+        "POKEMON_ZA_3_SELECT_TUTORIAL",
+        "POKEMON_ZA_4_SELECT",
+    }
+    if str(targetimage) not in select_targets:
+        return True
+
+    # FIELD_W／FIELD_BACK_Wは前後向きと手持ち番号を包含する。
+    # さらに戦闘中の固定Lv.表示やRPush表示がある画面も選択肢では
+    # ないため、いずれか一つでも存在する間はSELECT一致を採用しない。
+    return not (
+        self.image_check("POKEMON_ZA_FIELD_W")
+        or self.image_check("POKEMON_ZA_FIELD_BACK_W")
+        or self.image_check("POKEMON_ZA_BATTLE_ACTIVE_LEVEL")
+        or self.image_check("POKEMON_ZA_R_push")
+    )
+
+
 def image_check_exception(self, targetimage):
     """Handle Pokemon ZA checks that do not use a template image."""
     if targetimage in ("POKEMON_ZA_TRUE_RETURN", "TRUE_RETURN", "RETURN_TRUE", "RETURN TRUE"):

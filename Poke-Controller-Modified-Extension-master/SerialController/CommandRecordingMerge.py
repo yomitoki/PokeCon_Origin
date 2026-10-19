@@ -14,6 +14,36 @@ import uuid
 from CommandFunctionIndex import write_common_function_index
 
 
+MERGE_VIDEO_SOURCE_NAME = "recording.youtube_merge.avi"
+MERGE_WAV_SOURCE_NAME = "recording.youtube_merge.wav"
+
+
+class CommandRecordingSourceValidationError(RuntimeError):
+    """A closed source recording cannot become valid by waiting/retrying."""
+
+    def __init__(self, message, code="source_invalid", source_index=None,
+                 source_chunk_id="", retryable=False):
+        super().__init__(message)
+        self.code = str(code or "source_invalid")
+        self.source_index = source_index
+        self.source_chunk_id = str(source_chunk_id or "")
+        self.retryable = bool(retryable)
+
+
+def _merge_source_media_path(source_dir, media_type):
+    """Prefer the hard-link protected from legacy per-clip finalizers."""
+    names = {
+        "video": (MERGE_VIDEO_SOURCE_NAME, "recording.avi"),
+        "audio": (MERGE_WAV_SOURCE_NAME, "recording.wav"),
+    }
+    if media_type not in names:
+        raise ValueError("結合元メディア種別が不正です。")
+    alias_name, original_name = names[media_type]
+    alias = os.path.join(source_dir, alias_name)
+    return alias if os.path.isfile(alias) else os.path.join(
+        source_dir, original_name)
+
+
 def find_ffmpeg():
     executable = shutil.which("ffmpeg")
     if executable:
@@ -132,34 +162,60 @@ def _presentation_timing_info(source_dir):
         return None
 
 
-def _validated_chunk_media(chunks, source_dirs, strict=True):
+def _validated_chunk_media(chunks, source_dirs, strict=True,
+                           allow_low_presentations=False):
     """Use real AVI lengths and reject a grossly stalled preview source."""
     result = []
     for index, (chunk, source_dir) in enumerate(
             zip(chunks, source_dirs), start=1):
-        path = os.path.join(source_dir, "recording.avi")
+        path = _merge_source_media_path(source_dir, "video")
         declared = _chunk_duration(chunk)
         measured = _video_duration_info(path)
         if measured is None:
             if strict:
-                raise RuntimeError(
+                raise CommandRecordingSourceValidationError(
                     "分割録画{}の実映像時間を確認できません。元録画は削除しません。"
-                    .format(index))
+                    .format(index), code="video_unreadable",
+                    source_index=index,
+                    source_chunk_id=chunk.get("id", ""), retryable=True)
             measured = {
                 "fps": 0.0, "frames": 0, "duration": declared,
             }
         actual = max(0.0, float(measured["duration"]))
         tolerance = max(1.0, 3.0 / max(1.0, float(measured["fps"])))
         if declared > actual + tolerance:
-            raise RuntimeError(
+            raise CommandRecordingSourceValidationError(
                 "分割録画{}は管理上{:.1f}秒ですが実映像は{:.1f}秒です。"
                 "ループまたは停止後映像が欠落しているため、結合せず元録画を保持します。"
-                .format(index, declared, actual))
+                .format(index, declared, actual), code="video_too_short",
+                source_index=index,
+                source_chunk_id=chunk.get("id", ""))
 
         timing = _presentation_timing_info(source_dir)
+        quality_warnings = []
+        if (allow_low_presentations
+                and (timing is None
+                     or timing["elapsed_seconds"] <= 0.0)):
+            raise CommandRecordingSourceValidationError(
+                "分割録画{}はCommands録画時間を確認できません。"
+                "時間ずれを判定できないため、結合せず元録画を保持します。"
+                .format(index), code="recording_timing_unavailable",
+                source_index=index,
+                source_chunk_id=chunk.get("id", ""))
         if timing is not None:
             elapsed = timing["elapsed_seconds"]
             presentations = timing["presentation_frames"]
+            timing_tolerance = max(
+                0.25, 3.0 / max(1.0, float(measured["fps"])))
+            if ((allow_low_presentations or elapsed >= 1.0)
+                    and abs(actual - elapsed) > timing_tolerance):
+                raise CommandRecordingSourceValidationError(
+                    "分割録画{}はCommands録画時間{:.1f}秒に対して"
+                    "実映像が{:.1f}秒です。時間ずれがあるため、"
+                    "結合せず元録画を保持します。".format(
+                        index, elapsed, actual),
+                    code="recording_time_mismatch", source_index=index,
+                    source_chunk_id=chunk.get("id", ""))
             # A static game screen still produces preview presentations. A
             # one-frame-per-several-seconds value instead means the Tk/video
             # feed was blocked and the CFR writer only duplicated an old
@@ -167,15 +223,69 @@ def _validated_chunk_media(chunks, source_dirs, strict=True):
             # 60-second failure evidence.
             minimum_presentations = int(max(2.0, elapsed * 0.5))
             if elapsed >= 5.0 and presentations < minimum_presentations:
-                raise RuntimeError(
+                message = (
                     "分割録画{}は{:.1f}秒中、実表示フレームが{}枚しかありません。"
-                    "ループ映像が欠落しているため、結合せず元録画を保持します。"
                     .format(index, elapsed, presentations))
+                if not allow_low_presentations:
+                    raise CommandRecordingSourceValidationError(
+                        message
+                        + "ループ映像が欠落しているため、結合せず元録画を保持します。",
+                        code="low_presentation_rate", source_index=index,
+                        source_chunk_id=chunk.get("id", ""))
+                # The CFR AVI still contains the complete recorded duration,
+                # but repeats the last presented image while the preview/UI was
+                # stalled.  Rolling YouTube archival favors forward progress;
+                # preserve that limitation as durable metadata instead of
+                # blocking every later two-hour segment forever.
+                quality_warnings.append({
+                    "code": "low_presentation_rate",
+                    "message": (
+                        message
+                        + "録画済み映像には同一画面の繰り返しが含まれます。"),
+                    "elapsed_seconds": elapsed,
+                    "presentation_frames": presentations,
+                    "minimum_presentations": minimum_presentations,
+                })
         item = dict(measured)
         item["declared_duration"] = declared
         item["presentation"] = timing or {}
+        item["quality_warnings"] = quality_warnings
         result.append(item)
     return result
+
+
+def validate_command_recording_sources(chunks, output_root,
+                                       allow_low_presentations=False,
+                                       strict=True):
+    """Validate closed source AVIs before journaling or starting FFmpeg."""
+    ordered = sorted(
+        [dict(chunk) for chunk in chunks],
+        key=lambda chunk: (
+            str(chunk.get("started_wall", "")),
+            float(chunk.get("started", 0.0) or 0.0)))
+    if not ordered:
+        raise ValueError("結合対象の分割録画がありません。")
+    root = os.path.abspath(output_root)
+    source_dirs = [
+        _safe_source_directory(root, chunk.get("session_dir", ""))
+        for chunk in ordered
+    ]
+    video_paths = [
+        _merge_source_media_path(path, "video") for path in source_dirs]
+    missing = next((
+        (index, path, ordered[index - 1])
+        for index, path in enumerate(video_paths, start=1)
+        if not os.path.isfile(path)), None)
+    if missing is not None:
+        index, path, chunk = missing
+        raise CommandRecordingSourceValidationError(
+            "結合元の録画が見つかりません: "
+            + os.path.basename(os.path.dirname(path)),
+            code="video_missing", source_index=index,
+            source_chunk_id=chunk.get("id", ""))
+    return _validated_chunk_media(
+        ordered, source_dirs, strict=strict,
+        allow_low_presentations=allow_low_presentations)
 
 
 def _create_loop_skip_media(source_video, source_wav, building, index,
@@ -354,7 +464,8 @@ def _copy_timeline_snapshot(event, source_dir, building, prefix):
 
 def merge_command_recording_chunks(chunks, output_root, session_id,
                                    ffmpeg_path=None, run_command=None,
-                                   now=None):
+                                   now=None, allow_low_presentations=False,
+                                   prevalidated_source_media=None):
     """Create one MP4 plus combined Step/log files; source folders stay intact."""
     chunks = sorted(
         [dict(chunk) for chunk in chunks],
@@ -373,14 +484,29 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
         _safe_source_directory(root, chunk.get("session_dir", ""))
         for chunk in chunks
     ]
-    video_paths = [os.path.join(path, "recording.avi") for path in source_dirs]
-    missing = [path for path in video_paths if not os.path.isfile(path)]
-    if missing:
-        raise OSError("結合元の録画が見つかりません: " + os.path.basename(os.path.dirname(missing[0])))
+    video_paths = [
+        _merge_source_media_path(path, "video") for path in source_dirs]
+    missing = next((
+        (index, path, chunks[index - 1])
+        for index, path in enumerate(video_paths, start=1)
+        if not os.path.isfile(path)), None)
+    if missing is not None:
+        index, path, chunk = missing
+        raise CommandRecordingSourceValidationError(
+            "結合元の録画が見つかりません: "
+            + os.path.basename(os.path.dirname(path)),
+            code="video_missing", source_index=index,
+            source_chunk_id=chunk.get("id", ""))
 
     use_default_runner = run_command is None
-    source_media = _validated_chunk_media(
-        chunks, source_dirs, strict=use_default_runner)
+    if prevalidated_source_media is None:
+        source_media = _validated_chunk_media(
+            chunks, source_dirs, strict=use_default_runner,
+            allow_low_presentations=allow_low_presentations)
+    else:
+        source_media = [dict(item) for item in prevalidated_source_media]
+        if len(source_media) != len(chunks):
+            raise ValueError("事前検証した結合元情報の件数が一致しません。")
     source_durations = [float(item["duration"]) for item in source_media]
 
     ffmpeg_path = ffmpeg_path or find_ffmpeg()
@@ -398,7 +524,8 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
     os.makedirs(building)
 
     try:
-        wav_paths = [os.path.join(path, "recording.wav") for path in source_dirs]
+        wav_paths = [
+            _merge_source_media_path(path, "audio") for path in source_dirs]
         has_complete_audio = all(os.path.isfile(path) for path in wav_paths)
         loop_gaps = {}
         for chunk_index in range(1, len(chunks)):
@@ -466,8 +593,13 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
             "text": True,
         }
         if use_default_runner and os.name == "nt":
-            run_options["creationflags"] = getattr(
-                subprocess, "CREATE_NO_WINDOW", 0x08000000)
+            # PokeCon itself may run above normal priority to preserve Camera,
+            # preview, and controller timing.  A long two-hour x264 merge must
+            # use only otherwise-idle CPU instead of inheriting that priority.
+            run_options["creationflags"] = (
+                getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+                | getattr(subprocess, "IDLE_PRIORITY_CLASS", 0x00000040)
+            )
         completed = run_command(command, **run_options)
         if completed.returncode != 0 or not os.path.isfile(output_media):
             detail = str(getattr(completed, "stderr", "") or "")[-500:]
@@ -478,10 +610,10 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
                 raise RuntimeError(
                     "結合MP4の実映像時間を確認できません。元録画は削除しません。")
             output_duration = float(output_info["duration"])
-            if output_duration + 1.0 < duration:
+            if abs(output_duration - duration) > 1.0:
                 raise RuntimeError(
                     "結合MP4は予定{:.1f}秒に対して実映像{:.1f}秒です。"
-                    "ループまたは停止後映像が欠落しているため、元録画を保持します。"
+                    "時間ずれがあるため、元録画を保持します。"
                     .format(duration, output_duration))
 
         step_output = os.path.join(building, "steps.jsonl")
@@ -611,6 +743,14 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
             for chunk in chunks
             if chunk.get("recording_video_mode"))
         youtube_archive = dict(chunks[0].get("youtube_archive", {}) or {})
+        source_quality_warnings = []
+        for source_index, (chunk, media) in enumerate(
+                zip(chunks, source_media), start=1):
+            for warning in media.get("quality_warnings", []):
+                item = dict(warning)
+                item["source_index"] = source_index
+                item["source_chunk_id"] = str(chunk.get("id", ""))
+                source_quality_warnings.append(item)
         runtime_chunk = {
             "id": chunk_id,
             "session_dir": destination,
@@ -621,6 +761,11 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
             # If even one source was explicitly protected, the merged result
             # must inherit that protection before source folders are removed.
             "pinned": any(bool(chunk.get("pinned")) for chunk in chunks),
+            "monitor_retention_mode": (
+                "keep_all" if any(
+                    str(chunk.get("monitor_retention_mode", ""))
+                    .strip().lower() == "keep_all" for chunk in chunks)
+                else "smart"),
             "loop_anchor": False,
             "delete_pending": False,
             "command": str(chunks[0].get("command", "")),
@@ -629,6 +774,7 @@ def merge_command_recording_chunks(chunks, output_root, session_id,
             "source_chunk_ids": [str(chunk.get("id", "")) for chunk in chunks],
             "duration_saved": duration,
             "source_media": source_media,
+            "source_quality_warnings": source_quality_warnings,
             "recording_video_mode": recording_video_modes[0]
             if len(recording_video_modes) == 1
             else ("mixed" if recording_video_modes else ""),

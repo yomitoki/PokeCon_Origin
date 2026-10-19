@@ -1,7 +1,8 @@
 param(
     [ValidateSet("menu", "314", "314t", "312", "37", "last")]
     [string]$Runtime = "menu",
-    [switch]$CheckOnly
+    [switch]$CheckOnly,
+    [switch]$OpenPokeConStudio
 )
 
 $ErrorActionPreference = "Stop"
@@ -345,6 +346,9 @@ try {
         $windowArguments = @($windowScript)
         if ($script:startMaximized) {
             $windowArguments += "--start-maximized"
+        }
+        if ($OpenPokeConStudio) {
+            $windowArguments += "--open-pokecon-studio"
         }
         & $pythonPath @windowArguments
         $windowExitCode = $LASTEXITCODE

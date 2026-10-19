@@ -6,6 +6,56 @@ from __future__ import print_function
 import ast
 
 
+def _literal_dict(node, default=None):
+    try:
+        value = ast.literal_eval(node)
+    except (ValueError, TypeError, SyntaxError):
+        return {} if default is None else default
+    return value if isinstance(value, dict) else ({} if default is None else default)
+
+
+def _name(node):
+    if isinstance(node, ast.Name):
+        return node.id
+    return ""
+
+
+def _apply_literal_updates(tree, targets, operators, descriptions):
+    """Apply generated/managed ``dict.update`` blocks without executing source."""
+    calls = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "update" and node.args
+    ]
+    calls.sort(key=lambda node: (
+        int(getattr(node, "lineno", 1)),
+        int(getattr(node, "col_offset", 0))))
+    for call in calls:
+        values = _literal_dict(call.args[0])
+        if not values:
+            continue
+        owner = call.func.value
+        container = _name(owner)
+        if container == "IMAGE_DETECTION_TARGETS":
+            targets.update(values)
+        elif container == "IMAGE_DETECTION_OPERATORS":
+            operators.update(values)
+        elif container == "IMAGE_DETECTION_DESCRIPTIONS":
+            descriptions.update(values)
+        elif isinstance(owner, ast.Call) \
+                and isinstance(owner.func, ast.Attribute) \
+                and owner.func.attr == "setdefault" \
+                and _name(owner.func.value) == "IMAGE_DETECTION_DESCRIPTIONS" \
+                and owner.args:
+            try:
+                section = ast.literal_eval(owner.args[0])
+            except (ValueError, TypeError, SyntaxError):
+                continue
+            if section == "targets":
+                descriptions.setdefault("targets", {}).update(values)
+
+
 def parse_source_settings(source):
     tree = ast.parse(source)
     assignments = {}
@@ -18,14 +68,16 @@ def parse_source_settings(source):
                 assignments[name] = node.value
     try:
         targets = ast.literal_eval(assignments["IMAGE_DETECTION_TARGETS"])
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError, TypeError, SyntaxError):
         raise ValueError("ソースにIMAGE_DETECTION_TARGETSがありません。")
     if not isinstance(targets, dict):
         raise ValueError("IMAGE_DETECTION_TARGETSの形式が正しくありません。")
-    try: operators = ast.literal_eval(assignments["IMAGE_DETECTION_OPERATORS"])
-    except (KeyError, ValueError, TypeError): operators = {}
-    try: descriptions = ast.literal_eval(assignments["IMAGE_DETECTION_DESCRIPTIONS"])
-    except (KeyError, ValueError, TypeError): descriptions = {}
+    operators = _literal_dict(
+        assignments.get("IMAGE_DETECTION_OPERATORS"), {})
+    descriptions = _literal_dict(
+        assignments.get("IMAGE_DETECTION_DESCRIPTIONS"), {})
+    _apply_literal_updates(
+        tree, targets, operators, descriptions)
     result = {}
     for name, variants in targets.items():
         if not isinstance(variants, list):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import copy
 import difflib
 import hashlib
@@ -18,13 +19,16 @@ import cv2
 import numpy as np
 import platform
 import queue
+import stat
 import subprocess
 import threading
 import time
 import types
+import uuid
 import webbrowser
 from collections import deque
 from pathlib import Path
+import tkinter as tk
 import tkinter.ttk as ttk
 import tkinter.messagebox as tkmsg
 import Constant
@@ -43,6 +47,11 @@ try:
 except Exception:
     flag_import_plyer = False
 from Camera import Camera
+from CommandDebugPanel import CommandDebugPanel
+from CommandDebugTools import TimedPulseJob, execute_timed_pulse, enqueue_timed_pulse
+from CommandDebugEvidence import save_debug_evidence
+from PokeConRestart import (prepare_restart_state, consume_restart_state,
+                            build_restart_argv, discard_restart_state)
 import Settings
 from CommandLoader import CommandLoader, FileCommandLoader
 from GuiAssets import CaptureArea, ControllerGUI
@@ -67,7 +76,10 @@ from ImageDetectionMonitor import (crop_search_region, filter_target_names,
 from AnalysisRules import AnalysisRuleEngine, ANALYSIS_TYPES, CONDITION_TYPES
 from ObjectDetectionAssist import ObjectDetectionAssistWindow
 from DiskSpaceGuard import disk_space_violations
-from Recording import CaptureRecorder, DETECTION_STOP_REQUESTED
+from Recording import (CaptureRecorder, DETECTION_STOP_REQUESTED,
+                       FinalizeJobAlreadyRunning,
+                       prepare_segment_merge_source_alias,
+                       retire_finalize_manifest_for_segment_merge)
 from CommandMonitorRecording import (CommandInputActivityTracker,
                                      CommandStateTimeline, DarkStillFrameDetector,
                                      apply_stopped_session_recording_choice,
@@ -78,10 +90,12 @@ from CommandMonitorRecording import (CommandInputActivityTracker,
                                      historical_retention_ids,
                                      runtime_execution_location,
                                      runtime_execution_snapshot,
-                                     runtime_state_snapshot, state_path_text,
+                                     runtime_state_snapshot, state_path_text, relevant_state_path,
                                      temporary_chunk_ids_for_session,
                                      youtube_rolling_chunk_ids)
-from CommandRecordingMerge import merge_command_recording_chunks
+from CommandRecordingMerge import (CommandRecordingSourceValidationError,
+                                   merge_command_recording_chunks,
+                                   validate_command_recording_sources)
 from CommandFocusRepair import (matching_focus_functions,
                                 parse_focus_function_targets)
 from CommandFunctionIndex import (enabled_common_function_groups,
@@ -92,11 +106,20 @@ from YouTubeArchive import (COMMANDS_VIDEO_MODE_CHOICES,
                             COMMANDS_VIDEO_MODE_POKECON_WINDOW,
                             COMMANDS_VIDEO_MODE_VIDEO_ONLY,
                             authorize_installed_app, channel_profile_names,
+                            cancel_upload_job,
                             channel_store_path, commands_video_mode_label,
+                            completed_upload_has_remote_proof,
                             enqueue_upload_job, launch_upload_worker,
+                            _cleanup_session_identity_matches,
+                            _recording_media_source_identity,
+                            _source_identity_matches,
+                            _upload_job_identity_error,
+                            _upload_job_schema_error,
                             load_channel_store, normalize_commands_video_mode,
+                            release_upload_job_local_commit,
                             remove_channel_profile, set_default_channel_profile,
-                            upload_queue_dir)
+                            resume_upload_jobs_for_profile,
+                            upload_job_is_actionable, upload_queue_dir)
 from CommandRecoveryScripts import (CommandRecoveryExecutor,
                                     delete_recovery_favorite,
                                     normalize_recovery_favorites,
@@ -116,6 +139,7 @@ from AutomationTriggers import (StableRuleEvaluator, discover_state_values,
 from CommandStartOverride import apply_command_start_override
 from CommandRunOptions import (apply_command_run_options,
                                discover_command_run_options,
+                               discover_runtime_debug_options,
                                preserve_location_selection)
 from ControllerInputLog import rotate_log_range, python_replacement_body, replay_recording
 from StepDebugAssist import (DELETE_OPERATION_CODE, derive_follow_step_rule,
@@ -128,8 +152,12 @@ from StepDebugSource import (apply_operation_replacements,
                              extract_state_method_info,
                              find_sample_function_files,
                              split_mixed_step_rule)
-from QuickActions import (ACTION_BY_ID, ACTION_DEFINITIONS, POSITIONS,
-                          normalize_action_ids, normalize_position)
+from QuickActions import (ACTION_BY_ID, ACTION_DEFINITIONS, MAIN_PANEL_ACTION_IDS,
+                          POSITIONS, compact_log_height_budget,
+                          compact_log_panel_heights,
+                          main_panel_controls_layout,
+                          normalize_action_ids, normalize_main_panel_controls,
+                          normalize_position)
 from InputSetData import (COMMAND_INPUT_SET_VARIABLES, INPUT_SET_VARIABLES,
                           SCHEMA_VERSION,
                           has_complete_snapshot, legacy_combined_snapshot,
@@ -150,6 +178,7 @@ from InputSetRuntimeRegistry import (ActiveInputSetRegistry,
 from PokeConRecovery import show_recovery_dialog
 from ProcessShutdown import (active_recording_finalize_worker_pid,
                              launch_recording_finalize_worker,
+                             process_is_alive,
                              terminate_after_gui_shutdown)
 from ResourceControl import (SystemCpuSampler, clamp_cpu_target,
                              resource_throttle_level,
@@ -199,9 +228,55 @@ sys.path.append(addpath)
 WINDOW_CAPTURE_CLIENT_LABEL = "ゲーム画面のみ（タイトルバーなし）"
 WINDOW_CAPTURE_WINDOW_LABEL = "ウィンドウ全体（タイトルバーあり）"
 
+COMMAND_MONITOR_RETENTION_SMART = "smart"
+COMMAND_MONITOR_RETENTION_KEEP_ALL = "keep_all"
+COMMAND_MONITOR_DELETE_MARKER_SUFFIX = ".commands-delete.json"
+COMMAND_MONITOR_DELETE_SLOW_RETRY_SECONDS = 60.0
+# A just-closed AVI can be temporarily unreadable while Windows or antivirus
+# software releases a handle.  Escalate only after the same immutable file has
+# failed throughout a five-minute window, then quarantine that source so later
+# valid intervals can continue.
+COMMAND_YOUTUBE_UNREADABLE_ATTENTION_ATTEMPTS = 12
+COMMAND_YOUTUBE_UNREADABLE_ATTENTION_SECONDS = 300.0
+
+
+def normalize_command_monitor_retention_mode(value):
+    """Return the stable Commands recording retention mode key."""
+    text = str(value or "").strip().lower()
+    if text in (COMMAND_MONITOR_RETENTION_KEEP_ALL, "all", "full", "keep-all"):
+        return COMMAND_MONITOR_RETENTION_KEEP_ALL
+    return COMMAND_MONITOR_RETENTION_SMART
+
+
+def _youtube_queue_recording_window(job, metadata):
+    """Return a human-readable recording range without opening the media."""
+    job = job if isinstance(job, dict) else {}
+    metadata = metadata if isinstance(metadata, dict) else {}
+    started = str(metadata.get("started_wall", "") or "").strip()
+    ended = str(metadata.get("ended_wall", "") or "").strip()
+    try:
+        duration = float(
+            job.get("duration_seconds", 0.0)
+            or metadata.get("duration", 0.0)
+            or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    duration = max(0.0, duration)
+    if started and not ended and duration:
+        for pattern in ("%Y/%m/%d %H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+            try:
+                started_at = datetime.datetime.strptime(started, pattern)
+            except ValueError:
+                continue
+            ended_at = started_at + datetime.timedelta(seconds=duration)
+            ended = ended_at.strftime(pattern)
+            break
+    return started or "-", ended or "-", duration
+
 
 class PokeControllerApp:
-    def __init__(self, master=None, profile="default", start_maximized=False):
+    def __init__(self, master=None, profile="default", start_maximized=False,
+                 restart_state=None):
         self._logger = getLogger(__name__)
         self._logger.addHandler(NullHandler())
 
@@ -214,6 +289,15 @@ class PokeControllerApp:
         # Set only after the controlled close path has saved settings and
         # released recording, audio, camera, and shared runtime resources.
         self._process_exit_ready = False
+        self._restart_state = copy.deepcopy(restart_state)
+        self._restart_restoring_devices = bool(restart_state)
+        self._restart_restoring_snapshot = bool(restart_state)
+        self._restart_skip_camera = bool(restart_state and
+            restart_state["input_set_data"]["camera"].get("enabled") is False)
+        self._restart_requested_snapshot = None
+        self._restart_launch_argv = None
+        self._command_debug_restart_request = None
+        self._restart_needs_start_confirmation = bool(restart_state)
         self._main_thread = threading.current_thread()
         self._gui_action_queue = queue.Queue()
         self._pending_panel_outputs = {}
@@ -256,6 +340,9 @@ class PokeControllerApp:
         # Menubar and watch widgets are created before the asynchronous command
         # import finishes.  Keep a stable placeholder during that interval.
         self.cur_command = None
+        self._command_debug_pulse_job = None
+        self._command_debug_retest_request = None
+        self._command_debug_capture_busy = False
         self.py_classes = []
         self.sample_py_classes = []
         self.mcu_classes = []
@@ -281,6 +368,7 @@ class PokeControllerApp:
         self._operation_disk_last_check = 0.0
         self._operation_disk_last_ok = True
         self._operation_disk_interrupt_queued = False
+        self._operation_disk_violation_key = None
         self._operation_input_queue = queue.Queue()
         self._operation_input_accepting = False
         self._operation_input_writer = threading.Thread(
@@ -297,9 +385,20 @@ class PokeControllerApp:
         self._command_step_frame_queue = queue.Queue(maxsize=256)
         self._command_monitor_lock = threading.Lock()
         self._command_monitor_stop_in_progress = False
-        # Commands must not keep sending inputs when the visible capture is a
-        # sustained black/still frame. This detector is independent from the
-        # optional monitor recording so a recording failure cannot disable it.
+        # A rotated Commands chunk is prepared away from Tk.  Only one owner
+        # may call CaptureRecorder.start/stop during that handoff; the
+        # generation token prevents a late worker from publishing after Stop,
+        # Exit, an InputSet switch, or a command/session change.
+        self._command_monitor_start_generation = 0
+        self._command_monitor_start_request = None
+        self._command_monitor_start_thread = None
+        self._command_monitor_metadata_journal_lock = threading.Lock()
+        self._command_monitor_metadata_journal_threads = set()
+        self._command_monitor_protection_failures = set()
+        self._command_monitor_adjustment_protect_request = None
+        # Optional dark/still recovery is independent from monitor recording.
+        # Its Commands pause is disabled by default through the Commands-tab
+        # setting initialized while that recording page is built.
         self._commands_dark_safety_detector = DarkStillFrameDetector()
         self._commands_dark_safety_command = None
         self._commands_dark_safety_paused_command = None
@@ -333,12 +432,42 @@ class PokeControllerApp:
         # until the configured image is actually found.
         self.record_armed = False
         self._template_recording_stop_in_progress = False
+        self._recording_stop_callbacks = []
+        self._recording_stop_discard_requested = False
+        self._youtube_recording_rotation_in_progress = False
+        self._youtube_recording_rotation_continue = False
+        self._youtube_recording_rotation_thread = None
+        self._youtube_recording_rotation_retry_after = 0.0
+        self._youtube_upload_watchdog_id = None
+        self._youtube_queue_snapshot_lock = threading.Lock()
+        self._youtube_queue_snapshot_active = False
+        self._youtube_queue_snapshot_callbacks = []
+        self._youtube_queue_snapshot_resume_requested = False
+        self._youtube_queue_snapshot_resume_revision = 0
+        self._youtube_queue_snapshot = {"store": {}, "jobs": []}
+        self._youtube_channel_store_cache = {}
+        self._youtube_handoff_recorder = None
+        self._youtube_retiring_recorders = []
         self._template_finalize_after_stop = False
         self._template_exit_after_stop = False
+        self._command_monitor_exit_after_stop = False
         self._template_finalize_launched_paths = set()
+        self._startup_finalizer_discovery_active = False
+        self._startup_finalizer_discovery_generation = 0
         self._record_disk_last_check = 0.0
         self._record_disk_last_ok = True
+        self._record_disk_interrupt_queued = False
         self._record_disk_violation_key = None
+        # Capacity queries walk parent folders and call shutil.disk_usage().
+        # Keep both operations away from Tk/camera callbacks and publish only
+        # snapshots whose complete path/configuration key is still current.
+        self._disk_probe_lock = threading.Lock()
+        self._disk_probe_active = {}
+        self._disk_probe_pending = {}
+        self._disk_probe_results = {}
+        self._disk_probe_continuations = {"recording": {}, "operation": {}}
+        self._recording_disk_config_generation = 0
+        self._operation_disk_config_generation = 0
         self._last_vision_text = ""
         self.Line = None
         self.Discord = None
@@ -359,8 +488,12 @@ class PokeControllerApp:
         self.quick_actions_right_position = tk.StringVar(value="上")
         self.quick_actions_left_items = []
         self.quick_actions_right_items = []
+        self.main_panel_controls_in_quick_actions = tk.BooleanVar(value=False)
         self._quick_actions_window = None
         self._quick_action_proxy_buttons = []
+        self._main_panel_proxy_buttons = []
+        self._main_panel_compact_geometry_after = None
+        self._main_panel_compact_quick_rows = 0
         self._quick_action_sync_after = None
 
         self.pokeconname = Constant.NAME
@@ -461,6 +594,12 @@ class PokeControllerApp:
             command=self._resource_main_changed)
         self.keep_preview_fps_checkbox.grid(
             column="7", padx="8", pady="5", row="0", sticky="ew")
+        self.main_panel_compact_checkbox = ttk.Checkbutton(
+            self.top_command_f, text="MainPanel操作をクイック側へ移動",
+            variable=self.main_panel_controls_in_quick_actions,
+            command=self._main_panel_controls_layout_changed)
+        self.main_panel_compact_checkbox.grid(
+            column="8", padx="5", pady="5", row="0", sticky="w")
         self.preview_status_f = ttk.Frame(self.main_panel_header_f)
         self.preview_status_f.grid(
             column="0", columnspan="8", padx="5", pady=(0, 3),
@@ -938,6 +1077,12 @@ class PokeControllerApp:
             variable=self.record_storage_destination,
             command=lambda: self._set_record_storage_destination(
                 "youtube", open_tab=True)).pack(side="left", padx=(0, 12), pady=6)
+        ttk.Radiobutton(
+            destination_lf, text="録画なし", value="none",
+            variable=self.record_storage_destination,
+            command=lambda: self._set_record_storage_destination(
+                "none", open_tab=True)).pack(
+                    side="left", padx=(0, 12), pady=6)
         ttk.Label(
             destination_lf, textvariable=self.record_storage_status,
             foreground="#174a7e").pack(side="left", padx=6, pady=6)
@@ -977,6 +1122,8 @@ class PokeControllerApp:
         self.record_youtube_segment_minutes = tk.IntVar(value=120)
         self.record_youtube_commands_video_mode = tk.StringVar(
             value=commands_video_mode_label(COMMANDS_VIDEO_MODE_COMPOSITE))
+        self.record_youtube_commands_allow_low_presentations = (
+            tk.BooleanVar(value=True))
         self.record_youtube_status = tk.StringVar(
             value="YouTubeアップロード: OFF（現在の保存先はPC）")
         self._record_output_dialog = None
@@ -994,6 +1141,7 @@ class PokeControllerApp:
             self._record_compose_lock)
         self._record_compose_queue = deque()
         self._record_compose_active_session = None
+        self._record_compose_active_sessions = set()
         self._record_compose_closing_sessions = set()
         self._record_compose_queue_max_depth = 0
         self._recording_latest_snapshot = None
@@ -1412,8 +1560,28 @@ class PokeControllerApp:
         ttk.Label(self.action_commands_f, textvariable=self.command_start_status,
                   foreground="#174a7e").grid(
                       column="4", columnspan="6", padx="5", pady=(0, 5), row="1", sticky="w")
+        self.command_recovery_auto_pause_checkbox = ttk.Checkbutton(
+            self.action_commands_f,
+            text="自動一時停止・復旧Pythonの自動表示を無効にする（既定ON）",
+            variable=self.command_recovery_auto_pause_disabled,
+            command=self._on_command_recovery_auto_pause_changed)
+        self.command_recovery_auto_pause_checkbox.grid(
+            column="4", columnspan="6", padx="5", pady=(0, 5),
+            row="2", sticky="w")
         self.action_commands_f.configure(height="200", width="200")
         self.action_commands_f.grid(column="0", row="1", sticky="e")
+
+        self.command_debug_panel = CommandDebugPanel(
+            self.commands_f, on_pulse=self._command_debug_pulse,
+            on_capture=self.capture_command_debug_evidence,
+            on_retest=self.retest_current_command_step,
+            on_maximize=self._command_debug_save_maximize,
+            on_stop=self.stop_command_debug_tools,
+            on_restart=self.restart_pokecon_same_settings,
+            on_fresh_start=self.fresh_start_current_command)
+        # Keep the tools BESIDE Commands selection, not below the tall preview.
+        self.command_debug_panel.grid(column=1, row=0, rowspan=2, sticky="new", padx=5, pady=3)
+        self.commands_f.columnconfigure(0, weight=1)
 
         self.commands_f.configure(height="200", width="500")
         self.controller_nb.add(self.commands_tab, padding="0", text="Commands")
@@ -1491,6 +1659,10 @@ class PokeControllerApp:
         ttk.Button(self.others_preset_lf, text="Apply", command=self.load_others_preset).grid(column=3, row=0, padx=2, pady=4)
         ttk.Button(self.others_preset_lf, text="Delete", command=self.delete_others_preset).grid(column=4, row=0, padx=(2, 5), pady=4)
         ttk.Button(self.others_preset_lf, text="Open Dev Studio", command=self.open_dev_studio).grid(column=5, row=0, padx=(2, 5), pady=4)
+        ttk.Button(
+            self.others_preset_lf, text="Open PokeConStudio",
+            command=self.open_pokecon_studio).grid(
+                column=6, row=0, padx=(2, 5), pady=4)
         self.others_preset_lf.grid(column=0, row=0, padx=5, pady=(3, 0), sticky="ew")
         self.othres_outputs_lf = ttk.Labelframe(self.others_f)
         self.outputs_size_adjuster_lf = ttk.Labelframe(self.othres_outputs_lf)
@@ -2348,13 +2520,16 @@ class PokeControllerApp:
         self._startup_combined_item = self._prompt_startup_input_set()
         self._startup_input_item = None
         self._startup_effective_snapshot = {}
+        self._startup_legacy_recording_preset = None
         if self._startup_combined_item:
             startup_input_name = str(self._startup_combined_item.get("input_set", ""))
             self._set_active_input_set(
                 startup_input_name, self._startup_selected_combined_name)
             self.input_set_name.set(startup_input_name)
             startup_data = self._read_input_sets()
-            self._startup_input_item = startup_data["input_sets"].get(startup_input_name)
+            self._startup_input_item = (
+                copy.deepcopy(self._restart_state["input_set_data"])
+                if self._restart_state else startup_data["input_sets"].get(startup_input_name))
             top_assist = self._startup_input_item.get("commands_assist", {}) \
                 if isinstance(self._startup_input_item, dict) else {}
             tab_assist = self._startup_input_item.get("all_tabs", {}).get("commands_assist", {}) \
@@ -2385,13 +2560,21 @@ class PokeControllerApp:
                 # separate Recording preset.  Preserve that only for old data.
                 preset = self._read_recording_presets().get(
                     self._startup_combined_item.get("recording_set", ""))
-                if preset:
-                    self._apply_recording_preset_data(preset)
+                if isinstance(preset, dict):
+                    self._startup_legacy_recording_preset = copy.deepcopy(preset)
                 self._startup_effective_snapshot = legacy_combined_snapshot(
                     self._startup_input_item, self._startup_combined_item)
             self._apply_all_tabs_snapshot(
                 self._startup_effective_snapshot, runtime=False,
-                commands_enabled=startup_uses_commands)
+                commands_enabled=startup_uses_commands,
+                apply_recording=not bool(
+                    self._startup_legacy_recording_preset))
+            if self._startup_legacy_recording_preset:
+                # In a legacy combination the separately selected Recording
+                # set is authoritative over both the legacy InputSet fallback
+                # and any old all_tabs.recording copy.
+                self._apply_recording_preset_data(
+                    self._startup_legacy_recording_preset)
         if self.record_template_path.get():
             self.recorder.configure_template(self.record_template_path.get())
         self.apply_panel_assignment()
@@ -2481,11 +2664,14 @@ class PokeControllerApp:
             if input_item:
                 self._apply_input_set_data(
                     input_item, open_hardware=False,
-                    apply_serial=not isinstance(serial_override, dict))
+                    apply_serial=not isinstance(serial_override, dict),
+                    apply_recording=not bool(
+                        self._startup_legacy_recording_preset))
             if isinstance(serial_override, dict) and not self._startup_skip_hardware:
                 # Schema 3 stores the Serial identity inside the InputSet's
                 # complete snapshot. Sender is created later by the worker.
                 self._apply_serial_input_set(serial_override)
+        self._restart_restoring_devices = False
         if self._startup_skip_hardware:
             self._apply_hardware_unconfigured_selection()
         # open up a camera
@@ -2579,6 +2765,11 @@ class PokeControllerApp:
         self._software_controller_thread = threading.Thread(
             target=self._software_controller_loop, daemon=True, name="SoftwareControllerSender")
         self._software_controller_thread.start()
+        try:
+            debug_preferences = self._read_input_sets().get("command_debug_tools", {})
+            self.command_debug_panel.set_maximize(bool(debug_preferences.get("maximize", False)))
+        except (OSError, ValueError, AttributeError):
+            pass
 
         self.softcon_zl_button.bind("<Button-1>", lambda event, arg=Button.ZL: self.hold(event, arg))
         self.softcon_l_button.bind("<Button-1>", lambda event, arg=Button.L: self.hold(event, arg))
@@ -2683,6 +2874,10 @@ class PokeControllerApp:
 
     def _start_initial_video_open(self):
         """Open the startup video source without blocking Tk's event loop."""
+        if getattr(self, "_restart_skip_camera", False):
+            self._set_camera_unconfigured()
+            self.show_output("Analysis", text="Camera: 再起動前と同じ未接続状態で開始しました。")
+            return
         if self._startup_skip_hardware:
             self._set_camera_unconfigured()
             self.show_output("Analysis", text="Camera: 起動時の選択により未設定で開始しました。")
@@ -3554,7 +3749,7 @@ class PokeControllerApp:
 
         ttk.Button(dialog, text="選択...", command=choose_registration_folder).grid(
             column=2, row=1, padx=(0, 8), pady=5, sticky="w")
-        ttk.Label(dialog, text="例: ZA_Story/Common（Templateフォルダ以下）").grid(
+        ttk.Label(dialog, text="例: ZA_Story_PIC/Common（Templateフォルダ以下）").grid(
             column=1, columnspan=2, row=6, padx=8, pady=(0, 5), sticky="w")
 
         def save_registration():
@@ -4404,12 +4599,16 @@ class PokeControllerApp:
                 except tk.TclError:
                     pass
             if hasattr(self, "top_command_f"):
-                self.top_command_f.grid()
+                self._sync_main_panel_controls_header()
             self.camera_feature_limited_status.set(
                 "通常版：映像上の範囲指定とTk重ね描画を使用できます。")
         preview = getattr(self, "preview", None)
         if preview is not None:
             preview.setFeatureLimited(limited)
+        # Compact proxies must follow the same feature-limited visibility as
+        # the original header, including when this setting changes at runtime.
+        if self._main_panel_controls_compact() and hasattr(self, "panel_widgets"):
+            self.apply_panel_assignment()
         if notify:
             message = ("機能制限版を有効にしました。InputSetへ残すには「変更保存」を押してください。"
                        if limited else
@@ -4903,6 +5102,8 @@ class PokeControllerApp:
 
     def _write_step_debug_rules(self):
         self._write_step_debug_rules_file(self.step_debug_rules)
+        if getattr(self, "_restart_restoring_snapshot", False):
+            return
         self._sync_step_debug_rules_to_active_input_set()
         self._publish_shared_debug()
 
@@ -5240,7 +5441,10 @@ class PokeControllerApp:
         for encoding in ("utf-8", "cp932"):
             try:
                 with open(path, "r", encoding=encoding) as stream:
-                    return stream.read(), encoding
+                    source = stream.read()
+                if source.startswith("\ufeff"):
+                    return source[1:], "utf-8-sig"
+                return source, encoding
             except UnicodeDecodeError:
                 continue
         raise ValueError("ソースの文字コードを判定できません: " + str(path))
@@ -5988,8 +6192,31 @@ class PokeControllerApp:
                               values=(status, operation["line"], context, replacement_label))
             session.setdefault("tree_indices", {})[iid] = index
             index_iids[index] = iid
-        preview_index = next_index if next_index is not None else (
-            operation_count - 1 if operation_count else None)
+        focus_index = None
+        if not session.get("studio_focus_applied"):
+            focus_id = str(rule.get("focus_operation_id", "") or "")
+            if focus_id:
+                focus_index = next((
+                    index for index, operation in enumerate(info["operations"])
+                    if str(operation.get("id", "")) == focus_id), None)
+            if focus_index is None:
+                try:
+                    focus_line = int(rule.get("focus_line", 0) or 0)
+                except (TypeError, ValueError):
+                    focus_line = 0
+                if focus_line and info["operations"]:
+                    focus_index = min(
+                        range(operation_count),
+                        key=lambda index: (
+                            abs(int(info["operations"][index].get(
+                                "line", 0) or 0) - focus_line),
+                            int(info["operations"][index].get(
+                                "line", 0) or 0) > focus_line,
+                            index))
+            session["studio_focus_applied"] = True
+        preview_index = focus_index if focus_index is not None else (
+            next_index if next_index is not None else (
+                operation_count - 1 if operation_count else None))
         if preview_index is not None and preview_index in index_iids:
             tree.selection_set(index_iids[preview_index])
             tree.focus(index_iids[preview_index])
@@ -6605,6 +6832,255 @@ class PokeControllerApp:
             classes = [item for item in classes if getattr(item, "NAME", "") == command_name]
         return classes
 
+    @staticmethod
+    def _resolve_pokecon_studio_source_contexts(
+            source_path, cursor_line, loaded_commands):
+        """Resolve a saved Studio line to loaded Commands without constructing one.
+
+        ``loaded_commands`` is an iterable of ``(kind, class)`` pairs.  The
+        result can intentionally contain more than one item: a single method
+        may be registered for several states, or several loaded Commands may
+        inherit the same base method.  The caller must ask the user to choose
+        rather than silently using the first match.
+        """
+        path = os.path.abspath(str(source_path or ""))
+        if not path or not os.path.isfile(path):
+            raise ValueError("保存済みのPythonソースを特定できません。")
+        try:
+            line = max(1, int(cursor_line))
+        except (TypeError, ValueError):
+            raise ValueError("カーソル行を特定できません。")
+        source, _encoding = PokeControllerApp._read_step_debug_source_file(path)
+        tree = ast.parse(source, filename=path)
+
+        def canonical(value):
+            return os.path.normcase(os.path.realpath(os.path.abspath(value)))
+
+        def node_end_line(node):
+            end = getattr(node, "end_lineno", None)
+            if end is not None:
+                return int(end)
+            return max([
+                int(getattr(item, "lineno", 0) or 0)
+                for item in ast.walk(node)
+            ] or [int(getattr(node, "lineno", 1) or 1)])
+
+        def target_name(target):
+            if isinstance(target, ast.Attribute):
+                return target.attr
+            if isinstance(target, ast.Name):
+                return target.id
+            return ""
+
+        def literal_string(node):
+            constant_type = getattr(ast, "Constant", ())
+            if (isinstance(node, constant_type)
+                    and isinstance(getattr(node, "value", None), str)):
+                return node.value
+            legacy_type = getattr(ast, "Str", ())
+            if (isinstance(node, legacy_type)
+                    and isinstance(getattr(node, "s", None), str)):
+                return node.s
+            return None
+
+        def mapping_pairs(node):
+            if not isinstance(node, ast.Dict):
+                return None
+            pairs = []
+            for key, value in zip(node.keys, node.values):
+                state = literal_string(key)
+                if state is None:
+                    continue
+                if isinstance(value, ast.Attribute):
+                    method = value.attr
+                elif isinstance(value, ast.Name):
+                    method = value.id
+                else:
+                    continue
+                pairs.append((state, method))
+            return pairs
+
+        def state_mappings(class_chain):
+            mappings = {}
+            # inspect.getmro() is derived-to-base; initialization and class
+            # inheritance semantics are approximated base-to-derived here so
+            # a derived table with the same key wins.
+            for class_node in reversed(class_chain):
+                records = []
+                for node in ast.walk(class_node):
+                    if isinstance(node, ast.Assign):
+                        names = [target_name(item) for item in node.targets]
+                        pairs = mapping_pairs(node.value)
+                        for variable in names:
+                            if (pairs is not None
+                                    and variable.startswith("STATE_")
+                                    and variable.endswith("_FUNCTION")):
+                                records.append((
+                                    int(getattr(node, "lineno", 0) or 0),
+                                    "assign", variable, pairs))
+                    elif isinstance(node, ast.AnnAssign):
+                        variable = target_name(node.target)
+                        pairs = mapping_pairs(node.value)
+                        if (pairs is not None
+                                and variable.startswith("STATE_")
+                                and variable.endswith("_FUNCTION")):
+                            records.append((
+                                int(getattr(node, "lineno", 0) or 0),
+                                "assign", variable, pairs))
+                    elif (isinstance(node, ast.Call)
+                            and isinstance(node.func, ast.Attribute)
+                            and node.func.attr == "update" and node.args):
+                        variable = target_name(node.func.value)
+                        pairs = mapping_pairs(node.args[0])
+                        if (pairs is not None
+                                and variable.startswith("STATE_")
+                                and variable.endswith("_FUNCTION")):
+                            records.append((
+                                int(getattr(node, "lineno", 0) or 0),
+                                "update", variable, pairs))
+                for _line, action, variable, pairs in sorted(
+                        records, key=lambda item: item[0]):
+                    if action == "assign":
+                        mappings[variable] = {}
+                    table = mappings.setdefault(variable, {})
+                    for state, method in pairs:
+                        table[state] = method
+            return mappings
+
+        target_path = canonical(path)
+        class_nodes = {}
+        for node in tree.body:
+            if isinstance(node, ast.ClassDef):
+                class_nodes.setdefault(node.name, []).append(node)
+        function_types = (ast.FunctionDef, ast.AsyncFunctionDef)
+        contexts = []
+        seen = set()
+
+        for kind, command_class in list(loaded_commands or []):
+            try:
+                command_mro = inspect.getmro(command_class)
+                command_path = inspect.getsourcefile(command_class)
+            except (AttributeError, OSError, TypeError):
+                continue
+            # The run-option parser can follow inheritance only inside this
+            # saved file.  A base class imported from another file must not be
+            # presented as though the loaded derived Commands could be safely
+            # selected/reloaded from the editor's file.
+            if not command_path or canonical(command_path) != target_path:
+                continue
+            class_chain = []
+            ambiguous_definition = False
+            for base in command_mro:
+                try:
+                    base_path = inspect.getsourcefile(base)
+                except (OSError, TypeError):
+                    base_path = ""
+                if not base_path or canonical(base_path) != target_path:
+                    continue
+                matches = class_nodes.get(getattr(base, "__name__", ""), [])
+                if len(matches) != 1:
+                    ambiguous_definition = ambiguous_definition or len(matches) > 1
+                    continue
+                class_chain.append(matches[0])
+            if not class_chain or ambiguous_definition:
+                continue
+
+            method_nodes = []
+            for class_node in class_chain:
+                for node in class_node.body:
+                    if (isinstance(node, function_types)
+                            and int(getattr(node, "lineno", 0) or 0) <= line
+                            <= node_end_line(node)):
+                        method_nodes.append(node)
+            if not method_nodes:
+                continue
+            smallest_span = min(
+                node_end_line(node) - int(node.lineno)
+                for node in method_nodes)
+            method_nodes = [
+                node for node in method_nodes
+                if node_end_line(node) - int(node.lineno) == smallest_span]
+            mappings = state_mappings(class_chain)
+
+            options = {"enabled": False, "locations": []}
+            command_definitions = class_nodes.get(
+                getattr(command_class, "__name__", ""), [])
+            if len(command_definitions) == 1:
+                options = discover_command_run_options(
+                    source, class_name=command_class.__name__)
+            locations = list(options.get("locations", []))
+
+            for method_node in method_nodes:
+                method_name = method_node.name
+                state_matches = []
+                for variable, table in mappings.items():
+                    for state, handler in table.items():
+                        if handler == method_name:
+                            state_matches.append((variable, state))
+
+                if state_matches:
+                    for variable, state in state_matches:
+                        location = next((
+                            item for item in locations
+                            if item.get("mode") == "state"
+                            and item.get("variable") == variable
+                            and item.get("value") == state), None)
+                        key = (command_class, variable, state, method_name)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        contexts.append({
+                            "kind": str(kind),
+                            "command_class": command_class,
+                            "command_name": str(getattr(
+                                command_class, "NAME", command_class.__name__)),
+                            "class_name": command_class.__name__,
+                            "path": path,
+                            "cursor_line": line,
+                            "method": method_name,
+                            "method_line": int(method_node.lineno),
+                            "method_end_line": node_end_line(method_node),
+                            "variable": variable,
+                            "state": state,
+                            "location": copy.deepcopy(location),
+                            "run_options_enabled": bool(options.get("enabled")),
+                        })
+                    continue
+
+                location = None
+                step_match = re.match(r"^_step_(\d+)$", method_name)
+                if step_match:
+                    step_number = int(step_match.group(1))
+                    location = next((
+                        item for item in locations
+                        if item.get("kind") == "step"
+                        and item.get("value") == step_number), None)
+                if location is None:
+                    location = next((
+                        item for item in locations
+                        if str(item.get("method", "")) == method_name), None)
+                key = (command_class, "", "", method_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                contexts.append({
+                    "kind": str(kind),
+                    "command_class": command_class,
+                    "command_name": str(getattr(
+                        command_class, "NAME", command_class.__name__)),
+                    "class_name": command_class.__name__,
+                    "path": path,
+                    "cursor_line": line,
+                    "method": method_name,
+                    "method_line": int(method_node.lineno),
+                    "method_end_line": node_end_line(method_node),
+                    "variable": "",
+                    "state": "",
+                    "location": copy.deepcopy(location),
+                    "run_options_enabled": bool(options.get("enabled")),
+                })
+        return contexts
+
     def _state_variable_candidates(self, command_name):
         variables = set()
         for command_class in self._command_classes(command_name):
@@ -6699,15 +7175,7 @@ class PokeControllerApp:
                     "description": str(descriptions.get(state, "")),
                     "group": str(variable), "order": order,
                 })
-        debug_options = []
-        for attribute in (
-                "DEBUG", "debug", "TESTADDCODE", "testcode", "fastread"):
-            if hasattr(command_instance, attribute):
-                debug_options.append({
-                    "id": attribute, "attribute": attribute,
-                    "label": attribute, "description": "",
-                    "default": bool(getattr(command_instance, attribute)),
-                })
+        debug_options = discover_runtime_debug_options(command_instance)
         return {
             "enabled": bool(getattr(
                 command_instance, "COMMAND_RUN_SETTINGS", False)),
@@ -6805,7 +7273,8 @@ class PokeControllerApp:
         dialog.wait_window()
         return result["action"]
 
-    def _prompt_command_run_settings(self, command_instance):
+    def _prompt_command_run_settings(self, command_instance,
+                                     initial_config=None):
         """Show the Commands-owned Step selector after Start was requested."""
         command_name = str(getattr(command_instance, "NAME", "") or "")
         options = self._command_run_options(command_name)
@@ -6853,7 +7322,9 @@ class PokeControllerApp:
             return True
 
         result = {"start": False}
-        saved = copy.deepcopy(self.command_start_overrides.get(command_name, {}))
+        saved = copy.deepcopy(
+            initial_config if isinstance(initial_config, dict)
+            else self.command_start_overrides.get(command_name, {}))
         dialog = tk.Toplevel(self.root)
         dialog.title("{} - Step実行設定".format(command_name))
         dialog.geometry("1020x720")
@@ -7368,6 +7839,12 @@ class PokeControllerApp:
         self._refresh_inline_command_run_panel()
 
     def _refresh_command_start_status(self):
+        panel = getattr(self, "command_debug_panel", None)
+        if panel is not None and hasattr(panel, "set_fresh_start_supported"):
+            classes = self._command_classes(self._selected_command_name())
+            panel.set_fresh_start_supported(any(
+                isinstance(getattr(cls, "POKECON_FRESH_START", None), dict)
+                for cls in classes))
         if not hasattr(self, "command_start_status"):
             return
         command = self._selected_command_name()
@@ -7412,10 +7889,72 @@ class PokeControllerApp:
         data = self._read_input_sets()
         if not sync_command_recovery_scripts(
                 data, name, self.command_recovery_favorites,
-                auto_open=self.command_recovery_auto_open.get()):
+                auto_pause_disabled=(
+                    self.command_recovery_auto_pause_disabled.get())):
             return False
         self._write_input_sets(data)
         return True
+
+    def _automatic_command_recovery_disabled(self):
+        """Return whether automatic recovery pauses/popups are suppressed."""
+        setting = getattr(
+            self, "command_recovery_auto_pause_disabled", None)
+        if setting is None:
+            # Lightweight test doubles and older callers without the new
+            # setting retain the previous monitoring behavior.
+            return False
+        try:
+            return bool(setting.get())
+        except (AttributeError, tk.TclError, TypeError):
+            return bool(setting)
+
+    def _reset_automatic_command_recovery_state(
+            self, now=None, resume_dark_pause=False,
+            reset_loop=True, reset_dark=True):
+        """Drop automatic detector state and optionally release its pause."""
+        now = time.monotonic() if now is None else float(now)
+        if reset_loop:
+            self._command_recovery_detector_command = None
+            timeline = getattr(self, "_command_recovery_timeline", None)
+            if timeline is not None:
+                timeline.reset(loop_cycles=3)
+            tracker = getattr(self, "_command_recovery_input_tracker", None)
+            if tracker is not None:
+                tracker.reset(now)
+            self._command_recovery_last_check = 0.0
+            PokeControllerApp._clear_command_recovery_loop_pause_request(self)
+
+        if not reset_dark:
+            return False
+        detector = getattr(self, "_commands_dark_safety_detector", None)
+        if detector is not None:
+            detector.reset()
+        self._commands_dark_safety_command = None
+        paused_command = getattr(
+            self, "_commands_dark_safety_paused_command", None)
+        self._commands_dark_safety_paused_command = None
+        if (not resume_dark_pause or paused_command is None
+                or not getattr(paused_command, "alive", False)):
+            return False
+        if getattr(self, "_software_controller_override_active", False):
+            self._software_controller_paused_command = paused_command
+        elif hasattr(paused_command, "resume"):
+            paused_command.resume()
+        else:
+            paused_command.pause_requested = False
+        return True
+
+    def _on_command_recovery_auto_pause_changed(self):
+        disabled = PokeControllerApp._automatic_command_recovery_disabled(self)
+        resumed = False
+        if disabled:
+            resumed = PokeControllerApp._reset_automatic_command_recovery_state(
+                self, resume_dark_pause=True)
+            if hasattr(self, "record_monitor_status"):
+                self.record_monitor_status.set(
+                    "Commandsの自動一時停止と復旧Pythonの自動表示を無効にしました。"
+                    + (" 自動一時停止中のCommandsを再開しました。" if resumed else ""))
+        self._sync_command_recovery_scripts_to_active_input_set()
 
     def open_command_start_settings(self):
         if not getattr(self, "_commands_loaded", False):
@@ -9247,6 +9786,330 @@ class PokeControllerApp:
         except OSError as error:
             tkmsg.showerror("PokeCon Dev Studio", "起動できませんでした。\n" + str(error))
 
+    def _pokecon_studio_frame_sequence(self):
+        camera = getattr(self, "camera", None)
+        sequence = getattr(camera, "frameSequence", None)
+        return sequence() if callable(sequence) else None
+
+    def _pokecon_studio_fresh_frame(self, after_sequence=None):
+        """Provide Studio with live input without opening Camera twice."""
+        camera = getattr(self, "camera", None)
+        if camera is None:
+            return None
+        if after_sequence is not None:
+            wait_for_frame = getattr(camera, "waitForFrame", None)
+            if callable(wait_for_frame):
+                _sequence, frame = wait_for_frame(
+                    after_sequence, timeout=0.75)
+                return frame
+        read_fresh = getattr(camera, "readFreshFrame", None)
+        if callable(read_fresh):
+            return read_fresh(timeout=0.75)
+        read_frame = getattr(camera, "readFrame", None)
+        return read_frame() if callable(read_frame) else None
+
+    def _pokecon_studio_commands_busy(self):
+        """Return whether reloading/reselecting Commands would be unsafe."""
+        button = getattr(self, "start_button", None)
+        if button is None:
+            return False
+        try:
+            return str(button.cget("text")) != "Start"
+        except (AttributeError, tk.TclError):
+            return True
+
+    def _reload_pokecon_studio_commands(self):
+        """Reload Commands for Studio only while the runtime is idle."""
+        if not getattr(self, "_commands_loaded", False):
+            tkmsg.showinfo(
+                "PokeConStudio",
+                "Commandsの読み込み完了後に再実行してください。",
+                parent=self.root)
+            return False
+        if self._pokecon_studio_commands_busy():
+            tkmsg.showwarning(
+                "PokeConStudio",
+                "Commandsの実行中は再読込や停止地点の変更ができません。\n"
+                "現在のCommandsを停止してから再実行してください。",
+                parent=self.root)
+            return False
+        try:
+            self.reloadCommands()
+        except Exception as error:
+            self._logger.exception("PokeConStudio command reload failed")
+            tkmsg.showerror(
+                "PokeConStudio",
+                "Commandsを再読込できませんでした。\n{}".format(error),
+                parent=self.root)
+            return False
+        return True
+
+    def _pokecon_studio_source_contexts(self, source_path, cursor_line):
+        """Reload, then resolve Studio's saved cursor against fresh classes."""
+        if not self._reload_pokecon_studio_commands():
+            return []
+        loaded = (
+            [("python", item) for item in getattr(self, "py_classes", [])]
+            + [("sample", item)
+               for item in getattr(self, "sample_py_classes", [])])
+        try:
+            contexts = self._resolve_pokecon_studio_source_contexts(
+                source_path, cursor_line, loaded)
+        except (OSError, SyntaxError, TypeError, ValueError) as error:
+            tkmsg.showwarning(
+                "PokeConStudio - カーソル位置を特定できません",
+                "保存したソースとカーソル行からCommandsを特定できませんでした。\n\n"
+                "{}".format(error), parent=self.root)
+            return []
+        if not contexts:
+            tkmsg.showwarning(
+                "PokeConStudio - カーソル位置を特定できません",
+                "この行は、現在読み込まれているCommandsのStep関数として特定できません。\n"
+                "do()、補助関数、または状態辞書へ直接登録されていない関数は自動設定しません。",
+                parent=self.root)
+        return contexts
+
+    def _choose_pokecon_studio_source_context(self, contexts, purpose):
+        """Require an explicit choice when one method maps to several Steps."""
+        contexts = list(contexts or [])
+        if not contexts:
+            return None
+        if len(contexts) == 1:
+            return contexts[0]
+        result = {"context": None}
+        dialog = tk.Toplevel(self.root)
+        dialog.title("PokeConStudio - 対象Stepを選択")
+        dialog.geometry("1050x440")
+        dialog.minsize(760, 320)
+        dialog.transient(self.root)
+        dialog.grab_set()
+        ttk.Label(
+            dialog,
+            text=("カーソル位置の関数は複数のCommands／Stepから使われています。\n"
+                  "{}を設定する対象を明示的に選んでください。".format(purpose)),
+            justify="left", foreground="#9a4e00").pack(
+                fill="x", padx=12, pady=(12, 6))
+        listing = tk.Listbox(dialog, exportselection=False, height=12)
+        listing.pack(fill="both", expand=True, padx=12, pady=6)
+        for context in contexts:
+            location = context.get("location") or {}
+            step = ("{} :: {}".format(
+                context.get("variable", ""), context.get("state", ""))
+                if context.get("state") else
+                str(location.get("label") or "状態辞書に未登録"))
+            listing.insert(
+                "end", "{}  /  {}  /  {}()  /  行 {}".format(
+                    context.get("command_name", ""), step,
+                    context.get("method", ""),
+                    context.get("method_line", "")))
+        listing.selection_set(0)
+        listing.activate(0)
+
+        def accept():
+            selected = listing.curselection()
+            if not selected:
+                tkmsg.showwarning(
+                    "PokeConStudio", "対象を1件選んでください。",
+                    parent=dialog)
+                return
+            result["context"] = contexts[selected[0]]
+            dialog.destroy()
+
+        buttons = ttk.Frame(dialog)
+        buttons.pack(fill="x", padx=12, pady=(4, 12))
+        ttk.Button(buttons, text="キャンセル", command=dialog.destroy).pack(
+            side="right", padx=4)
+        ttk.Button(buttons, text="このStepを選択", command=accept).pack(
+            side="right", padx=4)
+        listing.bind("<Double-1>", lambda _event: accept())
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
+        dialog.wait_window()
+        return result["context"]
+
+    def _select_pokecon_studio_command(self, context):
+        """Select and instantiate exactly the class resolved from Studio."""
+        command_class = context.get("command_class")
+        command_name = context.get("command_name", "")
+        kind = context.get("kind")
+        try:
+            if kind == "python" and command_class in getattr(self, "py_classes", []):
+                self.command_filter_py_name.set("-")
+                if command_name not in [
+                        item.NAME for item in self._visible_python_classes()]:
+                    self.show_python_samples.set(True)
+                self.applyFilterPy()
+                if command_name not in self.py_cb["values"]:
+                    raise ValueError("Commands一覧に対象がありません: " + command_name)
+                self.py_cb.set(command_name)
+                self.command_nb.select(self.py_f)
+            elif (kind == "sample"
+                    and command_class in getattr(self, "sample_py_classes", [])):
+                self.command_filter_sample_py_name.set("-")
+                self.applyFilterSamplePy()
+                if command_name not in self.sample_py_cb["values"]:
+                    raise ValueError("Sample Commands一覧に対象がありません: " + command_name)
+                self.sample_py_cb.set(command_name)
+                self.command_nb.select(self.sample_py_f)
+            else:
+                raise ValueError("再読込後のCommandsクラスが一致しません。")
+            self.assignCommand()
+            if (self.cur_command is None
+                    or self.cur_command.__class__ is not command_class):
+                raise ValueError(
+                    "同名の別Commandsが選択されたため、安全のため中止しました。")
+            self._selected_command_run_changed()
+            return True
+        except Exception as error:
+            self._logger.exception("PokeConStudio command selection failed")
+            tkmsg.showwarning(
+                "PokeConStudio - Commands選択",
+                "対象Commandsを安全に選択できませんでした。\n{}".format(error),
+                parent=self.root)
+            return False
+
+    def open_pokecon_studio_run_settings(self, source_path, cursor_line):
+        """Preselect Studio's Step as the inclusive real-Commands end."""
+        contexts = self._pokecon_studio_source_contexts(
+            source_path, cursor_line)
+        candidates = [
+            item for item in contexts
+            if item.get("location") and item.get("run_options_enabled")]
+        if not candidates:
+            if contexts:
+                methods = ", ".join(sorted({
+                    str(item.get("method", "")) for item in contexts}))
+                tkmsg.showwarning(
+                    "PokeConStudio - Step実行設定",
+                    "カーソル位置（{}）に対応する開始・終了Stepを特定できません。\n"
+                    "このCommandsがStep実行設定を公開しているか確認してください。".format(
+                        methods or "不明な関数"), parent=self.root)
+            return False
+        context = self._choose_pokecon_studio_source_context(
+            candidates, "開始・終了範囲")
+        if context is None or not self._select_pokecon_studio_command(context):
+            return False
+        initial = copy.deepcopy(self.command_start_overrides.get(
+            context["command_name"], {}))
+        location = copy.deepcopy(context["location"])
+        if not initial.get("start"):
+            initial["start"] = copy.deepcopy(location)
+        initial["end"] = location
+        return self._prompt_command_run_settings(
+            self.cur_command, initial_config=initial)
+
+    def open_pokecon_studio_step_debug(self, source_path, cursor_line):
+        """Create or focus a real-Commands state-entry breakpoint from Studio."""
+        contexts = self._pokecon_studio_source_contexts(
+            source_path, cursor_line)
+        candidates = [
+            item for item in contexts
+            if item.get("variable") and item.get("state")]
+        if not candidates:
+            if contexts:
+                tkmsg.showwarning(
+                    "PokeConStudio - 操作前一時停止",
+                    "カーソル位置は状態辞書へ直接登録されたStep関数ではありません。\n"
+                    "do()や補助関数へ誤った停止地点は設定しません。",
+                    parent=self.root)
+            return False
+        context = self._choose_pokecon_studio_source_context(
+            candidates, "操作コード前の一時停止")
+        if context is None or not self._select_pokecon_studio_command(context):
+            return False
+
+        command_name = context["command_name"]
+        variable = context["variable"]
+        state = context["state"]
+        matching_index = next((
+            index for index, rule in enumerate(self.step_debug_rules)
+            if rule.get("enabled", True)
+            and rule.get("command") in ("", "すべて", command_name)
+            and rule.get("variable") == variable
+            and rule.get("state") == state), None)
+        disabled_exact_index = next((
+            index for index, rule in enumerate(self.step_debug_rules)
+            if rule.get("command") == command_name
+            and rule.get("variable") == variable
+            and rule.get("state") == state), None)
+        # Match the same first-enabled rule that the runtime wrapper will use.
+        # If no rule is active, revive only a command-specific draft; never
+        # broaden a disabled wildcard rule to every Commands implicitly.
+        rule_index = (matching_index if matching_index is not None
+                      else disabled_exact_index)
+        if rule_index is None:
+            rule = {
+                "id": str(time.time_ns()),
+                "enabled": True,
+                "command": command_name,
+                "variable": variable,
+                "state": state,
+                "auto_follow": False,
+                "use_replacements": True,
+                "replacements": {},
+            }
+            self.step_debug_rules.append(rule)
+            rule_index = len(self.step_debug_rules) - 1
+        else:
+            rule = self.step_debug_rules[rule_index]
+            rule["enabled"] = True
+        source = rule.get("source")
+        if not isinstance(source, dict):
+            source = {}
+            rule["source"] = source
+        source.update({
+            "file": os.path.abspath(context["path"]),
+            "method": context["method"],
+        })
+        rule["focus_line"] = int(context["cursor_line"])
+        self._write_step_debug_rules()
+        self.open_step_debug_assist()
+        if hasattr(self, "step_debug_rule_list"):
+            self.step_debug_rule_list.selection_clear(0, "end")
+            self.step_debug_rule_list.selection_set(rule_index)
+            self.step_debug_rule_list.activate(rule_index)
+            self.step_debug_rule_list.see(rule_index)
+        tkmsg.showinfo(
+            "PokeConStudio - 停止地点を設定しました",
+            "{} / {} :: {} を有効にしました。\n\n"
+            "CommandsをStartすると、カーソルを含むStep関数の実行直前で停止します。\n"
+            "停止後はStepデバッグ画面でカーソルに近い処理を確認してください。".format(
+                command_name, variable, state), parent=self.root)
+        return True
+
+    def open_pokecon_studio(self):
+        """Open the integrated edit/detection/runtime assistant."""
+        existing = getattr(self, "_pokecon_studio_window", None)
+        if existing is not None:
+            try:
+                if existing.winfo_exists():
+                    existing.deiconify()
+                    existing.lift()
+                    existing.focus_force()
+                    return
+            except tk.TclError:
+                pass
+        project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        try:
+            if project_dir not in sys.path:
+                sys.path.insert(0, project_dir)
+            from PokeConStudio.PokeConStudio import PokeConStudioWindow
+            self._pokecon_studio_window = PokeConStudioWindow(
+                self.root, project_dir,
+                frame_provider=self._pokecon_studio_fresh_frame,
+                frame_sequence_provider=self._pokecon_studio_frame_sequence,
+                runtime_actions={
+                    "run_settings": self.open_pokecon_studio_run_settings,
+                    "step_debug": self.open_pokecon_studio_step_debug,
+                    "reload_commands": self._reload_pokecon_studio_commands,
+                })
+            self.show_output(
+                "Analysis",
+                text="PokeConStudio opened with the current fresh Camera input.")
+        except (ImportError, OSError, RuntimeError, tk.TclError) as error:
+            tkmsg.showerror(
+                "PokeConStudio", "起動できませんでした。\n" + str(error),
+                parent=self.root)
+
     def set_init_device_name(self):
         if not self.com_port_name.get().strip() and int(self.com_port.get() or 0) == 0:
             self.serial_device_name.set("(未設定)")
@@ -9373,6 +10236,9 @@ class PokeControllerApp:
             self.com_port_name.set(device)
 
     def set_serial_data_format(self, event=None):
+        if PokeControllerApp._command_debug_wait_for_release(self):
+            self.serial_data_format_name.set(KeyPress.serial_data_format_name)
+            return False
         selected_format = normalize_serial_data_format_name(
             self.serial_data_format_name.get())
         if selected_format != self.serial_data_format_name.get():
@@ -9420,6 +10286,8 @@ class PokeControllerApp:
         self.changeAreaSize()
 
     def activateSerial(self):
+        if PokeControllerApp._command_debug_wait_for_release(self):
+            return False
         if self.serial_device_name.get().strip() == "(未設定)":
             return
         if self.ser.isOpened():
@@ -9448,6 +10316,8 @@ class PokeControllerApp:
             sender.set_show_serial(self.is_show_serial.get())
 
     def inactivateSerial(self):
+        if PokeControllerApp._command_debug_wait_for_release(self):
+            return False
         if self.ser.isOpened():
             print("Port is already opened and being closed.")
             self.ser.closeSerial()
@@ -10965,10 +11835,16 @@ class PokeControllerApp:
         for number in range(1, 11):
             getattr(self, "shortcut_button_{}".format(number)).configure(state="normal")
         if self._pending_startup_snapshot:
-            self._apply_all_tabs_snapshot(self._pending_startup_snapshot, runtime=True)
+            # The authoritative top-level InputSet recording object was
+            # applied during startup already.  Commands finish loading later;
+            # do not let an older all_tabs.recording copy overwrite it here.
+            self._apply_all_tabs_snapshot(
+                self._pending_startup_snapshot, runtime=True,
+                apply_recording=False)
             self._pending_startup_snapshot = None
             if self._startup_skip_hardware:
                 self._apply_hardware_unconfigured_selection()
+        self._restart_restoring_snapshot = False
         self._update_command_start_state()
         self._refresh_command_start_status()
         if error:
@@ -11204,6 +12080,7 @@ class PokeControllerApp:
         self.start_top_button["state"] = state
 
     def reloadCommands(self):
+        self._cancel_command_debug_pulse()
         self._state_value_cache.clear()
         if not self._commands_loaded:
             self.show_output("Analysis", text="Commandsを読み込み中です。完了後に再読込してください。")
@@ -11342,9 +12219,19 @@ class PokeControllerApp:
         except tk.TclError:
             pass
 
-    def startPlay(self, *event):
+    def startPlay(self, *event, _fresh_start_request=None):
+        fresh_launch = getattr(self, "_command_debug_fresh_start_launch", None)
+        if (getattr(self, "_command_debug_pulse_job", None) is not None
+                or getattr(self, "_command_debug_retest_request", None) is not None
+                or getattr(self, "_command_debug_restart_request", None) is not None
+                or getattr(self, "_command_debug_fresh_start_request", None) is not None
+                or (fresh_launch is not None and _fresh_start_request is not fresh_launch)):
+            self._command_debug_status("調整入力／再試験準備の完了まで別のStartはできません", error=True)
+            return
         if not self._commands_loaded:
             self.show_output("Analysis", text="Commandsをバックグラウンドで読み込み中です。")
+            return
+        if not PokeControllerApp._confirm_start_after_app_restart(self):
             return
         # set and init selected command
         self.assignCommand()
@@ -11352,9 +12239,12 @@ class PokeControllerApp:
             print("No commands have been assigned yet.")
             self._logger.info("No commands have been assigned yet.")
             return
-        if not self._prompt_command_run_settings(self.cur_command):
-            return
-        if not self._prepare_command_start_override(self.cur_command):
+        if _fresh_start_request is None:
+            if not self._prompt_command_run_settings(self.cur_command):
+                return
+            if not self._prepare_command_start_override(self.cur_command):
+                return
+        elif not self._command_debug_prepare_fresh_start(self.cur_command, _fresh_start_request):
             return
         self._mark_active_input_set_commands_used()
 
@@ -11365,15 +12255,44 @@ class PokeControllerApp:
         if not self._install_function_replacement_mappings(self.cur_command):
             return
         self._install_step_debug_wrappers(self.cur_command)
-        self._set_command_running_ui()
-        self._suspend_pc_gamepad_for_command()
-        self._auto_arm_command_monitor_recording()
-        self.cur_command.start(self.ser, lambda: self.stopPlayPost(started_command))
+        if _fresh_start_request is not None:
+            if not self._command_debug_fresh_start_matches(self.cur_command, _fresh_start_request):
+                self._command_debug_status("開始直前に接続／Commandsが変わりました。開始しません", error=True)
+                return
+            # Only this newly constructed, explicitly confirmed run is armed.
+            # Never resume an old paused command or persist this one-use flag.
+            self.cur_command._pokecon_fresh_start_requested = True
+            Command.isPause = False
+            self.cur_command.__dict__.pop("isPause", None)
+            self.cur_command.pause_requested = False
+            self.pause_button.configure(text="Pause", command=self.pausePlay)
+        try:
+            self._set_command_running_ui()
+            self._suspend_pc_gamepad_for_command()
+            self._auto_arm_command_monitor_recording()
+            self.cur_command.start(self.ser, lambda: self.stopPlayPost(started_command))
+        except Exception:
+            worker = getattr(started_command, "thread", None)
+            if (_fresh_start_request is not None
+                    and (worker is None or (getattr(worker, "ident", None) is None and not worker.is_alive()))):
+                # Setup failed before any worker could consume the one-use
+                # request. Finalize a possibly armed recording with the normal
+                # cleanup path; do not leave a nonexistent worker labelled Stop.
+                started_command.__dict__.pop("_pokecon_fresh_start_requested", None)
+                self.pause_button.configure(state="disabled", text="Pause", command=self.pausePlay)
+                self.stopPlayPost(started_command)
+            raise
         self._start_command_start_monitor(self.cur_command)
 
     def startShortcutPlay(self, *event, num=0):
+        if (getattr(self, "_command_debug_fresh_start_request", None) is not None
+                or getattr(self, "_command_debug_fresh_start_launch", None) is not None):
+            self._command_debug_status("はじめから準備中は別のShortcutを実行できません", error=True)
+            return
         if not self._commands_loaded:
             self.show_output("Analysis", text="Commandsをバックグラウンドで読み込み中です。")
+            return
+        if not PokeControllerApp._confirm_start_after_app_restart(self):
             return
         if self.cur_command is None:
             print("No commands have been assigned yet.")
@@ -11403,6 +12322,7 @@ class PokeControllerApp:
             pass
 
     def force_stop_play(self):
+        self._cancel_command_debug_pulse()
         """Use the last-resort worker interruption without blocking Tk."""
         command = self.cur_command
         if command is None:
@@ -11413,10 +12333,12 @@ class PokeControllerApp:
                 "処理途中のため、次回実行前にゲーム状態を確認してください。"):
             return
         self._request_command_monitor_stop_cleanup(command)
-        self._stop_command_monitor_capture_on_request(
+        recording_choice_deferred = self._stop_command_monitor_capture_on_request(
             command, "force_stop_requested")
-        # Force Stopでもワーカー終了を待たず、通常Stopと同じ保存確認を出す。
-        self._confirm_requested_command_monitor_stop(command)
+        # 録画中ならAVI/WAVをバックグラウンドで安全に閉じた直後に確認する。
+        # 録画なし／対象外なら従来どおりCommandsワーカーの終了を待たない。
+        if not recording_choice_deferred:
+            self._confirm_requested_command_monitor_stop(command)
         Command.isPause = False
         interrupted = False
         try:
@@ -11464,11 +12386,13 @@ class PokeControllerApp:
         self.root.after(1500, report_if_pending)
 
     def stopPlay(self):
+        self._cancel_command_debug_pulse()
         print(self.start_button["text"] + " " + self.cur_command.NAME)
         self._logger.info(self.start_button["text"] + " " + self.cur_command.NAME)
         command = self.cur_command
         self._request_command_monitor_stop_cleanup(command)
-        self._stop_command_monitor_capture_on_request(command, "stop_requested")
+        recording_choice_deferred = self._stop_command_monitor_capture_on_request(
+            command, "stop_requested")
         self.start_button.configure(state="disabled", text="Stopping...")
         self.start_top_button.configure(state="disabled", text="Stopping...")
 
@@ -11487,9 +12411,10 @@ class PokeControllerApp:
                 self._gui_action_queue.put(lambda: self.show_output(
                     "Analysis", text="通常停止要求に失敗しました。Force stopを使用できます: " + str(error)))
         threading.Thread(target=request_stop, daemon=True, name="CommandStopRequest").start()
-        # Commands本体が停止待ちになっても保存確認を失わないよう、
-        # 録画確定と停止要求の送信直後に今回分の選択を表示する。
-        self._confirm_requested_command_monitor_stop(command)
+        # Commands本体が停止待ちになっても保存確認を失わない。録画中の
+        # 場合だけはAVI/WAVのclose完了後、それ以外は停止要求の送信直後に表示する。
+        if not recording_choice_deferred:
+            self._confirm_requested_command_monitor_stop(command)
 
     def stopPlayPost(self, source_command=None):
         if threading.current_thread() is not self._main_thread:
@@ -11499,10 +12424,19 @@ class PokeControllerApp:
             return
         if (getattr(self, "record_mode", None) is not None
                 and self.record_mode.get() == "CommandMonitor"
-                and getattr(self, "_command_monitor_current_chunk", None) is not None):
-            self._finish_command_monitor_chunk("command_finished")
-            self.record_monitor_status.set(
-                "Commands終了を検出しました。録画とログは確認待ちで保持しています。")
+                and (getattr(self, "_command_monitor_current_chunk", None) is not None
+                     or getattr(self, "_command_monitor_stop_in_progress", False))):
+            finish_requested = self._finish_command_monitor_chunk(
+                "command_finished", background=True,
+                after_finish=lambda _error: self.stopPlayPost(source_command))
+            if finish_requested:
+                self.start_button.configure(
+                    state="disabled", text="Finalizing recording...")
+                self.start_top_button.configure(
+                    state="disabled", text="Finalizing recording...")
+                self.record_monitor_status.set(
+                    "Commands終了を検出しました。録画を確定しています。")
+                return
         # 旧経路や、Stop直後の確認前に終了通知が来た場合のフォールバック。
         # Stop側で確認済みなら要求は消費済みのため二重表示しない。
         self._confirm_requested_command_monitor_stop(source_command)
@@ -11546,6 +12480,12 @@ class PokeControllerApp:
                 try:
                     callback()
                 except Exception as error:
+                    if getattr(self, "_command_debug_restart_request", None) is not None:
+                        self._restart_requested_snapshot = None
+                        self._command_debug_restart_request = None
+                        self._restart_launch_argv = None
+                        PokeControllerApp._command_debug_status(
+                            self, "終了処理エラーのため、再起動予約を取り消しました", error=True, busy=False)
                     self._logger.warning("GUI callback failed: %s", error)
             self.root.after(50, self._drain_gui_actions)
         except tk.TclError:
@@ -11556,6 +12496,14 @@ class PokeControllerApp:
         self.mainwindow.mainloop()
 
     def _recording_background_work_active(self):
+        def writer_alive(recorder):
+            for name in ("writer_thread", "_video_late_close_thread"):
+                thread = getattr(recorder, name, None)
+                check = getattr(thread, "is_alive", None)
+                if thread is not None and callable(check) and check():
+                    return True
+            return False
+
         merge_lock = getattr(self, "_command_monitor_merge_lock", None)
         if merge_lock is None:
             merging = False
@@ -11563,27 +12511,87 @@ class PokeControllerApp:
             with merge_lock:
                 merging = bool(getattr(self, "_command_monitor_merge_active", 0))
         operation_thread = getattr(self, "_operation_finalize_thread", None)
-        return bool(getattr(self.recorder, "is_finalizing", False) or merging
+        rotation_thread = getattr(
+            self, "_youtube_recording_rotation_thread", None)
+        rotation_alive = getattr(rotation_thread, "is_alive", None)
+        command_start_request = getattr(
+            self, "_command_monitor_start_request", None)
+        command_start_thread = getattr(
+            self, "_command_monitor_start_thread", None)
+        command_start_alive = getattr(command_start_thread, "is_alive", None)
+        command_start_cleanup = (command_start_request or {}).get(
+            "cleanup_thread") if isinstance(command_start_request, dict) else None
+        command_cleanup_alive = getattr(
+            command_start_cleanup, "is_alive", None)
+        metadata_journal_lock = getattr(
+            self, "_command_monitor_metadata_journal_lock", None)
+        if metadata_journal_lock is None:
+            metadata_journal_active = False
+        else:
+            with metadata_journal_lock:
+                metadata_journal_active = any(
+                    thread.is_alive() for thread in getattr(
+                        self, "_command_monitor_metadata_journal_threads", ()))
+        handoff = getattr(self, "_youtube_handoff_recorder", None)
+        retiring = list(getattr(self, "_youtube_retiring_recorders", ()))
+        auxiliary_recording_work = bool(
+            (handoff is not None and (
+                getattr(handoff, "active", False)
+                or getattr(handoff, "is_finalizing", False)
+                or getattr(handoff, "audio_start_in_progress", False)
+                or writer_alive(handoff)))
+            or any(
+                getattr(recorder, "active", False)
+                or getattr(recorder, "is_finalizing", False)
+                or writer_alive(recorder)
+                for recorder in retiring))
+        return bool(getattr(self.recorder, "is_finalizing", False)
+                    or writer_alive(self.recorder) or merging
+                    or getattr(
+                        self, "_template_recording_stop_in_progress", False)
+                    or getattr(
+                        self, "_youtube_recording_rotation_in_progress", False)
+                    or command_start_request is not None
+                    or (command_start_thread is not None
+                        and callable(command_start_alive)
+                        and command_start_alive())
+                     or (command_start_cleanup is not None
+                         and callable(command_cleanup_alive)
+                         and command_cleanup_alive())
+                     or metadata_journal_active
+                    or (rotation_thread is not None
+                        and callable(rotation_alive) and rotation_alive())
+                    or auxiliary_recording_work
                     or getattr(self.operation_recorder, "is_finalizing", False)
+                    or writer_alive(self.operation_recorder)
                     or (operation_thread is not None and operation_thread.is_alive()))
 
     def exit(self):
         """Avoid destroying the window while the background MP4 encoder runs."""
+        if PokeControllerApp._command_debug_wait_for_release(self, lambda: self.exit()):
+            return
+        PokeControllerApp._cancel_command_debug_pulse(self)
         if (getattr(self, "_exit_waiting", False)
                 or getattr(self, "_template_exit_after_stop", False)):
             return
         self._preview_shutdown_mode = True
         self._refresh_preview_priority_status()
+        self._youtube_recording_rotation_continue = False
 
-        recording_mode = (self.record_mode.get()
-                          if getattr(self, "record_mode", None) is not None
-                          else "")
         deferred_jobs = self._template_finalize_candidates()
+        command_exit_work = bool(
+            getattr(self, "_command_monitor_current_chunk", None) is not None
+            or getattr(self, "_command_monitor_stop_in_progress", False)
+            or getattr(self, "_command_monitor_start_request", None) is not None)
         external_exit_work = bool(
             deferred_jobs
-            or (recording_mode in ("Template", "Manual", "Variable")
-                and (getattr(self.recorder, "active", False)
-                     or self._template_recording_stop_in_progress)))
+            or getattr(self.recorder, "active", False)
+            or self._template_recording_stop_in_progress
+            # The chunk that is already open is authoritative even when an
+            # InputSet switch has just changed the selected recording mode.
+            # Otherwise Exit can destroy the process between AVI close and
+            # the durable YouTube-tail enqueue.
+            or command_exit_work)
         if external_exit_work:
             if not tkmsg.askyesno(
                     "確認",
@@ -11597,6 +12605,18 @@ class PokeControllerApp:
             self.record_armed = False
             if hasattr(self, "record_button"):
                 self.record_button.configure(text="Closing AVI/WAV...")
+            if command_exit_work:
+                self._command_monitor_exit_after_stop = True
+                if (getattr(self, "_command_monitor_current_chunk", None)
+                        is not None
+                        and not getattr(
+                            self, "_command_monitor_stop_in_progress", False)):
+                    self._finish_command_monitor_chunk(
+                        "application_exit", background=True)
+                elif getattr(
+                        self, "_command_monitor_start_request", None) is not None:
+                    self._cancel_command_monitor_chunk_start()
+                return
             if (getattr(self.recorder, "active", False)
                     or self._template_recording_stop_in_progress):
                 self._request_template_recording_stop(exit_after=True)
@@ -11657,6 +12677,9 @@ class PokeControllerApp:
         self._exit_now(confirm=False)
 
     def _exit_now(self, confirm=True):
+        if PokeControllerApp._command_debug_wait_for_release(
+                self, lambda: self._exit_now(confirm=confirm)):
+            return
         # 一度proconのスレッドを落とす
         ret = not confirm or tkmsg.askyesno("確認", "Poke Controllerを終了しますか？")
         if not ret:
@@ -11664,6 +12687,15 @@ class PokeControllerApp:
             self._refresh_preview_priority_status()
             return
         if ret:
+            studio = getattr(self, "_pokecon_studio_window", None)
+            if studio is not None:
+                try:
+                    if studio.winfo_exists() and studio.close() is False:
+                        self._preview_shutdown_mode = False
+                        self._refresh_preview_priority_status()
+                        return
+                except tk.TclError:
+                    pass
             # Revoke permission and stop the actual class-level controller
             # loop only after exit is confirmed.
             self.pc_gamepad_input_enabled.set(False)
@@ -11830,6 +12862,23 @@ class PokeControllerApp:
             cv2.destroyAllWindows()
             self._stop_window_activity_tracking()
             self._close_active_input_set_registry()
+            restart_snapshot = getattr(self, "_restart_requested_snapshot", None)
+            if restart_snapshot is not None:
+                try:
+                    restart_path = prepare_restart_state(self.profile, restart_snapshot)
+                    self._restart_launch_argv = build_restart_argv(
+                        sys.executable, sys.argv, restart_path)
+                except Exception as error:
+                    if "restart_path" in locals():
+                        try:
+                            discard_restart_state(restart_path, self.profile)
+                        except Exception:
+                            self._logger.exception("Could not discard failed restart handoff")
+                    self._restart_launch_argv = None
+                    self._logger.exception("PokeCon restart preparation failed")
+                    tkmsg.showerror("再起動できません", "機器は安全に終了しましたが、再起動の準備に失敗しました。\n"
+                                    "自動で起動し直しません。\n\n" + str(error), parent=self.root)
+                self._restart_requested_snapshot = None
             self._logger.debug("Stop Poke Controller")
             self.root.destroy()
             self._process_exit_ready = True
@@ -11848,6 +12897,7 @@ class PokeControllerApp:
 
     def _quick_actions_snapshot(self):
         return {
+            "main_panel_controls": self._main_panel_controls_compact(),
             "left": {
                 "position": normalize_position(self.quick_actions_left_position.get()),
                 "items": normalize_action_ids(self.quick_actions_left_items),
@@ -11859,7 +12909,11 @@ class PokeControllerApp:
         }
 
     def _apply_quick_actions_snapshot(self, snapshot, refresh=True):
+        self.main_panel_controls_in_quick_actions.set(normalize_main_panel_controls(
+            snapshot.get("main_panel_controls") if isinstance(snapshot, dict) else None))
         if not isinstance(snapshot, dict):
+            if refresh and hasattr(self, "panel_widgets"):
+                self.apply_panel_assignment()
             return
         for side, position_var in (("left", self.quick_actions_left_position),
                                    ("right", self.quick_actions_right_position)):
@@ -11871,6 +12925,95 @@ class PokeControllerApp:
                     normalize_action_ids(saved.get("items", [])))
         if refresh and hasattr(self, "panel_widgets"):
             self.apply_panel_assignment()
+
+    def _main_panel_controls_compact(self):
+        variable = getattr(self, "main_panel_controls_in_quick_actions", None)
+        return bool(variable is not None and variable.get())
+
+    def _main_panel_controls_policy(self):
+        sides = self.panel_sides.get()
+        return main_panel_controls_layout(
+            self._main_panel_controls_compact(), self._camera_feature_limited_active(),
+            sides in ("Both sides", "Right side only"),
+            self.quick_actions_right_position.get())
+
+    def _sync_main_panel_controls_header(self):
+        if not hasattr(self, "top_command_f"):
+            return
+        if self._main_panel_controls_compact() or self._camera_feature_limited_active():
+            self.top_command_f.grid_remove()
+        else:
+            self.top_command_f.grid()
+
+    def _main_panel_controls_layout_changed(self):
+        # Only layout/persistence changes here. No input, capture, FPS-owner
+        # claim or automatic command start is performed by toggling this mode.
+        self.apply_panel_assignment()
+        self._sync_quick_actions_to_active_input_set()
+
+    def _compact_right_log_height(self):
+        preview_height = getattr(getattr(self, "preview", None), "show_height", 360)
+        if not self._main_panel_controls_compact():
+            return compact_log_height_budget(preview_height, 0, False)
+        quick = self.quick_actions_right_frame
+        # New grid children initially report reqheight=1 (or the previous
+        # layout's height). Reserve a conservative row budget until the idle
+        # geometry pass has measured the freshly built controls.
+        estimated = 28 + 32 * self._main_panel_compact_quick_rows
+        quick_height = max(quick.winfo_reqheight(),
+                           self.quick_actions_right_content.winfo_reqheight() + 28)
+        if self._main_panel_compact_geometry_after is not None:
+            quick_height = max(quick_height, estimated)
+        tool_height = quick_height + 3  # the quick frame's packing padding
+        if self.show_software_controller.get():
+            tool_height += max(1, self.softcon_frame.winfo_reqheight())
+        return compact_log_height_budget(preview_height, tool_height, True)
+
+    def _refresh_main_panel_compact_geometry(self):
+        self._main_panel_compact_geometry_after = None
+        if self._main_panel_controls_compact():
+            # This only resizes the side logs. It does not resize the preview
+            # or rebuild controls, and never runs capture/input callbacks.
+            self._apply_panel_adjuster_geometry()
+
+    def _render_main_panel_quick_controls(self, content):
+        restore = ttk.Checkbutton(
+            content, text="MainPanel操作をクイック側へ移動",
+            variable=self.main_panel_controls_in_quick_actions,
+            command=lambda: self.root.after_idle(
+                self._main_panel_controls_layout_changed))
+        restore.grid(column=0, columnspan=3, row=0, padx=2, pady=2, sticky="w")
+        if not self._main_panel_controls_policy()["show_fixed_actions"]:
+            ttk.Label(content, text="機能制限版：MainPanel操作は非表示",
+                      foreground="#505050").grid(
+                column=0, columnspan=3, row=1, padx=2, pady=2, sticky="w")
+            return 2
+        for index, action_id in enumerate(MAIN_PANEL_ACTION_IDS):
+            definition = ACTION_BY_ID[action_id]
+            target = getattr(self, definition["widget"], None)
+            if target is None:
+                continue
+            if definition["kind"] == "check":
+                control = ttk.Checkbutton(
+                    content, text=definition["label"],
+                    variable=getattr(self, definition["variable"]),
+                    command=lambda name=definition["command"]:
+                        self._quick_check_changed(name))
+                # The shared Tk variable is toggled once by this proxy. Do
+                # not invoke the original checkbutton and toggle it again.
+                row, column, span = 4, 0, 3
+            else:
+                control = ttk.Button(
+                    content, text=target.cget("text") or definition["label"],
+                    command=lambda selected=action_id:
+                        self._invoke_quick_action(selected))
+                row, column = divmod(index, 3)
+                row, span = row + 1, 1
+            control.configure(state=target.cget("state"))
+            control.grid(column=column, columnspan=span, row=row,
+                         padx=2, pady=2, sticky="ew")
+            self._main_panel_proxy_buttons.append((control, target))
+        return 5
 
     def _invoke_quick_action(self, action_id):
         definition = ACTION_BY_ID.get(action_id)
@@ -11903,9 +13046,13 @@ class PokeControllerApp:
             child.destroy()
         items = normalize_action_ids(getattr(self, "quick_actions_{}_items".format(side)))
         setattr(self, "quick_actions_{}_items".format(side), items)
-
+        row_offset = 0
+        if side == "right" and self._main_panel_controls_compact():
+            row_offset = self._render_main_panel_quick_controls(content)
+            if not self._main_panel_controls_policy()["show_right_user_actions"]:
+                items = []
         settings_button = ttk.Button(content, text="＋ クイック設定…", command=self.open_quick_actions_settings)
-        settings_button.grid(column=0, row=0, padx=2, pady=2, sticky="ew")
+        settings_button.grid(column=0, row=row_offset, padx=2, pady=2, sticky="ew")
         for index, action_id in enumerate(items, start=1):
             definition = ACTION_BY_ID[action_id]
             row, column = divmod(index, 3)
@@ -11930,14 +13077,24 @@ class PokeControllerApp:
                 target = getattr(self, definition.get("widget", ""), None)
                 if target is not None:
                     self._quick_action_proxy_buttons.append((control, target))
-            control.grid(column=column, row=row, padx=2, pady=2, sticky="ew")
+            control.grid(column=column, row=row + row_offset, padx=2, pady=2, sticky="ew")
         for column in range(3):
             content.columnconfigure(column, weight=1)
+        if side == "right" and self._main_panel_controls_compact():
+            self._main_panel_compact_quick_rows = row_offset + max(1, (len(items) + 3) // 3)
 
     def _render_quick_action_bars(self):
         self._quick_action_proxy_buttons = []
+        self._main_panel_proxy_buttons = []
         self._render_quick_action_bar("left")
         self._render_quick_action_bar("right")
+        pending = self._main_panel_compact_geometry_after
+        if pending is not None:
+            self.root.after_cancel(pending)
+            self._main_panel_compact_geometry_after = None
+        if self._main_panel_controls_compact():
+            self._main_panel_compact_geometry_after = self.root.after_idle(
+                self._refresh_main_panel_compact_geometry)
         if self._quick_action_sync_after is None:
             self._quick_action_sync_after = self.root.after(300, self._sync_quick_action_proxy_states)
 
@@ -11947,6 +13104,13 @@ class PokeControllerApp:
             for proxy, target in tuple(self._quick_action_proxy_buttons):
                 if proxy.winfo_exists() and target.winfo_exists():
                     proxy.configure(state=target.cget("state"))
+            for proxy, target in tuple(self._main_panel_proxy_buttons):
+                if proxy.winfo_exists() and target.winfo_exists():
+                    options = {"state": target.cget("state")}
+                    text = target.cget("text")
+                    if text:
+                        options["text"] = text
+                    proxy.configure(**options)
             self._quick_action_sync_after = self.root.after(300, self._sync_quick_action_proxy_states)
         except tk.TclError:
             pass
@@ -11986,6 +13150,7 @@ class PokeControllerApp:
         }
         left_position = tk.StringVar(value=normalize_position(self.quick_actions_left_position.get()))
         right_position = tk.StringVar(value=normalize_position(self.quick_actions_right_position.get()))
+        compact_main_panel = tk.BooleanVar(value=self._main_panel_controls_compact())
         position_box = ttk.LabelFrame(dialog, text="表示位置")
         position_box.pack(fill="x", padx=10, pady=5)
         ttk.Label(position_box, text="左ログ:").grid(column=0, row=0, padx=(8, 3), pady=5)
@@ -11996,6 +13161,10 @@ class PokeControllerApp:
                      textvariable=right_position).grid(column=3, row=0, padx=3, pady=5)
         ttk.Label(position_box, text="※ 非表示にしても Otherタブの「Quick actions...」から再設定できます。",
                   foreground="#505050").grid(column=4, row=0, padx=12, pady=5, sticky="w")
+        ttk.Checkbutton(
+            position_box, text="MainPanel操作をクイック側へ移動（右側・上部へ固定表示）",
+            variable=compact_main_panel).grid(
+                column=0, columnspan=5, row=1, padx=8, pady=5, sticky="w")
 
         available_box = ttk.LabelFrame(dialog, text="追加できる操作（検索可能）")
         available_box.pack(fill="both", expand=True, padx=10, pady=5)
@@ -12089,6 +13258,7 @@ class PokeControllerApp:
         selected_box.rowconfigure(0, weight=1)
 
         def apply_changes(close=False):
+            self.main_panel_controls_in_quick_actions.set(compact_main_panel.get())
             self.quick_actions_left_position.set(normalize_position(left_position.get()))
             self.quick_actions_right_position.set(normalize_position(right_position.get()))
             self.quick_actions_left_items = normalize_action_ids(working["left"])
@@ -12326,7 +13496,8 @@ class PokeControllerApp:
         sides = self.panel_sides.get()
         show_left = sides in ("Both sides", "Left side only")
         show_right = sides in ("Both sides", "Right side only")
-        show_right_host = show_right or self.show_software_controller.get()
+        show_right_host = (show_right or self.show_software_controller.get()
+                           or self._main_panel_controls_compact())
         if show_left and show_right:
             left_weight = max(1, self.side_width_balance.get())
             self.main_frame.columnconfigure(0, weight=left_weight)
@@ -12337,21 +13508,29 @@ class PokeControllerApp:
 
         total_height = max(240, int(getattr(getattr(self, "preview", None), "show_height", 360)))
 
-        def resize_pair(slot_names, ratio):
-            top_height = int(total_height * ratio.get() / 100)
-            for name, height in zip(slot_names, (top_height, total_height - top_height)):
+        def resize_pair(slot_names, ratio, height_budget, compact=False):
+            top_height = int(height_budget * ratio.get() / 100)
+            heights = (compact_log_panel_heights(height_budget, ratio.get()) if compact else
+                       (top_height, height_budget - top_height))
+            for name, height in zip(slot_names, heights):
                 self.panel_widgets[name][0].configure(height=max(40, height))
 
         if show_left and self.left_panel_count.get() == "2":
-            resize_pair(("left_top", "left_bottom"), self.panel_ratio)
+            resize_pair(("left_top", "left_bottom"), self.panel_ratio, total_height)
         if show_right and self.right_panel_count.get() == "2":
-            resize_pair(("right_top", "right_bottom"), self.right_panel_ratio)
+            resize_pair(("right_top", "right_bottom"), self.right_panel_ratio,
+                        self._compact_right_log_height(), self._main_panel_controls_compact())
+        elif show_right and self._main_panel_controls_compact():
+            panel = self.panel_widgets["right_top"][0]
+            panel.configure(height=self._compact_right_log_height())
+            panel.pack_propagate(False)
 
     def apply_panel_assignment(self, *event):
         """Reflect assignment in titles and expose it to command scripts.
 
         Output#1 through Output#4 can each be assigned to one of the four slots.
         """
+        self._sync_main_panel_controls_header()
         pending = getattr(self, "_panel_adjuster_update_after", None)
         if pending is not None:
             try:
@@ -12387,7 +13566,8 @@ class PokeControllerApp:
         # separate option from the side log panels.  Keep that container
         # visible as a host whenever the controller itself is enabled.
         show_controller = self.show_software_controller.get()
-        show_right_host = show_right or show_controller
+        compact_policy = self._main_panel_controls_policy()
+        show_right_host = compact_policy["show_right_host"] or show_controller
         self.update_size_adjuster_controls(show_left, show_right)
         self.left_output_area_f.grid_forget()
         self.output_area_f.grid_forget()
@@ -12405,19 +13585,29 @@ class PokeControllerApp:
         for panel, _, _ in self.panel_widgets.values():
             panel.pack_forget()
             panel.pack_propagate(True)
-        def pack_side(slot_names, split_ratio):
-            if len(slot_names) == 1:
+        def pack_side(slot_names, split_ratio, compact_height=None):
+            if len(slot_names) == 1 and compact_height is None:
                 self.panel_widgets[slot_names[0]][0].pack(expand=True, fill="both", side="top")
                 return
-            total_height = max(240, int(getattr(getattr(self, "preview", None), "show_height", 360)))
+            if len(slot_names) == 1:
+                panel = self.panel_widgets[slot_names[0]][0]
+                panel.configure(height=compact_height)
+                panel.pack_propagate(False)
+                panel.pack(expand=False, fill="both", side="top")
+                return
+            total_height = (compact_height if compact_height is not None else
+                            max(240, int(getattr(getattr(self, "preview", None), "show_height", 360))))
             top_height = int(total_height * split_ratio.get() / 100)
-            for name, height in zip(slot_names, (top_height, total_height - top_height)):
+            heights = (compact_log_panel_heights(total_height, split_ratio.get())
+                       if compact_height is not None else
+                       (top_height, total_height - top_height))
+            for name, height in zip(slot_names, heights):
                 panel = self.panel_widgets[name][0]
                 panel.configure(height=max(40, height))
                 panel.pack_propagate(False)
                 panel.pack(expand=False, fill="both", side="top")
         left_quick = normalize_position(self.quick_actions_left_position.get())
-        right_quick = normalize_position(self.quick_actions_right_position.get())
+        right_quick = compact_policy["right_quick_position"]
         if show_left and left_quick == "上":
             self.quick_actions_left_frame.pack(fill="x", padx=0, pady=(0, 3), side="top")
         if show_left and left_quick == "下":
@@ -12428,17 +13618,18 @@ class PokeControllerApp:
 
         # Pack the fixed top/bottom tools before the log panels so their
         # placement remains stable when the panel split adjuster is moved.
-        if show_right and right_quick == "上":
+        if compact_policy["show_right_host"] and right_quick == "上":
             self.quick_actions_right_frame.pack(fill="x", padx=0, pady=(0, 3), side="top")
         if show_controller and self.pos_software_controller.get() == "1":
             self.softcon_frame.pack(expand=False, fill="x", padx=0, pady=0, side="top")
-        if show_right and right_quick == "下":
+        if compact_policy["show_right_host"] and right_quick == "下":
             self.quick_actions_right_frame.pack(fill="x", padx=0, pady=(3, 0), side="bottom")
         if show_controller and self.pos_software_controller.get() == "2":
             self.softcon_frame.pack(expand=False, fill="x", padx=0, pady=0, side="bottom")
         if show_right:
             pack_side(("right_top",) if self.right_panel_count.get() == "1" else ("right_top", "right_bottom"),
-                      self.right_panel_ratio)
+                      self.right_panel_ratio,
+                      self._compact_right_log_height() if self._main_panel_controls_compact() else None)
         # Rebind the stdout proxy after a log destination is moved.
         if hasattr(self, "stdout_destination"):
             self.refresh_log_controls()
@@ -13355,6 +14546,7 @@ class PokeControllerApp:
         self.step_debug_rules = []
         self.command_start_overrides = {}
         self.command_run_favorites = {}
+        self.command_recovery_auto_pause_disabled.set(True)
         self.command_watch_enabled.set(False)
         self.command_watch_command.set("")
         self.command_watch_variables = []
@@ -13417,6 +14609,8 @@ class PokeControllerApp:
 
     def _set_active_input_set(self, name, combined_set=""):
         """Set the local active name and publish it to other PokeCon windows."""
+        if PokeControllerApp._command_debug_wait_for_release(self):
+            return False
         name = str(name or "").strip()
         self._active_input_set_name = name
         try:
@@ -13774,11 +14968,33 @@ class PokeControllerApp:
                 "run_favorites": copy.deepcopy(self.command_run_favorites),
                 "recovery_scripts": copy.deepcopy(
                     self.command_recovery_favorites),
-                "recovery_auto_open": bool(
-                    self.command_recovery_auto_open.get()),
+                "recovery_auto_pause_disabled": bool(
+                    self.command_recovery_auto_pause_disabled.get()),
+                "recovery_auto_open": not bool(
+                    self.command_recovery_auto_pause_disabled.get()),
             }
             result["shared_debug"] = self._shared_debug_config()
         return result
+
+    def _input_set_recording_data(self, item):
+        """Resolve one authoritative Recording snapshot for an InputSet."""
+        item = item if isinstance(item, dict) else {}
+        recording = item.get("recording")
+        all_tabs = item.get("all_tabs", {})
+        nested_recording = all_tabs.get("recording") \
+            if isinstance(all_tabs, dict) else None
+        if isinstance(recording, dict):
+            return copy.deepcopy(recording)
+        if isinstance(nested_recording, dict):
+            return copy.deepcopy(nested_recording)
+        # A pre-Recording InputSet has no ownership intent. Never inherit
+        # YouTube or "none" from the previously selected InputSet.
+        legacy = copy.deepcopy(self._recording_preset_data())
+        legacy["storage_destination"] = "pc"
+        legacy["youtube_upload_enabled"] = False
+        legacy["youtube_commands_allow_low_presentations"] = True
+        legacy["monitor_retention_mode"] = COMMAND_MONITOR_RETENTION_SMART
+        return legacy
 
     def _current_serial_data(self):
         selected = self._selected_serial_device_label() \
@@ -13868,6 +15084,15 @@ class PokeControllerApp:
         devices = [(key, str(value)) for key, value in (self.camera_dic or {}).items() if value != "Disable"]
         saved_value = saved.get("device_value", "")
         saved_path = saved.get("device_path", "")
+        if getattr(self, "_restart_restoring_devices", False):
+            if saved.get("enabled") is False:
+                return None
+            matches = [key for key, value in devices
+                       if ((saved_value and value.casefold() == saved_value.casefold())
+                           or (saved_path and saved_path.casefold() in value.casefold()))]
+            if len(matches) != 1:
+                raise RuntimeError("再起動前と同じカメラを一意に確認できません。別のカメラへ切り替えません。")
+            return int(matches[0])
         for key, value in devices:
             if saved_value and value.casefold() == saved_value.casefold():
                 return int(key)
@@ -14000,6 +15225,8 @@ class PokeControllerApp:
             camera_device_path=camera_device_path)
 
     def _apply_serial_input_set(self, saved):
+        if PokeControllerApp._command_debug_wait_for_release(self):
+            return False
         if not saved.get("enabled", bool(saved.get("device_name"))):
             self.serial_device_name.set("(未設定)")
             self.com_port.set(0)
@@ -14019,6 +15246,18 @@ class PokeControllerApp:
         if hasattr(self, "preview"):
             self.preview.changeRightMouseMode(self.serial_data_format_name.get())
         ports = list(list_ports.comports())
+        strict_restart = bool(getattr(self, "_restart_restoring_devices", False))
+        if strict_restart:
+            exact = [port for port in ports
+                     if str(getattr(port, "device", "")).casefold() == str(saved.get("port", "")).casefold()
+                     and (saved.get("vid") is None or getattr(port, "vid", None) == saved["vid"])
+                     and (saved.get("pid") is None or getattr(port, "pid", None) == saved["pid"])
+                     and (not saved.get("serial_number")
+                          or str(getattr(port, "serial_number", "") or "").casefold()
+                          == str(saved["serial_number"]).casefold())]
+            if len(exact) != 1:
+                raise RuntimeError("再起動前と同じSerialポートを確認できません。別のSwitchへ接続しません。")
+            ports = exact
         serial_number = str(saved.get("serial_number", "") or "").casefold()
         vid, pid = saved.get("vid"), saved.get("pid")
         matches = [port for port in ports if serial_number and
@@ -14074,7 +15313,11 @@ class PokeControllerApp:
             self.activateSerial()
         return True
 
-    def _apply_input_set_data(self, item, open_hardware=True, apply_serial=True):
+    def _apply_input_set_data(
+            self, item, open_hardware=True, apply_serial=True,
+            apply_recording=True):
+        if PokeControllerApp._command_debug_wait_for_release(self):
+            return False
         use_commands = input_set_commands_enabled(item)
         self.input_set_include_commands.set(use_commands)
         shared_config = item.get("shared_debug", {}) \
@@ -14106,11 +15349,12 @@ class PokeControllerApp:
             else top_assist.get("recovery_scripts")
         self.command_recovery_favorites = normalize_recovery_favorites(
             saved_recovery_scripts if use_commands else [])
-        saved_recovery_auto_open = tab_assist.get(
-            "recovery_auto_open",
-            top_assist.get("recovery_auto_open", True))
-        self.command_recovery_auto_open.set(
-            bool(saved_recovery_auto_open) if use_commands else True)
+        saved_recovery_auto_pause_disabled = tab_assist.get(
+            "recovery_auto_pause_disabled",
+            top_assist.get("recovery_auto_pause_disabled", True))
+        self.command_recovery_auto_pause_disabled.set(
+            bool(saved_recovery_auto_pause_disabled)
+            if use_commands else True)
         self._refresh_command_recovery_window_favorites()
         self._refresh_command_start_status()
         self._refresh_inline_command_run_panel()
@@ -14119,6 +15363,9 @@ class PokeControllerApp:
         audio = item.get("audio", {})
         resolved_camera_device_path = camera.get("device_path", "")
         camera_allowed = not self._startup_skip_hardware
+        if (getattr(self, "_restart_restoring_devices", False)
+                and camera.get("enabled") is False):
+            camera_allowed = False
         audio_allowed = not self._startup_skip_hardware
         use_window_input = camera.get("source_type") == "Window (Steam/game)"
         self._set_window_capture_mode(camera.get("capture_mode", "client"))
@@ -14216,8 +15463,12 @@ class PokeControllerApp:
             self.serial_device_name.set("(未設定)")
             self.com_port.set(0)
             self.com_port_name.set("")
-        recording = item.get("recording")
-        if isinstance(recording, dict):
+        # ``recording`` at the InputSet top level is authoritative. Older
+        # complete snapshots may also contain all_tabs.recording; apply only
+        # one resolved copy so an old/default nested value cannot undo
+        # storage_destination="none" or stop the same active clip twice.
+        if apply_recording:
+            recording = self._input_set_recording_data(item)
             self._apply_recording_preset_data(recording)
         assist = item.get("commands_assist") if use_commands else None
         if isinstance(assist, dict):
@@ -14236,7 +15487,8 @@ class PokeControllerApp:
             if not use_commands:
                 snapshot = strip_commands_from_snapshot(snapshot)
             self._apply_all_tabs_snapshot(
-                snapshot, runtime=open_hardware, commands_enabled=use_commands)
+                snapshot, runtime=open_hardware, commands_enabled=use_commands,
+                apply_recording=False)
         else:
             # Compatibility with the short-lived schema-2 quick-action field.
             saved_quick = item.get("quick_actions")
@@ -14305,6 +15557,8 @@ class PokeControllerApp:
             self.shared_debug_status.set("OFF：このInputSet内だけに保存します。")
 
     def load_input_set(self):
+        if PokeControllerApp._command_debug_wait_for_release(self):
+            return False
         name = self.input_set_name.get().strip()
         item = self._read_input_sets()["input_sets"].get(name)
         if not item:
@@ -14427,8 +15681,10 @@ class PokeControllerApp:
                                 "run_favorites": copy.deepcopy(self.command_run_favorites),
                                 "recovery_scripts": copy.deepcopy(
                                     self.command_recovery_favorites),
-                                "recovery_auto_open": bool(
-                                    self.command_recovery_auto_open.get())},
+                                "recovery_auto_pause_disabled": bool(
+                                    self.command_recovery_auto_pause_disabled.get()),
+                                "recovery_auto_open": not bool(
+                                    self.command_recovery_auto_pause_disabled.get())},
             "analysis_rules": list(self.analysis_rules),
             "controller_recordings": self._read_controller_recordings(),
             "quick_actions": self._quick_actions_snapshot(),
@@ -14445,7 +15701,11 @@ class PokeControllerApp:
         }
         return snapshot if include_commands else strip_commands_from_snapshot(snapshot)
 
-    def _apply_all_tabs_snapshot(self, snapshot, runtime=True, commands_enabled=None):
+    def _apply_all_tabs_snapshot(self, snapshot, runtime=True,
+                                 commands_enabled=None,
+                                 apply_recording=True):
+        if runtime and PokeControllerApp._command_debug_wait_for_release(self):
+            return False
         if not isinstance(snapshot, dict):
             return
         if commands_enabled is None:
@@ -14461,6 +15721,12 @@ class PokeControllerApp:
         values["resource_main_tool"] = preview_owner_requested
         for name, value in values.items():
             if not commands_enabled and name in COMMAND_INPUT_SET_VARIABLES:
+                continue
+            if (not apply_recording
+                    and name == "record_monitor_retention_mode"):
+                # The top-level ``recording`` object was already applied and
+                # is authoritative. A stale all_tabs.values copy must not
+                # switch the retention mode afterwards.
                 continue
             variable = getattr(self, name, None)
             if hasattr(variable, "set"):
@@ -14523,7 +15789,7 @@ class PokeControllerApp:
                 if hasattr(self, "preview"):
                     setattr(self.preview, attribute, value)
         recording = snapshot.get("recording")
-        if isinstance(recording, dict):
+        if apply_recording and isinstance(recording, dict):
             self._apply_recording_preset_data(recording)
         operation_capture = snapshot.get("operation_capture")
         if commands_enabled and isinstance(operation_capture, dict):
@@ -14568,8 +15834,8 @@ class PokeControllerApp:
             if commands_enabled and isinstance(assist.get("run_favorites"), dict) else {}
         self.command_recovery_favorites = normalize_recovery_favorites(
             assist.get("recovery_scripts", []) if commands_enabled else [])
-        self.command_recovery_auto_open.set(
-            bool(assist.get("recovery_auto_open", True))
+        self.command_recovery_auto_pause_disabled.set(
+            bool(assist.get("recovery_auto_pause_disabled", True))
             if commands_enabled else True)
         self._refresh_command_recovery_window_favorites()
         if commands_enabled and isinstance(assist.get("step_debug_rules"), list):
@@ -14868,6 +16134,17 @@ class PokeControllerApp:
 
     def _prompt_startup_input_set(self):
         self._startup_selected_combined_name = ""
+        restart_state = getattr(self, "_restart_state", None)
+        if restart_state is not None:
+            # This one-use state was created by this application's explicit
+            # restart action. Never overwrite the named InputSet/startup default.
+            name = restart_state["input_set"]
+            combined = restart_state["combined_set"]
+            self._startup_selected_combined_name = combined
+            self.input_recording_set_name.set(combined)
+            self.input_recording_input_name.set(name)
+            self._apply_startup_window_state(restart_state["maximized"])
+            return {"input_set": name, "recording_set": ""}
         data = self._read_input_sets()
         startup = data.get("startup", {})
         enabled = bool(startup.get("prompt", False))
@@ -14985,6 +16262,8 @@ class PokeControllerApp:
             item.get("recording_set", "") or "なし", serial_text))
 
     def load_input_recording_set(self):
+        if PokeControllerApp._command_debug_wait_for_release(self):
+            return False
         item = self._read_input_sets()["combined_sets"].get(self.input_recording_set_name.get().strip())
         if not item:
             tkmsg.showwarning("組み合わせセット", "呼び出す登録済み組み合わせセットを選択してください。")
@@ -15466,50 +16745,394 @@ class PokeControllerApp:
             self.record_max_disk_usage_percent.set(max_usage)
         return min_free_gb, max_usage
 
-    def _recording_disk_space_ok(self, show_popup=False, force=False):
-        """Check both tool/output drives, caching the result for camera callbacks."""
-        now = time.monotonic()
-        if not force and now - self._record_disk_last_check < 2.0:
-            return self._record_disk_last_ok
-        self._record_disk_last_check = now
-        min_free_gb, max_usage = self._recording_disk_thresholds()
-        violations = disk_space_violations(
-            (("ツール", os.path.dirname(os.path.abspath(__file__))),
-             ("録画保存先", self._effective_record_output_dir())),
-            min_free_gb=min_free_gb,
-            max_usage_percent=max_usage,
-        )
-        self._record_disk_last_ok = not violations
-        violation_key = tuple(
-            (item.get("drive"), item.get("error"), round(item.get("free_gb", -1), 2),
-             round(item.get("used_percent", -1), 1))
-            for item in violations
-        )
-        if violations and show_popup and (force or violation_key != self._record_disk_violation_key):
-            details = []
-            for item in violations:
-                if item.get("error"):
-                    details.append("{}: 容量を取得できません\n{}\n{}".format(
-                        item["label"], item["path"], item["error"]))
-                else:
-                    details.append("{} ({})\n空き {:.2f} GB / 使用率 {:.1f}%".format(
-                        item["label"], item["drive"], item["free_gb"], item["used_percent"]))
-            tkmsg.showerror(
-                "Recording: ドライブ容量不足",
-                "録画を開始または継続できません。\n\n{}\n\n"
-                "設定: 最小空き容量 {:.2f} GB / 最大使用率 {:.1f}%".format(
-                    "\n\n".join(details), min_free_gb, max_usage),
-            )
-        self._record_disk_violation_key = violation_key or None
-        return self._record_disk_last_ok
+    @staticmethod
+    def _ensure_disk_probe_state(app):
+        """Initialize async probe state for the app and lightweight tests."""
+        if not hasattr(app, "_disk_probe_lock"):
+            app._disk_probe_lock = threading.Lock()
+        if not hasattr(app, "_disk_probe_active"):
+            app._disk_probe_active = {}
+        if not hasattr(app, "_disk_probe_pending"):
+            app._disk_probe_pending = {}
+        if not hasattr(app, "_disk_probe_results"):
+            app._disk_probe_results = {}
+        if not hasattr(app, "_disk_probe_continuations"):
+            app._disk_probe_continuations = {
+                "recording": {}, "operation": {}}
 
-    def _interrupt_recording_for_disk_space(self):
-        """Finalize a partial recording and disarm automatic recording modes."""
+    @staticmethod
+    def _normalized_disk_probe_path(path):
+        # normcase/abspath are lexical.  Parent existence walking is deliberately
+        # left to DiskSpaceGuard on the worker.
+        return os.path.normcase(os.path.normpath(os.path.abspath(
+            str(path or os.curdir))))
+
+    def _recording_disk_probe_snapshot(self):
+        minimum, maximum = self._recording_disk_thresholds()
+        recorder = getattr(self, "recorder", None)
+        session_dir = str(getattr(recorder, "session_dir", "") or "")
+        output_path = session_dir if getattr(recorder, "active", False) \
+            and session_dir else self._effective_record_output_dir()
+        paths = (
+            ("ツール", os.path.dirname(os.path.abspath(__file__))),
+            ("録画保存先", output_path),
+        )
+        normalized = tuple(
+            (label, PokeControllerApp._normalized_disk_probe_path(path))
+            for label, path in paths)
+        generation = int(getattr(
+            self, "_recording_disk_config_generation", 0) or 0)
+        destination_getter = getattr(
+            self, "_record_storage_destination_key", None)
+        destination = (destination_getter()
+                       if callable(destination_getter) else "pc")
+        session_token = (
+            PokeControllerApp._normalized_disk_probe_path(session_dir)
+            if session_dir else "",
+            str(getattr(self, "_command_monitor_session_id", "") or ""),
+            str(getattr(self, "_active_input_set_name", "") or ""),
+            str(getattr(getattr(self, "record_mode", None), "get",
+                        lambda: "")() or ""),
+            str(destination or ""),
+        )
+        return {
+            "kind": "recording", "paths": normalized,
+            "minimum": minimum, "maximum": maximum,
+            "generation": generation, "session": session_token,
+            "key": ("recording", normalized, round(minimum, 6),
+                    round(maximum, 6), generation, session_token),
+        }
+
+    def _operation_disk_probe_snapshot(self):
+        minimum, maximum = self._recording_disk_thresholds()
+        session = getattr(self, "operation_capture_session", None)
+        session_dir = str(getattr(session, "session_dir", "") or "")
+        output_path = session_dir or self._operation_output_root()
+        paths = (
+            ("ツール", os.path.dirname(os.path.abspath(__file__))),
+            ("操作記録保存先", output_path),
+        )
+        normalized = tuple(
+            (label, PokeControllerApp._normalized_disk_probe_path(path))
+            for label, path in paths)
+        generation = int(getattr(
+            self, "_operation_disk_config_generation", 0) or 0)
+        session_token = (
+            PokeControllerApp._normalized_disk_probe_path(session_dir)
+            if session_dir else "",
+            str(getattr(self, "_active_input_set_name", "") or ""),
+            bool(getattr(getattr(
+                self, "operation_capture_include_audio", None), "get",
+                lambda: False)()),
+        )
+        return {
+            "kind": "operation", "paths": normalized,
+            "minimum": minimum, "maximum": maximum,
+            "generation": generation, "session": session_token,
+            "key": ("operation", normalized, round(minimum, 6),
+                    round(maximum, 6), generation, session_token),
+        }
+
+    def _disk_probe_context_active(self, kind):
+        if kind == "operation":
+            session = getattr(self, "operation_capture_session", None)
+            return bool(
+                getattr(getattr(self, "operation_recorder", None),
+                        "active", False)
+                or (session is not None and getattr(session, "active", False)))
+        return bool(
+            getattr(getattr(self, "recorder", None), "active", False)
+            or getattr(self, "record_armed", False)
+            or getattr(self, "_command_monitor_current_chunk", None) is not None
+            or getattr(self, "_command_monitor_start_request", None) is not None
+            or getattr(self, "_youtube_recording_rotation_in_progress", False))
+
+    @staticmethod
+    def _disk_violation_key(violations):
+        return tuple(
+            (item.get("drive"), item.get("path"), item.get("error"),
+             round(float(item.get("free_gb", -1.0)), 2),
+             round(float(item.get("used_percent", -1.0)), 1))
+            for item in violations)
+
+    def _show_disk_probe_violation(self, kind, snapshot, violations):
+        details = []
+        for item in violations:
+            if item.get("error"):
+                details.append("{}: 容量を取得できません\n{}\n{}".format(
+                    item.get("label", ""), item.get("path", ""),
+                    item.get("error", "")))
+            else:
+                details.append(
+                    "{} ({})\n空き {:.2f} GB / 使用率 {:.1f}%".format(
+                        item.get("label", ""), item.get("drive", ""),
+                        float(item.get("free_gb", 0.0)),
+                        float(item.get("used_percent", 0.0))))
+        if kind == "operation":
+            tkmsg.showerror(
+                "操作記録: ドライブ容量不足", "\n\n".join(details),
+                parent=self.root)
+            return
+        tkmsg.showerror(
+            "Recording: ドライブ容量不足",
+            "録画を開始または継続できません。\n\n{}\n\n"
+            "設定: 最小空き容量 {:.2f} GB / 最大使用率 {:.1f}%".format(
+                "\n\n".join(details), snapshot["minimum"],
+                snapshot["maximum"]), parent=self.root)
+
+    def _queue_disk_probe_interrupt(self, kind, snapshot, violations):
+        attribute = ("_operation_disk_interrupt_queued"
+                     if kind == "operation" else
+                     "_record_disk_interrupt_queued")
+        if bool(getattr(self, attribute, False)):
+            return False
+        setattr(self, attribute, True)
+
+        def interrupt():
+            if kind == "operation":
+                PokeControllerApp._interrupt_operation_capture_disk(
+                    self, snapshot=snapshot, violations=violations)
+            else:
+                PokeControllerApp._interrupt_recording_for_disk_space(
+                    self, snapshot=snapshot, violations=violations)
+
+        self._gui_action_queue.put(interrupt)
+        return True
+
+    def _start_disk_probe_worker(self, kind, snapshot):
+        def probe():
+            try:
+                violations = disk_space_violations(
+                    snapshot["paths"], min_free_gb=snapshot["minimum"],
+                    max_usage_percent=snapshot["maximum"])
+            except Exception as error:
+                violations = [{
+                    "label": "ドライブ", "path": snapshot["paths"][-1][1],
+                    "error": str(error)}]
+
+            def apply_result():
+                PokeControllerApp._apply_disk_probe_result(
+                    self, kind, snapshot, violations)
+
+            self._gui_action_queue.put(apply_result)
+
+        threading.Thread(
+            target=probe, daemon=True,
+            name=("RecordingDiskProbe" if kind == "recording"
+                  else "OperationDiskProbe")).start()
+
+    def _apply_disk_probe_result(self, kind, snapshot, violations):
+        PokeControllerApp._ensure_disk_probe_state(self)
+        with self._disk_probe_lock:
+            self._disk_probe_active.pop(kind, None)
+            pending = self._disk_probe_pending.get(kind)
+            completed_show_popup = bool(
+                pending is not None
+                and pending["snapshot"]["key"] == snapshot["key"]
+                and pending.get("show_popup", False))
+            if pending is not None and pending["snapshot"]["key"] == snapshot["key"]:
+                self._disk_probe_pending.pop(kind, None)
+        current = (self._recording_disk_probe_snapshot()
+                   if kind == "recording" else
+                   self._operation_disk_probe_snapshot())
+        shutting_down = bool(
+            getattr(self, "_preview_shutdown_mode", False)
+            or getattr(self, "_process_exit_ready", False))
+        matching = current["key"] == snapshot["key"] and not shutting_down
+        callbacks = []
+        show_popup = completed_show_popup
+        if matching:
+            now = time.monotonic()
+            result = {
+                "key": snapshot["key"], "checked_at": now,
+                "ok": not violations, "violations": list(violations),
+                "snapshot": snapshot,
+            }
+            with self._disk_probe_lock:
+                self._disk_probe_results[kind] = result
+                continuations = self._disk_probe_continuations.setdefault(
+                    kind, {})
+                for token, continuation in list(continuations.items()):
+                    if continuation[0] == snapshot["key"]:
+                        continuations.pop(token, None)
+                        if not violations:
+                            callbacks.append(continuation[1])
+            if kind == "recording":
+                self._record_disk_last_check = now
+                self._record_disk_last_ok = not violations
+            else:
+                self._operation_disk_last_check = now
+                self._operation_disk_last_ok = not violations
+            violation_key = PokeControllerApp._disk_violation_key(violations)
+            old_key = getattr(
+                self, "_record_disk_violation_key" if kind == "recording"
+                else "_operation_disk_violation_key", None)
+            if violations:
+                if PokeControllerApp._disk_probe_context_active(self, kind):
+                    PokeControllerApp._queue_disk_probe_interrupt(
+                        self, kind, snapshot, list(violations))
+                elif show_popup and violation_key != old_key:
+                    PokeControllerApp._show_disk_probe_violation(
+                        self, kind, snapshot, violations)
+                if kind == "recording":
+                    self._record_disk_violation_key = violation_key
+                else:
+                    self._operation_disk_violation_key = violation_key
+            else:
+                if kind == "recording":
+                    self._record_disk_violation_key = None
+                else:
+                    self._operation_disk_violation_key = None
+                for callback in callbacks:
+                    callback()
+        else:
+            with self._disk_probe_lock:
+                continuations = self._disk_probe_continuations.setdefault(
+                    kind, {})
+                for token, continuation in list(continuations.items()):
+                    if continuation[0] == snapshot["key"]:
+                        continuations.pop(token, None)
+
+        # A path/config change while one worker was active retains only the
+        # latest request and starts it after the stale worker has retired.
+        with self._disk_probe_lock:
+            pending = self._disk_probe_pending.get(kind)
+            can_start = pending is not None and kind not in self._disk_probe_active
+            if can_start:
+                next_snapshot = pending["snapshot"]
+                self._disk_probe_active[kind] = next_snapshot["key"]
+            else:
+                next_snapshot = None
+        if next_snapshot is not None:
+            if shutting_down:
+                with self._disk_probe_lock:
+                    self._disk_probe_active.pop(kind, None)
+                    self._disk_probe_pending.pop(kind, None)
+                return
+            latest = (self._recording_disk_probe_snapshot()
+                      if kind == "recording" else
+                      self._operation_disk_probe_snapshot())
+            if latest["key"] == next_snapshot["key"]:
+                PokeControllerApp._start_disk_probe_worker(
+                    self, kind, next_snapshot)
+            else:
+                with self._disk_probe_lock:
+                    self._disk_probe_active.pop(kind, None)
+
+    def _request_disk_probe(self, kind, snapshot, show_popup=False,
+                            force=False, continuation_key=None,
+                            on_ready=None):
+        PokeControllerApp._ensure_disk_probe_state(self)
+        now = time.monotonic()
+        with self._disk_probe_lock:
+            cached = self._disk_probe_results.get(kind)
+        if cached is not None and cached.get("key") == snapshot["key"]:
+            age = max(0.0, now - float(cached.get("checked_at", 0.0)))
+            # A force request still consumes the result that just completed;
+            # this prevents its continuation from starting a second probe.
+            maximum_age = 0.25 if force else 2.0
+            if age < maximum_age:
+                return bool(cached.get("ok"))
+        with self._disk_probe_lock:
+            if callable(on_ready) and continuation_key is not None:
+                self._disk_probe_continuations.setdefault(kind, {})[
+                    str(continuation_key)] = (snapshot["key"], on_ready)
+            previous = self._disk_probe_pending.get(kind)
+            self._disk_probe_pending[kind] = {
+                "snapshot": snapshot,
+                "show_popup": bool(show_popup or (
+                    previous is not None
+                    and previous["snapshot"]["key"] == snapshot["key"]
+                    and previous.get("show_popup", False))),
+            }
+            if kind in self._disk_probe_active:
+                start = False
+            else:
+                self._disk_probe_active[kind] = snapshot["key"]
+                start = True
+        if start:
+            PokeControllerApp._start_disk_probe_worker(self, kind, snapshot)
+        if kind == "recording":
+            self._record_disk_last_check = now
+        else:
+            self._operation_disk_last_check = now
+        # A same-key background refresh can safely use its last known state.
+        if (cached is not None and cached.get("key") == snapshot["key"]
+                and not force):
+            return bool(cached.get("ok"))
+        return None
+
+    def _recording_disk_space_ok(self, show_popup=False, force=False,
+                                 continuation_key=None, on_ready=None):
+        """Return a current snapshot or defer the decision to one worker."""
+        snapshot = self._recording_disk_probe_snapshot()
+        return PokeControllerApp._request_disk_probe(
+            self, "recording", snapshot, show_popup=show_popup, force=force,
+            continuation_key=continuation_key, on_ready=on_ready)
+
+    def _interrupt_recording_for_disk_space(
+            self, snapshot=None, violations=None):
+        """Close active recording data before reporting a capacity violation."""
         was_active = self.recorder.active
-        if was_active:
-            self._stop_capture_recorder()
+        completed = {"done": False}
+
+        def report_after_close(_error=None):
+            if completed["done"]:
+                return
+            completed["done"] = True
+            self._record_disk_interrupt_queued = False
+            if violations:
+                PokeControllerApp._show_disk_probe_violation(
+                    self, "recording", snapshot, violations)
+
         self.record_armed = False
         self._stop_command_record_window_capture()
+        if getattr(self, "_youtube_recording_rotation_in_progress", False):
+            # The rotation worker owns both recorders and will close the old
+            # segment under its original upload snapshot.
+            self._youtube_recording_rotation_continue = False
+            def wait_for_rotation():
+                if getattr(self, "_youtube_recording_rotation_in_progress", False):
+                    try:
+                        self.root.after(50, wait_for_rotation)
+                    except (AttributeError, tk.TclError):
+                        report_after_close()
+                    return
+                if getattr(self.recorder, "active", False):
+                    self._request_template_recording_stop(
+                        after_stop=report_after_close)
+                else:
+                    report_after_close()
+            wait_for_rotation()
+        elif getattr(self, "_command_monitor_start_request", None) is not None:
+            if not self._cancel_command_monitor_chunk_start(
+                    after_finish=report_after_close):
+                report_after_close()
+        elif getattr(self, "_command_monitor_current_chunk", None) is not None:
+            if not self._finish_command_monitor_chunk(
+                    "disk_space", background=True,
+                    after_finish=report_after_close):
+                report_after_close()
+        elif getattr(self, "_command_monitor_stop_in_progress", False):
+            def wait_for_command_close():
+                if getattr(self, "_command_monitor_stop_in_progress", False):
+                    try:
+                        self.root.after(50, wait_for_command_close)
+                    except (AttributeError, tk.TclError):
+                        report_after_close()
+                    return
+                report_after_close()
+            wait_for_command_close()
+        elif was_active:
+            request_stop = getattr(
+                self, "_request_template_recording_stop", None)
+            if callable(request_stop):
+                request_stop(launch_after=True, after_stop=report_after_close)
+            else:
+                self._stop_capture_recorder()
+                report_after_close()
+        else:
+            report_after_close()
         self._record_variable_active_rule_id = None
         self._record_variable_evaluator.reset()
         self.record_button.configure(text="Start recording")
@@ -15524,6 +17147,8 @@ class PokeControllerApp:
     def _build_operation_capture_tab(self, parent):
         """Build the single, ordered control surface for command authoring."""
         self.operation_capture_output_dir = tk.StringVar(value="")
+        self.operation_capture_output_dir.trace_add(
+            "write", self._operation_output_dir_changed)
         self.operation_capture_name = tk.StringVar(value="")
         self.operation_capture_include_audio = tk.BooleanVar(value=True)
         self.operation_capture_auto_controller = tk.BooleanVar(value=True)
@@ -15710,6 +17335,10 @@ class PokeControllerApp:
         return os.path.abspath(os.path.join(
             os.path.dirname(os.path.abspath(__file__)), "OperationSessions"))
 
+    def _operation_output_dir_changed(self, *_):
+        self._operation_disk_config_generation = int(getattr(
+            self, "_operation_disk_config_generation", 0) or 0) + 1
+
     def _operation_frame(self, frame=None):
         source = frame if frame is not None else getattr(self.camera, "image_bgr", None)
         if source is None:
@@ -15720,24 +17349,12 @@ class PokeControllerApp:
             return source
         return cv2.resize(source, (1280, 720), interpolation=cv2.INTER_AREA)
 
-    def _operation_disk_space_ok(self, show_popup=True):
-        minimum, maximum = self._recording_disk_thresholds()
-        session = getattr(self, "operation_capture_session", None)
-        output_path = session.session_dir if session is not None else self._operation_output_root()
-        violations = disk_space_violations(
-            (("ツール", os.path.dirname(os.path.abspath(__file__))),
-             ("操作記録保存先", output_path)),
-            min_free_gb=minimum, max_usage_percent=maximum)
-        if violations and show_popup:
-            text = "\n\n".join(
-                "{} ({})\n空き {:.2f} GB / 使用率 {:.1f}%".format(
-                    item.get("label", ""), item.get("drive", ""),
-                    float(item.get("free_gb", 0.0)), float(item.get("used_percent", 0.0)))
-                if not item.get("error") else
-                "{}: {}".format(item.get("label", ""), item.get("error", ""))
-                for item in violations)
-            tkmsg.showerror("操作記録: ドライブ容量不足", text, parent=self.root)
-        return not violations
+    def _operation_disk_space_ok(self, show_popup=True, force=False,
+                                 continuation_key=None, on_ready=None):
+        snapshot = self._operation_disk_probe_snapshot()
+        return PokeControllerApp._request_disk_probe(
+            self, "operation", snapshot, show_popup=show_popup, force=force,
+            continuation_key=continuation_key, on_ready=on_ready)
 
     def choose_operation_capture_output_dir(self):
         from tkinter import filedialog
@@ -15868,8 +17485,6 @@ class PokeControllerApp:
         frame = self._operation_frame()
         if frame is None:
             raise RuntimeError("Camera映像を開始してから操作記録を開始してください。")
-        if not self._operation_disk_space_ok(show_popup=True):
-            raise RuntimeError("保存先ドライブの容量制限により開始できません。")
         self._operation_disk_last_ok = True
         self._operation_disk_last_check = time.monotonic()
         self._operation_disk_interrupt_queued = False
@@ -15932,7 +17547,15 @@ class PokeControllerApp:
         if frame is None:
             tkmsg.showwarning("操作記録", "Camera映像を開始してから操作記録を開始してください。")
             return
-        if not self._operation_disk_space_ok(show_popup=True):
+        disk_ready = self._operation_disk_space_ok(
+            show_popup=True, force=True,
+            continuation_key="operation-capture-start",
+            on_ready=self.start_operation_capture)
+        if disk_ready is None:
+            self.operation_capture_status.set(
+                "保存先ドライブの容量を確認しています。完了後に開始します。")
+            return
+        if not disk_ready:
             return
         record_name = self.operation_capture_name.get().strip()
         paused_path = find_paused_session(
@@ -16067,6 +17690,16 @@ class PokeControllerApp:
         session = self.operation_capture_session
         if session is None or session.status != "paused":
             tkmsg.showinfo("操作記録", "再開できる一時停止セッションがありません。")
+            return
+        disk_ready = self._operation_disk_space_ok(
+            show_popup=True, force=True,
+            continuation_key="operation-capture-resume",
+            on_ready=self.resume_operation_capture)
+        if disk_ready is None:
+            self.operation_capture_status.set(
+                "保存先ドライブの容量を確認しています。完了後に再開します。")
+            return
+        if not disk_ready:
             return
         if not self._show_operation_pause_dialog(resume=True):
             return
@@ -16329,19 +17962,18 @@ class PokeControllerApp:
             return
         now = time.monotonic()
         if now - self._operation_disk_last_check >= 2.0:
-            self._operation_disk_last_check = now
-            self._operation_disk_last_ok = self._operation_disk_space_ok(show_popup=False)
-            if (not self._operation_disk_last_ok
-                    and not self._operation_disk_interrupt_queued):
-                self._operation_disk_interrupt_queued = True
-                self._gui_action_queue.put(self._interrupt_operation_capture_disk)
+            disk_ready = self._operation_disk_space_ok(show_popup=False)
+            if disk_ready is None:
+                return
+            self._operation_disk_last_ok = bool(disk_ready)
         if not self._operation_disk_last_ok:
             return
         clean = self._operation_frame(frame)
         if clean is not None:
             self.operation_recorder.add_frame(clean)
 
-    def _interrupt_operation_capture_disk(self):
+    def _interrupt_operation_capture_disk(self, snapshot=None,
+                                          violations=None):
         self._operation_disk_interrupt_queued = False
         if (self.operation_capture_session is not None
                 and self.operation_capture_session.active):
@@ -16349,7 +17981,9 @@ class PokeControllerApp:
             self.operation_capture_status.set(
                 "容量不足で一時停止しました。保存先を整理してから再開してください。")
             self.operation_capture_status_label.configure(fg="#c62828")
-            self._operation_disk_space_ok(show_popup=True)
+        if violations:
+            PokeControllerApp._show_disk_probe_violation(
+                self, "operation", snapshot, violations)
 
     def _update_operation_capture_ui(self):
         session = self.operation_capture_session
@@ -16607,12 +18241,17 @@ class PokeControllerApp:
 
     def _build_command_monitor_recording_tab(self, parent):
         self.command_recovery_favorites = []
-        self.command_recovery_auto_open = tk.BooleanVar(value=True)
+        # Safety monitoring remains available, but automatic Commands pauses
+        # and automatic recovery-window popups are opt-in.  Keep this setting
+        # on the Commands tab where it is visible while Commands is running.
+        self.command_recovery_auto_pause_disabled = tk.BooleanVar(value=True)
         self.record_monitor_chunk_seconds = tk.DoubleVar(value=30.0)
         self.record_monitor_keep_steps = tk.IntVar(value=15)
         self.record_monitor_loop_cycles = tk.IntVar(value=3)
         self.record_monitor_long_seconds = tk.DoubleVar(value=180.0)
         self.record_monitor_failure_tail_seconds = tk.DoubleVar(value=60.0)
+        self.record_monitor_retention_mode = tk.StringVar(
+            value=COMMAND_MONITOR_RETENTION_SMART)
         self.record_monitor_auto_arm = tk.BooleanVar(value=True)
         self.record_focus_repair_enabled = tk.BooleanVar(value=False)
         self.record_focus_repair_functions = tk.StringVar(value="")
@@ -16622,13 +18261,19 @@ class PokeControllerApp:
         self.record_monitor_confirm_delete_on_stop = tk.BooleanVar(value=True)
         self.record_monitor_status = tk.StringVar(
             value="停止中：このタブを選び［監視開始］を押してください。")
-        self.record_monitor_counts = tk.StringVar(value="一時 0本 / 保護 0本 / 削除待ち 0本")
+        self.record_monitor_counts = tk.StringVar(
+            value="一時 0本 / 全保持 0本 / 保護 0本 / YouTube確認待ち 0本 / 削除待ち 0本")
         self._recording_normal_mode = "Manual"
         self._command_monitor_timeline = CommandStateTimeline(loop_cycles=3)
         self._command_monitor_visual_detector = DarkStillFrameDetector()
         self._command_monitor_input_tracker = CommandInputActivityTracker(60.0)
         self._command_monitor_chunks = []
         self._command_monitor_current_chunk = None
+        self._record_output_scan_generation = 0
+        self._record_output_scan_active = False
+        self._record_output_scan_requested = None
+        self._record_output_reload_pending = False
+        self._record_output_reload_after_id = None
         self._command_monitor_last_check = 0.0
         self._command_monitor_last_trace_check = 0.0
         self._command_monitor_session_started = 0.0
@@ -16636,6 +18281,7 @@ class PokeControllerApp:
         self._command_monitor_last_location_key = ()
         self._command_monitor_last_snapshot = {}
         self._command_monitor_session_id = ""
+        self._command_monitor_session_retention_mode = ""
         self._command_monitor_command = None
         self._command_focus_targets = []
         self._command_common_function_groups = []
@@ -16650,15 +18296,21 @@ class PokeControllerApp:
         self._command_monitor_failure_capture_mode = ""
         self._command_monitor_merge_active = 0
         self._command_monitor_merge_lock = threading.Lock()
+        self._command_monitor_index_events = {}
+        self._command_monitor_index_events_lock = threading.Lock()
         self._command_monitor_delete_queue = queue.Queue()
         self._command_monitor_delete_thread = threading.Thread(
             target=self._command_monitor_delete_loop, daemon=True,
             name="CommandMonitorCleanup")
         self._command_monitor_delete_thread.start()
+        self._command_monitor_delete_probe_active = False
+        self._command_monitor_delete_probe_after = 0.0
+        self._command_monitor_delete_probe_results = {}
+        self._command_monitor_discard_probe_active = False
 
         ttk.Label(
             parent,
-            text=("Commands実行中を短い動画へ分割し、直近Step・長時間Step・ループだけを一時保持します。\n"
+            text=("Commands実行中を短い動画へ分割し、自動判定または全区間保持を選べます。\n"
                   "YouTube保存時は設定時間ごとに実行中のまま確定・キュー登録し、"
                   "元動画を削除します。Step履歴とOutputログは残します。"),
             foreground="#174a7e", justify="left", wraplength=980,
@@ -16708,12 +18360,22 @@ class PokeControllerApp:
             settings, text="Commands Stop時は今回の録画を必ず保存確認",
             foreground="#174a7e").grid(
                 column=4, columnspan=5, row=3, padx=6, pady=(1, 5), sticky="w")
-        ttk.Checkbutton(
+        ttk.Label(settings, text="録画保持モード").grid(
+            column=0, row=4, padx=(6, 4), pady=(1, 5), sticky="w")
+        ttk.Radiobutton(
             settings,
-            text="Stepループ（3周で一時停止確認）・暗転停止で復旧Pythonを自動表示",
-            variable=self.command_recovery_auto_open,
-            command=self._sync_command_recovery_scripts_to_active_input_set).grid(
-                column=0, columnspan=9, row=4, padx=6, pady=(1, 5), sticky="w")
+            text="自動判定（直近Step・異常・ループ周辺を保持）",
+            value=COMMAND_MONITOR_RETENTION_SMART,
+            variable=self.record_monitor_retention_mode,
+            command=self._on_command_monitor_retention_mode_changed).grid(
+                column=1, columnspan=4, row=4, padx=2, pady=(1, 5), sticky="w")
+        ttk.Radiobutton(
+            settings,
+            text="全区間を保持（録画用ループ判定・自動削除なし）",
+            value=COMMAND_MONITOR_RETENTION_KEEP_ALL,
+            variable=self.record_monitor_retention_mode,
+            command=self._on_command_monitor_retention_mode_changed).grid(
+                column=5, columnspan=4, row=4, padx=2, pady=(1, 5), sticky="w")
         ttk.Checkbutton(
             settings, text="集中修正モード（指定関数の動画・Step・実行行を保持）",
             variable=self.record_focus_repair_enabled).grid(
@@ -16796,9 +18458,71 @@ class PokeControllerApp:
         self.record_monitor_tree.bind(
             "<Double-1>", lambda _event: self.open_selected_command_recording_in_dev_studio())
 
+    def _command_monitor_retention_mode_key(self):
+        variable = getattr(self, "record_monitor_retention_mode", None)
+        try:
+            value = variable.get() if variable is not None else ""
+        except (AttributeError, tk.TclError):
+            value = ""
+        return normalize_command_monitor_retention_mode(value)
+
+    def _command_monitor_keep_all_enabled(self):
+        raw_session_mode = str(getattr(
+            self, "_command_monitor_session_retention_mode", "") or "")
+        session_mode = normalize_command_monitor_retention_mode(
+            raw_session_mode)
+        if (getattr(self, "_command_monitor_command", None) is None
+                or raw_session_mode not in (
+                    COMMAND_MONITOR_RETENTION_SMART,
+                    COMMAND_MONITOR_RETENTION_KEEP_ALL)):
+            session_mode = self._command_monitor_retention_mode_key()
+        return (session_mode
+                == COMMAND_MONITOR_RETENTION_KEEP_ALL)
+
+    def _on_command_monitor_retention_mode_changed(self):
+        mode = self._command_monitor_retention_mode_key()
+        self.record_monitor_retention_mode.set(mode)
+        session_mode = normalize_command_monitor_retention_mode(getattr(
+            self, "_command_monitor_session_retention_mode", ""))
+        if getattr(self, "_command_monitor_command", None) is not None:
+            active_label = ("全区間保持" if session_mode
+                            == COMMAND_MONITOR_RETENTION_KEEP_ALL else "自動判定")
+            next_label = ("全区間保持" if mode
+                          == COMMAND_MONITOR_RETENTION_KEEP_ALL else "自動判定")
+            self.record_monitor_status.set(
+                "設定を変更しました。実行中は{}のまま継続し、次回のCommands実行から{}を適用します。"
+                "永続化する場合はInputSetまたはRecordingセットを保存してください。".format(
+                    active_label, next_label))
+            return
+        timeline = getattr(self, "_command_monitor_timeline", None)
+        if timeline is not None:
+            try:
+                loop_cycles = max(
+                    2, int(self.record_monitor_loop_cycles.get()))
+            except (AttributeError, tk.TclError, TypeError, ValueError):
+                loop_cycles = 3
+            timeline.reset(loop_cycles=loop_cycles)
+        detector = getattr(self, "_command_monitor_visual_detector", None)
+        if detector is not None:
+            detector.reset()
+        tracker = getattr(self, "_command_monitor_input_tracker", None)
+        if tracker is not None:
+            tracker.reset(time.monotonic())
+        self._command_monitor_failure_capture_until = None
+        self._command_monitor_failure_capture_mode = ""
+        if mode == COMMAND_MONITOR_RETENTION_KEEP_ALL:
+            self.record_monitor_status.set(
+                "全区間保持モード: 録画用のループ判定と自動削除を行いません。")
+        else:
+            self.record_monitor_status.set(
+                "自動判定モード: 直近Step・異常・ループ周辺を保持します。")
+        self._refresh_command_monitor_tree()
+
     @staticmethod
     def _normalize_record_storage_destination(value, youtube_enabled=False):
         text = str(value or "").strip().lower()
+        if text in ("none", "off", "disabled", "no_recording"):
+            return "none"
         if text in ("youtube", "yt", "upload"):
             return "youtube"
         if text in ("pc", "local", "computer"):
@@ -16822,6 +18546,10 @@ class PokeControllerApp:
 
     def _set_record_storage_destination(self, value, open_tab=False):
         destination = self._normalize_record_storage_destination(value)
+        current_value = getattr(self, "record_storage_destination", None)
+        current_get = getattr(current_value, "get", None)
+        previous = self._normalize_record_storage_destination(
+            current_get() if callable(current_get) else "")
         self.record_storage_destination.set(destination)
         youtube = destination == "youtube"
         self.record_youtube_upload_enabled.set(youtube)
@@ -16829,8 +18557,67 @@ class PokeControllerApp:
             # YouTube is the selected long-term video store. Keep the local
             # source only until YouTube reports processing complete.
             self.record_youtube_delete_local.set(True)
+        elif getattr(self, "_youtube_recording_rotation_in_progress", False):
+            # The current segment is already being closed safely. Do not begin
+            # another YouTube segment after the destination changed.
+            self._youtube_recording_rotation_continue = False
+        destination_changed = previous != destination
+        stop_requested = False
+        if (destination_changed
+                and (getattr(self.recorder, "active", False)
+                     or getattr(
+                         self, "_command_monitor_start_request", None) is not None
+                     or getattr(
+                         self, "_youtube_recording_rotation_in_progress", False))):
+            # A segment is owned by the settings/channel captured at Start.
+            # Close it under that immutable snapshot before the newly selected
+            # destination is allowed to start another segment.
+            self.record_armed = False
+            if getattr(self, "_command_monitor_start_request", None) is not None:
+                stop_requested = bool(
+                    self._cancel_command_monitor_chunk_start())
+            elif (getattr(self, "_command_monitor_current_chunk", None)
+                    is not None
+                    and not getattr(
+                        self, "_command_monitor_stop_in_progress", False)):
+                finish_chunk = getattr(
+                    self, "_finish_command_monitor_chunk", None)
+                if callable(finish_chunk):
+                    finish_chunk("recording_disabled" if destination == "none"
+                                 else "input_set_changed", background=True)
+                    stop_requested = True
+            elif not getattr(self, "_command_monitor_stop_in_progress", False):
+                stop_recording = getattr(
+                    self, "_request_template_recording_stop", None)
+                if callable(stop_recording):
+                    stop_recording(launch_after=True)
+                    stop_requested = True
+        if destination == "none":
+            # Applying an InputSet whose destination is "none" must also stop
+            # an already armed monitor.  Otherwise Template/Commands could
+            # silently start another file even though the persisted setting
+            # says that recording is disabled.
+            self.record_armed = False
+            mode_getter = getattr(getattr(self, "record_mode", None), "get", None)
+            mode = mode_getter() if callable(mode_getter) else ""
+            if (getattr(self.recorder, "active", False)
+                    and not stop_requested
+                    and not getattr(
+                        self, "_command_monitor_stop_in_progress", False)):
+                if (mode == "CommandMonitor"
+                        and getattr(self, "_command_monitor_current_chunk", None)
+                        is not None):
+                    finish_chunk = getattr(
+                        self, "_finish_command_monitor_chunk", None)
+                    if callable(finish_chunk):
+                        finish_chunk("recording_disabled", background=True)
+                else:
+                    stop_recording = getattr(
+                        self, "_request_template_recording_stop", None)
+                    if callable(stop_recording):
+                        stop_recording(launch_after=True)
         tabs = getattr(self, "recording_destination_tabs", None)
-        if open_tab and tabs is not None:
+        if open_tab and tabs is not None and destination != "none":
             page = self.recording_youtube_settings_page if youtube \
                 else self.recording_pc_settings_page
             tabs.select(page)
@@ -16841,9 +18628,12 @@ class PokeControllerApp:
         return destination
 
     def _update_record_storage_status(self):
-        if self._record_storage_destination_key() == "youtube":
+        destination = self._record_storage_destination_key()
+        if destination == "youtube":
             text = ("録画動画の保存先: YouTube（処理完了まではPCへ一時保存。"
                     "ログ・検知画像・索引はPCに残します）")
+        elif destination == "none":
+            text = "録画なし（このInputSetでは通常録画・Commands監視録画を開始しません）"
         else:
             text = "録画動画の保存先: PC（YouTubeへはアップロードしません）"
         status = getattr(self, "record_storage_status", None)
@@ -16909,8 +18699,144 @@ class PokeControllerApp:
     def _youtube_upload_queue_dir(self):
         return upload_queue_dir(Settings.GuiSettings.SETTING_PATH)
 
-    def _refresh_youtube_channel_choices(self):
-        names = channel_profile_names(self._youtube_channel_store_path())
+    @staticmethod
+    def _read_youtube_queue_snapshot(queue_dir, store_path):
+        """Read the shared channel/queue state on a background worker."""
+        store = load_channel_store(store_path)
+        jobs = []
+        try:
+            names = [name for name in os.listdir(queue_dir)
+                     if name.endswith(".json")]
+        except OSError:
+            names = []
+        for name in names:
+            path = os.path.join(queue_dir, name)
+            try:
+                with open(path, "r", encoding="utf-8") as stream:
+                    job = json.load(stream)
+            except (OSError, TypeError, ValueError):
+                job = None
+            jobs.append((name, job))
+        return {"store": store, "jobs": jobs}
+
+    def _request_youtube_queue_snapshot(self, callback=None,
+                                        resume_uploads=False):
+        """Deduplicate queue scans and publish their UI result on Tk."""
+        lock = getattr(self, "_youtube_queue_snapshot_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._youtube_queue_snapshot_lock = lock
+        with lock:
+            callbacks = getattr(
+                self, "_youtube_queue_snapshot_callbacks", None)
+            if not isinstance(callbacks, list):
+                callbacks = []
+                self._youtube_queue_snapshot_callbacks = callbacks
+            if callable(callback):
+                callbacks.append(callback)
+            if resume_uploads:
+                self._youtube_queue_snapshot_resume_requested = True
+                self._youtube_queue_snapshot_resume_revision = int(getattr(
+                    self, "_youtube_queue_snapshot_resume_revision", 0)) + 1
+            if bool(getattr(
+                    self, "_youtube_queue_snapshot_active", False)):
+                return False
+            self._youtube_queue_snapshot_active = True
+        queue_dir = self._youtube_upload_queue_dir()
+        store_path = self._youtube_channel_store_path()
+
+        def worker():
+            while True:
+                with lock:
+                    scan_revision = int(getattr(
+                        self, "_youtube_queue_snapshot_resume_revision", 0))
+                try:
+                    snapshot = (
+                        PokeControllerApp._read_youtube_queue_snapshot(
+                            queue_dir, store_path))
+                except Exception as error:
+                    self._logger.warning(
+                        "YouTube queue snapshot failed: %s", error)
+                    snapshot = {"store": {}, "jobs": []}
+                with lock:
+                    # A resume request can arrive after this scan started,
+                    # commonly just after a new durable job was published.
+                    # Never decide whether to launch from that older view.
+                    if int(getattr(
+                            self,
+                            "_youtube_queue_snapshot_resume_revision",
+                            0)) != scan_revision:
+                        continue
+                    resume = bool(getattr(
+                        self, "_youtube_queue_snapshot_resume_requested",
+                        False))
+                    self._youtube_queue_snapshot_resume_requested = False
+                if (resume
+                        and dict(snapshot.get(
+                            "store", {}) or {}).get("profiles")
+                        and any(upload_job_is_actionable(job)
+                                for _name, job in snapshot.get("jobs", []))):
+                    try:
+                        launch_upload_worker(queue_dir, store_path)
+                    except OSError as error:
+                        self._logger.warning(
+                            "YouTube upload worker launch failed: %s", error)
+                with lock:
+                    if int(getattr(
+                            self,
+                            "_youtube_queue_snapshot_resume_revision",
+                            0)) != scan_revision:
+                        continue
+                    break
+
+            def apply_snapshot(value=snapshot, value_revision=scan_revision):
+                # Keep the scan active until this GUI publication is queued and
+                # applied. Otherwise a second worker can publish a newer result
+                # first and this callback can overwrite it with stale state.
+                with lock:
+                    scan_again = int(getattr(
+                        self, "_youtube_queue_snapshot_resume_revision",
+                        0)) != value_revision
+                    if scan_again:
+                        # Preserve callbacks and the resume flag for the newer
+                        # scan. Publishing this value would let an old empty
+                        # queue overwrite the view containing the new job.
+                        pending = []
+                    else:
+                        pending = list(getattr(
+                            self, "_youtube_queue_snapshot_callbacks", ()))
+                        self._youtube_queue_snapshot_callbacks = []
+                    self._youtube_queue_snapshot_active = False
+                if scan_again:
+                    PokeControllerApp._request_youtube_queue_snapshot(self)
+                    return
+                self._youtube_queue_snapshot = value
+                self._youtube_channel_store_cache = dict(
+                    value.get("store", {}) or {})
+                for pending_callback in pending:
+                    try:
+                        pending_callback(value)
+                    except Exception as error:
+                        self._logger.warning(
+                            "YouTube queue snapshot callback failed: %s", error)
+            self._gui_action_queue.put(apply_snapshot)
+
+        threading.Thread(
+            target=worker, daemon=True,
+            name="YouTubeQueueSnapshot").start()
+        return True
+
+    def _apply_youtube_channel_store(self, store, update_status=True):
+        """Apply an already-read channel store without touching the disk."""
+        store = dict(store or {}) if isinstance(store, dict) else {}
+        profiles = store.get("profiles", {})
+        if not isinstance(profiles, dict):
+            profiles = {}
+        store["profiles"] = profiles
+        store["default_profile"] = str(
+            store.get("default_profile", "") or "")
+        self._youtube_channel_store_cache = store
+        names = sorted(store.get("profiles", {}), key=str.casefold)
         combo = getattr(self, "record_youtube_channel_cb", None)
         if combo is not None:
             combo.configure(values=[""] + names)
@@ -16918,35 +18844,118 @@ class PokeControllerApp:
         if selected and selected not in names:
             self.record_youtube_status.set(
                 "YouTube保存: InputSet指定チャンネルが未認証です: " + selected)
-        else:
+        elif update_status:
             self._update_youtube_recording_status()
         return names
 
+    def _refresh_youtube_channel_choices(self, callback=None,
+                                         error_callback=None):
+        """Read the shared channel store off Tk and apply only the newest read."""
+        generation = int(getattr(
+            self, "_youtube_channel_refresh_generation", 0)) + 1
+        self._youtube_channel_refresh_generation = generation
+        store_path = self._youtube_channel_store_path()
+
+        def worker():
+            store = None
+            error = None
+            try:
+                store = load_channel_store(store_path)
+            except Exception as caught:
+                error = caught
+
+            def finished():
+                if generation != int(getattr(
+                        self, "_youtube_channel_refresh_generation", 0)):
+                    return
+                if error is not None:
+                    self._logger.warning(
+                        "YouTube channel store refresh failed: %s", error)
+                    if callable(error_callback):
+                        error_callback(error)
+                    return
+                names = PokeControllerApp._apply_youtube_channel_store(
+                    self, store)
+                if callable(callback):
+                    callback(store, names)
+
+            self._gui_action_queue.put(finished)
+
+        threading.Thread(
+            target=worker, daemon=True,
+            name="YouTubeChannelRefresh").start()
+        return True
+
     def _update_youtube_recording_status(self):
-        if self._record_storage_destination_key() != "youtube":
+        destination = self._record_storage_destination_key()
+        if destination == "none":
+            self.record_youtube_status.set(
+                "YouTubeアップロード: OFF（現在の設定は録画なし）")
+            return
+        if destination != "youtube":
             self.record_youtube_status.set(
                 "YouTubeアップロード: OFF（現在の保存先はPC）")
             return
-        store = load_channel_store(self._youtube_channel_store_path())
         requested = self.record_youtube_channel_profile.get().strip()
-        resolved = requested or store.get("default_profile", "")
-        if not resolved:
-            self.record_youtube_status.set("YouTube保存: ON / 既定チャンネル未設定")
-            return
-        profile = dict(store.get("profiles", {}).get(resolved, {}) or {})
-        title = str(profile.get("channel_title", "") or resolved)
         try:
             segment_minutes = int(float(
                 self.record_youtube_segment_minutes.get()))
         except (tk.TclError, TypeError, ValueError):
             segment_minutes = 120
-        self.record_youtube_status.set(
-            "YouTube保存: ON / {} / {}分ごと / Commands: {} / 処理確認後{}".format(
-                title, segment_minutes,
-                commands_video_mode_label(
-                    self.record_youtube_commands_video_mode.get()),
-                "ローカル動画削除" if self.record_youtube_delete_local.get()
-                else "ローカル動画保持"))
+        commands_mode = self.record_youtube_commands_video_mode.get()
+        allow_low_presentations = bool(
+            self.record_youtube_commands_allow_low_presentations.get())
+        delete_local = bool(self.record_youtube_delete_local.get())
+
+        def apply_status(snapshot):
+            if self._record_storage_destination_key() != "youtube":
+                return
+            store = dict(snapshot.get("store", {}) or {})
+            resolved = requested or store.get("default_profile", "")
+            if not resolved:
+                self.record_youtube_status.set(
+                    "YouTube保存: ON / 既定チャンネル未設定")
+                return
+            profile = dict(
+                store.get("profiles", {}).get(resolved, {}) or {})
+            title = str(profile.get("channel_title", "") or resolved)
+            authentication_required = 0
+            profile_updated_at = str(profile.get("updated_at", "") or "")
+            for _name, job in snapshot.get("jobs", []):
+                if not isinstance(job, dict):
+                    continue
+                job_profile = str(
+                    job.get("authentication_profile")
+                    or job.get("channel_profile_resolved")
+                    or job.get("channel_profile") or resolved).strip()
+                status = str(job.get("status", "") or "")
+                error_text = str(job.get("error", "") or "")
+                failure_at = str(
+                    job.get("authentication_required_at")
+                    or job.get("updated_at") or "")
+                profile_was_reauthorized = bool(
+                    profile_updated_at and failure_at
+                    and profile_updated_at > failure_at)
+                if (job_profile == resolved and not profile_was_reauthorized
+                        and (status == "authentication_required"
+                             or "invalid_grant" in error_text.lower())):
+                    authentication_required += 1
+            if authentication_required:
+                self.record_youtube_status.set(
+                    "YouTube再認証が必要: {} / 再開待ち{}件".format(
+                        title, authentication_required))
+                return
+            self.record_youtube_status.set(
+                "YouTube保存: ON / {} / {}分ごと / Commands: {} / "
+                "低品質許容: {} / 処理確認後{}".format(
+                    title, segment_minutes,
+                    commands_video_mode_label(commands_mode),
+                    "ON" if allow_low_presentations else "OFF",
+                    "ローカル動画削除" if delete_local else
+                    "ローカル動画保持"))
+
+        PokeControllerApp._request_youtube_queue_snapshot(
+            self, callback=apply_status)
 
     def _on_youtube_commands_video_mode_changed(self, _event=None):
         self._update_youtube_recording_status()
@@ -17092,19 +19101,29 @@ class PokeControllerApp:
             foreground="#555555").grid(
                 column=3, columnspan=5, row=2, padx=(4, 6), pady=(0, 5),
                 sticky="w")
+        ttk.Checkbutton(
+            frame,
+            text=("Commands低品質許容（表示フレーム不足でも、"
+                  "記録時間と実映像時間が一致した場合のみアップロード）"),
+            variable=self.record_youtube_commands_allow_low_presentations,
+            command=self._update_youtube_recording_status).grid(
+                column=0, columnspan=8, row=3, padx=6, pady=(0, 5),
+                sticky="w")
         ttk.Label(
             frame, textvariable=self.record_youtube_status,
             foreground="#174a7e").grid(
-                column=0, columnspan=8, row=3, padx=6, pady=(0, 3), sticky="w")
+                column=0, columnspan=8, row=4, padx=6, pady=(0, 3), sticky="w")
         ttk.Label(
             frame,
             text=("PC側には限定公開URL・Step・関数呼び出し索引・JPEG・ログ・ソースが残ります。"
                   "複数PokeConは同じ永続キューを共有し、1本ずつアップロードします。"),
             foreground="#555555").grid(
-                column=0, columnspan=8, row=4, padx=6, pady=(0, 5), sticky="w")
+                column=0, columnspan=8, row=5, padx=6, pady=(0, 5), sticky="w")
         frame.columnconfigure(3, weight=1)
         self._refresh_youtube_channel_choices()
-        self.root.after(1500, self._resume_youtube_uploads)
+        self.root.after(1000, self._resume_pending_recording_finalizers)
+        self._youtube_upload_watchdog_id = self.root.after(
+            1500, self._youtube_upload_watchdog)
 
     def _open_youtube_archive_guide(self):
         path = os.path.join(
@@ -17127,8 +19146,9 @@ class PokeControllerApp:
         viewer.insert("1.0", content)
         viewer.configure(state="disabled")
 
-    def _show_youtube_upload_queue(self):
-        queue_dir = self._youtube_upload_queue_dir()
+    @staticmethod
+    def _read_youtube_queue_dialog_rows(queue_dir):
+        """Build queue rows, including session metadata, away from Tk."""
         rows = []
         try:
             names = sorted(
@@ -17140,42 +19160,295 @@ class PokeControllerApp:
             try:
                 with open(path, "r", encoding="utf-8") as stream:
                     job = json.load(stream)
-            except (OSError, ValueError):
+            except (OSError, TypeError, ValueError):
                 continue
-            rows.append("{} | {} | {} | {}".format(
-                job.get("status", "pending"), job.get("input_set", "-"),
-                job.get("recording_kind", "-"),
-                job.get("error", "") or os.path.basename(
-                    str(job.get("media_path", "") or ""))))
+            if not isinstance(job, dict):
+                continue
+            session_dir = str(job.get("session_dir", "") or "")
+            metadata = {}
+            try:
+                with open(os.path.join(session_dir, "command_monitor.json"),
+                          "r", encoding="utf-8") as stream:
+                    loaded = json.load(stream)
+                metadata = loaded if isinstance(loaded, dict) else {}
+            except (OSError, TypeError, ValueError):
+                pass
+            started, ended, duration_seconds = (
+                _youtube_queue_recording_window(job, metadata))
+            duration = "{:.1f}秒".format(duration_seconds) \
+                if duration_seconds else "-"
+            video_ids = [
+                str(segment.get("video_id", "") or "")
+                for segment in job.get("segments", [])
+                if isinstance(segment, dict)
+                and str(segment.get("video_id", "") or "")]
+            status = str(job.get("status", "pending") or "pending")
+            media_name = os.path.basename(str(
+                job.get("media_path", "") or ""))
+            active_error = str(job.get("error", "") or "").strip()
+            previous_error = str(
+                job.get("previous_upload_error", "") or "").strip()
+            previous_error_at = str(
+                job.get("previous_upload_error_at", "") or "").strip()
+            detail_lines = []
+            if status == "waiting_media":
+                # Legacy queue files may still carry an HTTP error from an
+                # older attempt. Show it as history, separately from the
+                # current local finalization/restoration wait.
+                missing_since = str(
+                    job.get("media_missing_since", "") or "").strip()
+                detail_lines.append(
+                    "現在理由: ローカル動画の確定・復旧待ち"
+                    "（開始: {}）: {}".format(
+                        missing_since or "時刻不明", media_name or "-"))
+                if not previous_error and active_error:
+                    previous_error = active_error
+                    previous_error_at = str(
+                        job.get("permanent_request_error_at")
+                        or job.get("upload_attention_required_at")
+                        or job.get("quota_waiting_at") or "").strip()
+                active_error = ""
+                retry = "-"
+            else:
+                if active_error:
+                    if status == "quota_waiting":
+                        active_error_at = job.get("quota_waiting_at", "")
+                    elif status == "upload_attention_required":
+                        active_error_at = (
+                            job.get("permanent_request_error_at")
+                            or job.get("upload_attention_required_at", ""))
+                    elif status == "authentication_required":
+                        active_error_at = job.get(
+                            "authentication_required_at", "")
+                    else:
+                        active_error_at = job.get("updated_at", "")
+                    active_error_at = str(active_error_at or "").strip()
+                    detail_lines.append(
+                        "現在エラー発生: {}\n{}".format(
+                            active_error_at or "時刻不明", active_error))
+                elif media_name:
+                    detail_lines.append(media_name)
+                retry = job.get("quota_retry_after", "-") \
+                    if status == "quota_waiting" else "-"
+            if (previous_error
+                    and (not active_error or previous_error != active_error)):
+                detail_lines.append(
+                    "過去エラー発生: {}\n{}".format(
+                        previous_error_at or "時刻不明", previous_error))
+            detail = "\n".join(detail_lines) or "-"
+            rows.append(
+                "[{status}] Job {job_id}\n"
+                "InputSet: {input_set} / 種別: {kind}\n"
+                "録画範囲: {started} ～ {ended} / 長さ: {duration}\n"
+                "キュー登録: {created} / 更新: {updated} / 試行: {attempts}\n"
+                "YouTube ID: {video_ids}\n"
+                "次回再試行: {retry}\n{detail}".format(
+                    status=status,
+                    job_id=os.path.splitext(name)[0],
+                    input_set=job.get("input_set", "-"),
+                    kind=job.get("recording_kind", "-"),
+                    started=started, ended=ended, duration=duration,
+                    created=job.get("created_at", "-"),
+                    updated=job.get("updated_at", "-"),
+                    attempts=job.get("attempts", 0),
+                    video_ids=", ".join(video_ids) or "-",
+                    retry=retry or "-",
+                    detail=detail))
+        return {
+            "rows": rows,
+            "queue_exists": os.path.isdir(queue_dir),
+        }
+
+    def _show_youtube_upload_queue(self):
+        queue_dir = self._youtube_upload_queue_dir()
         dialog = tk.Toplevel(self.root)
         dialog.title("YouTubeアップロードキュー")
         dialog.geometry("900x460")
         viewer = tk.Text(dialog, wrap="word", padx=10, pady=10)
         viewer.pack(fill="both", expand=True, padx=6, pady=6)
-        viewer.insert("1.0", "\n".join(rows) if rows else "キューは空です。")
-        viewer.configure(state="disabled")
         actions = ttk.Frame(dialog)
         actions.pack(fill="x", padx=6, pady=(0, 6))
-        if os.path.isdir(queue_dir):
-            ttk.Button(
-                actions, text="キューフォルダを開く",
-                command=lambda: os.startfile(queue_dir)).pack(side="left")
-        ttk.Button(actions, text="閉じる", command=dialog.destroy).pack(side="right")
+        folder_button = ttk.Button(
+            actions, text="キューフォルダを開く", state="disabled",
+            command=lambda: os.startfile(queue_dir))
+        folder_button.pack(side="left")
+        context = {"closed": False, "generation": 0}
+
+        def replace_text(value):
+            viewer.configure(state="normal")
+            viewer.delete("1.0", "end")
+            viewer.insert("1.0", value)
+            viewer.configure(state="disabled")
+
+        def close_dialog():
+            context["closed"] = True
+            try:
+                dialog.destroy()
+            except tk.TclError:
+                pass
+
+        def destroyed(event=None):
+            if event is None or getattr(event, "widget", dialog) is dialog:
+                context["closed"] = True
+
+        def refresh():
+            if context["closed"]:
+                return
+            context["generation"] += 1
+            generation = context["generation"]
+            replace_text("キューを読み込み中です…")
+            folder_button.configure(state="disabled")
+
+            def worker():
+                result = None
+                error = None
+                try:
+                    result = (
+                        PokeControllerApp._read_youtube_queue_dialog_rows(
+                            queue_dir))
+                except Exception as caught:
+                    error = caught
+
+                def finished():
+                    if (context["closed"]
+                            or generation != context["generation"]):
+                        return
+                    if error is not None:
+                        self._logger.warning(
+                            "YouTube queue dialog refresh failed: %s", error)
+                        replace_text("キューの読み込みに失敗しました: " + str(error))
+                        return
+                    rows = list(result.get("rows", ()) or ())
+                    replace_text(
+                        "\n\n".join(rows) if rows else "キューは空です。")
+                    if result.get("queue_exists"):
+                        folder_button.configure(state="normal")
+
+                self._gui_action_queue.put(finished)
+
+            threading.Thread(
+                target=worker, daemon=True,
+                name="YouTubeQueueDialog").start()
+
+        ttk.Button(
+            actions, text="再読込", command=refresh).pack(
+                side="left", padx=(6, 0))
+        ttk.Button(
+            actions, text="閉じる", command=close_dialog).pack(side="right")
+        try:
+            dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+            dialog.bind("<Destroy>", destroyed, add="+")
+        except (AttributeError, tk.TclError):
+            pass
+        refresh()
+        return dialog
 
     def _resume_youtube_uploads(self):
-        queue_dir = self._youtube_upload_queue_dir()
-        store = load_channel_store(self._youtube_channel_store_path())
+        return PokeControllerApp._request_youtube_queue_snapshot(
+            self, resume_uploads=True)
+
+    def _youtube_upload_watchdog(self):
+        """Restart the bounded uploader while actionable jobs remain."""
+        self._youtube_upload_watchdog_id = None
+        if getattr(self, "_preview_shutdown_mode", False):
+            return
         try:
-            pending = (os.path.isdir(queue_dir) and any(
-                name.endswith(".json") for name in os.listdir(queue_dir)))
-        except OSError:
-            pending = False
-        if pending and store.get("profiles"):
+            self._resume_youtube_uploads()
+        except Exception as error:
+            self._logger.warning(
+                "YouTube upload watchdog refresh failed: %s", error)
+        if getattr(self, "_preview_shutdown_mode", False):
+            return
+        try:
+            # The independent worker intentionally has a bounded lifetime.
+            # Periodic relaunch makes waiting_media/processing/cleanup jobs
+            # survive that boundary without requiring a PokeCon restart.
+            self._youtube_upload_watchdog_id = self.root.after(
+                5 * 60 * 1000, self._youtube_upload_watchdog)
+        except (AttributeError, RuntimeError):
+            self._youtube_upload_watchdog_id = None
+
+    def _resume_pending_recording_finalizers(self):
+        """Recover durable MP4 jobs left by a previous interruption."""
+        if bool(getattr(self, "_startup_finalizer_discovery_active", False)):
+            return False
+        generation = int(getattr(
+            self, "_startup_finalizer_discovery_generation", 0) or 0) + 1
+        self._startup_finalizer_discovery_generation = generation
+        self._startup_finalizer_discovery_active = True
+
+        def discover():
             try:
-                launch_upload_worker(
-                    queue_dir, self._youtube_channel_store_path())
-            except OSError as error:
-                self._logger.warning("YouTube upload worker launch failed: %s", error)
+                candidates = PokeControllerApp._template_finalize_candidates(
+                    self)
+                error = None
+            except Exception as caught:
+                candidates = []
+                error = caught
+
+            def apply_discovery():
+                if generation != int(getattr(
+                        self, "_startup_finalizer_discovery_generation", 0)
+                        or 0):
+                    return
+                self._startup_finalizer_discovery_active = False
+                if (getattr(self, "_preview_shutdown_mode", False)
+                        or getattr(self, "_process_exit_ready", False)):
+                    return
+                if error is not None:
+                    self._logger.warning(
+                        "Pending MP4 job discovery failed: %s", error)
+                    return
+                jobs = []
+                for path in candidates:
+                    path = os.path.abspath(path)
+                    if PokeControllerApp._template_finalize_manifest_reserved(
+                            self, path):
+                        continue
+                    # Reserve on Tk before launching. A concurrent Stop may
+                    # have claimed/queued the same manifest since discovery.
+                    self._template_finalize_launched_paths.add(path)
+                    jobs.append(path)
+                if jobs:
+                    PokeControllerApp._launch_deferred_template_finalizer(
+                        self, jobs=jobs, jobs_reserved=True)
+
+            self._gui_action_queue.put(apply_discovery)
+
+        threading.Thread(
+            target=discover, daemon=True,
+            name="RecordingFinalizerDiscovery").start()
+        return True
+
+    @staticmethod
+    def _complete_youtube_authorization(client_path, profile_name,
+                                        store_path, queue_dir):
+        """Authorize and perform every durable queue follow-up off Tk."""
+        authorization = authorize_installed_app(
+            client_path, profile_name, store_path)
+        resumed = []
+        post_errors = []
+        try:
+            resumed = resume_upload_jobs_for_profile(
+                queue_dir, store_path,
+                authorization.get("profile", ""))
+        except Exception as error:
+            post_errors.append(("キュー再開", error))
+        store = None
+        try:
+            store = load_channel_store(store_path)
+        except Exception as error:
+            post_errors.append(("設定再読込", error))
+        try:
+            launch_upload_worker(queue_dir, store_path)
+        except Exception as error:
+            post_errors.append(("アップローダー起動", error))
+        return {
+            "authorization": authorization,
+            "resumed": resumed,
+            "store": store,
+            "post_errors": post_errors,
+        }
 
     def _open_youtube_channel_settings(self):
         from tkinter import filedialog, simpledialog
@@ -17195,16 +19468,100 @@ class PokeControllerApp:
             column=0, row=1, padx=(10, 2), pady=4, sticky="e")
         combo = ttk.Combobox(dialog, textvariable=selection, state="readonly", width=34)
         combo.grid(column=1, columnspan=2, row=1, padx=2, pady=4, sticky="ew")
+        context = {"closed": False, "generation": 0, "busy": False}
+        action_buttons = []
+
+        def set_busy(value):
+            context["busy"] = bool(value)
+            state = "disabled" if value else "normal"
+            for button in action_buttons:
+                try:
+                    button.configure(state=state)
+                except (AttributeError, tk.TclError):
+                    pass
+
+        def destroyed(event=None):
+            if event is None or getattr(event, "widget", dialog) is dialog:
+                context["closed"] = True
+
+        def close_dialog():
+            context["closed"] = True
+            try:
+                dialog.destroy()
+            except tk.TclError:
+                pass
+
+        def apply_store(store, preferred=""):
+            names = PokeControllerApp._apply_youtube_channel_store(
+                self, store)
+            combo.configure(values=names)
+            current = str(preferred or selection.get() or "").strip()
+            if current not in names:
+                current = str(store.get("default_profile", "") or "")
+                if current not in names:
+                    current = names[0] if names else ""
+            selection.set(current)
+            status.set(
+                "既定チャンネル: "
+                + (str(store.get("default_profile", "") or "") or "未設定"))
+            return names
+
+        def run_task(task, pending_text, success, thread_name):
+            if context["closed"] or context["busy"]:
+                return False
+            context["generation"] += 1
+            generation = context["generation"]
+            set_busy(True)
+            status.set(pending_text)
+
+            def worker():
+                result = None
+                error = None
+                try:
+                    result = task()
+                except Exception as caught:
+                    error = caught
+
+                def finished():
+                    if generation != context["generation"]:
+                        return
+                    if error is not None:
+                        self._logger.warning(
+                            "YouTube channel settings task failed: %s", error)
+                    if context["closed"]:
+                        # A closed settings dialog must never be touched, but
+                        # the Recording page may still receive a completed
+                        # durable store update on Tk.
+                        result_store = result.get("store") \
+                            if isinstance(result, dict) else None
+                        if isinstance(result_store, dict):
+                            PokeControllerApp._apply_youtube_channel_store(
+                                self, result_store)
+                        return
+                    set_busy(False)
+                    if error is not None:
+                        status.set("処理失敗: " + str(error))
+                        tkmsg.showerror(
+                            "YouTubeチャンネル", str(error), parent=dialog)
+                        return
+                    success(result)
+
+                self._gui_action_queue.put(finished)
+
+            threading.Thread(
+                target=worker, daemon=True, name=thread_name).start()
+            return True
 
         def refresh():
-            store = load_channel_store(self._youtube_channel_store_path())
-            names = sorted(store.get("profiles", {}), key=str.casefold)
-            combo.configure(values=names)
-            current = selection.get()
-            if current not in names:
-                selection.set(store.get("default_profile", "") or (names[0] if names else ""))
-            status.set("既定チャンネル: " + (store.get("default_profile", "") or "未設定"))
-            self._refresh_youtube_channel_choices()
+            store_path = self._youtube_channel_store_path()
+
+            def loaded(result):
+                apply_store(result["store"])
+
+            return run_task(
+                lambda: {"store": load_channel_store(store_path)},
+                "チャンネル設定を読み込み中です…", loaded,
+                "YouTubeChannelDialogRefresh")
 
         def authorize():
             name = simpledialog.askstring(
@@ -17216,47 +19573,72 @@ class PokeControllerApp:
                 filetypes=(("JSON", "*.json"), ("All files", "*.*")))
             if not path:
                 return
-            status.set("ブラウザーでGoogle認証を完了してください…")
+            store_path = self._youtube_channel_store_path()
+            queue_dir = self._youtube_upload_queue_dir()
 
-            def worker():
-                result = None
-                error = None
-                try:
-                    result = authorize_installed_app(
-                        path, name, self._youtube_channel_store_path())
-                except Exception as caught:
-                    error = caught
+            def oauth_task():
+                return PokeControllerApp._complete_youtube_authorization(
+                    path, name, store_path, queue_dir)
 
-                def finished():
-                    if error is not None:
-                        status.set("認証失敗: " + str(error))
-                        tkmsg.showerror("YouTube認証", str(error), parent=dialog)
-                        return
-                    selection.set(result.get("profile", ""))
-                    refresh()
-                    tkmsg.showinfo(
-                        "YouTube認証",
+            def authorized(result):
+                authorization = result["authorization"]
+                store = result.get("store")
+                if isinstance(store, dict):
+                    apply_store(
+                        store, preferred=authorization.get("profile", ""))
+                else:
+                    selection.set(authorization.get("profile", ""))
+                resumed = list(result.get("resumed", ()) or ())
+                post_errors = list(result.get("post_errors", ()) or ())
+                message = "認証しました: {}".format(
+                    authorization.get("channel_title")
+                    or authorization.get("profile"))
+                if resumed:
+                    message += "\n再開待ち{}件をアップロードキューへ戻しました。".format(
+                        len(resumed))
+                if post_errors:
+                    details = "\n".join(
+                        "{}: {}".format(label, error)
+                        for label, error in post_errors)
+                    message += (
+                        "\n認証設定とローカルジョブは保持されています。"
+                        "次回の自動確認で再試行します。\n" + details)
+                    for label, error in post_errors:
+                        self._logger.warning(
+                            "YouTube %s after authorization failed: %s",
+                            label, error)
+                    status.set(
+                        "認証済み（後処理は次回の自動確認で再試行します）")
+                    tkmsg.showwarning(
+                        "YouTube認証", message, parent=dialog)
+                else:
+                    status.set(
                         "認証しました: {}".format(
-                            result.get("channel_title") or result.get("profile")),
-                        parent=dialog)
-                    self._resume_youtube_uploads()
+                            authorization.get("channel_title")
+                            or authorization.get("profile")))
+                    tkmsg.showinfo(
+                        "YouTube認証", message, parent=dialog)
 
-                self._gui_action_queue.put(finished)
-
-            threading.Thread(
-                target=worker, daemon=True, name="YouTubeOAuth").start()
+            run_task(
+                oauth_task,
+                "ブラウザーでGoogle認証を完了してください…",
+                authorized, "YouTubeOAuth")
 
         def make_default():
             name = selection.get().strip()
             if not name:
                 return
-            try:
-                set_default_channel_profile(
-                    self._youtube_channel_store_path(), name)
-            except (OSError, ValueError) as error:
-                tkmsg.showerror("YouTubeチャンネル", str(error), parent=dialog)
-                return
-            refresh()
+            store_path = self._youtube_channel_store_path()
+
+            def applied(result):
+                apply_store(result["store"], preferred=name)
+                status.set("既定チャンネル: " + name)
+
+            run_task(
+                lambda: {"store": set_default_channel_profile(
+                    store_path, name)},
+                "既定チャンネルを更新中です…", applied,
+                "YouTubeChannelDefault")
 
         def remove():
             name = selection.get().strip()
@@ -17264,20 +19646,40 @@ class PokeControllerApp:
                     "YouTubeチャンネル", "認証設定「{}」を削除しますか？".format(name),
                     parent=dialog):
                 return
-            remove_channel_profile(self._youtube_channel_store_path(), name)
-            refresh()
+            store_path = self._youtube_channel_store_path()
 
-        ttk.Button(dialog, text="OAuth JSONを読込して認証…", command=authorize).grid(
-            column=0, row=2, padx=(10, 3), pady=5)
-        ttk.Button(dialog, text="選択を既定にする", command=make_default).grid(
-            column=1, row=2, padx=3, pady=5)
-        ttk.Button(dialog, text="選択を削除", command=remove).grid(
-            column=2, row=2, padx=3, pady=5)
-        ttk.Button(dialog, text="閉じる", command=dialog.destroy).grid(
+            def removed(result):
+                apply_store(result["store"])
+                status.set("認証設定を削除しました: " + name)
+
+            run_task(
+                lambda: {"store": remove_channel_profile(
+                    store_path, name)},
+                "認証設定を削除中です…", removed,
+                "YouTubeChannelRemove")
+
+        authorize_button = ttk.Button(
+            dialog, text="OAuth JSONを読込して認証…", command=authorize)
+        authorize_button.grid(column=0, row=2, padx=(10, 3), pady=5)
+        default_button = ttk.Button(
+            dialog, text="選択を既定にする", command=make_default)
+        default_button.grid(column=1, row=2, padx=3, pady=5)
+        remove_button = ttk.Button(
+            dialog, text="選択を削除", command=remove)
+        remove_button.grid(column=2, row=2, padx=3, pady=5)
+        action_buttons.extend(
+            (authorize_button, default_button, remove_button))
+        ttk.Button(dialog, text="閉じる", command=close_dialog).grid(
             column=3, row=2, padx=(3, 10), pady=5)
         ttk.Label(dialog, textvariable=status, foreground="#174a7e").grid(
             column=0, columnspan=4, row=3, padx=10, pady=(2, 10), sticky="w")
+        try:
+            dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+            dialog.bind("<Destroy>", destroyed, add="+")
+        except (AttributeError, tk.TclError):
+            pass
         refresh()
+        return dialog
 
     def _on_recording_mode_tab_changed(self, _event=None):
         if not hasattr(self, "recording_mode_tabs"):
@@ -17301,6 +19703,12 @@ class PokeControllerApp:
             self.record_mode.set(self._recording_normal_mode or "Manual")
 
     def _arm_command_monitor_recording(self, show_popup=True):
+        if self._record_storage_destination_key() == "none":
+            message = "このInputSetは［録画なし］に設定されています。"
+            if show_popup:
+                tkmsg.showinfo("Commands監視録画", message, parent=self.root)
+            self.record_monitor_status.set(message)
+            return False
         if getattr(self, "operation_capture_session", None) is not None:
             if show_popup:
                 tkmsg.showinfo(
@@ -17316,7 +19724,16 @@ class PokeControllerApp:
                     "Commands監視録画", "カメラ映像を開始してから監視を開始してください。")
             self.record_monitor_status.set("開始できません：カメラ映像がありません。")
             return False
-        if not self._recording_disk_space_ok(show_popup=show_popup, force=True):
+        disk_ready = self._recording_disk_space_ok(
+            show_popup=show_popup, force=True,
+            continuation_key="command-monitor-arm",
+            on_ready=lambda: self._arm_command_monitor_recording(
+                show_popup=show_popup))
+        if disk_ready is None:
+            self.record_monitor_status.set(
+                "録画保存先の容量を確認しています。完了後に監視を開始します。")
+            return False
+        if not disk_ready:
             self.record_monitor_status.set(
                 "開始できません：録画保存先の容量制限です。")
             return False
@@ -17342,7 +19759,19 @@ class PokeControllerApp:
         return True
 
     def _auto_arm_command_monitor_recording(self):
-        if not self.record_monitor_auto_arm.get():
+        # Auto-arm OFF suppresses creating a new armed monitor, not starting a
+        # fresh session for a monitor the user already armed manually.  The
+        # same Command object is commonly reused across Start presses.
+        if (not self.record_monitor_auto_arm.get()
+                and not self.record_armed):
+            return
+        destination_getter = getattr(
+            self, "_record_storage_destination_key", None)
+        destination = (destination_getter()
+                       if callable(destination_getter) else "pc")
+        if destination == "none":
+            self.record_monitor_status.set(
+                "録画なし：Commandsは録画せず実行します。")
             return
         if self.record_mode.get() != "CommandMonitor":
             # Recordingタブを開いていなくても、Commands Start時の自動監視
@@ -17441,6 +19870,13 @@ class PokeControllerApp:
         return state_path_text(snapshot) or "Step取得待ち"
 
     def _start_command_monitor_chunk(self, frame, command, now=None):
+        """Compatibility entry point; all Commands starts are worker-owned."""
+        return self._request_command_monitor_chunk_restart(
+            frame, command, event_name="recording_started")
+
+    def _start_command_monitor_chunk_sync_unused(
+            self, frame, command, now=None):
+        """Former synchronous implementation retained for migration tests only."""
         now = time.monotonic() if now is None else float(now)
         if self.recorder.active:
             return None
@@ -17467,6 +19903,10 @@ class PokeControllerApp:
             "ended": None,
             "states": [],
             "pinned": False,
+            "monitor_retention_mode": (
+                COMMAND_MONITOR_RETENTION_KEEP_ALL
+                if self._command_monitor_keep_all_enabled()
+                else COMMAND_MONITOR_RETENTION_SMART),
             "loop_anchor": False,
             "delete_pending": False,
             "command": str(getattr(command, "NAME", "")),
@@ -17501,12 +19941,34 @@ class PokeControllerApp:
                 self._active_recording_youtube_config.get("enabled")),
             "audio_start_async": bool(audio_device),
         }
-        chunk["source"] = self._ensure_command_monitor_source_snapshot(
-            chunk, chunk["source"])
         with self._command_monitor_lock:
             self._command_monitor_current_chunk = chunk
         self._command_monitor_chunks.append(chunk)
-        self._write_command_monitor_metadata(chunk)
+
+        def persist_started_chunk():
+            error = None
+            try:
+                if not self._write_command_monitor_metadata(chunk):
+                    error = OSError(
+                        "Commands録画の開始ジャーナルを保存できませんでした。")
+            except Exception as caught:
+                error = caught
+            finally:
+                if error is not None:
+                    chunk["_start_journal_error"] = str(error)
+                    chunk["pinned"] = True
+                    chunk["delete_pending"] = False
+                chunk.pop("_start_journal_pending", None)
+                chunk["_start_journal_ready"].set()
+            if error is None:
+                self._queue_command_monitor_source_snapshot(
+                    chunk, chunk.get("source", {}), assign_source=True)
+
+        chunk["_start_journal_pending"] = True
+        chunk["_start_journal_ready"] = threading.Event()
+        threading.Thread(
+            target=persist_started_chunk, daemon=True,
+            name="CommandMonitorStartJournal").start()
         self._refresh_command_monitor_tree()
         return chunk
 
@@ -17515,30 +19977,68 @@ class PokeControllerApp:
         location = dict(location or {})
         if not chunk:
             return location
-        snapshots = chunk.setdefault("source_snapshots", {})
+        if (chunk.get("delete_pending")
+                or chunk.get("explicit_delete_pending")):
+            return location
+        session_dir = os.path.abspath(str(
+            chunk.get("session_dir", "") or ""))
+        expected_identity = chunk.get("_source_snapshot_session_identity")
+
+        def session_matches():
+            if not session_dir or not os.path.isdir(session_dir):
+                return False
+            if not expected_identity:
+                return True
+            try:
+                details = os.lstat(session_dir)
+                current = (
+                    int(getattr(details, "st_dev", 0) or 0),
+                    int(getattr(details, "st_ino", 0) or 0),
+                    os.path.normcase(os.path.realpath(session_dir)))
+            except OSError:
+                return False
+            return current == expected_identity
+
+        if not session_matches():
+            return location
+        snapshot_lock = chunk.setdefault(
+            "_source_snapshot_lock", threading.Lock())
 
         def snapshot_one(frame):
             frame = dict(frame or {})
             source_file = os.path.abspath(str(frame.get("file", "") or ""))
             if not source_file or not os.path.isfile(source_file):
                 return frame
-            relative = snapshots.get(source_file)
-            if not relative:
-                digest = hashlib.sha1(
-                    source_file.lower().encode("utf-8")).hexdigest()[:12]
-                safe_name = re.sub(
-                    r"[^0-9A-Za-z_.-]+", "_", os.path.basename(source_file))
-                relative = os.path.join(
-                    "source_snapshots", "{}_{}".format(digest, safe_name))
-                target = os.path.join(chunk["session_dir"], relative)
-                try:
-                    os.makedirs(os.path.dirname(target), exist_ok=True)
-                    shutil.copy2(source_file, target)
-                    snapshots[source_file] = relative
-                except OSError as error:
-                    self._logger.warning(
-                        "Command source snapshot failed: %s", error)
+            with snapshot_lock:
+                if (chunk.get("delete_pending")
+                        or chunk.get("explicit_delete_pending")
+                        or not session_matches()):
                     return frame
+                snapshots = chunk.setdefault("source_snapshots", {})
+                relative = snapshots.get(source_file)
+                if not relative:
+                    digest = hashlib.sha1(
+                        source_file.lower().encode("utf-8")).hexdigest()[:12]
+                    safe_name = re.sub(
+                        r"[^0-9A-Za-z_.-]+", "_", os.path.basename(source_file))
+                    relative = os.path.join(
+                        "source_snapshots", "{}_{}".format(digest, safe_name))
+                    target = os.path.join(session_dir, relative)
+                    try:
+                        # Never recreate a retired session root. Deletion is
+                        # gated on the pending flag/trace drain, and this second
+                        # identity check closes the remaining replacement race.
+                        if not session_matches():
+                            return frame
+                        os.makedirs(os.path.dirname(target), exist_ok=True)
+                        if not session_matches():
+                            return frame
+                        shutil.copy2(source_file, target)
+                        snapshots[source_file] = relative
+                    except OSError as error:
+                        self._logger.warning(
+                            "Command source snapshot failed: %s", error)
+                        return frame
             frame["snapshot"] = relative
             return frame
 
@@ -17548,6 +20048,47 @@ class PokeControllerApp:
         if stack:
             location["stack"] = stack
         return location
+
+    def _queue_command_monitor_source_snapshot(
+            self, chunk, location, assign_source=False):
+        """Snapshot source evidence after the minimal start journal is durable."""
+        if not chunk:
+            return False
+        session_dir = os.path.abspath(str(
+            chunk.get("session_dir", "") or ""))
+        ready = threading.Event()
+        chunk["_source_snapshot_pending"] = True
+        chunk["_source_snapshot_ready"] = ready
+        captured = copy.deepcopy(dict(location or {}))
+
+        def worker():
+            try:
+                details = os.lstat(session_dir)
+                chunk["_source_snapshot_session_identity"] = (
+                    int(getattr(details, "st_dev", 0) or 0),
+                    int(getattr(details, "st_ino", 0) or 0),
+                    os.path.normcase(os.path.realpath(session_dir)))
+                snapped = self._ensure_command_monitor_source_snapshot(
+                    chunk, captured)
+                if assign_source:
+                    chunk["source"] = snapped
+                if not self._write_command_monitor_metadata(chunk):
+                    chunk["_source_snapshot_error"] = (
+                        "Commands source snapshot metadata could not be saved")
+            except Exception as error:
+                chunk["_source_snapshot_error"] = str(error)
+                self._logger.warning(
+                    "Command source snapshot failed: %s", error)
+            finally:
+                chunk.pop("_source_snapshot_pending", None)
+                ready.set()
+                self._gui_action_queue.put(
+                    lambda: self._flush_command_monitor_deletes())
+
+        threading.Thread(
+            target=worker, daemon=True,
+            name="CommandMonitorSourceSnapshot").start()
+        return True
 
     def _command_trace_writer_loop(self):
         while True:
@@ -17564,7 +20105,14 @@ class PokeControllerApp:
                 by_path = {}
                 for item in batch:
                     if item is not None:
-                        path, payload = item
+                        if len(item) > 2:
+                            path, payload, chunk = item
+                            payload = dict(payload)
+                            payload["location"] = (
+                                self._ensure_command_monitor_source_snapshot(
+                                    chunk, payload.get("location", {})))
+                        else:
+                            path, payload = item
                         by_path.setdefault(path, []).append(payload)
                 for path, payloads in by_path.items():
                     try:
@@ -17647,7 +20195,10 @@ class PokeControllerApp:
             location = runtime_execution_location(
                 self._command_monitor_command,
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-        location = self._ensure_command_monitor_source_snapshot(chunk, location)
+        # Source stat/copy may block on a busy or remote disk.  Carry the
+        # immutable location into the trace worker; it snapshots before the
+        # JSONL append while Tk/capture keep running.
+        location = copy.deepcopy(dict(location or {}))
         path = os.path.join(chunk["session_dir"], "steps.jsonl")
         payload = {
             "time": datetime.datetime.now().isoformat(timespec="milliseconds"),
@@ -17676,7 +20227,7 @@ class PokeControllerApp:
                         matched.append(name)
         if isinstance(extra, dict):
             payload.update(extra)
-        self._command_trace_queue.put((path, payload))
+        self._command_trace_queue.put((path, payload, chunk))
 
     def _ensure_command_focus_trace(self, command):
         """Start the worker-local selected-function tracer once per run."""
@@ -17766,31 +20317,218 @@ class PokeControllerApp:
 
     def _write_command_monitor_metadata(self, chunk):
         if not chunk:
-            return
-        payload = {key: value for key, value in chunk.items()
-                   if key not in ("started", "ended")}
-        payload["started_monotonic"] = chunk.get("started")
-        payload["ended_monotonic"] = chunk.get("ended")
-        payload["duration"] = max(
-            0.0, (chunk.get("ended") or time.monotonic()) - chunk.get("started", 0.0))
-        payload["mode"] = "Commands monitoring recording"
-        payload["execution_path"] = {
-            "file": "steps.jsonl",
-            "scope": "retained_video_only",
-            "video_start": 0.0,
-            "video_end": payload["duration"],
-            "sample_interval_seconds": 0.1,
-        }
-        if self._command_trace_targets:
-            payload["execution_path"]["focused_function_trace"] = (
-                "worker_local_exact_lines")
+            return False
+        # Common-function indexing and Tk can persist the same chunk at once.
+        # Serialize snapshot + replace so a late worker cannot overwrite a
+        # newer explicit-delete tombstone with its stale payload.
+        metadata_lock = chunk.setdefault("_metadata_lock", threading.Lock())
+        with metadata_lock:
+            snapshot = chunk.copy()
+            payload = {key: value for key, value in snapshot.items()
+                       if key not in (
+                           "started", "ended", "_metadata_lock",
+                           "_delete_journal_pending",
+                           "_start_journal_pending",
+                           "_start_journal_ready",
+                           "_start_journal_error",
+                           "_source_snapshot_pending",
+                           "_source_snapshot_ready",
+                           "_source_snapshot_lock",
+                            "_source_snapshot_session_identity",
+                            "_source_snapshot_error",
+                            "_delete_tombstone_recovery",
+                            "_retention_journal_pending",
+                            "_retention_journal_pending_generation",
+                            "_protection_journal_pending",
+                            "_protection_journal_pending_generation")}
+            payload["started_monotonic"] = snapshot.get("started")
+            payload["ended_monotonic"] = snapshot.get("ended")
+            payload["duration"] = max(
+                0.0, (snapshot.get("ended") or time.monotonic())
+                - snapshot.get("started", 0.0))
+            payload["mode"] = "Commands monitoring recording"
+            payload["execution_path"] = {
+                "file": "steps.jsonl",
+                "scope": "retained_video_only",
+                "video_start": 0.0,
+                "video_end": payload["duration"],
+                "sample_interval_seconds": 0.1,
+            }
+            if self._command_trace_targets:
+                payload["execution_path"]["focused_function_trace"] = (
+                    "worker_local_exact_lines")
+            path = os.path.join(snapshot["session_dir"], "command_monitor.json")
+            temporary = "{}.{}.tmp".format(path, threading.get_ident())
+            try:
+                with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
+                    json.dump(payload, stream, ensure_ascii=False, indent=2)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+                return True
+            except OSError as error:
+                try:
+                    os.remove(temporary)
+                except OSError:
+                    pass
+                self._logger.warning("Command monitor metadata failed: %s", error)
+                return False
+
+    @staticmethod
+    def _command_monitor_chunk_storage_identity(chunk):
+        session_dir = str((chunk or {}).get("session_dir", "") or "")
+        if session_dir:
+            session_dir = os.path.normcase(os.path.normpath(os.path.abspath(
+                session_dir)))
+        return session_dir, str((chunk or {}).get("id", "") or "")
+
+    def _queue_command_monitor_metadata_journal(
+            self, chunks, pending_key="_retention_journal_pending",
+            completion=None):
+        """Persist changed chunk state without blocking Tk or early deletion."""
+        unique = []
+        for chunk in chunks or ():
+            if (isinstance(chunk, dict)
+                    and not any(item is chunk for item in unique)):
+                unique.append(chunk)
+        if not unique:
+            return False
+        # A history scan may already have read the pre-change metadata while
+        # this in-memory decision is being journaled.  Invalidate that snapshot
+        # now; its Tk apply callback will schedule a fresh scan after the
+        # journal worker becomes idle.
+        if bool(getattr(self, "_record_output_scan_active", False)):
+            self._record_output_scan_generation = int(getattr(
+                self, "_record_output_scan_generation", 0) or 0) + 1
+            self._record_output_scan_requested = None
+            schedule_reload = getattr(
+                self, "_schedule_command_monitor_output_reload", None)
+            if callable(schedule_reload):
+                schedule_reload()
+        work = []
+        token_key = pending_key + "_generation"
+        for chunk in unique:
+            token = int(chunk.get(token_key, 0) or 0) + 1
+            chunk[token_key] = token
+            chunk[pending_key] = True
+            work.append((chunk, token))
+
+        journal_lock = getattr(
+            self, "_command_monitor_metadata_journal_lock", None)
+        if journal_lock is None:
+            journal_lock = threading.Lock()
+            self._command_monitor_metadata_journal_lock = journal_lock
+        journal_threads = getattr(
+            self, "_command_monitor_metadata_journal_threads", None)
+        if journal_threads is None:
+            journal_threads = set()
+            self._command_monitor_metadata_journal_threads = journal_threads
+
+        def journal():
+            outcomes = []
+            try:
+                for chunk, token in work:
+                    error = None
+                    try:
+                        if not self._write_command_monitor_metadata(chunk):
+                            error = OSError(
+                                "Commands recording metadata could not be saved")
+                    except Exception as caught:
+                        error = caught
+                    current = int(chunk.get(token_key, 0) or 0) == token
+                    if current:
+                        if error is not None:
+                            # Fail closed: an unjournaled delete decision must
+                            # never be applied to the only local recording.
+                            chunk["pinned"] = True
+                            chunk["delete_pending"] = False
+                            chunk["retention_journal_error"] = str(error)
+                        else:
+                            chunk.pop("retention_journal_error", None)
+                        if pending_key == "_protection_journal_pending":
+                            identity = (
+                                PokeControllerApp.
+                                _command_monitor_chunk_storage_identity(chunk))
+                            with journal_lock:
+                                failures = getattr(
+                                    self,
+                                    "_command_monitor_protection_failures",
+                                    None)
+                                if failures is None:
+                                    failures = set()
+                                    self._command_monitor_protection_failures = (
+                                        failures)
+                                if error is not None:
+                                    failures.add(identity)
+                                else:
+                                    failures.discard(identity)
+                        chunk.pop(pending_key, None)
+                    outcomes.append({
+                        "chunk": chunk,
+                        "error": error,
+                        "superseded": not current,
+                        "token": token,
+                    })
+                action_queue = getattr(self, "_gui_action_queue", None)
+                if action_queue is not None:
+                    def apply_journal():
+                        self._flush_command_monitor_deletes()
+                        self._refresh_command_monitor_tree()
+                        if callable(completion):
+                            def current(item):
+                                return (
+                                    not item["superseded"]
+                                    and int(item["chunk"].get(
+                                        token_key, 0) or 0) == item["token"])
+
+                            completion({
+                                "completed": [
+                                    item["chunk"] for item in outcomes
+                                    if (item["error"] is None
+                                        and current(item))],
+                                "failed": [
+                                    item["chunk"] for item in outcomes
+                                    if (item["error"] is not None
+                                        and current(item))],
+                                "superseded": [
+                                    item["chunk"] for item in outcomes
+                                    if not current(item)],
+                            })
+
+                    action_queue.put(apply_journal)
+            finally:
+                with journal_lock:
+                    journal_threads.discard(threading.current_thread())
+
+        worker = threading.Thread(
+            target=journal, daemon=True,
+            name="CommandMonitorMetadataJournal")
+        with journal_lock:
+            journal_threads.add(worker)
         try:
-            with open(os.path.join(chunk["session_dir"], "command_monitor.json"),
-                      "w", encoding="utf-8", newline="\n") as stream:
-                json.dump(payload, stream, ensure_ascii=False, indent=2)
-                stream.write("\n")
-        except OSError as error:
-            self._logger.warning("Command monitor metadata failed: %s", error)
+            worker.start()
+        except Exception as error:
+            with journal_lock:
+                journal_threads.discard(worker)
+                failures = getattr(
+                    self, "_command_monitor_protection_failures", None)
+                if failures is None:
+                    failures = set()
+                    self._command_monitor_protection_failures = failures
+                for chunk, token in work:
+                    if int(chunk.get(token_key, 0) or 0) != token:
+                        continue
+                    chunk["pinned"] = True
+                    chunk["delete_pending"] = False
+                    chunk["retention_journal_error"] = str(error)
+                    chunk.pop(pending_key, None)
+                    if pending_key == "_protection_journal_pending":
+                        failures.add(
+                            PokeControllerApp.
+                            _command_monitor_chunk_storage_identity(chunk))
+            raise
+        return True
 
     def _queue_command_common_function_index(self, chunk):
         monitor = dict(chunk.get("common_function_monitor", {}) or {}) \
@@ -17799,9 +20537,18 @@ class PokeControllerApp:
         if not monitor.get("enabled") or not groups:
             return
 
+        session_dir = os.path.abspath(chunk["session_dir"])
+        completed = threading.Event()
+        with self._command_monitor_index_events_lock:
+            self._command_monitor_index_events[session_dir] = completed
+
         def worker():
             try:
-                self._command_trace_queue.join()
+                trace_queue = getattr(self, "_command_trace_queue", None)
+                if trace_queue is not None:
+                    trace_queue.join()
+                if chunk.get("explicit_delete_pending"):
+                    return
                 duration = max(
                     0.0, float(chunk.get("ended", time.monotonic()))
                     - float(chunk.get("started", 0.0) or 0.0))
@@ -17810,18 +20557,27 @@ class PokeControllerApp:
                 monitor["occurrence_count"] = int(
                     index.get("occurrence_count", 0) or 0)
                 chunk["common_function_monitor"] = monitor
-                self._write_command_monitor_metadata(chunk)
+                if not chunk.get("explicit_delete_pending"):
+                    self._write_command_monitor_metadata(chunk)
             except (OSError, TypeError, ValueError) as error:
                 self._logger.warning(
                     "Common function caller index failed: %s", error)
+            finally:
+                completed.set()
+                with self._command_monitor_index_events_lock:
+                    if self._command_monitor_index_events.get(
+                            session_dir) is completed:
+                        self._command_monitor_index_events.pop(
+                            session_dir, None)
 
         threading.Thread(
             target=worker, daemon=True,
             name="CommandCommonFunctionIndex").start()
 
-    def _write_command_monitor_output_log(self, chunk):
+    def _write_command_monitor_output_log(self, chunk, lines=None):
         try:
-            lines = self._record_log_lines(240)
+            if lines is None:
+                lines = self._record_log_lines(240)
             with open(os.path.join(chunk["session_dir"], "commands.log"),
                       "w", encoding="utf-8", newline="\n") as stream:
                 stream.write("\n".join(lines))
@@ -17830,10 +20586,341 @@ class PokeControllerApp:
         except (OSError, tk.TclError) as error:
             self._logger.warning("Command monitor output log failed: %s", error)
 
+    def _cancel_command_monitor_chunk_start(self, after_finish=None):
+        """Invalidate one in-flight rotated start and finish cleanup off Tk."""
+        with self._command_monitor_lock:
+            request = getattr(self, "_command_monitor_start_request", None)
+            if request is None:
+                return False
+            request["cancelled"] = True
+            self._command_monitor_start_generation = int(getattr(
+                self, "_command_monitor_start_generation", 0) or 0) + 1
+            if callable(after_finish):
+                request.setdefault("finish_callbacks", []).append(after_finish)
+        return True
+
+    def _request_command_monitor_chunk_restart(
+            self, frame, command, event_name="recording_rotated"):
+        """Prepare a rotated recorder/journal off Tk, then publish atomically."""
+        if frame is None or command is None:
+            return False
+        with self._command_monitor_lock:
+            if getattr(self, "_command_monitor_start_request", None) is not None:
+                return False
+            if self._command_monitor_current_chunk is not None:
+                return False
+        if not self.record_armed or not getattr(command, "alive", False):
+            return False
+        if not self._confirm_selected_audio_for_use():
+            self.record_monitor_status.set(
+                "使用中のAudioを反映しなかったため録画を再開していません。")
+            return False
+
+        # Every Tk-backed value is frozen before the worker starts.  In
+        # particular, never call _start_capture_recorder from the worker.
+        audio_device = self._selected_audio_device_name()
+        fps = self.fps.get()
+        audio_gain = self.audio_gain.get()
+        audio_options = self._audio_level_options()
+        output_dir = self._effective_record_output_dir()
+        youtube_config = self._youtube_recording_config_snapshot()
+        if (youtube_config.get("enabled")
+                and youtube_config.get("record_mode") == "CommandMonitor"
+                and youtube_config.get("commands_video_mode")
+                == COMMANDS_VIDEO_MODE_POKECON_WINDOW
+                and not self._prepare_command_record_window_capture(
+                    frame, show_popup=False)):
+            youtube_config["commands_video_mode"] = COMMANDS_VIDEO_MODE_COMPOSITE
+
+        try:
+            initial_frame = frame.copy()
+        except (AttributeError, TypeError, ValueError):
+            initial_frame = frame
+        old_recorder = self.recorder
+        session_id = str(getattr(
+            self, "_command_monitor_session_id", "") or "")
+        with self._command_monitor_lock:
+            self._command_monitor_start_generation = int(getattr(
+                self, "_command_monitor_start_generation", 0) or 0) + 1
+            generation = self._command_monitor_start_generation
+            request = {
+                "generation": generation,
+                "command": command,
+                "command_session_id": session_id,
+                "old_recorder": old_recorder,
+                "latest_frame": initial_frame,
+                "latest_presented_at": time.monotonic(),
+                "cancelled": False,
+                "finish_callbacks": [],
+                "cleanup_thread": None,
+                "done": threading.Event(),
+            }
+            self._command_monitor_start_request = request
+
+        chunk = {
+            "id": str(time.time_ns()),
+            "session_dir": "",
+            "started": time.monotonic(),
+            "started_wall": datetime.datetime.now().isoformat(
+                timespec="seconds"),
+            "ended": None,
+            "states": [],
+            "pinned": False,
+            "monitor_retention_mode": (
+                COMMAND_MONITOR_RETENTION_KEEP_ALL
+                if self._command_monitor_keep_all_enabled()
+                else COMMAND_MONITOR_RETENTION_SMART),
+            "loop_anchor": False,
+            "delete_pending": False,
+            "command": str(getattr(command, "NAME", "")),
+            "command_session_id": session_id,
+            "source": copy.deepcopy(dict(self._command_monitor_source)),
+            "source_snapshots": {},
+            "focus_matched": False,
+            "focus_repair": {
+                "enabled": bool(self._command_focus_targets),
+                "targets": list(self._command_focus_targets),
+                "matched_functions": [],
+                "trace_mode": "selected_function_lines",
+                "trace_dropped": int(self._command_focus_trace_dropped),
+            },
+            "common_function_monitor": {
+                "enabled": bool(self._command_common_targets),
+                "groups": copy.deepcopy(self._command_common_function_groups),
+                "targets": list(self._command_common_targets),
+                "index_file": "common_function_index.json",
+            },
+            "recording_video_mode": (
+                youtube_config.get(
+                    "commands_video_mode", COMMANDS_VIDEO_MODE_COMPOSITE)
+                if youtube_config.get("enabled")
+                else self.record_output_mode.get()),
+            "youtube_archive": dict(youtube_config),
+            "youtube_roll_pending": bool(youtube_config.get("enabled")),
+            "audio_start_async": bool(audio_device),
+            "_start_journal_pending": True,
+            "_start_journal_ready": threading.Event(),
+        }
+        request["chunk"] = chunk
+
+        def notify_callbacks(error):
+            callbacks = list(request.get("finish_callbacks", ()))
+            request["finish_callbacks"] = []
+            for callback in callbacks:
+                try:
+                    callback(error)
+                except Exception as caught:
+                    self._logger.warning(
+                        "Command monitor start completion callback failed: %s",
+                        caught)
+
+        def clear_request(error=None):
+            with self._command_monitor_lock:
+                if self._command_monitor_start_request is request:
+                    self._command_monitor_start_request = None
+            request["done"].set()
+            notify_callbacks(error)
+            if error is not None and not request.get("cancelled"):
+                self.record_armed = False
+                self._stop_command_record_window_capture()
+                message = (
+                    "Commands監視録画の次区間を開始できなかったため、"
+                    "監視録画を停止しました: {}"
+                ).format(error)
+                self._logger.error(message)
+                self.record_monitor_status.set(message)
+                self.show_output("Analysis", text=message)
+            if getattr(self, "_command_monitor_exit_after_stop", False):
+                self._command_monitor_exit_after_stop = False
+                self._exit_waiting = True
+                self._wait_for_recording_finalization()
+
+        def cleanup_unpublished(successor, error=None):
+            cleanup_error = error
+            try:
+                if getattr(successor, "active", False):
+                    self._stop_capture_recorder_instance(
+                        successor, youtube_config=youtube_config, discard=True)
+            except Exception as caught:
+                cleanup_error = cleanup_error or caught
+            finally:
+                retire = getattr(successor, "retire_finalize_worker", None)
+                if callable(retire):
+                    retire()
+            self._gui_action_queue.put(
+                lambda cleanup_error=cleanup_error: clear_request(cleanup_error))
+
+        def apply_started(successor):
+            with self._command_monitor_lock:
+                current_request = self._command_monitor_start_request
+                valid = bool(
+                    current_request is request
+                    and not request.get("cancelled")
+                    and generation == self._command_monitor_start_generation
+                    and self._command_monitor_current_chunk is None
+                    and session_id == str(getattr(
+                        self, "_command_monitor_session_id", "") or ""))
+                latest_frame = request.get("latest_frame", initial_frame)
+                # Preparation time is outside the new segment. Even when no
+                # presented callback arrived during a slow open, activation
+                # must not turn that delay into repeated-frame CFR debt.
+                activation_at = time.monotonic()
+            valid = bool(
+                valid and self.record_armed
+                and command is getattr(self, "_command_monitor_command", None)
+                and command is getattr(self, "cur_command", None)
+                and getattr(command, "alive", False)
+                and not self._command_monitor_stop_in_progress
+                and getattr(
+                    self, "_command_monitor_adjustment_protect_request", None)
+                is None
+                and not getattr(self, "_preview_shutdown_mode", False))
+            if not valid:
+                cleanup = threading.Thread(
+                    target=cleanup_unpublished, args=(successor,), daemon=True,
+                    name="CommandMonitorStartCancel")
+                request["cleanup_thread"] = cleanup
+                cleanup.start()
+                return
+            try:
+                successor.activate_timeline(
+                    latest_frame, started_at=activation_at)
+            except Exception as error:
+                cleanup = threading.Thread(
+                    target=cleanup_unpublished,
+                    args=(successor, error), daemon=True,
+                    name="CommandMonitorStartCancel")
+                request["cleanup_thread"] = cleanup
+                cleanup.start()
+                return
+            chunk["started"] = float(successor.started_at)
+            chunk["started_wall"] = datetime.datetime.now().isoformat(
+                timespec="seconds")
+            with self._record_compose_condition:
+                self.recorder = successor
+                self._active_recording_youtube_config = dict(youtube_config)
+                self._record_compose_queue_max_depth = 0
+                self._recording_latest_snapshot = None
+                self._recording_last_presentation_at = 0.0
+            with self._command_monitor_lock:
+                self._command_monitor_current_chunk = chunk
+                if self._command_monitor_start_request is request:
+                    self._command_monitor_start_request = None
+            self._command_monitor_chunks.append(chunk)
+            request["done"].set()
+            self._queue_command_monitor_source_snapshot(
+                chunk, chunk.get("source", {}), assign_source=True)
+            try:
+                self._sync_audio_device_usage()
+            except Exception as error:
+                self._logger.warning(
+                    "Command monitor audio usage refresh failed: %s", error)
+            self._refresh_command_monitor_tree()
+            snapshot = runtime_state_snapshot(command)
+            self._command_monitor_last_snapshot = dict(snapshot)
+            location = runtime_execution_location(
+                command, os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__))))
+            if event_name == "recording_started":
+                self._command_monitor_timeline.add(
+                    snapshot, activation_at,
+                    detect_loops=not self._command_monitor_keep_all_enabled())
+                self._command_monitor_last_location_key = (
+                    execution_location_key(location))
+            step_frame = self._queue_command_monitor_step_frame(
+                chunk, latest_frame)
+            self._write_command_monitor_event(
+                chunk, snapshot, event_name, location=location,
+                now=activation_at, extra={
+                    "step_frame": step_frame,
+                    "clean_frame": bool(step_frame),
+                    "step_frame_dropped": not bool(step_frame),
+                })
+            if old_recorder is not successor:
+                with self._record_compose_condition:
+                    if old_recorder not in self._youtube_retiring_recorders:
+                        self._youtube_retiring_recorders.append(old_recorder)
+                self._retire_youtube_recorder(old_recorder)
+            notify_callbacks(None)
+
+        def start_worker():
+            successor = CaptureRecorder(output_dir)
+            successor.audio_monitor = getattr(self, "audio_monitor", None)
+            successor.defer_finalization = bool(youtube_config.get("enabled"))
+            successor.durable_finalization = bool(youtube_config.get("enabled"))
+            error = None
+            try:
+                successor.start(
+                    initial_frame, fps, audio_device, audio_gain,
+                    cleanup_rules=[], minimum_duration=0,
+                    audio_level_options=audio_options,
+                    async_audio_start=bool(audio_device),
+                    defer_timeline_activation=True)
+                if not getattr(successor, "active", False):
+                    raise RuntimeError(
+                        "Commands録画の次区間を開始できませんでした。")
+                chunk["session_dir"] = os.path.abspath(successor.session_dir)
+                chunk["started"] = float(getattr(
+                    successor, "started_at", time.monotonic()) or time.monotonic())
+                if not self._write_command_monitor_metadata(chunk):
+                    raise OSError(
+                        "Commands録画の開始ジャーナルを保存できませんでした。")
+            except Exception as caught:
+                error = caught
+            finally:
+                chunk.pop("_start_journal_pending", None)
+                if error is not None:
+                    chunk["_start_journal_error"] = str(error)
+                chunk["_start_journal_ready"].set()
+            if error is not None:
+                cleanup_unpublished(successor, error)
+                return
+            self._gui_action_queue.put(
+                lambda successor=successor: apply_started(successor))
+
+        thread = threading.Thread(
+            target=start_worker, daemon=True,
+            name="CommandMonitorChunkStart")
+        request["thread"] = thread
+        self._command_monitor_start_thread = thread
+        thread.start()
+        return True
+
     def _complete_command_monitor_chunk_finish(
-            self, chunk, restart=False, frame=None, error=None):
+            self, chunk, restart=False, frame=None, error=None,
+            after_finish=None, prune_after_finish=True,
+            metadata_persisted=False):
         """Complete a monitor stop on Tk after its writer drain finishes."""
         self._command_monitor_stop_in_progress = False
+        priority_callbacks = list(getattr(
+            self, "_command_monitor_priority_finish_callbacks", ()))
+        pending_callbacks = list(getattr(
+            self, "_command_monitor_pending_finish_callbacks", ()))
+        self._command_monitor_priority_finish_callbacks = []
+        self._command_monitor_pending_finish_callbacks = []
+        if callable(after_finish):
+            if prune_after_finish:
+                pending_callbacks.insert(0, after_finish)
+            else:
+                # The callback that initiated this close owns the first
+                # retention/confirmation transition. A later explicit Stop may
+                # also register as priority while the worker drains, but it
+                # must not consume the saved-recording choice first.
+                priority_callbacks.insert(0, after_finish)
+        finish_callbacks = priority_callbacks + pending_callbacks
+        suppress_prune = bool(getattr(
+            self, "_command_monitor_suppress_finish_prune", False))
+        self._command_monitor_suppress_finish_prune = False
+
+        def notify_finish_callbacks(callback_error):
+            for callback in finish_callbacks:
+                try:
+                    callback(callback_error)
+                except Exception as caught:
+                    self._logger.warning(
+                        "Command monitor stop completion callback failed: %s",
+                        caught)
+
         try:
             self._sync_audio_device_usage()
         except Exception as sync_error:
@@ -17846,6 +20933,15 @@ class PokeControllerApp:
         if error is not None:
             # The recorder has already rejected new frames at this point.
             # Do not reuse it while its old writer may still be draining.
+            chunk["recording_close_pending"] = True
+            chunk["recording_close_failed"] = True
+            chunk["recording_close_error"] = str(error)
+            chunk["delete_pending"] = False
+            chunk["merge_pending"] = False
+            chunk["pinned"] = True
+            if not metadata_persisted:
+                self._write_command_monitor_metadata(chunk)
+            self._refresh_command_monitor_tree()
             self.record_armed = False
             self._stop_command_record_window_capture()
             message = (
@@ -17855,7 +20951,14 @@ class PokeControllerApp:
             self._logger.error(message)
             self.record_monitor_status.set(message)
             self.show_output("Analysis", text=message)
+            self._command_monitor_exit_after_stop = False
+            notify_finish_callbacks(error)
             return False
+        chunk["recording_close_pending"] = False
+        chunk.pop("recording_close_failed", None)
+        chunk.pop("recording_close_error", None)
+        if not metadata_persisted:
+            self._write_command_monitor_metadata(chunk)
         queue_index = getattr(
             self, "_queue_command_common_function_index", None)
         if callable(queue_index):
@@ -17864,7 +20967,10 @@ class PokeControllerApp:
             self, "_queue_ready_command_monitor_youtube_segment", None)
         if callable(queue_youtube_segment):
             try:
-                queue_youtube_segment(chunk.get("command_session_id", ""))
+                queue_youtube_segment(
+                    chunk.get("command_session_id", ""),
+                    force=bool(chunk.pop(
+                        "_youtube_finalize_after_finish", False)))
             except Exception as queue_error:
                 self._logger.warning(
                     "Commands rolling YouTube segment failed: %s",
@@ -17874,47 +20980,74 @@ class PokeControllerApp:
         # immediately instead of waiting for another state transition/frame
         # maintenance pass.
         prune = getattr(self, "_mark_command_monitor_prune_candidates", None)
-        if callable(prune):
+        keep_all_check = getattr(
+            self, "_command_monitor_keep_all_enabled", None)
+        keep_all = bool(keep_all_check()) if callable(keep_all_check) else False
+        if (prune_after_finish and not suppress_prune
+                and callable(prune) and not keep_all):
             try:
-                prune(time.monotonic())
+                prune(time.monotonic(), persist_metadata=False)
             except Exception as prune_error:
                 self._logger.warning(
                     "Command monitor post-finalize cleanup failed: %s",
                     prune_error)
+        notify_finish_callbacks(None)
+        if getattr(self, "_command_monitor_exit_after_stop", False):
+            self._command_monitor_exit_after_stop = False
+            self._exit_waiting = True
+            self.show_output(
+                "Analysis",
+                text="Commands録画の確定とYouTubeキュー保存後にPokeConを閉じます。")
+            self._wait_for_recording_finalization()
+            return True
         command = getattr(self, "cur_command", None)
         if (restart and frame is not None and self.record_armed
                 and command is self._command_monitor_command
                 and getattr(command, "alive", False)):
-            now = time.monotonic()
-            chunk = self._start_command_monitor_chunk(frame, command, now)
-            if chunk is None:
+            if not self._request_command_monitor_chunk_restart(
+                    frame, command, event_name="recording_rotated"):
                 return False
-            event_now = time.monotonic()
-            snapshot = runtime_state_snapshot(command)
-            self._command_monitor_last_snapshot = dict(snapshot)
-            location = runtime_execution_location(
-                command, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            step_frame = self._queue_command_monitor_step_frame(
-                self._command_monitor_current_chunk, frame)
-            self._write_command_monitor_event(
-                self._command_monitor_current_chunk, snapshot,
-                "recording_rotated", location=location, now=event_now, extra={
-                    "step_frame": step_frame,
-                    "clean_frame": bool(step_frame),
-                    "step_frame_dropped": not bool(step_frame),
-                })
         return True
 
     def _finish_command_monitor_chunk(
             self, reason="chunk_end", frame=None, restart=False,
-            background=False):
+            background=False, after_finish=None, prune_after_finish=True):
         with self._command_monitor_lock:
             chunk = self._command_monitor_current_chunk
-        if chunk is None or self._command_monitor_stop_in_progress:
+        if chunk is None:
             return False
-        PokeControllerApp._drain_command_focus_trace(
-            self, self._command_monitor_command, chunk=chunk)
+        if self._command_monitor_stop_in_progress:
+            if callable(after_finish):
+                callback_attribute = (
+                    "_command_monitor_priority_finish_callbacks"
+                    if not prune_after_finish else
+                    "_command_monitor_pending_finish_callbacks")
+                callbacks = getattr(self, callback_attribute, None)
+                if callbacks is None:
+                    callbacks = []
+                    setattr(self, callback_attribute, callbacks)
+                callbacks.append(after_finish)
+            if not prune_after_finish:
+                self._command_monitor_suppress_finish_prune = True
+            if reason in {
+                    "application_exit", "command_changed", "command_finished",
+                    "command_stopped", "disk_space", "force_stop_requested",
+                    "input_set_changed", "monitor_error", "monitoring_stopped",
+                    "recording_disabled", "stop_requested"}:
+                chunk["_youtube_finalize_after_finish"] = True
+            return bool(callable(after_finish) or not prune_after_finish)
+        self._command_monitor_priority_finish_callbacks = []
+        self._command_monitor_pending_finish_callbacks = []
+        self._command_monitor_suppress_finish_prune = not prune_after_finish
+        finish_command = self._command_monitor_command
         chunk["ended"] = time.monotonic()
+        chunk["_youtube_finalize_after_finish"] = reason in {
+            "application_exit", "command_changed", "command_finished",
+            "command_stopped", "disk_space", "force_stop_requested",
+            "input_set_changed",
+            "monitor_error", "monitoring_stopped", "recording_disabled",
+            "stop_requested",
+        }
         recorder = getattr(self, "recorder", None)
         audio_started = float(getattr(
             recorder, "audio_start_started_at", 0.0) or 0.0)
@@ -17929,10 +21062,14 @@ class PokeControllerApp:
             recorder, "audio_start_error", "") or "")
         if audio_error:
             chunk["audio_start_error"] = audio_error
-        self._write_command_monitor_event(
-            chunk, runtime_state_snapshot(self._command_monitor_command), reason)
-        self._write_command_monitor_output_log(chunk)
-        self._write_command_monitor_metadata(chunk)
+        chunk["recording_close_pending"] = True
+        chunk.pop("recording_close_failed", None)
+        chunk.pop("recording_close_error", None)
+        finish_snapshot = runtime_state_snapshot(self._command_monitor_command)
+        try:
+            finish_log_lines = self._record_log_lines(240)
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            finish_log_lines = []
         self._command_monitor_stop_in_progress = True
         restart_frame = None
         if restart and frame is not None:
@@ -17943,19 +21080,64 @@ class PokeControllerApp:
 
         def stop_recorder():
             error = None
+            journal_error = None
+            try:
+                # Source copying is independent evidence work. A slow copy must
+                # never turn an otherwise valid AVI close into a recording
+                # failure; deletion remains gated until that worker signals.
+                PokeControllerApp._drain_command_focus_trace(
+                    self, finish_command, chunk=chunk)
+                self._write_command_monitor_event(
+                    chunk, finish_snapshot, reason)
+                self._write_command_monitor_output_log(
+                    chunk, lines=finish_log_lines)
+                if not self._write_command_monitor_metadata(chunk):
+                    journal_error = OSError(
+                        "Commands録画の終了待ち状態を保存できませんでした。")
+            except Exception as caught:
+                journal_error = caught
             try:
                 self._stop_capture_recorder()
             except Exception as stop_error:
                 error = stop_error
+            if error is None and journal_error is not None:
+                error = journal_error
+            if error is not None:
+                chunk["recording_close_pending"] = True
+                chunk["recording_close_failed"] = True
+                chunk["recording_close_error"] = str(error)
+                chunk["delete_pending"] = False
+                chunk["merge_pending"] = False
+                chunk["pinned"] = True
+            else:
+                chunk["recording_close_pending"] = False
+                chunk.pop("recording_close_failed", None)
+                chunk.pop("recording_close_error", None)
+            if not self._write_command_monitor_metadata(chunk) and error is None:
+                error = OSError(
+                    "Commands録画の終了結果を保存できませんでした。")
+                chunk["recording_close_pending"] = True
+                chunk["recording_close_failed"] = True
+                chunk["recording_close_error"] = str(error)
+                chunk["delete_pending"] = False
+                chunk["merge_pending"] = False
+                chunk["pinned"] = True
+                self._write_command_monitor_metadata(chunk)
             if background:
                 self._gui_action_queue.put(
                     lambda error=error: self._complete_command_monitor_chunk_finish(
                         chunk, restart=restart,
-                        frame=restart_frame, error=error))
+                        frame=restart_frame, error=error,
+                        after_finish=after_finish,
+                        prune_after_finish=prune_after_finish,
+                        metadata_persisted=True))
             else:
                 self._complete_command_monitor_chunk_finish(
                     chunk, restart=restart,
-                    frame=restart_frame, error=error)
+                    frame=restart_frame, error=error,
+                    after_finish=after_finish,
+                    prune_after_finish=prune_after_finish,
+                    metadata_persisted=True)
 
         if background:
             threading.Thread(
@@ -18160,7 +21342,8 @@ class PokeControllerApp:
             self, reason, command=None, automatic=False, pause_command=True):
         command = command if command is not None else getattr(
             self, "cur_command", None)
-        if automatic and not self.command_recovery_auto_open.get():
+        if (automatic
+                and PokeControllerApp._automatic_command_recovery_disabled(self)):
             return False
         self._command_recovery_context_command = command
         if pause_command and command is not None and getattr(command, "alive", False):
@@ -18330,6 +21513,10 @@ class PokeControllerApp:
             self._command_recovery_last_check = 0.0
             PokeControllerApp._clear_command_recovery_loop_pause_request(self)
             return False
+        if PokeControllerApp._automatic_command_recovery_disabled(self):
+            PokeControllerApp._reset_automatic_command_recovery_state(
+                self, now=now, resume_dark_pause=False, reset_dark=False)
+            return False
         if running is None:
             try:
                 running = self.start_button["text"] == "Stop"
@@ -18422,6 +21609,8 @@ class PokeControllerApp:
 
     def _command_monitor_begin_session(self, command):
         self._command_monitor_command = command
+        self._command_monitor_session_retention_mode = (
+            self._command_monitor_retention_mode_key())
         self._command_monitor_session_id = datetime.datetime.now().strftime(
             "%Y%m%d_%H%M%S_%f")
         self._command_monitor_session_started = time.monotonic()
@@ -18466,9 +21655,14 @@ class PokeControllerApp:
                     getattr(command, "NAME", "Commands"),
                     ", ".join(self._command_focus_targets)))
         else:
-            self.record_monitor_status.set(
-                "監視中: {} / Stepを自動検出しています".format(
-                    getattr(command, "NAME", "Commands")))
+            if self._command_monitor_keep_all_enabled():
+                self.record_monitor_status.set(
+                    "全区間保持中: {} / 録画用ループ判定・自動削除なし".format(
+                        getattr(command, "NAME", "Commands")))
+            else:
+                self.record_monitor_status.set(
+                    "監視中: {} / Stepを自動検出しています".format(
+                        getattr(command, "NAME", "Commands")))
 
     def _update_command_monitor_state(self, command, now, frame=None):
         state_due = now - self._command_monitor_last_check >= 0.25
@@ -18485,7 +21679,9 @@ class PokeControllerApp:
             self._command_monitor_last_snapshot = dict(snapshot)
         else:
             snapshot = dict(self._command_monitor_last_snapshot)
-        result = self._command_monitor_timeline.add(snapshot, now) if state_due else {
+        detect_loops = not self._command_monitor_keep_all_enabled()
+        result = self._command_monitor_timeline.add(
+            snapshot, now, detect_loops=detect_loops) if state_due else {
             "changed": False, "loop_started": False, "loop_ended": False,
         }
         location = runtime_execution_location(
@@ -18519,8 +21715,10 @@ class PokeControllerApp:
                 for chunk in self._command_monitor_chunks:
                     end = chunk.get("ended") or now
                     if end >= loop.get("anchor_start", now) and chunk.get("started", now) <= loop.get("anchor_end", now):
-                        chunk["loop_anchor"] = True
-                        self._write_command_monitor_metadata(chunk)
+                        if not chunk.get("loop_anchor"):
+                            chunk["loop_anchor"] = True
+                            self._queue_command_monitor_metadata_journal(
+                                [chunk])
                 self.record_monitor_status.set(
                     "ループ検出: {}Step × {}周 / 開始・終了各約{}秒だけを保持".format(
                         loop.get("period", 0),
@@ -18530,7 +21728,9 @@ class PokeControllerApp:
                 self.record_monitor_status.set(
                     "ループ終了を検出しました。終了後15 Stepまでは開始側と終了側を分けて保持します。")
             else:
-                if self._command_focus_targets:
+                if self._command_monitor_keep_all_enabled():
+                    prefix = "全区間保持中: "
+                elif self._command_focus_targets:
                     prefix = "集中修正監視中: "
                 elif self._command_common_targets:
                     prefix = "共通関数の呼び出し元を索引化中: "
@@ -18538,8 +21738,9 @@ class PokeControllerApp:
                     prefix = "監視中: "
                 self.record_monitor_status.set(
                     prefix + self._command_monitor_step_text(snapshot))
-        if state_due:
-            self._mark_command_monitor_prune_candidates(now)
+        if state_due and detect_loops:
+            self._mark_command_monitor_prune_candidates(
+                now, persist_metadata=False)
         return result
 
     def _update_command_monitor_visual_state(self, frame, now):
@@ -18598,6 +21799,13 @@ class PokeControllerApp:
             return {"sampled": False, "stall_started": False,
                     "recovered": False, "active": None,
                     "command_paused": False, "command_resumed": False}
+        if PokeControllerApp._automatic_command_recovery_disabled(self):
+            resumed = PokeControllerApp._reset_automatic_command_recovery_state(
+                self, now=now, resume_dark_pause=True, reset_loop=False)
+            return {"sampled": False, "stall_started": False,
+                    "recovered": False, "active": None,
+                    "command_paused": False,
+                    "command_resumed": bool(resumed)}
         command = getattr(self, "cur_command", None)
         try:
             running = self.start_button["text"] == "Stop"
@@ -18630,11 +21838,8 @@ class PokeControllerApp:
                 self._commands_dark_safety_paused_command = command
                 self._release_command_input_for_dark_pause(command)
                 result["command_paused"] = True
-                try:
-                    recovery_window_enabled = bool(
-                        self.command_recovery_auto_open.get())
-                except Exception:
-                    recovery_window_enabled = False
+                recovery_window_enabled = not (
+                    PokeControllerApp._automatic_command_recovery_disabled(self))
                 hold_seconds = int(round(getattr(
                     self._commands_dark_safety_detector,
                     "hold_seconds", 60.0)))
@@ -18727,9 +21932,80 @@ class PokeControllerApp:
             self.record_monitor_status.set("60秒以内にキー操作が再開したため、無操作判定を解除しました。")
         return result
 
-    def _mark_command_monitor_prune_candidates(self, now=None,
-                                               explicit_stop=False):
+    def _mark_command_monitor_prune_candidates(
+            self, now=None, explicit_stop=False, persist_metadata=True):
         now = time.monotonic() if now is None else float(now)
+        deferred_metadata = []
+
+        def persist_or_defer(chunk):
+            if persist_metadata:
+                self._write_command_monitor_metadata(chunk)
+            elif not any(item is chunk for item in deferred_metadata):
+                deferred_metadata.append(chunk)
+
+        def start_deferred_journal():
+            if persist_metadata or not deferred_metadata:
+                return
+            self._queue_command_monitor_metadata_journal(deferred_metadata)
+
+        if self._command_monitor_keep_all_enabled():
+            session_id = str(getattr(
+                self, "_command_monitor_session_id", "") or "")
+            starts = []
+            for chunk in self._command_monitor_chunks:
+                chunk_mode = normalize_command_monitor_retention_mode(
+                    chunk.get("monitor_retention_mode", ""))
+                current_session = bool(
+                    session_id
+                    and str(chunk.get("command_session_id", "")) == session_id
+                    and not chunk.get("historical"))
+                if (not current_session
+                        and chunk_mode != COMMAND_MONITOR_RETENTION_KEEP_ALL):
+                    continue
+                if chunk.get("explicit_delete_pending"):
+                    if not chunk.get("delete_pending"):
+                        chunk["delete_pending"] = True
+                        persist_or_defer(chunk)
+                    continue
+                if chunk.get("youtube_source_cleanup_pending"):
+                    if not chunk.get("delete_pending"):
+                        chunk["delete_pending"] = True
+                        persist_or_defer(chunk)
+                    continue
+                changed = bool(chunk.get("delete_pending"))
+                chunk["delete_pending"] = False
+                if (current_session
+                        and chunk_mode != COMMAND_MONITOR_RETENTION_KEEP_ALL):
+                    chunk["monitor_retention_mode"] = (
+                        COMMAND_MONITOR_RETENTION_KEEP_ALL)
+                    changed = True
+                try:
+                    starts.append(float(chunk.get("started", now) or now))
+                except (TypeError, ValueError):
+                    pass
+                if changed:
+                    persist_or_defer(chunk)
+            keep_after = min(starts) if starts else now
+            retention = {
+                "keep_after": keep_after,
+                "keep_before": None,
+                "keep_ranges": [(keep_after, None)],
+                "loop_anchors": [],
+                "loop_skip_ranges": [],
+                "preserve_loop_start": False,
+                "loop_compacted": False,
+                "mode": COMMAND_MONITOR_RETENTION_KEEP_ALL,
+            }
+            if persist_metadata:
+                self._update_command_monitor_loop_segments(retention, now)
+            else:
+                for changed in (
+                        PokeControllerApp._update_command_monitor_loop_segments(
+                            self, retention, now, persist_metadata=False)):
+                    persist_or_defer(changed)
+            start_deferred_journal()
+            self._refresh_command_monitor_tree()
+            return retention
         visual = getattr(self._command_monitor_visual_detector, "active", None)
         inactivity = getattr(self._command_monitor_input_tracker, "active", None)
         terminals = []
@@ -18770,10 +22046,26 @@ class PokeControllerApp:
         keep_ranges = list(retention.get("keep_ranges") or [(
             retention["keep_after"], retention.get("keep_before"))])
         for chunk in self._command_monitor_chunks:
+            if chunk.get("explicit_delete_pending"):
+                if not chunk.get("delete_pending"):
+                    chunk["delete_pending"] = True
+                    persist_or_defer(chunk)
+                continue
+            if chunk.get("youtube_source_cleanup_pending"):
+                if not chunk.get("delete_pending"):
+                    chunk["delete_pending"] = True
+                    persist_or_defer(chunk)
+                continue
             if (chunk is self._command_monitor_current_chunk or chunk.get("pinned")
                     or chunk.get("merge_pending") or chunk.get("focus_matched")
-                    or chunk.get("youtube_roll_pending")):
-                chunk["delete_pending"] = False
+                    or chunk.get("youtube_roll_pending")
+                    or chunk.get("youtube_merge_attention_required")
+                    or normalize_command_monitor_retention_mode(
+                        chunk.get("monitor_retention_mode", ""))
+                    == COMMAND_MONITOR_RETENTION_KEEP_ALL):
+                if chunk.get("delete_pending"):
+                    chunk["delete_pending"] = False
+                    persist_or_defer(chunk)
                 continue
             end = chunk.get("ended") or now
             started = chunk.get("started", end)
@@ -18781,7 +22073,10 @@ class PokeControllerApp:
                 end >= float(start)
                 and (finish is None or started <= float(finish))
                 for start, finish in keep_ranges)
-            chunk["delete_pending"] = not keep
+            delete_pending = not keep
+            if bool(chunk.get("delete_pending")) != delete_pending:
+                chunk["delete_pending"] = delete_pending
+                persist_or_defer(chunk)
         if explicit_stop:
             # Stop直後の保存確認より先に保持範囲の整理が走る。現在Runの
             # 全録画が範囲外でも、最新1本はユーザーの保存判断まで残す。
@@ -18793,13 +22088,21 @@ class PokeControllerApp:
                     chunk for chunk in self._command_monitor_chunks
                     if str(chunk.get("id", "")) == restored_id), None)
                 if restored is not None:
-                    self._write_command_monitor_metadata(restored)
+                    persist_or_defer(restored)
+        if persist_metadata:
+            self._update_command_monitor_loop_segments(retention, now)
+        else:
+            for changed in (
+                    PokeControllerApp._update_command_monitor_loop_segments(
+                        self, retention, now, persist_metadata=False)):
+                persist_or_defer(changed)
+        start_deferred_journal()
         self._flush_command_monitor_deletes()
-        self._update_command_monitor_loop_segments(retention, now)
         self._refresh_command_monitor_tree()
         return retention
 
-    def _update_command_monitor_loop_segments(self, retention, now=None):
+    def _update_command_monitor_loop_segments(
+            self, retention, now=None, persist_metadata=True):
         """Mark the retained loop discontinuity for the merge interstitial."""
         now = time.monotonic() if now is None else float(now)
         session_id = str(getattr(
@@ -18844,11 +22147,15 @@ class PokeControllerApp:
                     desired[id(chunk)]["loop_gap_before"] = True
                     desired[id(chunk)]["loop_gap_seconds"] = actual_gap
             previous = chunk
+        changed_chunks = []
         for chunk in candidates:
             updates = desired[id(chunk)]
             if any(chunk.get(key) != value for key, value in updates.items()):
                 chunk.update(updates)
-                self._write_command_monitor_metadata(chunk)
+                changed_chunks.append(chunk)
+                if persist_metadata:
+                    self._write_command_monitor_metadata(chunk)
+        return changed_chunks
 
     def _command_monitor_failure_tail_seconds(self):
         try:
@@ -18857,59 +22164,922 @@ class PokeControllerApp:
         except (tk.TclError, TypeError, ValueError):
             return 60.0
 
+    @staticmethod
+    def _command_monitor_youtube_delete_protected(chunk):
+        """Keep local media until every durable YouTube step is complete."""
+        archive_enabled = bool(dict(
+            chunk.get("youtube_archive", {}) or {}).get("enabled"))
+        if (chunk.get("recording_close_pending")
+                or chunk.get("recording_close_failed")
+                or chunk.get("youtube_roll_pending")
+                or chunk.get("youtube_merge_attention_required")
+                or chunk.get("merge_pending")):
+            return True
+        raw_upload = chunk.get("youtube_upload", {}) or {}
+        if not raw_upload:
+            # A merged/raw YouTube interval without a verifiable queue job is
+            # unknown, never disposable.  Only the upload worker (or a queue
+            # state proven completed below) may release it.
+            return archive_enabled
+        if not isinstance(raw_upload, dict):
+            return True
+        upload = dict(raw_upload)
+        status = str(upload.get("status", "") or "").strip().lower()
+        job_path = str(upload.get("job_path", "") or "").strip()
+        job = None
+        if job_path:
+            try:
+                with open(job_path, "r", encoding="utf-8") as stream:
+                    job = json.load(stream)
+                if not isinstance(job, dict):
+                    return True
+                status = str(
+                    job.get("status", status) or status).strip().lower()
+            except (OSError, TypeError, ValueError):
+                # Missing or unreadable queue state cannot prove completion.
+                return True
+            expected_id = os.path.basename(job_path)
+            if expected_id.lower().endswith(".json"):
+                expected_id = expected_id[:-len(".json")]
+            if (_upload_job_schema_error(job)
+                    or _upload_job_identity_error(job, expected_id)):
+                # A schema-shaped payload under the wrong deterministic name
+                # must never authorize deletion of the raw source recording.
+                return True
+        if status == "completed":
+            # ``completed`` is only a trustworthy remote durability proof when
+            # every persisted segment names the YouTube object that received
+            # it. A hand-written/stale status with no IDs must not release the
+            # last local raw fallback after merged-media cleanup.
+            if not completed_upload_has_remote_proof(job):
+                return True
+        if chunk.get("youtube_source_cleanup_pending"):
+            # Raw AVI/WAV may be retired once its merged MP4 is either still
+            # present behind a non-invalid durable job or already completed.
+            # If the queue/media identity is uncertain, keep the raw fallback.
+            cleanup_identity = chunk.get(
+                "youtube_source_cleanup_identity", {}) or {}
+            expected_job = chunk.get(
+                "youtube_source_cleanup_job", {}) or {}
+            if (not isinstance(cleanup_identity, dict)
+                    or not cleanup_identity
+                    or not isinstance(expected_job, dict)
+                    or not expected_job
+                    or not isinstance(job, dict)):
+                return True
+            raw_expected_job_path = str(
+                expected_job.get("job_path", "") or "").strip()
+            raw_expected_media = str(
+                expected_job.get("media_path", "") or "").strip()
+            raw_expected_session = str(
+                expected_job.get("session_dir", "") or "").strip()
+            expected_job_id = str(expected_job.get("id", "") or "")
+            if (not raw_expected_job_path or not raw_expected_media
+                    or not raw_expected_session or not expected_job_id):
+                return True
+            expected_job_path = os.path.abspath(raw_expected_job_path)
+            expected_media = os.path.abspath(raw_expected_media)
+            expected_session = os.path.abspath(raw_expected_session)
+            if (os.path.normcase(os.path.abspath(job_path))
+                    != os.path.normcase(expected_job_path)
+                    or _upload_job_identity_error(
+                        job, expected_job_id,
+                        expected_media, expected_session)):
+                return True
+            if status == "completed":
+                return False
+            if status in ("", "invalid_job", "cancelled"):
+                return True
+            media_path = os.path.abspath(str(
+                job.get("media_path", "") or ""))
+            media_identity = _recording_media_source_identity(job)
+            if (not _cleanup_session_identity_matches(job)
+                    or media_identity is None
+                    or not _source_identity_matches(
+                        media_path, media_identity)):
+                return True
+            return False
+        if archive_enabled:
+            return status != "completed"
+        return bool(status) and status != "completed"
+
+    @staticmethod
+    def _command_monitor_delete_probe_snapshot(chunk):
+        """Copy only state that can change YouTube deletion eligibility."""
+        if not isinstance(chunk, dict):
+            return {}
+        return {
+            "id": str(chunk.get("id", "") or ""),
+            "session_dir": str(chunk.get("session_dir", "") or ""),
+            "pinned": bool(chunk.get("pinned")),
+            "delete_pending": bool(chunk.get("delete_pending")),
+            "recording_close_pending": bool(
+                chunk.get("recording_close_pending")),
+            "recording_close_failed": bool(
+                chunk.get("recording_close_failed")),
+            "youtube_merge_attention_required": bool(
+                chunk.get("youtube_merge_attention_required")),
+            "youtube_roll_pending": bool(chunk.get("youtube_roll_pending")),
+            "merge_pending": bool(chunk.get("merge_pending")),
+            "youtube_source_cleanup_pending": bool(
+                chunk.get("youtube_source_cleanup_pending")),
+            "youtube_source_cleanup_identity": dict(
+                chunk.get("youtube_source_cleanup_identity", {}) or {})
+            if isinstance(
+                chunk.get("youtube_source_cleanup_identity", {}) or {}, dict)
+            else chunk.get("youtube_source_cleanup_identity"),
+            "youtube_source_cleanup_job": dict(
+                chunk.get("youtube_source_cleanup_job", {}) or {})
+            if isinstance(
+                chunk.get("youtube_source_cleanup_job", {}) or {}, dict)
+            else chunk.get("youtube_source_cleanup_job"),
+            "youtube_archive": dict(
+                chunk.get("youtube_archive", {}) or {}),
+            "youtube_upload": dict(
+                chunk.get("youtube_upload", {}) or {})
+            if isinstance(chunk.get("youtube_upload", {}) or {}, dict)
+            else chunk.get("youtube_upload"),
+            "_delete_tombstone_recovery": dict(
+                chunk.get("_delete_tombstone_recovery", {}) or {})
+            if isinstance(
+                chunk.get("_delete_tombstone_recovery", {}) or {}, dict)
+            else {},
+        }
+
+    @staticmethod
+    def _command_monitor_delete_requires_background_probe(chunk):
+        upload = chunk.get("youtube_upload", {}) \
+            if isinstance(chunk, dict) else {}
+        return bool(isinstance(upload, dict)
+                    and str(upload.get("job_path", "") or "").strip())
+
+    def _start_command_monitor_delete_eligibility_sweep(
+            self, chunks, callback, prepare_delete=False):
+        """Probe queue/media state away from Tk, then post one GUI apply."""
+        work = [
+            (chunk, PokeControllerApp._command_monitor_delete_probe_snapshot(
+                chunk))
+            for chunk in chunks if isinstance(chunk, dict)
+        ]
+        if not work:
+            return False
+        output_root = os.path.abspath(self._effective_record_output_dir()) \
+            if prepare_delete else ""
+
+        def worker():
+            results = []
+            for original, snapshot in work:
+                state = "protected"
+                prepared = None
+                error_text = ""
+                try:
+                    protected = (
+                        PokeControllerApp._command_monitor_youtube_delete_protected(
+                            snapshot))
+                    if not protected and not prepare_delete:
+                        state = "safe"
+                    elif not protected:
+                        target = os.path.abspath(str(
+                            snapshot.get("session_dir", "") or ""))
+                        recovery = snapshot.get(
+                            "_delete_tombstone_recovery", {}) or {}
+                        if isinstance(recovery, dict) and recovery:
+                            # Re-read the marker and lstat the staged directory
+                            # in this worker.  The scan-time identity is only a
+                            # hint and never authorizes deletion by itself.
+                            prepared = (
+                                PokeControllerApp.
+                                _command_monitor_delete_tombstone_recovery(
+                                    output_root, target))
+                            if (prepared is not None
+                                    and snapshot.get(
+                                        "youtube_source_cleanup_pending")):
+                                prepared["youtube_cleanup_probe"] = snapshot
+                            state = "safe" if prepared is not None else "unsafe"
+                        elif snapshot.get("youtube_source_cleanup_pending"):
+                            pinned = snapshot.get(
+                                "youtube_source_cleanup_identity", {}) or {}
+                            if (not isinstance(pinned, dict)
+                                    or os.path.normcase(os.path.abspath(str(
+                                        pinned.get("target", "") or "")))
+                                    != os.path.normcase(target)):
+                                state = "unsafe"
+                            else:
+                                prepared = (
+                                    PokeControllerApp.
+                                    _command_monitor_prepared_delete_item(
+                                        pinned, snapshot))
+                                state = "safe" if prepared is not None \
+                                    else "unsafe"
+                        else:
+                            try:
+                                prepared = (
+                                    PokeControllerApp._command_monitor_delete_target_snapshot(
+                                        output_root, target))
+                            except FileNotFoundError:
+                                state = "missing"
+                            except OSError as error:
+                                state = "retry"
+                                error_text = str(error)
+                            else:
+                                prepared = (
+                                    PokeControllerApp.
+                                    _command_monitor_prepared_delete_item(
+                                        prepared, snapshot))
+                                state = "safe" if prepared is not None \
+                                    else "unsafe"
+                except Exception as error:
+                    # A failed proof always retains data. The bounded sweep
+                    # cadence can retry transient queue/share failures later.
+                    state = "retry"
+                    error_text = str(error)
+                results.append({
+                    "original": original,
+                    "snapshot": snapshot,
+                    "state": state,
+                    "prepared": prepared,
+                    "error": error_text,
+                })
+
+            def apply_results(items=results):
+                callback(items)
+
+            self._gui_action_queue.put(apply_results)
+
+        threading.Thread(
+            target=worker, daemon=True,
+            name="CommandMonitorDeleteEligibility").start()
+        return True
+
+    @staticmethod
+    def _command_monitor_delete_target_snapshot(root, target):
+        """Pin one real recording directory without following reparse points."""
+        root = os.path.abspath(str(root or ""))
+        target = os.path.abspath(str(target or ""))
+        try:
+            lexical_inside = (
+                os.path.normcase(os.path.commonpath([root, target]))
+                == os.path.normcase(root)
+                and os.path.normcase(target) != os.path.normcase(root))
+        except ValueError:
+            lexical_inside = False
+        if not lexical_inside:
+            return None
+
+        details = os.lstat(target)
+        attributes = int(getattr(details, "st_file_attributes", 0) or 0)
+        reparse_flag = int(getattr(
+            stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400) or 0x400)
+        if (stat.S_ISLNK(details.st_mode)
+                or attributes & reparse_flag
+                or not stat.S_ISDIR(details.st_mode)):
+            return None
+
+        root_realpath = os.path.normcase(os.path.realpath(root))
+        target_realpath = os.path.normcase(os.path.realpath(target))
+        try:
+            real_inside = (
+                os.path.normcase(os.path.commonpath(
+                    [root_realpath, target_realpath])) == root_realpath
+                and os.path.normcase(target_realpath)
+                != os.path.normcase(root_realpath))
+        except ValueError:
+            real_inside = False
+        if not real_inside:
+            return None
+        return {
+            "root": root,
+            "root_realpath": root_realpath,
+            "target": target,
+            "target_realpath": target_realpath,
+            "device": int(getattr(details, "st_dev", 0) or 0),
+            "inode": int(getattr(details, "st_ino", 0) or 0),
+        }
+
+    @staticmethod
+    def _command_monitor_delete_target_state(item):
+        """Return safe, missing, or unsafe for a previously pinned folder."""
+        if not isinstance(item, dict):
+            return "unsafe", None
+        root = str(item.get("root", "") or "")
+        target = str(item.get("target", "") or "")
+        try:
+            current = PokeControllerApp._command_monitor_delete_target_snapshot(
+                root, target)
+        except FileNotFoundError:
+            return "missing", None
+        if current is None:
+            return "unsafe", None
+        try:
+            matches = bool(
+                current["root_realpath"] == item.get("root_realpath")
+                and current["target_realpath"] == item.get("target_realpath")
+                and current["device"] == int(item.get("device", 0) or 0)
+                and current["inode"] == int(item.get("inode", 0) or 0))
+        except (TypeError, ValueError):
+            matches = False
+        return ("safe", current) if matches else ("unsafe", current)
+
+    @staticmethod
+    def _command_monitor_delete_tombstone(target):
+        directory = os.path.dirname(os.path.abspath(target))
+        basename = os.path.basename(os.path.abspath(target))
+        for _attempt in range(8):
+            candidate = os.path.join(
+                directory,
+                ".{}.commands-delete-{}.tombstone".format(
+                    basename, uuid.uuid4().hex))
+            if not os.path.lexists(candidate):
+                return candidate
+        raise FileExistsError(
+            "Commands cleanup tombstoneを作成できません: " + target)
+
+    @staticmethod
+    def _command_monitor_is_delete_tombstone(path):
+        """Recognize only tombstone names created by this cleanup worker."""
+        name = os.path.basename(os.path.abspath(str(path or "")))
+        return bool(name.startswith(".")
+                    and ".commands-delete-" in name
+                    and name.endswith(".tombstone"))
+
+    @staticmethod
+    def _command_monitor_delete_marker_path(target):
+        # Keep the journal beside, not inside, the staged directory. rmtree may
+        # remove command_monitor.json and this marker before hitting a locked
+        # AVI; an external sidecar must survive that partial traversal.
+        return (os.path.abspath(str(target or ""))
+                + COMMAND_MONITOR_DELETE_MARKER_SUFFIX)
+
+    @staticmethod
+    def _write_command_monitor_delete_marker(item, tombstone):
+        """Journal one exact directory identity before its atomic rename.
+
+        The marker is an fsynced sidecar at the planned tombstone path. It
+        survives both a process exit after ``os.replace`` and a partial rmtree
+        that removed the in-directory metadata before encountering a locked
+        media file.
+        """
+        target = os.path.abspath(str(item.get("target", "") or ""))
+        tombstone = os.path.abspath(str(tombstone or ""))
+        root = os.path.abspath(str(item.get("root", "") or ""))
+        if (not target or not root
+                or not PokeControllerApp._command_monitor_is_delete_tombstone(
+                    tombstone)):
+            raise ValueError("Commands cleanup marker target is invalid")
+        payload = {
+            "version": 1,
+            "state": "staged_delete",
+            "root": root,
+            "root_realpath": str(item.get("root_realpath", "") or ""),
+            "original_target": os.path.abspath(str(
+                item.get("original_target", target) or target)),
+            "tombstone_path": tombstone,
+            "device": int(item.get("device", 0) or 0),
+            "inode": int(item.get("inode", 0) or 0),
+            "created_at": datetime.datetime.now().isoformat(
+                timespec="seconds"),
+        }
+        probe = item.get("youtube_cleanup_probe")
+        if isinstance(probe, dict):
+            payload["youtube_cleanup_probe"] = dict(probe)
+        marker_path = PokeControllerApp._command_monitor_delete_marker_path(
+            tombstone)
+        temporary = "{}.{}.tmp".format(marker_path, uuid.uuid4().hex)
+        try:
+            with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
+                json.dump(payload, stream, ensure_ascii=False, indent=2)
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, marker_path)
+        except Exception:
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
+            raise
+        return payload
+
+    @staticmethod
+    def _command_monitor_delete_tombstone_recovery(root, target):
+        """Re-adopt one staged tombstone only after exact identity checks."""
+        root = os.path.abspath(str(root or ""))
+        target = os.path.abspath(str(target or ""))
+        if not PokeControllerApp._command_monitor_is_delete_tombstone(target):
+            return None
+        marker_path = PokeControllerApp._command_monitor_delete_marker_path(
+            target)
+        try:
+            with open(marker_path, "r", encoding="utf-8") as stream:
+                marker = json.load(stream)
+            if (not isinstance(marker, dict)
+                    or int(marker.get("version", 0) or 0) != 1
+                    or marker.get("state") != "staged_delete"):
+                return None
+            current = (
+                PokeControllerApp._command_monitor_delete_target_snapshot(
+                    root, target))
+            if current is None:
+                return None
+            marker_root = os.path.abspath(str(marker.get("root", "") or ""))
+            marker_tombstone = os.path.abspath(str(
+                marker.get("tombstone_path", "") or ""))
+            original = os.path.abspath(str(
+                marker.get("original_target", "") or ""))
+            try:
+                original_inside = bool(
+                    os.path.normcase(os.path.commonpath([root, original]))
+                    == os.path.normcase(root)
+                    and os.path.normcase(original) != os.path.normcase(root)
+                    and os.path.normcase(original) != os.path.normcase(target))
+            except ValueError:
+                original_inside = False
+            if (os.path.normcase(marker_root) != os.path.normcase(root)
+                    or os.path.normcase(marker_tombstone)
+                    != os.path.normcase(target)
+                    or str(marker.get("root_realpath", "") or "")
+                    != str(current.get("root_realpath", "") or "")
+                    or int(marker.get("device", 0) or 0)
+                    != int(current.get("device", 0) or 0)
+                    or int(marker.get("inode", 0) or 0)
+                    != int(current.get("inode", 0) or 0)
+                    or not original_inside):
+                return None
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return None
+        recovered = dict(current)
+        recovered.update({
+            "retry_key": original,
+            "original_target": original,
+            "staged": True,
+            "delete_marker_path": marker_path,
+        })
+        probe = marker.get("youtube_cleanup_probe")
+        if isinstance(probe, dict):
+            recovered["youtube_cleanup_probe"] = dict(probe)
+        for key in ("last_error", "last_failed_at", "retry_count",
+                    "retry_after_seconds"):
+            if key in marker:
+                recovered[key] = marker[key]
+        return recovered
+
+    @staticmethod
+    def _update_command_monitor_delete_marker_retry(item, error, attempt,
+                                                    retry_after):
+        """Persist deferred cleanup diagnostics without weakening identity."""
+        target = os.path.abspath(str(item.get("target", "") or ""))
+        marker_path = PokeControllerApp._command_monitor_delete_marker_path(
+            target)
+        try:
+            recovered = (
+                PokeControllerApp._command_monitor_delete_tombstone_recovery(
+                    item.get("root", ""), target))
+            if recovered is None:
+                return False
+            with open(marker_path, "r", encoding="utf-8") as stream:
+                marker = json.load(stream)
+            marker["last_error"] = str(error or "")
+            marker["last_failed_at"] = datetime.datetime.now().isoformat(
+                timespec="seconds")
+            marker["retry_count"] = int(attempt)
+            marker["retry_after_seconds"] = float(retry_after)
+            temporary = "{}.{}.tmp".format(marker_path, uuid.uuid4().hex)
+            try:
+                with open(temporary, "w", encoding="utf-8",
+                          newline="\n") as stream:
+                    json.dump(marker, stream, ensure_ascii=False, indent=2)
+                    stream.write("\n")
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, marker_path)
+            except Exception:
+                try:
+                    os.remove(temporary)
+                except OSError:
+                    pass
+                raise
+            return True
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+
+    def _schedule_command_monitor_delete_retry(self, item, delay):
+        """Requeue a staged object slowly; the durable marker covers exits."""
+        target = os.path.abspath(str(item.get("target", "") or ""))
+        key = (os.path.normcase(target), int(item.get("device", 0) or 0),
+               int(item.get("inode", 0) or 0))
+        lock = getattr(self, "_command_monitor_delete_retry_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._command_monitor_delete_retry_lock = lock
+        timers = getattr(self, "_command_monitor_delete_retry_timers", None)
+        if not isinstance(timers, dict):
+            timers = {}
+            self._command_monitor_delete_retry_timers = timers
+
+        def requeue():
+            with lock:
+                timers.pop(key, None)
+            self._command_monitor_delete_queue.put_nowait(item)
+
+        with lock:
+            if key in timers:
+                return False
+            timer = threading.Timer(max(1.0, float(delay)), requeue)
+            timer.daemon = True
+            timers[key] = timer
+        timer.start()
+        return True
+
+    @staticmethod
+    def _command_monitor_prepared_delete_item(identity, chunk=None):
+        """Carry one pinned source identity into the cleanup worker."""
+        if not isinstance(identity, dict) or not identity:
+            return None
+        item = dict(identity)
+        raw_target = str(item.get("target", "") or "").strip()
+        if not raw_target:
+            return None
+        target = os.path.abspath(raw_target)
+        item["retry_key"] = target
+        item["original_target"] = target
+        item["staged"] = False
+        if isinstance(chunk, dict) and chunk.get(
+                "youtube_source_cleanup_pending"):
+            item["youtube_cleanup_probe"] = (
+                PokeControllerApp._command_monitor_delete_probe_snapshot(
+                    chunk))
+        return item
+
     def _queue_command_monitor_folder_delete(self, path, output_root=None):
+        if not str(path or "").strip():
+            return False
         root = os.path.abspath(
             output_root or self._effective_record_output_dir())
         target = os.path.abspath(path)
         try:
-            safe = os.path.commonpath([root, target]) == root and target != root
-        except ValueError:
-            safe = False
-        if not safe:
-            return False
-        if not os.path.isdir(target):
+            item = PokeControllerApp._command_monitor_delete_target_snapshot(
+                root, target)
+        except FileNotFoundError:
             return True
-        self._command_monitor_delete_queue.put_nowait(target)
+        except OSError as error:
+            self._logger.warning(
+                "Command monitor cleanup target inspection failed: %s", error)
+            return False
+        if item is None:
+            self._logger.warning(
+                "Command monitor cleanup rejected an unsafe/replaced folder: %s",
+                target)
+            return False
+        item = PokeControllerApp._command_monitor_prepared_delete_item(item)
+        self._command_monitor_delete_queue.put_nowait(item)
         return True
 
     def _command_monitor_delete_loop(self):
         """Delete large video folders without ever blocking Tk or input."""
+        retry_attempts = {}
         while True:
-            target = self._command_monitor_delete_queue.get()
+            item = self._command_monitor_delete_queue.get()
+            target = str(item.get("target", "") or "") \
+                if isinstance(item, dict) else ""
+            retry_key = str(item.get("retry_key", target) or target) \
+                if isinstance(item, dict) else target
+            delete_item = item
             try:
+                if not isinstance(item, dict) or not target:
+                    self._logger.warning(
+                        "Command monitor cleanup ignored an invalid queue item.")
+                    continue
                 # A queued raw Step still must never recreate a folder after
                 # its recording was deleted.
                 self._command_step_frame_queue.join()
-                if os.path.isdir(target):
-                    shutil.rmtree(target)
+                trace_queue = getattr(self, "_command_trace_queue", None)
+                if trace_queue is not None:
+                    trace_queue.join()
+                with self._command_monitor_index_events_lock:
+                    index_event = self._command_monitor_index_events.get(
+                        str(item.get("original_target", target) or target))
+                if index_event is not None:
+                    index_event.wait()
+
+                youtube_probe = item.get("youtube_cleanup_probe")
+                if (isinstance(youtube_probe, dict)
+                        and PokeControllerApp.
+                        _command_monitor_youtube_delete_protected(
+                            youtube_probe)):
+                    retry_attempts.pop(retry_key, None)
+                    retry_delay = COMMAND_MONITOR_DELETE_SLOW_RETRY_SECONDS
+                    deferred_attempt = int(item.get(
+                        "retry_count", 0) or 0) + 1
+                    item["retry_count"] = deferred_attempt
+                    if item.get("staged"):
+                        PokeControllerApp._update_command_monitor_delete_marker_retry(
+                            item,
+                            "YouTube queue/media identity is not proven",
+                            deferred_attempt, retry_delay)
+                    PokeControllerApp._schedule_command_monitor_delete_retry(
+                        self, item, retry_delay)
+                    self._logger.warning(
+                        "Command monitor cleanup retained raw recording because "
+                        "its YouTube queue/media identity is no longer proven; "
+                        "retrying in %.0fs: %s", retry_delay, target)
+                    continue
+
+                state, _current = (
+                    PokeControllerApp._command_monitor_delete_target_state(item))
+                if state == "missing":
+                    try:
+                        os.remove(str(item.get(
+                            "delete_marker_path", "") or ""))
+                    except OSError:
+                        pass
+                    retry_attempts.pop(retry_key, None)
+                    continue
+                if state != "safe":
+                    retry_attempts.pop(retry_key, None)
+                    self._logger.warning(
+                        "Command monitor cleanup retained an unsafe/replaced "
+                        "folder without retrying: %s", target)
+                    continue
+
+                delete_item = item
+                if not item.get("staged"):
+                    tombstone = (
+                        PokeControllerApp._command_monitor_delete_tombstone(
+                            target))
+                    try:
+                        # Persist the exact source identity in a sidecar beside
+                        # the planned tombstone before the rename. A later
+                        # process can resume even if a partial rmtree removed
+                        # all metadata inside the directory, without adopting a
+                        # same-name replacement at the original path.
+                        PokeControllerApp._write_command_monitor_delete_marker(
+                            item, tombstone)
+                        os.replace(target, tombstone)
+                    except FileNotFoundError:
+                        try:
+                            os.remove(PokeControllerApp.
+                                      _command_monitor_delete_marker_path(
+                                          tombstone))
+                        except OSError:
+                            pass
+                        retry_attempts.pop(retry_key, None)
+                        continue
+                    except OSError:
+                        try:
+                            os.remove(PokeControllerApp.
+                                      _command_monitor_delete_marker_path(
+                                          tombstone))
+                        except OSError:
+                            pass
+                        raise
+                    delete_item = dict(item)
+                    delete_item.update({
+                        "target": tombstone,
+                        "target_realpath": os.path.normcase(
+                            os.path.realpath(tombstone)),
+                        "retry_key": retry_key,
+                        "original_target": item.get(
+                            "original_target", target),
+                        "staged": True,
+                        "delete_marker_path": (
+                            PokeControllerApp.
+                            _command_monitor_delete_marker_path(tombstone)),
+                    })
+                    try:
+                        staged = (
+                            PokeControllerApp._command_monitor_delete_target_snapshot(
+                                item["root"], tombstone))
+                    except FileNotFoundError:
+                        retry_attempts.pop(retry_key, None)
+                        continue
+                    same_identity = bool(
+                        staged is not None
+                        and staged["root_realpath"] == item["root_realpath"]
+                        and staged["device"] == item["device"]
+                        and staged["inode"] == item["inode"])
+                    if not same_identity:
+                        # The name may have been replaced between the last lstat
+                        # and os.replace. Never move this unknown object back to
+                        # the original path: another replacement could appear
+                        # between an existence check and that restore. Keep the
+                        # tombstone plus its sidecar quarantined for inspection.
+                        retry_attempts.pop(retry_key, None)
+                        self._logger.warning(
+                            "Command monitor cleanup quarantined a tombstone "
+                            "whose identity changed before deletion: %s "
+                            "(original path: %s)", tombstone, target)
+                        continue
+                    delete_item = dict(item)
+                    delete_item.update(staged)
+                    delete_item.update({
+                        "retry_key": retry_key,
+                        "original_target": item.get(
+                            "original_target", target),
+                        "staged": True,
+                        "delete_marker_path": (
+                            PokeControllerApp.
+                            _command_monitor_delete_marker_path(tombstone)),
+                    })
+                    target = tombstone
+
+                # Queue state and the merged primary media live outside the raw
+                # source directory. Recheck their fixed identities after the
+                # atomic source rename as well. If proof was lost, retain and
+                # retry the isolated tombstone; never write back to the original
+                # path where a replacement may now exist.
+                youtube_probe = delete_item.get("youtube_cleanup_probe")
+                if (isinstance(youtube_probe, dict)
+                        and PokeControllerApp.
+                        _command_monitor_youtube_delete_protected(
+                            youtube_probe)):
+                    original = str(delete_item.get(
+                        "original_target", "") or "")
+                    retry_attempts.pop(retry_key, None)
+                    # Eligibility can change between the background probe and
+                    # this worker.  Keep the exact queued identity alive and
+                    # retry it slowly whether or not it has already been
+                    # staged.  In particular, never restore a tombstone by
+                    # checking-then-replacing the original path: a replacement
+                    # could appear in that TOCTOU window and be overwritten.
+                    retry_delay = COMMAND_MONITOR_DELETE_SLOW_RETRY_SECONDS
+                    deferred_attempt = int(delete_item.get(
+                        "retry_count", 0) or 0) + 1
+                    delete_item["retry_count"] = deferred_attempt
+                    if delete_item.get("staged"):
+                        PokeControllerApp._update_command_monitor_delete_marker_retry(
+                            delete_item,
+                            "YouTube queue/media identity is not proven",
+                            deferred_attempt, retry_delay)
+                    PokeControllerApp._schedule_command_monitor_delete_retry(
+                        self, delete_item, retry_delay)
+                    self._logger.warning(
+                        "Command monitor cleanup retained raw recording after "
+                        "YouTube queue/media identity changed: %s", original)
+                    continue
+
+                # Revalidate the exact, atomically isolated directory
+                # immediately before rmtree.  A mismatch is a permanent safety
+                # stop, not a transient filesystem retry.
+                state, _current = (
+                    PokeControllerApp._command_monitor_delete_target_state(
+                        delete_item))
+                if state == "missing":
+                    try:
+                        os.remove(str(delete_item.get(
+                            "delete_marker_path", "") or ""))
+                    except OSError:
+                        pass
+                    retry_attempts.pop(retry_key, None)
+                    continue
+                if state != "safe":
+                    retry_attempts.pop(retry_key, None)
+                    self._logger.warning(
+                        "Command monitor cleanup retained a replaced tombstone "
+                        "without retrying: %s", target)
+                    continue
+                shutil.rmtree(target)
+                try:
+                    os.remove(str(delete_item.get(
+                        "delete_marker_path", "") or ""))
+                except OSError as marker_error:
+                    self._logger.warning(
+                        "Command monitor cleanup sidecar removal failed: %s",
+                        marker_error)
+                retry_attempts.pop(retry_key, None)
             except OSError as error:
-                self._logger.warning("Command monitor cleanup failed: %s", error)
+                attempt = retry_attempts.get(retry_key, 0) + 1
+                if attempt <= 5:
+                    retry_attempts[retry_key] = attempt
+                    delay = min(4.0, 0.25 * (2 ** (attempt - 1)))
+                    self._logger.warning(
+                        "Command monitor cleanup failed; retry %s/5 in %.2fs: %s",
+                        attempt, delay, error)
+                    # This is a dedicated cleanup worker. Sleeping here never
+                    # blocks Tk, capture, or controller input, and prevents a
+                    # locked file from causing an unbounded busy loop.
+                    time.sleep(delay)
+                    self._command_monitor_delete_queue.put_nowait(
+                        delete_item)
+                else:
+                    retry_delay = COMMAND_MONITOR_DELETE_SLOW_RETRY_SECONDS
+                    PokeControllerApp._update_command_monitor_delete_marker_retry(
+                        delete_item, error, attempt, retry_delay)
+                    self._logger.warning(
+                        "Command monitor cleanup remains deferred after 5 "
+                        "retries; retrying the same tombstone in %.0fs: %s",
+                        retry_delay, error)
+                    PokeControllerApp._schedule_command_monitor_delete_retry(
+                        self, delete_item, retry_delay)
             finally:
                 self._command_monitor_delete_queue.task_done()
 
     def _flush_command_monitor_deletes(self):
-        if self.recorder.is_finalizing:
+        if getattr(getattr(self, "recorder", None), "is_finalizing", False):
             return False
         before = len(self._command_monitor_chunks)
         kept = []
+        probe_candidates = []
+        probe_results = getattr(
+            self, "_command_monitor_delete_probe_results", None)
+        if not isinstance(probe_results, dict):
+            probe_results = {}
+            self._command_monitor_delete_probe_results = probe_results
         for chunk in self._command_monitor_chunks:
             if (chunk.get("delete_pending") and not chunk.get("pinned")
-                    and not chunk.get("merge_pending")
-                    and chunk is not self._command_monitor_current_chunk):
-                try:
-                    if not self._queue_command_monitor_folder_delete(
-                            chunk["session_dir"]):
-                        kept.append(chunk)
-                except OSError as error:
-                    self._logger.warning("Command monitor cleanup failed: %s", error)
+                    and not chunk.get("_delete_journal_pending")
+                    and not chunk.get("_start_journal_pending")
+                    and not chunk.get("_source_snapshot_pending")
+                    and not chunk.get("_retention_journal_pending")
+                    and not chunk.get("_protection_journal_pending")
+                    and chunk is not getattr(
+                        self, "_command_monitor_current_chunk", None)):
+                key = id(chunk)
+                snapshot = (
+                    PokeControllerApp._command_monitor_delete_probe_snapshot(
+                        chunk))
+                result = probe_results.get(key)
+                if (result is not None
+                        and result.get("snapshot") != snapshot):
+                    probe_results.pop(key, None)
+                    result = None
+                if result is None:
+                    probe_candidates.append(chunk)
                     kept.append(chunk)
+                    continue
+                state = str(result.get("state", "") or "")
+                if state == "safe":
+                    prepared = result.get("prepared")
+                    if isinstance(prepared, dict):
+                        self._command_monitor_delete_queue.put_nowait(prepared)
+                    probe_results.pop(key, None)
+                    continue
+                if state == "missing":
+                    probe_results.pop(key, None)
+                    continue
+                # Unsafe targets retain their data without being requeued. The
+                # result remains cached until the chunk state changes.
+                if state == "retry":
+                    probe_results.pop(key, None)
+                    kept.append(chunk)
+                    continue
+                kept.append(chunk)
             else:
                 kept.append(chunk)
         self._command_monitor_chunks = kept
+        now = time.monotonic()
+        if (probe_candidates
+                and not bool(getattr(
+                    self, "_command_monitor_delete_probe_active", False))
+                and now >= float(getattr(
+                    self, "_command_monitor_delete_probe_after", 0.0) or 0.0)):
+            self._command_monitor_delete_probe_active = True
+
+            def apply_probe(results):
+                self._command_monitor_delete_probe_active = False
+                retry_later = False
+                live_chunks = list(self._command_monitor_chunks)
+                for result in results:
+                    original = result.get("original")
+                    if not any(chunk is original for chunk in live_chunks):
+                        continue
+                    current = (
+                        PokeControllerApp._command_monitor_delete_probe_snapshot(
+                            original))
+                    if current != result.get("snapshot"):
+                        continue
+                    state = str(result.get("state", "") or "")
+                    if state in ("safe", "missing", "unsafe"):
+                        probe_results[id(original)] = result
+                    else:
+                        retry_later = True
+                        if result.get("error"):
+                            self._logger.warning(
+                                "Command monitor cleanup eligibility check "
+                                "failed; retaining data: %s",
+                                result.get("error"))
+                if retry_later or any(
+                        str(result.get("state", "") or "") == "protected"
+                        for result in results):
+                    self._command_monitor_delete_probe_after = (
+                        time.monotonic() + 5.0)
+                else:
+                    self._command_monitor_delete_probe_after = 0.0
+                changed = PokeControllerApp._flush_command_monitor_deletes(self)
+                if changed:
+                    self._refresh_command_monitor_tree()
+
+            if not (
+                    PokeControllerApp.
+                    _start_command_monitor_delete_eligibility_sweep(
+                        self, probe_candidates, apply_probe,
+                        prepare_delete=True)):
+                self._command_monitor_delete_probe_active = False
         return len(kept) != before
 
-    def _load_command_monitor_chunks(self):
-        root = os.path.abspath(self._effective_record_output_dir())
+    @staticmethod
+    def _scan_command_monitor_chunks(root):
+        """Read one output root without accessing Tk-owned state."""
+        root = os.path.abspath(root)
         loaded = []
         try:
             names = sorted(os.listdir(root)) if os.path.isdir(root) else []
@@ -18918,18 +23088,74 @@ class PokeControllerApp:
         now = time.monotonic()
         for name in names:
             session_dir = os.path.abspath(os.path.join(root, name))
+            tombstone_named = (
+                PokeControllerApp._command_monitor_is_delete_tombstone(
+                    session_dir))
+            tombstone_recovery = (
+                PokeControllerApp.
+                _command_monitor_delete_tombstone_recovery(
+                    root, session_dir)) if tombstone_named else None
             metadata_path = os.path.join(session_dir, "command_monitor.json")
-            if not os.path.isfile(metadata_path):
-                continue
             try:
-                with open(metadata_path, "r", encoding="utf-8") as stream:
-                    value = json.load(stream)
+                if os.path.isfile(metadata_path):
+                    with open(metadata_path, "r", encoding="utf-8") as stream:
+                        value = json.load(stream)
+                elif tombstone_recovery is not None:
+                    # A failed rmtree may already have removed the directory's
+                    # normal metadata. The external sidecar carries the exact
+                    # identity and the YouTube proof snapshot needed to keep
+                    # the remainder recoverable.
+                    probe = tombstone_recovery.get(
+                        "youtube_cleanup_probe", {}) or {}
+                    value = dict(probe) if isinstance(probe, dict) else {}
+                    value.setdefault("id", "cleanup-" + name)
+                    value["delete_pending"] = True
+                    value.setdefault("duration", 0.0)
+                else:
+                    continue
                 if not isinstance(value, dict):
                     continue
                 duration = max(0.0, float(value.get("duration", 0.0) or 0.0))
                 chunk_id = str(value.get("id") or "history-" + name)
                 if any(item["id"] == chunk_id for item in loaded):
                     chunk_id += "-" + name
+                invalid_tombstone = bool(
+                    tombstone_named and tombstone_recovery is None)
+                close_pending = bool(
+                    value.get("recording_close_pending", False))
+                close_failed = bool(
+                    value.get("recording_close_failed", False))
+                close_error = str(
+                    value.get("recording_close_error", "") or "")
+                if not close_pending and not close_failed:
+                    # Builds predating the explicit close journal can leave a
+                    # dead-owner ``recording``/``closing`` manifest. Never let
+                    # startup retention or rolling merge treat that AVI as a
+                    # normally closed source.
+                    finalize_path = os.path.join(
+                        session_dir, "mp4_finalize_job.json")
+                    try:
+                        with open(finalize_path, "r", encoding="utf-8") as stream:
+                            finalize_state = json.load(stream)
+                        if not isinstance(finalize_state, dict):
+                            raise ValueError("invalid finalize manifest")
+                        finalize_status = str(finalize_state.get(
+                            "status", "") or "").strip().lower()
+                        finalize_owner = finalize_state.get("worker_pid", 0)
+                        if finalize_status == "close_failed":
+                            close_pending = True
+                            close_failed = True
+                            close_error = str(finalize_state.get(
+                                "close_error", "") or
+                                "前回終了時に録画映像を安全に閉じられませんでした。")
+                        elif finalize_status in ("recording", "closing"):
+                            close_pending = True
+                            if not process_is_alive(finalize_owner):
+                                close_failed = True
+                                close_error = (
+                                    "前回終了時に録画映像を安全に閉じられませんでした。")
+                    except (OSError, TypeError, ValueError):
+                        pass
                 loaded.append({
                     "id": chunk_id,
                     "session_dir": session_dir,
@@ -18937,14 +23163,41 @@ class PokeControllerApp:
                     "started_wall": str(value.get("started_wall", name)),
                     "ended": 0.0,
                     "states": [str(item) for item in value.get("states", [])],
-                    "pinned": bool(value.get("pinned", False)),
+                    # A valid marker is the durable deletion authorization.
+                    # An invalid/missing marker on a tombstone-shaped folder is
+                    # quarantined instead of being treated as an ordinary old
+                    # recording directory.
+                    "pinned": bool(
+                        invalid_tombstone
+                        or (value.get("pinned", False)
+                            and tombstone_recovery is None)),
+                    "monitor_retention_mode": (
+                        normalize_command_monitor_retention_mode(
+                            value.get("monitor_retention_mode", ""))),
                     "loop_anchor": False,
-                    "delete_pending": False,
+                    # Explicit Stop/discard decisions are durable tombstones.
+                    # If the daemon cleanup was interrupted, retry next start.
+                    "delete_pending": bool(
+                        tombstone_recovery is not None
+                        or ((value.get("delete_pending", False)
+                             or value.get("explicit_delete_pending", False))
+                            and not invalid_tombstone)),
+                    "explicit_delete_pending": bool(value.get(
+                        "explicit_delete_pending",
+                        value.get("delete_pending", False))),
                     "command": str(value.get("command", "")),
                     "command_session_id": str(value.get("command_session_id", "")),
                     "merged": bool(value.get("merged", False)),
                     "source_chunk_ids": [str(item) for item in
                                          value.get("source_chunk_ids", [])],
+                    "source_media": [dict(item) for item in
+                                     value.get("source_media", [])
+                                     if isinstance(item, dict)],
+                    "source_quality_warnings": [dict(item) for item in
+                                                value.get(
+                                                    "source_quality_warnings",
+                                                    [])
+                                                if isinstance(item, dict)],
                     "source": dict(value.get("source", {}) or {}),
                     "sources": [dict(item) for item in value.get("sources", [])
                                 if isinstance(item, dict)],
@@ -18954,21 +23207,87 @@ class PokeControllerApp:
                         value.get("recording_video_mode", "") or ""),
                     "youtube_archive": dict(
                         value.get("youtube_archive", {}) or {}),
+                    # ``merge_pending`` is an in-process exclusion gate, not a
+                    # restart state. A crash during preflight is reclaimed from
+                    # the durable youtube_roll_pending/merged relationship.
                     "youtube_roll_pending": bool(
                         value.get("youtube_roll_pending", False)),
+                    "youtube_merge_attention_required": bool(
+                        value.get("youtube_merge_attention_required", False)),
+                    "youtube_merge_attention_error": str(
+                        value.get("youtube_merge_attention_error", "") or ""),
+                    "youtube_merge_attention_code": str(
+                        value.get("youtube_merge_attention_code", "") or ""),
+                    "youtube_merge_attention_at": str(
+                        value.get("youtube_merge_attention_at", "") or ""),
+                    "youtube_merge_retry_probe": dict(
+                        value.get("youtube_merge_retry_probe", {}) or {})
+                    if isinstance(
+                        value.get("youtube_merge_retry_probe", {}) or {}, dict)
+                    else {},
                     "youtube_rolling_committed": bool(
                         value.get("youtube_rolling_committed", False)),
+                    "youtube_source_cleanup_pending": bool(
+                        value.get("youtube_source_cleanup_pending", False)),
+                    "youtube_source_cleanup_identity": dict(
+                        value.get("youtube_source_cleanup_identity", {}) or {})
+                    if isinstance(value.get(
+                        "youtube_source_cleanup_identity", {}) or {}, dict)
+                    else {},
+                    "youtube_source_cleanup_job": dict(
+                        value.get("youtube_source_cleanup_job", {}) or {})
+                    if isinstance(value.get(
+                        "youtube_source_cleanup_job", {}) or {}, dict)
+                    else {},
+                    "recording_close_pending": close_pending,
+                    "recording_close_failed": close_failed,
+                    "recording_close_error": close_error,
                     "youtube_segment_final": bool(
                         value.get("youtube_segment_final", False)),
+                    "youtube_upload": dict(
+                        value.get("youtube_upload", {}) or {}),
                     "focus_matched": bool(value.get("focus_matched", False)),
                     "focus_repair": dict(value.get("focus_repair", {}) or {}),
+                    "_delete_tombstone_recovery": dict(
+                        tombstone_recovery or {}),
+                    "cleanup_deferred_error": str(
+                        (tombstone_recovery or {}).get("last_error", "") or
+                        ("Commands cleanup marker identity is invalid"
+                         if invalid_tombstone else "")),
                     "historical": True,
                     "duration_saved": duration,
                 })
             except (OSError, TypeError, ValueError):
                 continue
+        return loaded
+
+    def _apply_scanned_command_monitor_chunks(self, loaded):
+        """Apply one current, idle scan and only then reconcile retention."""
+        journal_lock = getattr(
+            self, "_command_monitor_metadata_journal_lock", None)
+        if journal_lock is None:
+            failed_protection = set(getattr(
+                self, "_command_monitor_protection_failures", ()))
+        else:
+            with journal_lock:
+                failed_protection = set(getattr(
+                    self, "_command_monitor_protection_failures", ()))
+        for chunk in loaded:
+            identity = PokeControllerApp._command_monitor_chunk_storage_identity(
+                chunk)
+            if identity in failed_protection:
+                # The protection intent is newer than the disk snapshot.  A
+                # failed fsync must remain fail-closed across a history reload;
+                # otherwise the old unpinned metadata could immediately queue
+                # the only local copy for deletion.
+                chunk["pinned"] = True
+                chunk["delete_pending"] = False
+                chunk["explicit_delete_pending"] = False
+                chunk["retention_journal_error"] = (
+                    "Commands recording protection metadata is not durable")
         # Rebuild the old chunks as one chronological tail.  Giving every old
         # chunk the same end time made all of them look current forever.
+        now = time.monotonic()
         cursor = now
         for chunk in reversed(loaded):
             duration = float(chunk.get("duration_saved", 0.0) or 0.0)
@@ -18982,7 +23301,21 @@ class PokeControllerApp:
             loop_cycles=max(2, int(self.record_monitor_loop_cycles.get())),
         )
         for chunk in loaded:
+            archive = dict(chunk.get("youtube_archive", {}) or {})
+            youtube_recovery = bool(
+                archive.get("enabled")
+                and (chunk.get("youtube_roll_pending")
+                     or chunk.get("youtube_merge_attention_required")
+                     or chunk.get("merged")
+                     or chunk.get("youtube_rolling_committed")))
+            close_recovery = bool(
+                chunk.get("recording_close_pending")
+                or chunk.get("recording_close_failed"))
             if (not chunk.get("pinned") and not chunk.get("focus_matched")
+                    and chunk.get("monitor_retention_mode")
+                    != COMMAND_MONITOR_RETENTION_KEEP_ALL
+                    and not youtube_recovery
+                    and not close_recovery
                     and chunk["id"] not in keep_ids):
                 chunk["delete_pending"] = True
         loaded_count = len(loaded)
@@ -18995,6 +23328,68 @@ class PokeControllerApp:
                 "前回までのCommands監視録画を{}本読み込み、不要な{}本を自動削除しました。".format(
                     len(self._command_monitor_chunks), deleted_count))
         self._refresh_command_monitor_tree()
+        if (any(dict(chunk.get("youtube_archive", {}) or {}).get(
+                "enabled") for chunk in self._command_monitor_chunks)
+                and hasattr(self, "root")):
+            self.root.after(
+                500, self._reconcile_command_monitor_youtube_recordings)
+
+    def _load_command_monitor_chunks(self):
+        """Scan the selected output root once on a worker, then apply on Tk."""
+        if PokeControllerApp._command_monitor_output_reload_busy(self):
+            PokeControllerApp._schedule_command_monitor_output_reload(self)
+            return False
+        root = os.path.normcase(os.path.normpath(os.path.abspath(
+            self._effective_record_output_dir())))
+        generation = int(getattr(
+            self, "_record_output_scan_generation", 0) or 0) + 1
+        self._record_output_scan_generation = generation
+        request = {"generation": generation, "root": root}
+        self._record_output_scan_requested = request
+        if bool(getattr(self, "_record_output_scan_active", False)):
+            return False
+        self._record_output_scan_active = True
+
+        def scan():
+            loaded = PokeControllerApp._scan_command_monitor_chunks(root)
+
+            def apply_scan():
+                self._record_output_scan_active = False
+                current_request = getattr(
+                    self, "_record_output_scan_requested", None)
+                current_root = os.path.normcase(os.path.normpath(os.path.abspath(
+                    self._effective_record_output_dir())))
+                exact = bool(
+                    isinstance(current_request, dict)
+                    and current_request.get("generation") == generation
+                    and current_request.get("root") == root
+                    and current_root == root)
+                if (getattr(self, "_preview_shutdown_mode", False)
+                        or getattr(self, "_process_exit_ready", False)):
+                    self._record_output_scan_requested = None
+                    return
+                idle = not PokeControllerApp._command_monitor_output_reload_busy(
+                    self)
+                if (not exact or not idle
+                        or getattr(self, "record_armed", False)
+                        or getattr(getattr(self, "recorder", None),
+                                   "active", False)):
+                    # Never reconcile/delete from a stale root snapshot.  A
+                    # single delayed reload will retry once start/stop/merge
+                    # state becomes idle.
+                    PokeControllerApp._schedule_command_monitor_output_reload(
+                        self)
+                    return
+                self._record_output_scan_requested = None
+                PokeControllerApp._apply_scanned_command_monitor_chunks(
+                    self, loaded)
+
+            self._gui_action_queue.put(apply_scan)
+
+        threading.Thread(
+            target=scan, daemon=True,
+            name="CommandMonitorHistoryScan").start()
+        return True
 
     def _refresh_command_monitor_tree(self):
         if not hasattr(self, "record_monitor_tree"):
@@ -19007,6 +23402,8 @@ class PokeControllerApp:
                 status = "録画中"
             elif chunk.get("merge_pending"):
                 status = "結合中"
+            elif chunk.get("youtube_merge_attention_required"):
+                status = "結合確認待ち"
             elif chunk.get("pinned"):
                 status = "保護"
             elif chunk.get("focus_matched"):
@@ -19015,6 +23412,10 @@ class PokeControllerApp:
                 status = "統合済み"
             elif chunk.get("delete_pending"):
                 status = "削除待ち"
+            elif normalize_command_monitor_retention_mode(
+                    chunk.get("monitor_retention_mode", "")) \
+                    == COMMAND_MONITOR_RETENTION_KEEP_ALL:
+                status = "全区間保持"
             elif chunk.get("loop_anchor"):
                 status = "ループ保持"
             elif chunk.get("historical"):
@@ -19033,68 +23434,391 @@ class PokeControllerApp:
                     os.path.basename(chunk.get("session_dir", ""))))
             if iid in selected_ids:
                 self.record_monitor_tree.selection_add(iid)
-        temporary = sum(1 for chunk in self._command_monitor_chunks
-                        if not chunk.get("pinned"))
+        keep_all = sum(
+            1 for chunk in self._command_monitor_chunks
+            if (not chunk.get("pinned")
+                and normalize_command_monitor_retention_mode(
+                    chunk.get("monitor_retention_mode", ""))
+                == COMMAND_MONITOR_RETENTION_KEEP_ALL))
+        temporary = sum(
+            1 for chunk in self._command_monitor_chunks
+            if (not chunk.get("pinned")
+                and normalize_command_monitor_retention_mode(
+                    chunk.get("monitor_retention_mode", ""))
+                != COMMAND_MONITOR_RETENTION_KEEP_ALL))
         protected = sum(1 for chunk in self._command_monitor_chunks
                         if chunk.get("pinned"))
+        attention = sum(
+            1 for chunk in self._command_monitor_chunks
+            if chunk.get("youtube_merge_attention_required"))
         pending = sum(1 for chunk in self._command_monitor_chunks
                       if chunk.get("delete_pending"))
         self.record_monitor_counts.set(
-            "一時 {}本 / 保護 {}本 / 削除待ち {}本".format(
-                temporary, protected, pending))
+            "一時 {}本 / 全保持 {}本 / 保護 {}本 / "
+            "YouTube確認待ち {}本 / 削除待ち {}本".format(
+                temporary, keep_all, protected, attention, pending))
 
     def protect_command_monitor_recordings(self):
+        if getattr(self, "_command_monitor_adjustment_protect_request", None) \
+                is not None:
+            self.record_monitor_status.set(
+                "調整停止用の保護情報を保存しています。完了までお待ちください。")
+            return False
         if not self._command_monitor_chunks:
             tkmsg.showinfo("Commands監視録画", "現在保持されている録画はありません。")
-            return
-        for chunk in self._command_monitor_chunks:
+            return False
+        targets = list(self._command_monitor_chunks)
+        if all(chunk.get("pinned")
+               and chunk.get("_protection_journal_pending")
+               for chunk in targets):
+            self.record_monitor_status.set(
+                "録画とログの保護情報を保存しています。完了までお待ちください。")
+            return False
+        for chunk in targets:
             chunk["pinned"] = True
             chunk["delete_pending"] = False
-            self._write_command_monitor_metadata(chunk)
+            chunk["explicit_delete_pending"] = False
         self.record_monitor_status.set(
-            "現在保持されている録画とログを保護しました。自動削除されません。")
+            "現在保持されている録画とログの保護情報を保存しています。")
         self._refresh_command_monitor_tree()
 
+        def journal_complete(result):
+            failed = list(result.get("failed", ()))
+            if failed:
+                self.record_monitor_status.set(
+                    "保護情報を保存できない録画がありました。録画は削除せず保護しています。")
+                if not getattr(self, "_preview_shutdown_mode", False):
+                    tkmsg.showwarning(
+                        "Commands監視録画",
+                        "{}本の保護情報をディスクへ保存できませんでした。\n"
+                        "録画は削除せず保護しています。保存先を確認して再試行してください。".format(
+                            len(failed)), parent=self.root)
+                return
+            if result.get("superseded"):
+                return
+            self.record_monitor_status.set(
+                "現在保持されている録画とログを保護しました。自動削除されません。")
+
+        try:
+            return self._queue_command_monitor_metadata_journal(
+                targets, pending_key="_protection_journal_pending",
+                completion=journal_complete)
+        except Exception as error:
+            for chunk in targets:
+                chunk["pinned"] = True
+                chunk["delete_pending"] = False
+            self._logger.warning(
+                "Command monitor protection journal could not start: %s", error)
+            self.record_monitor_status.set(
+                "保護情報の保存を開始できませんでした。録画は削除せず保護しています。")
+            if not getattr(self, "_preview_shutdown_mode", False):
+                tkmsg.showwarning(
+                    "Commands監視録画",
+                    "保護情報の保存を開始できませんでした。\n"
+                    "録画は削除せず保護しています。保存先を確認してください。",
+                    parent=self.root)
+            return False
+
     def stop_command_for_adjustment_with_recordings(self):
-        self.protect_command_monitor_recordings()
         command = getattr(self, "cur_command", None)
-        if command is not None and getattr(command, "alive", False):
-            self.stopPlay()
+        if getattr(self, "_command_monitor_adjustment_protect_request", None) \
+                is not None:
+            self.record_monitor_status.set(
+                "調整停止用の保護情報を保存しています。完了後にCommandsを停止します。")
+            return False
+        targets = list(self._command_monitor_chunks)
+        if not targets:
+            tkmsg.showinfo("Commands監視録画", "現在保持されている録画はありません。")
+            if command is not None and getattr(command, "alive", False):
+                self.stopPlay()
+            return True
+        for chunk in targets:
+            chunk["pinned"] = True
+            chunk["delete_pending"] = False
+            chunk["explicit_delete_pending"] = False
+        request = {
+            "token": object(),
+            "command": command,
+            "chunks": targets,
+        }
+        self._command_monitor_adjustment_protect_request = request
+        self.record_monitor_status.set(
+            "調整停止の前に録画とログの保護情報を保存しています。")
+        self._refresh_command_monitor_tree()
+
+        def journal_complete(result):
+            if getattr(
+                    self, "_command_monitor_adjustment_protect_request", None) \
+                    is not request:
+                return
+            self._command_monitor_adjustment_protect_request = None
+            failed = list(result.get("failed", ()))
+            superseded = list(result.get("superseded", ()))
+            if failed or superseded:
+                for target in targets:
+                    target["pinned"] = True
+                    target["delete_pending"] = False
+                target_ids = {str(chunk.get("id", "")) for chunk in targets}
+                for chunk in self._command_monitor_chunks:
+                    if str(chunk.get("id", "")) in target_ids:
+                        chunk["pinned"] = True
+                        chunk["delete_pending"] = False
+                self._refresh_command_monitor_tree()
+                self.record_monitor_status.set(
+                    "保護情報を保存できなかったためCommandsを停止していません。録画は保護しています。")
+                if not getattr(self, "_preview_shutdown_mode", False):
+                    tkmsg.showwarning(
+                        "Commands監視録画",
+                        "録画の保護情報をディスクへ保存できなかったため、"
+                        "Commandsを停止していません。\n"
+                        "録画は削除せず保護しています。保存先を確認して再試行してください。",
+                        parent=self.root)
+                return
+            if (getattr(self, "_preview_shutdown_mode", False)
+                    or getattr(self, "_process_exit_ready", False)):
+                return
+            if (getattr(self, "cur_command", None) is command
+                    and command is not None
+                    and getattr(command, "alive", False)):
+                self.record_monitor_status.set(
+                    "録画とログを保護しました。Commandsを停止しています。")
+                self.stopPlay()
+            else:
+                self.record_monitor_status.set(
+                    "録画とログを保護しました。対象のCommandsはすでに終了しています。")
+
+        try:
+            queued = self._queue_command_monitor_metadata_journal(
+                targets, pending_key="_protection_journal_pending",
+                completion=journal_complete)
+        except Exception as error:
+            queued = False
+            self._logger.warning(
+                "Command adjustment protection journal could not start: %s",
+                error)
+        if not queued:
+            if getattr(
+                    self, "_command_monitor_adjustment_protect_request", None) \
+                    is request:
+                self._command_monitor_adjustment_protect_request = None
+            for chunk in targets:
+                chunk["pinned"] = True
+                chunk["delete_pending"] = False
+            self.record_monitor_status.set(
+                "保護情報の保存を開始できなかったためCommandsを停止していません。")
+            if not getattr(self, "_preview_shutdown_mode", False):
+                tkmsg.showwarning(
+                    "Commands監視録画",
+                    "録画の保護情報を保存できなかったため、Commandsを停止していません。\n"
+                    "録画は削除せず保護しています。保存先を確認してください。",
+                    parent=self.root)
+            return False
+        return True
 
     def toggle_selected_command_monitor_chunks(self):
+        if getattr(self, "_command_monitor_adjustment_protect_request", None) \
+                is not None:
+            tkmsg.showinfo(
+                "Commands監視録画",
+                "調整停止用の保護情報を保存しています。完了後に切り替えてください。")
+            return False
         selected = set(self.record_monitor_tree.selection())
         if not selected:
             tkmsg.showinfo("Commands監視録画", "保護を切り替える録画を選択してください。")
-            return
+            return False
+        targets = []
         for chunk in self._command_monitor_chunks:
             if chunk["id"] in selected:
                 chunk["pinned"] = not chunk.get("pinned")
                 chunk["delete_pending"] = False
-                self._write_command_monitor_metadata(chunk)
+                chunk["explicit_delete_pending"] = False
+                targets.append(chunk)
+        if not targets:
+            return False
         self._refresh_command_monitor_tree()
+        self.record_monitor_status.set("選択した録画の保護情報を保存しています。")
+
+        def journal_complete(result):
+            failed = list(result.get("failed", ()))
+            if failed:
+                self.record_monitor_status.set(
+                    "保護情報を保存できない録画がありました。対象は削除せず保護しています。")
+                if not getattr(self, "_preview_shutdown_mode", False):
+                    tkmsg.showwarning(
+                        "Commands監視録画",
+                        "{}本の保護情報を保存できませんでした。\n"
+                        "対象は削除せず保護しています。保存先を確認してください。".format(
+                            len(failed)), parent=self.root)
+                return
+            if result.get("superseded"):
+                return
+            self.record_monitor_status.set("選択した録画の保護を更新しました。")
+
+        try:
+            return self._queue_command_monitor_metadata_journal(
+                targets, pending_key="_protection_journal_pending",
+                completion=journal_complete)
+        except Exception as error:
+            for chunk in targets:
+                chunk["pinned"] = True
+                chunk["delete_pending"] = False
+            self._refresh_command_monitor_tree()
+            self._logger.warning(
+                "Command monitor protection toggle journal could not start: %s",
+                error)
+            self.record_monitor_status.set(
+                "保護情報の保存を開始できませんでした。対象は削除せず保護しています。")
+            if not getattr(self, "_preview_shutdown_mode", False):
+                tkmsg.showwarning(
+                    "Commands監視録画",
+                    "保護情報の保存を開始できませんでした。\n"
+                    "対象は削除せず保護しています。保存先を確認してください。",
+                    parent=self.root)
+            return False
 
     def discard_command_monitor_temporary(self):
-        targets = [chunk for chunk in self._command_monitor_chunks
-                   if not chunk.get("pinned")]
-        if not targets:
-            tkmsg.showinfo("Commands監視録画", "破棄できる一時録画はありません。")
+        candidates = [chunk for chunk in self._command_monitor_chunks
+                      if not chunk.get("pinned")]
+
+        def confirm_and_discard(targets):
+            if not targets:
+                tkmsg.showinfo(
+                    "Commands監視録画",
+                    "破棄できる一時録画はありません。")
+                return
+            if not tkmsg.askyesno(
+                    "Commands監視録画",
+                    "保護されていない一時録画{}本を破棄しますか？\n"
+                    "保護録画は削除されません。".format(len(targets))):
+                return
+            closing_current = any(
+                chunk is self._command_monitor_current_chunk
+                for chunk in targets)
+            for chunk in targets:
+                chunk["delete_pending"] = True
+                chunk["explicit_delete_pending"] = True
+                chunk["_delete_journal_pending"] = True
+            completion = {
+                "journal_ready": False,
+                "close_ready": not closing_current,
+                "error": None,
+            }
+
+            def maybe_finish_discard():
+                if (not completion["journal_ready"]
+                        or not completion["close_ready"]):
+                    return
+                if completion["error"] is not None:
+                    self.record_monitor_status.set(
+                        "破棄状態を保存できなかったため、録画を保持します: {}".format(
+                            completion["error"]))
+                    self._refresh_command_monitor_tree()
+                    return
+                flush = getattr(
+                    self, "_flush_command_monitor_deletes", None)
+                if callable(flush):
+                    flush()
+                else:
+                    PokeControllerApp._flush_command_monitor_deletes(self)
+                self.record_monitor_status.set(
+                    "保護されていない一時録画を破棄しました。")
+                self._refresh_command_monitor_tree()
+
+            def finish_discard(error):
+                completion["close_ready"] = True
+                if error is not None:
+                    completion["error"] = error
+                maybe_finish_discard()
+
+            def persist_discard():
+                error = None
+                try:
+                    for chunk in targets:
+                        if not self._write_command_monitor_metadata(chunk):
+                            raise OSError(
+                                "Commands録画の破棄状態を保存できませんでした。")
+                except Exception as caught:
+                    error = caught
+
+                def apply_journal():
+                    for chunk in targets:
+                        chunk.pop("_delete_journal_pending", None)
+                    completion["journal_ready"] = True
+                    if error is not None:
+                        completion["error"] = error
+                    maybe_finish_discard()
+
+                self._gui_action_queue.put(apply_journal)
+
+            threading.Thread(
+                target=persist_discard, daemon=True,
+                name="CommandMonitorDiscardJournal").start()
+            finish_requested = False
+            if closing_current:
+                finish_requested = self._finish_command_monitor_chunk(
+                    "manual_discard", background=True,
+                    after_finish=finish_discard)
+            if finish_requested:
+                self.record_monitor_status.set(
+                    "録画を確定し、破棄状態を保存しています。")
+            else:
+                self.record_monitor_status.set(
+                    "保護されていない一時録画の破棄状態を保存しています。")
+            self._refresh_command_monitor_tree()
+
+        if not candidates:
+            confirm_and_discard([])
             return
-        if not tkmsg.askyesno(
-                "Commands監視録画",
-                "保護されていない一時録画{}本を破棄しますか？\n"
-                "保護録画は削除されません。".format(len(targets))):
+        if bool(getattr(
+                self, "_command_monitor_discard_probe_active", False)):
+            self.record_monitor_status.set(
+                "YouTube録画の削除可否を確認中です。")
             return
-        if self._command_monitor_current_chunk in targets:
-            self._finish_command_monitor_chunk("manual_discard")
-        for chunk in targets:
-            chunk["delete_pending"] = True
-        self._flush_command_monitor_deletes()
-        self.record_monitor_status.set("保護されていない一時録画を破棄しました。")
-        self._refresh_command_monitor_tree()
+        self._command_monitor_discard_probe_active = True
+        self.record_monitor_status.set(
+            "YouTube録画の削除可否を確認中です。")
+
+        def apply_probe(results):
+            self._command_monitor_discard_probe_active = False
+            targets = []
+            live_chunks = list(self._command_monitor_chunks)
+            for result in results:
+                original = result.get("original")
+                if (str(result.get("state", "") or "") != "safe"
+                        or not any(chunk is original for chunk in live_chunks)
+                        or original.get("pinned")):
+                    continue
+                current = (
+                    PokeControllerApp._command_monitor_delete_probe_snapshot(
+                        original))
+                if current == result.get("snapshot"):
+                    targets.append(original)
+            confirm_and_discard(targets)
+
+        if not (
+                PokeControllerApp.
+                _start_command_monitor_delete_eligibility_sweep(
+                    self, candidates, apply_probe,
+                    prepare_delete=False)):
+            self._command_monitor_discard_probe_active = False
+            confirm_and_discard([])
 
     def _request_command_monitor_stop_cleanup(self, command):
         """Remember an explicit Stop without including natural command exits."""
         if command is None:
+            return
+        destination_getter = getattr(
+            self, "_record_storage_destination_key", None)
+        destination = (destination_getter()
+                       if callable(destination_getter) else "pc")
+        if (destination == "none"
+                and self._command_monitor_current_chunk is None
+                and not getattr(self.recorder, "active", False)
+                and getattr(
+                    self, "_command_monitor_start_request", None) is None
+                and not getattr(self, "record_armed", False)):
+            self._command_monitor_stop_cleanup_command = None
+            self._command_monitor_stop_cleanup_session_id = ""
             return
         self._command_monitor_stop_cleanup_command = command
         session_id = ""
@@ -19105,24 +23829,23 @@ class PokeControllerApp:
         self._command_monitor_stop_cleanup_session_id = (
             session_id or "no-recording-{}".format(time.time_ns()))
 
-    def _stop_command_monitor_capture_on_request(self, command, reason):
-        """Bound and stop recording immediately, even if Commands cannot exit."""
-        if (getattr(self, "record_mode", None) is None
-                or self.record_mode.get() != "CommandMonitor"
-                or command is None
-                or command is not getattr(self, "_command_monitor_command", None)):
-            return False
-        self.record_armed = False
-        PokeControllerApp._drain_command_focus_trace(
-            self, command, chunk=self._command_monitor_current_chunk)
-        PokeControllerApp._stop_command_focus_trace(self, command)
-        if self._command_monitor_current_chunk is not None:
-            self._finish_command_monitor_chunk(reason)
+    def _complete_command_monitor_capture_on_request(self, command, error=None,
+                                                     confirm=True):
+        """Apply explicit-Stop retention after the recorder has safely closed."""
         self._stop_command_record_window_capture()
+        if error is not None:
+            if confirm:
+                self._confirm_requested_command_monitor_stop(command)
+            return False
         retention = self._mark_command_monitor_prune_candidates(
-            time.monotonic(), explicit_stop=True) or {}
+            time.monotonic(), explicit_stop=True,
+            persist_metadata=False) or {}
         mode = retention.get("mode")
-        if mode == "loop":
+        if mode == COMMAND_MONITOR_RETENTION_KEEP_ALL:
+            message = (
+                "Stop時に録画を確定しました。全区間保持モードのため、"
+                "今回の全チャンクを保存候補に残します。")
+        elif mode == "loop":
             message = (
                 "Stop時に録画を確定しました。ループ前{} Stepと開始／終了各約{}秒を保持し、"
                 "長い中間区間は省略します。"
@@ -19153,7 +23876,44 @@ class PokeControllerApp:
             message = "Stop時にCommands監視録画を停止し、直近の有効なStep範囲だけを保持します。"
         self.record_monitor_status.set(message)
         self._refresh_command_monitor_tree()
+        if confirm:
+            self._confirm_requested_command_monitor_stop(command)
         return True
+
+    def _stop_command_monitor_capture_on_request(self, command, reason):
+        """Bound recording now and close it off Tk, even if Commands cannot exit."""
+        if (getattr(self, "record_mode", None) is None
+                or self.record_mode.get() != "CommandMonitor"
+                or command is None
+                or command is not getattr(self, "_command_monitor_command", None)):
+            return False
+        self.record_armed = False
+        PokeControllerApp._stop_command_focus_trace(self, command)
+        if getattr(self, "_command_monitor_start_request", None) is not None:
+            cancelled = self._cancel_command_monitor_chunk_start(
+                after_finish=lambda error: (
+                    self._complete_command_monitor_capture_on_request(
+                        command, error=error, confirm=True)))
+            if cancelled:
+                self.record_monitor_status.set(
+                    "Stopを受け付けました。録画開始処理を取り消し、保存先を安全に閉じています。")
+                return True
+        if (self._command_monitor_current_chunk is not None
+                or getattr(self, "_command_monitor_stop_in_progress", False)):
+            finish_requested = self._finish_command_monitor_chunk(
+                reason, background=True, prune_after_finish=False,
+                after_finish=lambda error: (
+                    self._complete_command_monitor_capture_on_request(
+                        command, error=error, confirm=True)))
+            if finish_requested:
+                self.record_monitor_status.set(
+                    "Stopを受け付けました。録画を確定しています。")
+                return True
+        # No AVI/WAV close is pending. Keep the original ordering: callers send
+        # command.end() first, then show the saved-recording confirmation.
+        self._complete_command_monitor_capture_on_request(
+            command, error=None, confirm=False)
+        return False
 
     def _consume_command_monitor_stop_cleanup(self, command):
         if (command is None
@@ -19174,9 +23934,423 @@ class PokeControllerApp:
         self._confirm_save_stopped_command_monitor_recordings(session_id)
         return True
 
+    def _reconcile_command_monitor_youtube_recordings(self):
+        """Recover rolling segments left between merge, queue, and cleanup."""
+        if (getattr(self, "_command_monitor_merge_active", 0)
+                or getattr(self, "_command_monitor_stop_in_progress", False)):
+            if hasattr(self, "root"):
+                self.root.after(
+                    1000, self._reconcile_command_monitor_youtube_recordings)
+            return False
+        chunks = list(getattr(self, "_command_monitor_chunks", ()))
+        chunk_ids = {str(chunk.get("id", "")) for chunk in chunks}
+        merged_candidates = []
+        for chunk in chunks:
+            archive = dict(chunk.get("youtube_archive", {}) or {})
+            upload = dict(chunk.get("youtube_upload", {}) or {})
+            source_ids = {
+                str(value) for value in chunk.get("source_chunk_ids", ())
+                if value not in (None, "")
+            }
+            recovery_needed = bool(
+                chunk.get("youtube_roll_pending")
+                or not chunk.get("youtube_rolling_committed")
+                or source_ids.intersection(chunk_ids)
+                or upload.get("status") == "local_commit_pending")
+            if (chunk.get("merged") and archive.get("enabled")
+                    and recovery_needed
+                    and not chunk.get("_youtube_recovery_checked")):
+                merged_candidates.append(chunk)
+        if merged_candidates:
+            # Recover one completed MP4 at a time. Queue discovery, enqueue,
+            # and every fsync stay off Tk; the uploader is launched only after
+            # the merged/source relationship is fully durable.
+            merged_chunk = merged_candidates[0]
+            merged_id = str(merged_chunk.get("id", ""))
+            source_ids = {
+                str(value) for value in merged_chunk.get("source_chunk_ids", ())
+                if value not in (None, "")
+            }
+            for chunk in chunks:
+                if str(chunk.get("id", "")) in source_ids:
+                    chunk["merge_pending"] = True
+                    chunk["delete_pending"] = False
+            with self._command_monitor_merge_lock:
+                self._command_monitor_merge_active += 1
+
+            def recovery_snapshot(chunk):
+                snapshot = chunk.copy()
+                for key in ("youtube_archive", "youtube_upload",
+                            "youtube_source_cleanup_identity",
+                            "youtube_source_cleanup_job",
+                            "common_function_monitor"):
+                    value = snapshot.get(key)
+                    if isinstance(value, dict):
+                        snapshot[key] = value.copy()
+                return snapshot
+
+            merged_snapshot = recovery_snapshot(merged_chunk)
+            source_snapshots = {
+                str(chunk.get("id", "")): recovery_snapshot(chunk)
+                for chunk in chunks
+                if str(chunk.get("id", "")) in source_ids
+            }
+            def recover_merged_upload():
+                outcome = {
+                    "merged_id": merged_id,
+                    "job_path": "",
+                    "committed_source_ids": set(),
+                    "retained_source_ids": set(),
+                    "source_metadata_committed": False,
+                    "merged_metadata_committed": False,
+                    "queue_released": False,
+                    "error": None,
+                }
+
+                def durable_job_for_session(item, session_dir, media_path):
+                    upload = dict(item.get("youtube_upload", {}) or {})
+                    stored_value = str(
+                        upload.get("job_path", "") or "").strip()
+                    stored = os.path.abspath(stored_value) \
+                        if stored_value else ""
+                    candidates = [stored] if stored else []
+                    queue_dir = os.path.abspath(
+                        self._youtube_upload_queue_dir())
+                    try:
+                        candidates.extend(
+                            os.path.join(queue_dir, name)
+                            for name in os.listdir(queue_dir)
+                            if name.endswith(".json"))
+                    except OSError:
+                        pass
+                    for candidate in dict.fromkeys(candidates):
+                        candidate = os.path.abspath(candidate) \
+                            if candidate else ""
+                        if (not candidate
+                                or os.path.normcase(os.path.dirname(candidate))
+                                != os.path.normcase(queue_dir)
+                                or not candidate.lower().endswith(".json")):
+                            continue
+                        try:
+                            details = os.lstat(candidate)
+                            attributes = int(getattr(
+                                details, "st_file_attributes", 0) or 0)
+                            reparse_flag = int(getattr(
+                                stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                                or 0x400)
+                            if (stat.S_ISLNK(details.st_mode)
+                                    or attributes & reparse_flag
+                                    or not stat.S_ISREG(details.st_mode)):
+                                continue
+                            with open(candidate, "r", encoding="utf-8") as stream:
+                                job = json.load(stream)
+                        except (OSError, TypeError, ValueError):
+                            continue
+                        status = str(job.get("status", "") or "") \
+                            if isinstance(job, dict) else ""
+                        expected_id = os.path.basename(candidate)[:-len(".json")]
+                        if (_upload_job_schema_error(job)
+                                or status in ("invalid_job", "cancelled")
+                                or _upload_job_identity_error(
+                                    job, expected_id,
+                                    media_path, session_dir)):
+                            continue
+                        return candidate, status
+                    return "", ""
+
+                try:
+                    session_dir = os.path.abspath(str(
+                        merged_snapshot.get("session_dir", "") or ""))
+                    media_path = os.path.join(session_dir, "recording.mp4")
+                    try:
+                        media_ready = (os.path.isfile(media_path)
+                                       and os.path.getsize(media_path) > 1024)
+                    except OSError:
+                        media_ready = False
+                    job_path, job_status = durable_job_for_session(
+                        merged_snapshot, session_dir, media_path)
+                    if media_ready and not job_path:
+                        queue_upload = getattr(
+                            self, "_queue_command_monitor_youtube_upload", None)
+                        job_path = queue_upload(
+                            merged_snapshot, background=False,
+                            launch_worker=False,
+                            hold_for_local_commit=True,
+                            persist_metadata=False) \
+                            if callable(queue_upload) else ""
+                    if not job_path:
+                        raise OSError(
+                            "完成済みYouTube動画をアップロードキューへ登録できませんでした。")
+                    held_job = str(job_path).lower().endswith(
+                        ".json.local-commit")
+                    final_job_path = (str(job_path)[:-len(".local-commit")]
+                                      if held_job else str(job_path))
+                    final_job_path = os.path.abspath(final_job_path)
+                    cleanup_job = {
+                        "id": os.path.basename(final_job_path)[:-len(".json")],
+                        "job_path": final_job_path,
+                        "media_path": media_path,
+                        "session_dir": session_dir,
+                    }
+                    outcome["job_path"] = final_job_path
+                    merged_snapshot["pinned"] = True
+                    merged_snapshot["youtube_roll_pending"] = True
+                    merged_snapshot["youtube_rolling_committed"] = False
+                    upload = dict(
+                        merged_snapshot.get("youtube_upload", {}) or {})
+                    upload["status"] = (
+                        "local_commit_pending" if held_job else "queued")
+                    upload["job_path"] = final_job_path
+                    merged_snapshot["youtube_upload"] = upload
+                    # Never rewrite the merged manifest after a final .json is
+                    # visible: an already-running legacy uploader can append
+                    # remote IDs there. A held job is still invisible, so its
+                    # final intended path/state is safe to journal now.
+                    if (held_job
+                            and not self._write_command_monitor_metadata(
+                                merged_snapshot)):
+                        raise OSError(
+                            "結合済み動画のYouTube復旧情報を保存できませんでした。")
+                    outcome["merged_metadata_committed"] = True
+
+                    relationship_committed = True
+                    for source_id, snapshot in source_snapshots.items():
+                        snapshot["merge_pending"] = False
+                        snapshot["youtube_roll_pending"] = False
+                        snapshot["youtube_rolling_committed"] = True
+                        snapshot["youtube_source_cleanup_pending"] = True
+                        snapshot["youtube_source_cleanup_job"] = dict(
+                            cleanup_job)
+                        snapshot["delete_pending"] = False
+                        snapshot["pinned"] = False
+                        source_upload = dict(
+                            snapshot.get("youtube_upload", {}) or {})
+                        source_upload["status"] = (
+                            "local_commit_pending" if held_job else "queued")
+                        source_upload["job_path"] = final_job_path
+                        snapshot["youtube_upload"] = source_upload
+                        try:
+                            saved = bool(
+                                self._write_command_monitor_metadata(snapshot))
+                        except Exception as journal_error:
+                            saved = False
+                            self._logger.warning(
+                                "Commands YouTube source journal failed: %s",
+                                journal_error)
+                        relationship_committed = (
+                            saved and relationship_committed)
+                    if not relationship_committed:
+                        raise OSError(
+                            "結合元録画のYouTube復旧情報を保存できませんでした。")
+                    released_path = (release_upload_job_local_commit(job_path)
+                                     if held_job else final_job_path)
+                    if not released_path:
+                        raise OSError(
+                            "YouTubeアップロードキューの保留を解除できませんでした。")
+                    outcome["job_path"] = released_path
+                    outcome["queue_released"] = True
+                    merged_snapshot["youtube_roll_pending"] = False
+                    merged_snapshot["youtube_rolling_committed"] = True
+                    upload["status"] = "queued"
+                    upload["job_path"] = released_path
+                    merged_snapshot["youtube_upload"] = upload
+                    launch = getattr(
+                        self, "_launch_youtube_upload_worker", None)
+                    if callable(launch) and job_status not in (
+                            "cleanup_pending", "completed"):
+                        launch(dict(
+                            merged_snapshot.get("youtube_archive", {}) or {}),
+                            job_path=released_path)
+
+                    cleanup_committed = True
+                    for source_id, snapshot in source_snapshots.items():
+                        cleanup_identity = snapshot.get(
+                            "youtube_source_cleanup_identity", {}) or {}
+                        identity_ready = bool(
+                            isinstance(cleanup_identity, dict)
+                            and cleanup_identity)
+                        snapshot["delete_pending"] = identity_ready
+                        source_upload = dict(
+                            snapshot.get("youtube_upload", {}) or {})
+                        source_upload["status"] = "queued"
+                        source_upload["job_path"] = released_path
+                        snapshot["youtube_upload"] = source_upload
+                        try:
+                            saved = bool(
+                                self._write_command_monitor_metadata(snapshot))
+                        except Exception as journal_error:
+                            saved = False
+                            self._logger.warning(
+                                "Commands YouTube cleanup journal failed: %s",
+                                journal_error)
+                        if saved:
+                            if identity_ready:
+                                outcome["committed_source_ids"].add(source_id)
+                            else:
+                                # Old manifests did not pin the raw directory
+                                # before merge. Never adopt its current identity
+                                # after restart: retain it fail-closed.
+                                outcome["retained_source_ids"].add(source_id)
+                        else:
+                            cleanup_committed = False
+                    outcome["source_metadata_committed"] = cleanup_committed
+                    if not cleanup_committed:
+                        raise OSError(
+                            "結合元録画の削除許可を保存できませんでした。")
+                except Exception as caught:
+                    outcome["error"] = caught
+
+                def apply_recovery(result=outcome):
+                    try:
+                        current_by_id = {
+                            str(chunk.get("id", "")): chunk
+                            for chunk in self._command_monitor_chunks
+                        }
+                        current_merged = current_by_id.get(
+                            result.get("merged_id", ""))
+                        job_path = str(result.get("job_path", "") or "")
+                        if (current_merged is not None
+                                and result.get("merged_metadata_committed")):
+                            current_merged["pinned"] = True
+                            released = bool(result.get("queue_released"))
+                            current_merged["youtube_roll_pending"] = not released
+                            current_merged["youtube_rolling_committed"] = released
+                            merged_upload = dict(
+                                current_merged.get("youtube_upload", {}) or {})
+                            merged_upload["status"] = (
+                                "queued" if released else "local_commit_pending")
+                            merged_upload["job_path"] = job_path
+                            current_merged["youtube_upload"] = merged_upload
+
+                        committed_ids = set(
+                            result.get("committed_source_ids", ()))
+                        retained_ids = set(
+                            result.get("retained_source_ids", ()))
+                        kept = []
+                        for chunk in self._command_monitor_chunks:
+                            source_id = str(chunk.get("id", ""))
+                            if source_id not in source_ids:
+                                kept.append(chunk)
+                                continue
+                            source_snapshot = source_snapshots.get(
+                                source_id, {})
+                            cleanup_identity = source_snapshot.get(
+                                "youtube_source_cleanup_identity", {}) or {}
+                            cleanup_job = source_snapshot.get(
+                                "youtube_source_cleanup_job", {}) or {}
+                            if isinstance(cleanup_identity, dict):
+                                chunk["youtube_source_cleanup_identity"] = dict(
+                                    cleanup_identity)
+                            if isinstance(cleanup_job, dict):
+                                chunk["youtube_source_cleanup_job"] = dict(
+                                    cleanup_job)
+                            if (source_id not in committed_ids
+                                    and source_id not in retained_ids):
+                                chunk["merge_pending"] = True
+                                chunk["delete_pending"] = False
+                                kept.append(chunk)
+                                continue
+                            chunk["merge_pending"] = False
+                            chunk["youtube_roll_pending"] = False
+                            chunk["youtube_rolling_committed"] = True
+                            chunk["youtube_source_cleanup_pending"] = True
+                            chunk["delete_pending"] = (
+                                source_id in committed_ids)
+                            chunk["pinned"] = False
+                            source_upload = dict(
+                                chunk.get("youtube_upload", {}) or {})
+                            source_upload["status"] = "queued"
+                            source_upload["job_path"] = job_path
+                            chunk["youtube_upload"] = source_upload
+                            # Keep sources visible until the background
+                            # eligibility sweep validates the pinned folder,
+                            # exact queue relation, and primary-media identity.
+                            kept.append(chunk)
+                        self._command_monitor_chunks = kept
+                        completed = bool(
+                            result.get("merged_metadata_committed")
+                            and result.get("queue_released")
+                            and result.get("source_metadata_committed"))
+                        session_id = str(
+                            merged_snapshot.get("command_session_id", "") or "")
+                        if completed:
+                            if current_merged is not None:
+                                current_merged["_youtube_recovery_checked"] = True
+                            attempts = getattr(
+                                self,
+                                "_command_monitor_youtube_merge_retry_attempts",
+                                None)
+                            if isinstance(attempts, dict):
+                                attempts.pop(session_id, None)
+                            self.record_monitor_status.set(
+                                "YouTubeアップロードの復旧情報を保存しました。"
+                                + ("旧形式で同一性を確認できない元録画は保持します。"
+                                   if retained_ids else
+                                   "元の短い録画を安全確認後に削除します。"))
+                            PokeControllerApp._flush_command_monitor_deletes(
+                                self)
+                        else:
+                            self.record_monitor_status.set(
+                                "YouTubeアップロードの復旧保存に失敗しました。"
+                                "完成動画と元録画を保持して再試行します。")
+                            PokeControllerApp._schedule_command_monitor_youtube_merge_retry(
+                                self, session_id,
+                                reason=str(result.get("error") or "復旧保存待ち"))
+                        self._refresh_command_monitor_tree()
+                    finally:
+                        with self._command_monitor_merge_lock:
+                            self._command_monitor_merge_active = max(
+                                0, self._command_monitor_merge_active - 1)
+                        if (result.get("merged_metadata_committed")
+                                and result.get("queue_released")
+                                and result.get("source_metadata_committed")
+                                and hasattr(self, "root")):
+                            self.root.after(
+                                500,
+                                self._reconcile_command_monitor_youtube_recordings)
+
+                self._gui_action_queue.put(apply_recovery)
+
+            threading.Thread(
+                target=recover_merged_upload, daemon=True,
+                name="CommandYouTubeRecoveryCommit").start()
+            return True
+
+        # If PokeCon closed before raw chunks reached the queue, finalize one
+        # old Commands run now. finish_merge schedules this reconciliation
+        # again, keeping CPU-heavy merges serialized.
+        session_ids = []
+        for chunk in self._command_monitor_chunks:
+            archive = dict(chunk.get("youtube_archive", {}) or {})
+            session_id = str(chunk.get("command_session_id", "") or "")
+            if (archive.get("enabled") and chunk.get("youtube_roll_pending")
+                    and session_id and session_id not in session_ids):
+                session_ids.append(session_id)
+        for session_id in session_ids:
+            command = getattr(self, "_command_monitor_command", None)
+            running_session = bool(
+                session_id == str(getattr(
+                    self, "_command_monitor_session_id", "") or "")
+                and getattr(command, "alive", False)
+                and getattr(self, "record_armed", False))
+            target_ids = youtube_rolling_chunk_ids(
+                self._command_monitor_chunks, session_id,
+                force=not running_session)
+            if target_ids:
+                self._merge_stopped_command_monitor_recordings(
+                    session_id, target_ids, youtube_rolling=True,
+                    final_segment=not running_session)
+                return True
+        return False
+
     def _queue_ready_command_monitor_youtube_segment(
             self, session_id=None, force=False):
         """Finalize one ready YouTube segment without stopping Commands."""
+        # A two-hour encode can overlap the next capture interval.  Keep these
+        # CPU-heavy merges strictly serial; finish/reconciliation will start
+        # the next accumulated segment after the active one commits.
+        if getattr(self, "_command_monitor_merge_active", 0):
+            return False
         session_id = str(session_id or getattr(
             self, "_command_monitor_session_id", "") or "")
         target_ids = youtube_rolling_chunk_ids(
@@ -19186,6 +24360,54 @@ class PokeControllerApp:
         self._merge_stopped_command_monitor_recordings(
             session_id, target_ids, youtube_rolling=True,
             final_segment=bool(force))
+        return True
+
+    def _schedule_command_monitor_youtube_merge_retry(
+            self, session_id, reason=""):
+        """Retry a recovered YouTube merge without spinning forever."""
+        session_id = str(session_id or "")
+        root = getattr(self, "root", None)
+        schedule = getattr(root, "after", None)
+        if not session_id or not callable(schedule):
+            return False
+        scheduled = getattr(
+            self, "_command_monitor_youtube_merge_retry_scheduled", None)
+        if not isinstance(scheduled, set):
+            scheduled = set()
+            self._command_monitor_youtube_merge_retry_scheduled = scheduled
+        if session_id in scheduled:
+            return True
+        attempts = getattr(
+            self, "_command_monitor_youtube_merge_retry_attempts", None)
+        if not isinstance(attempts, dict):
+            attempts = {}
+            self._command_monitor_youtube_merge_retry_attempts = attempts
+        attempt = int(attempts.get(session_id, 0) or 0) + 1
+        # A YouTube segment may legally be as long as 11 hours.  Its low-
+        # priority MP4 finalizer can therefore outlive the former 24-minute
+        # retry window on a busy multi-PokeCon host.  Keep the UI retry bounded
+        # while allowing roughly 12 hours at the capped one-minute interval.
+        max_attempts = 720
+        if attempt > max_attempts:
+            self._logger.error(
+                "Commands rolling YouTube merge retry exhausted for %s: %s",
+                session_id, reason)
+            return False
+        attempts[session_id] = attempt
+        delay_ms = min(60000, 500 * (2 ** min(attempt - 1, 7)))
+        scheduled.add(session_id)
+
+        def retry():
+            scheduled.discard(session_id)
+            reconcile = getattr(
+                self, "_reconcile_command_monitor_youtube_recordings", None)
+            if callable(reconcile):
+                reconcile()
+
+        schedule(delay_ms, retry)
+        self._logger.warning(
+            "Commands rolling YouTube merge retry %s/%s in %.1fs for %s: %s",
+            attempt, max_attempts, delay_ms / 1000.0, session_id, reason)
         return True
 
     def _merge_stopped_command_monitor_recordings(
@@ -19199,6 +24421,69 @@ class PokeControllerApp:
         youtube_rolling = bool(
             youtube_rolling or dict(
                 targets[0].get("youtube_archive", {}) or {}).get("enabled"))
+        presentation_policies = {
+            bool(dict(chunk.get("youtube_archive", {}) or {}).get(
+                "allow_low_presentations", True))
+            for chunk in targets
+        } if youtube_rolling else {False}
+        if len(presentation_policies) != 1:
+            # youtube_rolling_chunk_ids normally splits at this boundary. A
+            # stale callback may still arrive with a pre-change mixed target;
+            # fail closed and let reconciliation select each side separately.
+            for chunk in targets:
+                chunk["merge_pending"] = False
+                chunk["delete_pending"] = False
+                chunk["youtube_roll_pending"] = True
+            self.record_monitor_status.set(
+                "低品質許容設定が異なるCommands録画は区切って順番に結合します。")
+            self._refresh_command_monitor_tree()
+            reconcile = getattr(
+                self, "_reconcile_command_monitor_youtube_recordings", None)
+            if hasattr(self, "root") and callable(reconcile):
+                self.root.after(500, reconcile)
+            return False
+        allow_low_presentations = bool(
+            youtube_rolling and next(iter(presentation_policies)))
+        if any(chunk.get("recording_close_pending")
+               or chunk.get("recording_close_failed") for chunk in targets):
+            self.record_monitor_status.set(
+                "安全に閉じられていないCommands録画が含まれるため、"
+                "結合・アップロード・削除を行いません。")
+            self._refresh_command_monitor_tree()
+            return False
+        with self._command_monitor_merge_lock:
+            merge_busy = bool(self._command_monitor_merge_active)
+        if merge_busy:
+            if youtube_rolling:
+                # Keep a durable final-tail intent, but never start a second
+                # FFmpeg while the previous rolling segment is still encoding.
+                for chunk in targets:
+                    chunk["youtube_roll_pending"] = True
+                    chunk["delete_pending"] = False
+
+                def persist_waiting_tail(pending_targets=list(targets)):
+                    for pending in pending_targets:
+                        snapshot = pending.copy()
+                        self._write_command_monitor_metadata(snapshot)
+
+                threading.Thread(
+                    target=persist_waiting_tail, daemon=True,
+                    name="CommandYouTubePendingJournal").start()
+                self.record_monitor_status.set(
+                    "YouTube用動画を結合中です。残り区間は現在の結合完了後に順番に処理します。")
+                reconcile = getattr(
+                    self, "_reconcile_command_monitor_youtube_recordings", None)
+                if hasattr(self, "root") and callable(reconcile):
+                    self.root.after(1000, reconcile)
+            elif hasattr(self, "root"):
+                self.record_monitor_status.set(
+                    "別の録画を結合中です。完了後に今回分を結合します。")
+                self.root.after(
+                    1000,
+                    lambda: self._merge_stopped_command_monitor_recordings(
+                        session_id, target_ids, youtube_rolling=False,
+                        final_segment=final_segment))
+            return False
         if len(targets) < 2 and not youtube_rolling:
             self.record_monitor_status.set(
                 "今回のCommands録画は1本のため、そのまま保持しました。")
@@ -19207,7 +24492,10 @@ class PokeControllerApp:
         for chunk in targets:
             chunk["merge_pending"] = True
             chunk["delete_pending"] = False
-            self._write_command_monitor_metadata(chunk)
+            if youtube_rolling:
+                chunk["youtube_roll_pending"] = True
+            else:
+                self._write_command_monitor_metadata(chunk)
         if youtube_rolling:
             self.record_monitor_status.set(
                 "YouTube用録画{}本をバックグラウンドで確定しています。"
@@ -19221,28 +24509,114 @@ class PokeControllerApp:
         with self._command_monitor_merge_lock:
             self._command_monitor_merge_active += 1
 
-        def finish_merge(merged=None, error=None):
+        validated_source_ids = set()
+
+        def source_snapshot(chunk):
+            snapshot = chunk.copy()
+            for key in ("youtube_archive", "youtube_upload",
+                        "youtube_source_cleanup_identity",
+                        "youtube_source_cleanup_job",
+                        "youtube_merge_retry_probe",
+                        "common_function_monitor"):
+                value = snapshot.get(key)
+                if isinstance(value, dict):
+                    snapshot[key] = value.copy()
+            if str(snapshot.get("id", "") or "") in validated_source_ids:
+                snapshot.pop("youtube_merge_retry_probe", None)
+            return snapshot
+
+        def finish_merge(outcome):
+            merged = outcome.get("merged")
+            error = outcome.get("error")
+            source_attention = bool(
+                outcome.get("source_validation_error"))
+            attention_ids = {
+                str(value) for value in outcome.get("attention_chunk_ids", [])
+                if str(value)
+            }
             current_by_id = {
                 str(chunk.get("id", "")): chunk
                 for chunk in self._command_monitor_chunks
             }
             current_targets = [current_by_id[value] for value in target_ids
                                if value in current_by_id]
+            if outcome.get("source_validation_succeeded"):
+                for chunk in current_targets:
+                    chunk.pop("youtube_merge_retry_probe", None)
+            if outcome.get("retry_probe_state_committed"):
+                retry_source_id = str(
+                    outcome.get("retry_probe_chunk_id", "") or "")
+                retry_probe_state = outcome.get("retry_probe_state")
+                retry_chunk = current_by_id.get(retry_source_id)
+                if retry_chunk is not None:
+                    if isinstance(retry_probe_state, dict):
+                        retry_chunk["youtube_merge_retry_probe"] = dict(
+                            retry_probe_state)
+                    else:
+                        retry_chunk.pop("youtube_merge_retry_probe", None)
             if error is not None:
                 for chunk in current_targets:
                     chunk["merge_pending"] = False
-                    self._write_command_monitor_metadata(chunk)
+                    chunk["delete_pending"] = False
+                    if (youtube_rolling and source_attention
+                            and str(chunk.get("id", "")) in attention_ids):
+                        chunk["pinned"] = True
+                        chunk["youtube_roll_pending"] = False
+                        chunk["youtube_merge_attention_required"] = True
+                        chunk["youtube_merge_attention_error"] = str(error)
+                        chunk["youtube_merge_attention_code"] = str(
+                            getattr(error, "code", "source_invalid") or
+                            "source_invalid")
+                        chunk["youtube_merge_attention_at"] = str(
+                            outcome.get("attention_at", "") or "")
+                        chunk.pop("youtube_merge_retry_probe", None)
                 if youtube_rolling:
-                    self.record_monitor_status.set(
-                        "YouTube用録画の確定に失敗しました。"
-                        "元録画は削除せず、次の区切りで再試行します。")
-                    self._logger.warning(
-                        "Commands rolling YouTube merge failed: %s", error)
+                    if source_attention:
+                        retry_attempts = getattr(
+                            self,
+                            "_command_monitor_youtube_merge_retry_attempts",
+                            None)
+                        if isinstance(retry_attempts, dict):
+                            retry_attempts.pop(str(session_id or ""), None)
+                        self.record_monitor_status.set(
+                            "YouTube用録画に時間ずれまたはファイル異常があるため、"
+                            "この区間を削除せず確認待ちにしました。"
+                            "後続の正常区間は引き続き処理します。")
+                        self._logger.error(
+                            "Commands rolling YouTube source requires "
+                            "attention (%s): %s",
+                            getattr(error, "code", "source_invalid"), error)
+                        if not outcome.get("attention_state_committed"):
+                            journal = getattr(
+                                self, "_queue_command_monitor_metadata_journal",
+                                None)
+                            if callable(journal):
+                                journal(current_targets)
+                        reconcile = getattr(
+                            self,
+                            "_reconcile_command_monitor_youtube_recordings",
+                            None)
+                        if hasattr(self, "root") and callable(reconcile):
+                            self.root.after(500, reconcile)
+                    elif outcome.get("phase") == "manifest_owner":
+                        self.record_monitor_status.set(
+                            "旧方式の個別MP4処理が終了してからYouTube用に結合します。")
+                    else:
+                        self.record_monitor_status.set(
+                            "YouTube用録画の確定に失敗しました。"
+                            "元録画は削除せず、時間をおいて再試行します。")
+                    if not source_attention:
+                        self._logger.warning(
+                            "Commands rolling YouTube merge failed: %s", error)
+                        PokeControllerApp._schedule_command_monitor_youtube_merge_retry(
+                            self, session_id, reason=str(error))
                 else:
                     self.record_monitor_status.set(
                         "録画の結合に失敗しました。分割録画は削除せず保持しています。")
                 self._refresh_command_monitor_tree()
                 if not youtube_rolling:
+                    for chunk in current_targets:
+                        self._write_command_monitor_metadata(chunk)
                     tkmsg.showwarning(
                         "Commands録画の結合",
                         "録画を1本に結合できませんでした。"
@@ -19251,48 +24625,87 @@ class PokeControllerApp:
                 return
 
             if youtube_rolling:
-                merged["pinned"] = True
-                merged["youtube_roll_pending"] = False
-                merged["youtube_rolling_committed"] = True
-                merged["youtube_segment_final"] = bool(final_segment)
-                # The rolling boundary may exceed the requested duration by
-                # one short capture chunk.  Let this already-bounded MP4 stay
-                # one YouTube video instead of creating a tiny second part.
-                archive = dict(merged.get("youtube_archive", {}) or {})
-                duration = max(
-                    0.0, float(merged.get("duration_saved", 0.0) or 0.0))
-                try:
-                    configured = int(archive.get("segment_seconds", 7200) or 7200)
-                except (TypeError, ValueError):
-                    configured = 7200
-                archive["segment_seconds"] = min(
-                    11 * 3600, max(configured, int(duration + 1.999)))
-                merged["youtube_archive"] = archive
-                self._write_command_monitor_metadata(merged)
-                queue_upload = getattr(
-                    self, "_queue_command_monitor_youtube_upload", None)
-                job_path = queue_upload(merged, background=False) \
-                    if callable(queue_upload) else ""
-                if not job_path:
+                if outcome.get("queue_failed"):
                     for chunk in current_targets:
                         chunk["merge_pending"] = False
-                        self._write_command_monitor_metadata(chunk)
-                    self._queue_command_monitor_folder_delete(
-                        merged.get("session_dir", ""), output_root=output_root)
+                        chunk["delete_pending"] = False
+                        identity = dict(outcome.get(
+                            "source_cleanup_identities", {}).get(
+                                str(chunk.get("id", "") or ""), {}) or {})
+                        if identity:
+                            chunk["youtube_source_cleanup_identity"] = identity
+                    # Keep the already encoded MP4. A queue filesystem failure
+                    # must not force another two-hour FFmpeg encode on every
+                    # retry; reconciliation retries this merged folder itself.
+                    merged["pinned"] = True
+                    merged["youtube_roll_pending"] = True
+                    merged["youtube_rolling_committed"] = False
+                    insert_at = min(
+                        (self._command_monitor_chunks.index(chunk)
+                         for chunk in current_targets),
+                        default=len(self._command_monitor_chunks))
+                    if not any(str(chunk.get("id", "")) == str(
+                            merged.get("id", ""))
+                            for chunk in self._command_monitor_chunks):
+                        self._command_monitor_chunks.insert(
+                            min(insert_at, len(self._command_monitor_chunks)),
+                            merged)
                     self.record_monitor_status.set(
                         "YouTubeアップロードキューへ登録できませんでした。"
-                        "元の短い録画は削除せず保持し、次の区切りで再試行します。")
+                        "完成動画と元の短い録画を保持して再試行します。")
                     self._logger.warning(
                         "Commands rolling YouTube queue registration failed: %s",
                         merged.get("session_dir", ""))
+                    PokeControllerApp._schedule_command_monitor_youtube_merge_retry(
+                        self, session_id, reason="YouTube queue registration")
                     self._refresh_command_monitor_tree()
                     return
+                source_metadata_committed = bool(
+                    outcome.get("source_metadata_committed"))
+                if source_metadata_committed:
+                    merged["_youtube_recovery_checked"] = True
+                    retry_attempts = getattr(
+                        self, "_command_monitor_youtube_merge_retry_attempts", None)
+                    if isinstance(retry_attempts, dict):
+                        retry_attempts.pop(str(session_id or ""), None)
+                    for chunk in current_targets:
+                        source_id = str(chunk.get("id", "") or "")
+                        chunk["merge_pending"] = False
+                        chunk["youtube_roll_pending"] = False
+                        chunk["youtube_rolling_committed"] = True
+                        chunk["youtube_source_cleanup_pending"] = True
+                        chunk["youtube_source_cleanup_identity"] = dict(
+                            outcome.get("source_cleanup_identities", {}).get(
+                                source_id, {}) or {})
+                        chunk["youtube_source_cleanup_job"] = dict(
+                            outcome.get("source_cleanup_job", {}) or {})
+                        chunk["delete_pending"] = True
+                        chunk["pinned"] = False
+                        upload = dict(chunk.get("youtube_upload", {}) or {})
+                        upload["status"] = "queued"
+                        upload["job_path"] = outcome.get("job_path", "")
+                        chunk["youtube_upload"] = upload
+                else:
+                    # Keep the live deletion gate set until reconciliation has
+                    # durably linked every source to the queued merged job.
+                    for chunk in current_targets:
+                        chunk["merge_pending"] = True
+                        chunk["delete_pending"] = False
+                    PokeControllerApp._schedule_command_monitor_youtube_merge_retry(
+                        self, session_id, reason="source metadata commit")
+            else:
+                source_metadata_committed = True
+                retry_attempts = getattr(
+                    self, "_command_monitor_youtube_merge_retry_attempts", None)
+                if isinstance(retry_attempts, dict):
+                    retry_attempts.pop(str(session_id or ""), None)
             insert_at = min(
                 (self._command_monitor_chunks.index(chunk) for chunk in current_targets),
                 default=len(self._command_monitor_chunks))
-            self._command_monitor_chunks = [
-                chunk for chunk in self._command_monitor_chunks
-                if str(chunk.get("id", "")) not in target_ids]
+            if not youtube_rolling:
+                self._command_monitor_chunks = [
+                    chunk for chunk in self._command_monitor_chunks
+                    if str(chunk.get("id", "")) not in target_ids]
             self._command_monitor_chunks.insert(
                 min(insert_at, len(self._command_monitor_chunks)), merged)
             if not youtube_rolling:
@@ -19300,50 +24713,607 @@ class PokeControllerApp:
                     self, "_queue_command_monitor_youtube_upload", None)
                 if callable(queue_upload):
                     queue_upload(merged)
-            for chunk in current_targets:
-                self._queue_command_monitor_folder_delete(
-                    chunk.get("session_dir", ""), output_root=output_root)
+            if not youtube_rolling:
+                for chunk in current_targets:
+                    source_id = str(chunk.get("id", "") or "")
+                    prepared = (
+                        PokeControllerApp._command_monitor_prepared_delete_item(
+                            outcome.get(
+                                "source_cleanup_identities", {}).get(
+                                    source_id, {})))
+                    if isinstance(prepared, dict):
+                        self._command_monitor_delete_queue.put_nowait(prepared)
+            elif source_metadata_committed:
+                # This call only schedules the background queue/media/identity
+                # sweep. No queue JSON, stat, or lstat runs on Tk.
+                PokeControllerApp._flush_command_monitor_deletes(self)
             if youtube_rolling:
-                self.record_monitor_status.set(
-                    "YouTube用動画を確定してアップロードキューへ登録しました。"
-                    "元の短い録画{}本は削除します。".format(
-                        len(current_targets)))
+                if source_metadata_committed:
+                    self.record_monitor_status.set(
+                        "YouTube用動画を確定してアップロードキューへ登録しました。"
+                        "元の短い録画{}本は削除します。".format(
+                            len(current_targets)))
+                else:
+                    self.record_monitor_status.set(
+                        "YouTubeキューは保存済みです。元録画の状態保存を"
+                        "再試行してから削除します。")
             else:
                 self.record_monitor_status.set(
                     "今回のCommands仮録画{}本を1本へ結合して保持しました。".format(
                         len(current_targets)))
             self._refresh_command_monitor_tree()
-            if youtube_rolling and not final_segment:
-                self._queue_ready_command_monitor_youtube_segment(session_id)
+
+        def persist_retry_state(cleanup_identities=None):
+            committed = True
+            cleanup_identities = cleanup_identities or {}
+            for chunk in targets:
+                snapshot = source_snapshot(chunk)
+                snapshot["merge_pending"] = False
+                snapshot["delete_pending"] = False
+                if youtube_rolling:
+                    snapshot["youtube_roll_pending"] = True
+                    identity = cleanup_identities.get(str(
+                        snapshot.get("id", "") or ""), {}) or {}
+                    if isinstance(identity, dict) and identity:
+                        snapshot["youtube_source_cleanup_identity"] = dict(
+                            identity)
+                try:
+                    saved = bool(
+                        self._write_command_monitor_metadata(snapshot))
+                except Exception as journal_error:
+                    saved = False
+                    self._logger.warning(
+                        "Commands rolling retry journal failed: %s",
+                        journal_error)
+                committed = saved and committed
+            return committed
+
+        def persist_attention_state(error, attention_ids, attention_time):
+            """Durably quarantine immutable bad inputs without blocking later ones."""
+            committed = True
+            attention_ids = {str(value) for value in attention_ids if str(value)}
+            attention_code = str(
+                getattr(error, "code", "source_invalid") or "source_invalid")
+            for chunk in targets:
+                snapshot = source_snapshot(chunk)
+                snapshot["merge_pending"] = False
+                snapshot["delete_pending"] = False
+                source_id = str(snapshot.get("id", "") or "")
+                if source_id in attention_ids:
+                    snapshot["pinned"] = True
+                    snapshot["youtube_roll_pending"] = False
+                    snapshot.pop("youtube_merge_retry_probe", None)
+                    snapshot["youtube_merge_attention_required"] = True
+                    snapshot["youtube_merge_attention_error"] = str(error)
+                    snapshot["youtube_merge_attention_code"] = attention_code
+                    snapshot["youtube_merge_attention_at"] = attention_time
+                else:
+                    snapshot["youtube_roll_pending"] = True
+                try:
+                    saved = bool(
+                        self._write_command_monitor_metadata(snapshot))
+                except Exception as journal_error:
+                    saved = False
+                    self._logger.warning(
+                        "Commands rolling attention journal failed: %s",
+                        journal_error)
+                committed = saved and committed
+            return committed
+
+        def persist_retry_probe_state(source_id, state):
+            """Journal one unreadable source without fsyncing the full batch."""
+            source_id = str(source_id or "")
+            source = next((
+                chunk for chunk in targets
+                if str(chunk.get("id", "") or "") == source_id), None)
+            if source is None:
+                return False
+            snapshot = source_snapshot(source)
+            snapshot["merge_pending"] = False
+            snapshot["delete_pending"] = False
+            snapshot["youtube_roll_pending"] = True
+            if isinstance(state, dict):
+                snapshot["youtube_merge_retry_probe"] = dict(state)
+            else:
+                snapshot.pop("youtube_merge_retry_probe", None)
+            try:
+                return bool(self._write_command_monitor_metadata(snapshot))
+            except Exception as journal_error:
+                self._logger.warning(
+                    "Commands unreadable-source retry journal failed: %s",
+                    journal_error)
+                return False
 
         def worker():
-            merged = None
-            error = None
+            outcome = {
+                "merged": None,
+                "error": None,
+                "phase": "merge",
+                "queue_failed": False,
+                "job_path": "",
+                "queue_released": False,
+                "merged_metadata_committed": False,
+                "source_metadata_committed": False,
+                "source_cleanup_identities": {},
+                "source_validation_identities": {},
+                "source_validation_succeeded": False,
+                "source_validation_error": False,
+                "retry_probe_chunk_id": "",
+                "retry_probe_state": None,
+                "retry_probe_state_committed": False,
+                "attention_state_committed": False,
+                "attention_chunk_ids": [],
+                "attention_at": "",
+            }
             try:
-                # CaptureRecorder finalizes each short clip asynchronously.
-                # Do not read its AVI/WAV files until all writers/muxers have
-                # released them.  This wait never blocks Tk or controller I/O.
-                deadline = time.monotonic() + 600.0
-                while self.recorder.is_finalizing and time.monotonic() < deadline:
-                    time.sleep(0.2)
-                if self.recorder.is_finalizing:
-                    raise TimeoutError("分割録画の保存完了を10分以内に確認できませんでした。")
-                # Source/Step events use a dedicated writer so they never
-                # delay controller input.  Flush it before reading the chunks.
+                prevalidated_source_media = None
+                # Pin every source directory before FFmpeg begins.  The GUI
+                # must later enqueue these exact identities, never a fresh
+                # same-name directory that appeared after the merge.
+                outcome["phase"] = "preflight"
+                for chunk in targets:
+                    source_id = str(chunk.get("id", "") or "")
+                    session_dir_value = str(
+                        chunk.get("session_dir", "") or "").strip()
+                    if not session_dir_value:
+                        raise ValueError("Commands録画フォルダーが不明です。")
+                    session_dir = os.path.abspath(session_dir_value)
+                    try:
+                        cleanup_identity = (
+                            PokeControllerApp.
+                            _command_monitor_delete_target_snapshot(
+                                output_root, session_dir))
+                    except FileNotFoundError:
+                        cleanup_identity = None
+                    if cleanup_identity is None:
+                        raise OSError(
+                            "結合元Commands録画フォルダーの"
+                            "安全な同一性を確認できません: " + session_dir)
+                    outcome["source_cleanup_identities"][source_id] = (
+                        cleanup_identity)
+                    outcome["source_validation_identities"][source_id] = dict(
+                        cleanup_identity)
+                if youtube_rolling:
+                    # All disk durability work belongs to this worker.  At a
+                    # two-hour boundary this is normally 241 fsync operations;
+                    # doing them on Tk starved preview timestamps and created
+                    # thousands of late CFR writes at Stop.
+                    for chunk in targets:
+                        source_id = str(chunk.get("id", "") or "")
+                        session_dir_value = str(
+                            chunk.get("session_dir", "") or "").strip()
+                        if not session_dir_value:
+                            raise ValueError("Commands録画フォルダーが不明です。")
+                        session_dir = os.path.abspath(session_dir_value)
+                        video_path = os.path.join(
+                            session_dir, "recording.avi")
+                        video_alias = os.path.join(
+                            session_dir, "recording.youtube_merge.avi")
+                        try:
+                            prepare_segment_merge_source_alias(video_path)
+                        except OSError as alias_error:
+                            if (not os.path.isfile(video_path)
+                                    and not os.path.isfile(video_alias)):
+                                raise CommandRecordingSourceValidationError(
+                                    "結合元の録画が見つかりません: "
+                                    + os.path.basename(session_dir),
+                                    code="video_missing",
+                                    source_chunk_id=source_id)
+                            if "別ファイル" in str(alias_error):
+                                raise CommandRecordingSourceValidationError(
+                                    str(alias_error), code="video_alias_conflict",
+                                    source_chunk_id=source_id)
+                            raise
+                        protected_video = video_alias \
+                            if os.path.isfile(video_alias) else video_path
+                        try:
+                            video_details = os.stat(protected_video)
+                        except (OSError, TypeError, ValueError):
+                            pass
+                        else:
+                            identity = dict(outcome[
+                                "source_validation_identities"][source_id])
+                            identity.update({
+                                "video_path": os.path.abspath(protected_video),
+                                "video_device": int(getattr(
+                                    video_details, "st_dev", 0) or 0),
+                                "video_inode": int(getattr(
+                                    video_details, "st_ino", 0) or 0),
+                                "video_size": int(getattr(
+                                    video_details, "st_size", 0) or 0),
+                                "video_mtime_ns": int(getattr(
+                                    video_details, "st_mtime_ns", 0) or 0),
+                            })
+                            outcome["source_validation_identities"][
+                                source_id] = identity
+                        wav_path = os.path.join(session_dir, "recording.wav")
+                        wav_alias = os.path.join(
+                            session_dir, "recording.youtube_merge.wav")
+                        if os.path.isfile(wav_path) or os.path.isfile(wav_alias):
+                            prepare_segment_merge_source_alias(wav_path)
+                    # The protected hard links above are now stable even if a
+                    # legacy per-clip finalizer retires its original filename.
+                    # Validate before the per-source recovery fsync loop so an
+                    # immutable bad source does not cause hundreds of writes.
+                    outcome["phase"] = "source_validation"
+                    prevalidated_source_media = (
+                        validate_command_recording_sources(
+                            targets, output_root,
+                            allow_low_presentations=allow_low_presentations,
+                            strict=True))
+                    validated_source_ids.update(
+                        str(chunk.get("id", "") or "")
+                        for chunk in targets)
+                    outcome["source_validation_succeeded"] = True
+                    outcome["phase"] = "preflight_journal"
+                    for chunk in targets:
+                        source_id = str(chunk.get("id", "") or "")
+                        cleanup_identity = dict(
+                            outcome["source_cleanup_identities"][source_id])
+                        snapshot = source_snapshot(chunk)
+                        snapshot["youtube_roll_pending"] = True
+                        snapshot["merge_pending"] = True
+                        snapshot["delete_pending"] = False
+                        snapshot["youtube_source_cleanup_identity"] = dict(
+                            cleanup_identity)
+                        if not self._write_command_monitor_metadata(snapshot):
+                            raise OSError(
+                                "Commands録画の復旧情報を保存できませんでした。")
+                    # Only retire the legacy per-clip job after the rolling
+                    # recovery intent is durable for every source.  The alias
+                    # already protects the immutable AVI during this handoff.
+                    for chunk in targets:
+                        source_id = str(chunk.get("id", "") or "")
+                        session_dir = os.path.abspath(str(
+                            chunk.get("session_dir", "") or ""))
+                        try:
+                            retire_finalize_manifest_for_segment_merge(
+                                os.path.join(
+                                    session_dir, "mp4_finalize_job.json"),
+                                os.path.join(session_dir, "recording.avi"))
+                        except FinalizeJobAlreadyRunning:
+                            outcome["phase"] = "manifest_owner"
+                            raise
+                        except ValueError as manifest_error:
+                            raise CommandRecordingSourceValidationError(
+                                str(manifest_error),
+                                code="finalize_manifest_mismatch",
+                                source_chunk_id=source_id)
+                else:
+                    # PC-retained monitor chunks still create their own MP4s.
+                    deadline = time.monotonic() + 600.0
+                    while (self.recorder.is_finalizing
+                           and time.monotonic() < deadline):
+                        time.sleep(0.2)
+                    if self.recorder.is_finalizing:
+                        raise TimeoutError(
+                            "分割録画の保存完了を10分以内に確認できませんでした。")
                 self._command_trace_queue.join()
                 self._command_step_frame_queue.join()
+                outcome["phase"] = "merge"
                 merged = merge_command_recording_chunks(
-                    targets, output_root, session_id)
-            except Exception as caught:
-                error = caught
+                    targets, output_root, session_id,
+                    allow_low_presentations=allow_low_presentations,
+                    prevalidated_source_media=prevalidated_source_media)
+                outcome["merged"] = merged
+                if youtube_rolling:
+                    merged["pinned"] = True
+                    merged["youtube_roll_pending"] = False
+                    merged["youtube_rolling_committed"] = False
+                    merged["youtube_segment_final"] = bool(final_segment)
+                    archive = dict(merged.get("youtube_archive", {}) or {})
+                    duration = max(
+                        0.0, float(merged.get("duration_saved", 0.0) or 0.0))
+                    try:
+                        configured = int(
+                            archive.get("segment_seconds", 7200) or 7200)
+                    except (TypeError, ValueError):
+                        configured = 7200
+                    archive["segment_seconds"] = min(
+                        11 * 3600, max(configured, int(duration + 1.999)))
+                    merged["youtube_archive"] = archive
+                    queue_upload = getattr(
+                        self, "_queue_command_monitor_youtube_upload", None)
+                    job_path = queue_upload(
+                        merged, background=False, launch_worker=False,
+                        hold_for_local_commit=True,
+                        persist_metadata=False) \
+                        if callable(queue_upload) else ""
+                    outcome["job_path"] = job_path
+                    if not job_path:
+                        outcome["queue_failed"] = True
+                        merged["pinned"] = True
+                        merged["youtube_roll_pending"] = True
+                        merged["youtube_rolling_committed"] = False
+                        upload = dict(merged.get("youtube_upload", {}) or {})
+                        upload["status"] = "queue_retry"
+                        merged["youtube_upload"] = upload
+                        self._write_command_monitor_metadata(merged)
+                        persist_retry_state(
+                            outcome.get("source_cleanup_identities", {}))
+                    else:
+                        # The staging job is invisible to both new and already
+                        # running legacy upload workers.  First persist the
+                        # merged/source relationship with deletion disabled.
+                        held_job = str(job_path).lower().endswith(
+                            ".json.local-commit")
+                        final_job_path = (
+                            str(job_path)[:-len(".local-commit")]
+                            if held_job else str(job_path))
+                        final_job_path = os.path.abspath(final_job_path)
+                        merged_session_dir = os.path.abspath(str(
+                            merged.get("session_dir", "") or ""))
+                        merged_media_path = os.path.join(
+                            merged_session_dir, "recording.mp4")
+                        cleanup_job = {
+                            "id": os.path.basename(
+                                final_job_path)[:-len(".json")],
+                            "job_path": final_job_path,
+                            "media_path": merged_media_path,
+                            "session_dir": merged_session_dir,
+                        }
+                        outcome["source_cleanup_job"] = dict(cleanup_job)
+                        outcome["job_path"] = final_job_path
+                        merged_upload = dict(
+                            merged.get("youtube_upload", {}) or {})
+                        merged_upload["status"] = (
+                            "local_commit_pending" if held_job else "queued")
+                        merged_upload["job_path"] = final_job_path
+                        merged["youtube_upload"] = merged_upload
+                        relationship_committed = (
+                            bool(self._write_command_monitor_metadata(merged))
+                            if held_job else True)
+                        outcome["merged_metadata_committed"] = (
+                            relationship_committed)
+                        relationship_snapshots = []
+                        for chunk in targets:
+                            snapshot = source_snapshot(chunk)
+                            source_id = str(snapshot.get("id", "") or "")
+                            snapshot["merge_pending"] = False
+                            snapshot["youtube_roll_pending"] = False
+                            snapshot["youtube_rolling_committed"] = True
+                            snapshot["youtube_source_cleanup_pending"] = True
+                            snapshot["youtube_source_cleanup_identity"] = dict(
+                                outcome["source_cleanup_identities"][source_id])
+                            snapshot["youtube_source_cleanup_job"] = dict(
+                                cleanup_job)
+                            snapshot["delete_pending"] = False
+                            snapshot["pinned"] = False
+                            upload = dict(
+                                snapshot.get("youtube_upload", {}) or {})
+                            upload["status"] = (
+                                "local_commit_pending" if held_job else "queued")
+                            upload["job_path"] = final_job_path
+                            snapshot["youtube_upload"] = upload
+                            saved = bool(
+                                self._write_command_monitor_metadata(snapshot)) \
+                                and relationship_committed
+                            relationship_committed = (
+                                saved and relationship_committed)
+                            relationship_snapshots.append(snapshot)
+                        if relationship_committed:
+                            released_path = (
+                                release_upload_job_local_commit(job_path)
+                                if held_job else final_job_path)
+                            if released_path:
+                                outcome["job_path"] = released_path
+                                outcome["queue_released"] = True
+                                merged["youtube_rolling_committed"] = True
+                                merged_upload["status"] = "queued"
+                                merged_upload["job_path"] = released_path
+                                # Atomic promotion can wake an older detached
+                                # worker immediately; at this point every source
+                                # relationship is already durable and safe.
+                                launch = getattr(
+                                    self, "_launch_youtube_upload_worker", None)
+                                if callable(launch):
+                                    launch(archive, job_path=released_path)
 
-            def apply_result(result=merged, failure=error):
+                                cleanup_committed = True
+                                for snapshot in relationship_snapshots:
+                                    snapshot["delete_pending"] = True
+                                    upload = dict(
+                                        snapshot.get("youtube_upload", {}) or {})
+                                    upload["status"] = "queued"
+                                    upload["job_path"] = released_path
+                                    snapshot["youtube_upload"] = upload
+                                    cleanup_committed = bool(
+                                        self._write_command_monitor_metadata(
+                                            snapshot)) and cleanup_committed
+                                outcome["source_metadata_committed"] = (
+                                    cleanup_committed)
+            except Exception as caught:
+                validation_error = isinstance(
+                    caught, CommandRecordingSourceValidationError)
+                source_id = str(getattr(
+                    caught, "source_chunk_id", "") or "")
+                if (not source_id and validation_error
+                        and getattr(caught, "source_index", None)):
+                    try:
+                        source_id = str(targets[
+                            int(caught.source_index) - 1].get("id", "") or "")
+                    except (IndexError, TypeError, ValueError):
+                        source_id = ""
+                retryable_unreadable = bool(
+                    youtube_rolling and validation_error
+                    and outcome.get("phase") == "source_validation"
+                    and getattr(caught, "retryable", False)
+                    and str(getattr(caught, "code", "") or "")
+                    == "video_unreadable" and source_id)
+                if retryable_unreadable:
+                    identity = dict(outcome.get(
+                        "source_validation_identities", {}).get(
+                            source_id, {}) or {})
+                    fingerprint_keys = (
+                        "video_device", "video_inode", "video_size",
+                        "video_mtime_ns")
+                    protected_video = str(
+                        identity.get("video_path", "") or "")
+                    try:
+                        current_video = os.stat(protected_video)
+                        current_fingerprint = {
+                            "video_device": int(getattr(
+                                current_video, "st_dev", 0) or 0),
+                            "video_inode": int(getattr(
+                                current_video, "st_ino", 0) or 0),
+                            "video_size": int(getattr(
+                                current_video, "st_size", 0) or 0),
+                            "video_mtime_ns": int(getattr(
+                                current_video, "st_mtime_ns", 0) or 0),
+                        }
+                    except (OSError, TypeError, ValueError):
+                        current_fingerprint = {}
+                    if any(identity.get(key) != current_fingerprint.get(key)
+                           for key in fingerprint_keys):
+                        for key in fingerprint_keys:
+                            identity.pop(key, None)
+                    source = next((
+                        chunk for chunk in targets
+                        if str(chunk.get("id", "") or "") == source_id),
+                        None)
+                    raw_previous = source.get(
+                        "youtube_merge_retry_probe", {}) \
+                        if isinstance(source, dict) else {}
+                    previous = dict(raw_previous) \
+                        if isinstance(raw_previous, dict) else {}
+                    outcome["retry_probe_chunk_id"] = source_id
+                    if all(key in identity for key in fingerprint_keys):
+                        fingerprint = {
+                            "device": int(identity["video_device"]),
+                            "inode": int(identity["video_inode"]),
+                            "size": int(identity["video_size"]),
+                            "mtime_ns": int(identity["video_mtime_ns"]),
+                        }
+                        now_epoch = time.time()
+                        now_at = datetime.datetime.now().isoformat(
+                            timespec="seconds")
+                        try:
+                            previous_version = int(
+                                previous.get("version", 0) or 0)
+                            previous_attempts = max(0, int(
+                                previous.get("attempts", 0) or 0))
+                            previous_first_epoch = float(
+                                previous.get("first_epoch", now_epoch)
+                                or now_epoch)
+                        except (TypeError, ValueError):
+                            previous_version = 0
+                            previous_attempts = 0
+                            previous_first_epoch = now_epoch
+                        same_source = bool(
+                            previous_version == 1
+                            and previous.get("code") == "video_unreadable"
+                            and previous.get("source_fingerprint")
+                            == fingerprint)
+                        attempts = previous_attempts + 1 \
+                            if same_source else 1
+                        first_epoch = previous_first_epoch \
+                            if same_source else now_epoch
+                        first_at = str(previous.get("first_at", "") or "") \
+                            if same_source else now_at
+                        probe_state = {
+                            "version": 1,
+                            "code": "video_unreadable",
+                            "source_fingerprint": fingerprint,
+                            "attempts": attempts,
+                            "first_at": first_at,
+                            "first_epoch": first_epoch,
+                            "last_at": now_at,
+                            "last_epoch": now_epoch,
+                        }
+                        elapsed = max(0.0, now_epoch - first_epoch)
+                        if (attempts >= int(
+                                COMMAND_YOUTUBE_UNREADABLE_ATTENTION_ATTEMPTS)
+                                and elapsed >= float(
+                                    COMMAND_YOUTUBE_UNREADABLE_ATTENTION_SECONDS)):
+                            caught = CommandRecordingSourceValidationError(
+                                "同一の分割録画を{}回、5分以上連続で"
+                                "読み取れませんでした。破損または恒久的な"
+                                "読み取り異常の可能性があるため、この区間だけ"
+                                "確認待ちにします。".format(attempts),
+                                code="video_unreadable_persistent",
+                                source_index=getattr(
+                                    caught, "source_index", None),
+                                source_chunk_id=source_id)
+                        else:
+                            outcome["retry_probe_state"] = probe_state
+                            outcome["retry_probe_state_committed"] = (
+                                persist_retry_probe_state(
+                                    source_id, probe_state))
+                    elif previous:
+                        # Without a stable AVI identity an old count cannot
+                        # safely contribute to terminal quarantine.
+                        outcome["retry_probe_state"] = None
+                        outcome["retry_probe_state_committed"] = (
+                            persist_retry_probe_state(source_id, None))
+                source_validation_error = bool(
+                    youtube_rolling and validation_error
+                    and not getattr(caught, "retryable", False))
+                outcome["source_validation_error"] = source_validation_error
+                if source_validation_error:
+                    outcome["attention_chunk_ids"] = (
+                        [source_id] if source_id else [
+                            str(chunk.get("id", "") or "")
+                            for chunk in targets])
+                    outcome["attention_at"] = (
+                        datetime.datetime.now().isoformat(timespec="seconds"))
+                if youtube_rolling and outcome.get("merged") is not None:
+                    # Encoding already succeeded. Keep that MP4 visible to the
+                    # recovery path instead of classifying a later queue/fsync
+                    # failure as a merge failure and encoding two hours again.
+                    outcome["post_merge_error"] = caught
+                    if not outcome.get("job_path"):
+                        outcome["queue_failed"] = True
+                    self._logger.warning(
+                        "Commands rolling YouTube post-merge commit failed: %s",
+                        caught)
+                else:
+                    outcome["error"] = caught
+                if youtube_rolling and outcome.get("merged") is None:
+                    if source_validation_error:
+                        outcome["attention_state_committed"] = (
+                            persist_attention_state(
+                                caught, outcome["attention_chunk_ids"],
+                                outcome["attention_at"]))
+                    elif (validation_error
+                          and outcome.get("phase") == "source_validation"):
+                        # The durable source state already says roll-pending;
+                        # an OpenCV sharing/read failure needs no 240-file fsync
+                        # rewrite before its bounded retry.
+                        pass
+                    else:
+                        persist_retry_state(
+                            outcome.get("source_cleanup_identities", {}))
+
+            def apply_result(result=outcome):
                 try:
-                    finish_merge(result, failure)
+                    finish_merge(result)
                 finally:
                     with self._command_monitor_merge_lock:
                         self._command_monitor_merge_active = max(
                             0, self._command_monitor_merge_active - 1)
+                        merge_idle = self._command_monitor_merge_active == 0
+                    completed = bool(
+                        result.get("error") is None
+                        and not result.get("queue_failed")
+                        and (not youtube_rolling
+                             or (result.get("queue_released")
+                                 and result.get("merged_metadata_committed")
+                                 and result.get("source_metadata_committed"))))
+                    if merge_idle and completed and youtube_rolling:
+                        if not final_segment:
+                            queue_next = getattr(
+                                self,
+                                "_queue_ready_command_monitor_youtube_segment",
+                                None)
+                            if callable(queue_next):
+                                queue_next(session_id, force=False)
+                    if merge_idle and completed and youtube_rolling:
+                        reconcile = getattr(
+                            self,
+                            "_reconcile_command_monitor_youtube_recordings",
+                            None)
+                        if hasattr(self, "root") and callable(reconcile):
+                            self.root.after(500, reconcile)
 
             self._gui_action_queue.put(apply_result)
 
@@ -19443,6 +25413,8 @@ class PokeControllerApp:
         self._refresh_command_monitor_tree()
 
     def _command_monitor_failure_active(self):
+        if self._command_monitor_keep_all_enabled():
+            return False
         return bool(
             self._command_monitor_timeline.active_loop
             or getattr(self._command_monitor_visual_detector, "active", None)
@@ -19452,14 +25424,38 @@ class PokeControllerApp:
         if PokeControllerApp._camera_feature_limited_active(self):
             self._command_monitor_visual_detector.reset()
             return
+        command = getattr(self, "cur_command", None)
+        start_lock = getattr(self, "_command_monitor_lock", None)
+        if start_lock is None:
+            start_request = getattr(
+                self, "_command_monitor_start_request", None)
+        else:
+            with start_lock:
+                start_request = getattr(
+                    self, "_command_monitor_start_request", None)
+        if start_request is not None:
+            if (getattr(
+                    self, "_command_monitor_adjustment_protect_request", None)
+                    is not None
+                    or not self.record_armed
+                    or command is not start_request.get("command")
+                    or not getattr(command, "alive", False)
+                    or str(getattr(
+                        self, "_command_monitor_session_id", "") or "")
+                    != str(start_request.get("command_session_id", "") or "")):
+                self._cancel_command_monitor_chunk_start()
+            # The presented-frame callback updates a single bounded latest
+            # frame while VideoWriter/manifest creation is in progress.
+            return
         if not self.record_armed:
             return
+        adjustment_protect_pending = bool(getattr(
+            self, "_command_monitor_adjustment_protect_request", None))
         # Chunk rotation drains its ordered AVI queue on a worker. Preview and
         # Commands safety checks continue, but a second recorder must not be
         # started until that drain has completed.
         if self._command_monitor_stop_in_progress:
             return
-        command = getattr(self, "cur_command", None)
         if command is None or not getattr(command, "alive", False):
             if self._command_monitor_current_chunk is not None:
                 PokeControllerApp._drain_command_focus_trace(
@@ -19479,35 +25475,35 @@ class PokeControllerApp:
                 return
             self._command_monitor_begin_session(command)
         now = time.monotonic()
-        if not self.recorder.active and not self._command_monitor_failure_active():
-            if not self._recording_disk_space_ok(show_popup=True, force=True):
-                self._interrupt_recording_for_disk_space()
+        if (not self.recorder.active
+                and not self._command_monitor_failure_active()):
+            if adjustment_protect_pending:
+                # Do not publish a chunk that was not part of the protection
+                # journal snapshot. Normal start processing resumes on failure;
+                # a successful journal immediately requests Commands Stop.
                 return
-            chunk = self._start_command_monitor_chunk(frame, command, now)
-            if chunk is None:
+            disk_ready = self._recording_disk_space_ok(
+                show_popup=True)
+            if disk_ready is not True:
                 return
-            now = time.monotonic()
-            snapshot = runtime_state_snapshot(command)
-            self._command_monitor_last_snapshot = dict(snapshot)
-            self._command_monitor_timeline.add(snapshot, now)
-            location = runtime_execution_location(
-                command, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            self._command_monitor_last_location_key = execution_location_key(location)
-            step_frame = self._queue_command_monitor_step_frame(
-                self._command_monitor_current_chunk, frame)
-            self._write_command_monitor_event(
-                self._command_monitor_current_chunk, snapshot, "recording_started",
-                location=location, now=now, extra={
-                    "step_frame": step_frame,
-                    "clean_frame": bool(step_frame),
-                    "step_frame_dropped": not bool(step_frame),
-                })
+            self._request_command_monitor_chunk_restart(
+                frame, command, event_name="recording_started")
+            return
         PokeControllerApp._ensure_command_focus_trace(self, command)
         PokeControllerApp._drain_command_focus_trace(
             self, command, chunk=self._command_monitor_current_chunk)
         state_result = self._update_command_monitor_state(command, now, frame=frame)
-        visual_result = self._update_command_monitor_visual_state(frame, now)
-        input_result = self._update_command_monitor_input_state(now)
+        keep_all = self._command_monitor_keep_all_enabled()
+        if keep_all:
+            # Full-retention recording is continuous. Commands safety has its
+            # own detector; these detectors only bound recording evidence.
+            visual_result = {
+                "stall_started": False, "recovered": False, "active": None}
+            input_result = {
+                "stall_started": False, "recovered": False, "active": None}
+        else:
+            visual_result = self._update_command_monitor_visual_state(frame, now)
+            input_result = self._update_command_monitor_input_state(now)
         evidence_started = bool(
             state_result.get("loop_started") or visual_result.get("stall_started")
             or input_result.get("stall_started"))
@@ -19515,9 +25511,11 @@ class PokeControllerApp:
         if evidence_started and self._command_monitor_current_chunk is not None:
             if state_result.get("loop_started"):
                 reason = "loop_evidence_bounded"
-                self._mark_command_monitor_prune_candidates(now)
-                if not getattr(
-                        self.recorder, "audio_start_in_progress", False):
+                self._mark_command_monitor_prune_candidates(
+                    now, persist_metadata=False)
+                if (not adjustment_protect_pending
+                        and not getattr(
+                            self.recorder, "audio_start_in_progress", False)):
                     self._finish_command_monitor_chunk(
                         reason, frame=frame, restart=True, background=True)
                     bounded_for_evidence = True
@@ -19539,13 +25537,15 @@ class PokeControllerApp:
         if (failure_until is not None
                 and self._command_monitor_current_chunk is not None
                 and now >= float(failure_until)
+                and not adjustment_protect_pending
                 and not getattr(
                     self.recorder, "audio_start_in_progress", False)):
             reason = "{}_evidence_60s_bounded".format(
                 self._command_monitor_failure_capture_mode or "failure")
             self._finish_command_monitor_chunk(
                 reason, background=True)
-            self._mark_command_monitor_prune_candidates(now)
+            self._mark_command_monitor_prune_candidates(
+                now, persist_metadata=False)
             self.record_monitor_status.set(
                 "停止開始から約{}秒の原因確認映像を保持しました。復帰するまで後続の無変化映像は破棄します。".format(
                     int(self._command_monitor_failure_tail_seconds())))
@@ -19558,30 +25558,20 @@ class PokeControllerApp:
         if recovered:
             self._command_monitor_failure_capture_until = None
             self._command_monitor_failure_capture_mode = ""
-            self._mark_command_monitor_prune_candidates(now)
+            self._mark_command_monitor_prune_candidates(
+                now, persist_metadata=False)
             if (not self._command_monitor_failure_active()
-                    and not self.recorder.active):
-                chunk = self._start_command_monitor_chunk(
-                    frame, command, now)
-                if chunk is None:
-                    return
-                now = time.monotonic()
-                snapshot = runtime_state_snapshot(command)
-                self._command_monitor_last_snapshot = dict(snapshot)
-                step_frame = self._queue_command_monitor_step_frame(
-                    self._command_monitor_current_chunk, frame)
-                self._write_command_monitor_event(
-                    self._command_monitor_current_chunk, snapshot,
-                    "recording_resumed", now=now, extra={
-                        "step_frame": step_frame,
-                        "clean_frame": bool(step_frame),
-                        "step_frame_dropped": not bool(step_frame),
-                    })
+                    and not self.recorder.active
+                    and not adjustment_protect_pending):
+                self._request_command_monitor_chunk_restart(
+                    frame, command, event_name="recording_resumed")
+                return
         try:
             chunk_seconds = max(10.0, float(self.record_monitor_chunk_seconds.get()))
         except (tk.TclError, TypeError, ValueError):
             chunk_seconds = 30.0
         if (not bounded_for_evidence
+                and not adjustment_protect_pending
                 and self._command_monitor_current_chunk is not None
                 and not getattr(
                     self.recorder, "audio_start_in_progress", False)
@@ -19596,11 +25586,69 @@ class PokeControllerApp:
         """Apply the destination to the next recording without moving active files."""
         self.recorder.output_dir = self._effective_record_output_dir()
 
+    def _command_monitor_output_reload_busy(self):
+        merge_lock = getattr(self, "_command_monitor_merge_lock", None)
+        if merge_lock is None:
+            merge_active = False
+        else:
+            with merge_lock:
+                merge_active = bool(getattr(
+                    self, "_command_monitor_merge_active", 0))
+        journal_lock = getattr(
+            self, "_command_monitor_metadata_journal_lock", None)
+        if journal_lock is None:
+            journal_active = False
+        else:
+            with journal_lock:
+                journal_active = any(
+                    thread.is_alive() for thread in getattr(
+                        self, "_command_monitor_metadata_journal_threads", ()))
+        return bool(
+            getattr(self, "_command_monitor_current_chunk", None) is not None
+            or getattr(self, "_command_monitor_stop_in_progress", False)
+            or getattr(self, "_command_monitor_start_request", None) is not None
+            or journal_active
+            or merge_active)
+
+    def _schedule_command_monitor_output_reload(self):
+        self._record_output_reload_pending = True
+        if getattr(self, "_record_output_reload_after_id", None) is not None:
+            return
+
+        def retry():
+            self._record_output_reload_after_id = None
+            if not getattr(self, "_record_output_reload_pending", False):
+                return
+            if PokeControllerApp._command_monitor_output_reload_busy(self):
+                try:
+                    self._record_output_reload_after_id = self.root.after(
+                        250, retry)
+                except (AttributeError, tk.TclError):
+                    pass
+                return
+            self._record_output_reload_pending = False
+            if (hasattr(self, "_command_monitor_chunks")
+                    and not self.record_armed
+                    and not self.recorder.active):
+                self._load_command_monitor_chunks()
+
+        try:
+            self._record_output_reload_after_id = self.root.after(250, retry)
+        except (AttributeError, tk.TclError):
+            self._record_output_reload_after_id = None
+
     def _record_output_dir_changed(self, *_):
+        self._recording_disk_config_generation = int(getattr(
+            self, "_recording_disk_config_generation", 0) or 0) + 1
         self._apply_record_output_dir()
+        if bool(getattr(self, "_record_output_reload_suspended", False)):
+            return
         if (hasattr(self, "_command_monitor_chunks")
                 and not self.record_armed and not self.recorder.active):
-            self._load_command_monitor_chunks()
+            if PokeControllerApp._command_monitor_output_reload_busy(self):
+                PokeControllerApp._schedule_command_monitor_output_reload(self)
+            else:
+                self._load_command_monitor_chunks()
 
     def choose_record_output_dir(self):
         from tkinter import filedialog
@@ -19688,6 +25736,7 @@ class PokeControllerApp:
             "monitor_loop_cycles": self.record_monitor_loop_cycles.get(),
             "monitor_long_seconds": self.record_monitor_long_seconds.get(),
             "monitor_failure_tail_seconds": self.record_monitor_failure_tail_seconds.get(),
+            "monitor_retention_mode": self._command_monitor_retention_mode_key(),
             "monitor_auto_arm": self.record_monitor_auto_arm.get(),
             "monitor_confirm_delete_on_stop": self.record_monitor_confirm_delete_on_stop.get(),
             "focus_repair_enabled": self.record_focus_repair_enabled.get(),
@@ -19701,6 +25750,8 @@ class PokeControllerApp:
             "youtube_segment_minutes": self.record_youtube_segment_minutes.get(),
             "youtube_commands_video_mode": normalize_commands_video_mode(
                 self.record_youtube_commands_video_mode.get()),
+            "youtube_commands_allow_low_presentations": bool(
+                self.record_youtube_commands_allow_low_presentations.get()),
         }
 
     def save_recording_preset(self):
@@ -19725,8 +25776,44 @@ class PokeControllerApp:
     def _apply_recording_preset_data(
             self, data, show_limited_warning=False):
         """Apply recording data from a preset or an all-tab InputSet snapshot."""
+        # Close the old runtime before replacing its mode/rules. In particular,
+        # an active Commands chunk must go through its metadata/rolling-upload
+        # finish path even when the new InputSet changes mode to Manual.
+        active_chunk = getattr(self, "_command_monitor_current_chunk", None)
+        pending_chunk_start = getattr(
+            self, "_command_monitor_start_request", None) is not None
+        monitor_stop_in_progress = bool(getattr(
+            self, "_command_monitor_stop_in_progress", False))
+        if monitor_stop_in_progress:
+            # A background chunk rotation has already detached the recorder,
+            # so the branches below may see neither an active recorder nor a
+            # stoppable chunk.  Disarm now to prevent its old completion
+            # callback from restarting with the newly applied InputSet.
+            self.record_armed = False
+        if pending_chunk_start:
+            self.record_armed = False
+            self._cancel_command_monitor_chunk_start()
+        elif (active_chunk is not None
+                and not monitor_stop_in_progress):
+            self.record_armed = False
+            self._finish_command_monitor_chunk(
+                "input_set_changed", background=True)
+        elif (getattr(self.recorder, "active", False)
+              or getattr(self, "_youtube_recording_rotation_in_progress", False)):
+            self.record_armed = False
+            self._youtube_recording_rotation_continue = False
+            request_stop = getattr(
+                self, "_request_template_recording_stop", None)
+            if callable(request_stop):
+                request_stop(launch_after=True)
         self.record_mode.set(data.get("mode", "Manual"))
-        self.record_output_dir.set(data.get("output_dir", ""))
+        reload_was_suspended = bool(getattr(
+            self, "_record_output_reload_suspended", False))
+        self._record_output_reload_suspended = True
+        try:
+            self.record_output_dir.set(data.get("output_dir", ""))
+        finally:
+            self._record_output_reload_suspended = reload_was_suspended
         self._apply_record_output_dir()
         self.record_template_path.set(data.get("template_path", ""))
         self.record_threshold.set(data.get("threshold", 0.9))
@@ -19755,6 +25842,14 @@ class PokeControllerApp:
         self.record_monitor_long_seconds.set(data.get("monitor_long_seconds", 180.0))
         self.record_monitor_failure_tail_seconds.set(
             data.get("monitor_failure_tail_seconds", 60.0))
+        self.record_monitor_retention_mode.set(
+            normalize_command_monitor_retention_mode(
+                data.get("monitor_retention_mode", "")))
+        if not reload_was_suspended:
+            # The output-dir trace must not scan/prune historical recordings
+            # with the previous InputSet's retention values. Reload exactly
+            # once after the complete retention policy is in place.
+            self._record_output_dir_changed()
         self.record_monitor_auto_arm.set(data.get("monitor_auto_arm", True))
         self.record_focus_repair_enabled.set(
             data.get("focus_repair_enabled", False))
@@ -19775,6 +25870,8 @@ class PokeControllerApp:
         self.record_youtube_commands_video_mode.set(commands_video_mode_label(
             data.get("youtube_commands_video_mode",
                      COMMANDS_VIDEO_MODE_COMPOSITE)))
+        self.record_youtube_commands_allow_low_presentations.set(bool(
+            data.get("youtube_commands_allow_low_presentations", True)))
         self._set_record_storage_destination(
             storage_destination, open_tab=False)
         # 手動Stop時の保存確認は必須。旧InputSetのOFF値も引き継がない。
@@ -19917,6 +26014,11 @@ class PokeControllerApp:
     def _poll_recording_ui_state(self):
         """Keep the Recording tab and quick button explicit about live state."""
         try:
+            now = time.monotonic()
+            if now - float(getattr(
+                    self, "_youtube_status_last_poll", 0.0) or 0.0) >= 5.0:
+                self._youtube_status_last_poll = now
+                self._update_youtube_recording_status()
             if (hasattr(self, "_command_monitor_chunks")
                     and self._flush_command_monitor_deletes()):
                 self._refresh_command_monitor_tree()
@@ -19935,11 +26037,22 @@ class PokeControllerApp:
                                if self.record_mode.get() == "CommandMonitor" else
                                "● 録画条件を監視中：条件成立で録画を開始します")
                 color = "#b26a00"
+            elif getattr(
+                    self, "_youtube_recording_rotation_in_progress", False):
+                state = "youtube_rotating"
+                button_text = "■ 分割停止"
+                status_text = "◐ YouTube用の区間を確定中です"
+                color = "#1565c0"
             elif self.recorder.is_finalizing:
                 state = "finalizing"
                 button_text = "○ 録画開始"
                 status_text = "◐ 録画停止中：MP4を保存処理中です"
                 color = "#1565c0"
+            elif self._record_storage_destination_key() == "none":
+                state = "recording_disabled"
+                button_text = "○ 録画なし"
+                status_text = "○ このInputSetでは録画しません"
+                color = "#555555"
             else:
                 state = "idle"
                 button_text = ("○ Step自動録画を監視開始"
@@ -19975,6 +26088,26 @@ class PokeControllerApp:
                 "操作セッションを完了してから通常録画を開始してください。",
                 parent=self.root)
             return
+        if getattr(self, "_youtube_recording_rotation_in_progress", False):
+            self._youtube_recording_rotation_continue = False
+            if self.record_mode.get() in ("Template", "Variable"):
+                self.record_armed = False
+            self.recording_state_text.set(
+                "YouTube用区間を確定後、次の録画を開始せず停止します")
+            return
+        if getattr(self, "_template_recording_stop_in_progress", False):
+            self.recording_state_text.set(
+                "録画映像を安全に閉じています。完了後に次の操作ができます。")
+            return
+        if (self._record_storage_destination_key() == "none"
+                and not getattr(self.recorder, "active", False)
+                and not self.record_armed):
+            tkmsg.showinfo(
+                "Recording",
+                "このInputSetは［録画なし］に設定されています。\n"
+                "録画する場合はRecordingタブ上部でPCまたはYouTubeを選択してください。",
+                parent=self.root)
+            return
         if (not getattr(self.recorder, "active", False)
                 and not self.record_armed and self.record_debug.get()
                 and not self._require_tk_video_overlay(
@@ -19986,11 +26119,32 @@ class PokeControllerApp:
         if self.record_mode.get() == "CommandMonitor":
             if self.record_armed:
                 self.record_armed = False
-                if self._command_monitor_current_chunk is not None:
-                    self._finish_command_monitor_chunk("monitoring_stopped")
+
+                def finish_monitoring_stop(error):
+                    if error is not None:
+                        return
+                    self.record_monitor_status.set(
+                        "監視を停止しました。一時録画は確認または次回整理まで保持します。")
+                    self._refresh_command_monitor_tree()
+
+                finish_requested = False
+                if getattr(
+                        self, "_command_monitor_start_request", None) is not None:
+                    finish_requested = self._cancel_command_monitor_chunk_start(
+                        after_finish=finish_monitoring_stop)
+                elif (self._command_monitor_current_chunk is not None
+                        or getattr(
+                            self, "_command_monitor_stop_in_progress", False)):
+                    finish_requested = self._finish_command_monitor_chunk(
+                        "monitoring_stopped", background=True,
+                        after_finish=finish_monitoring_stop)
                 self._stop_command_record_window_capture()
-                self.record_monitor_status.set(
-                    "監視を停止しました。一時録画は確認または次回整理まで保持します。")
+                if finish_requested:
+                    self.record_monitor_status.set(
+                        "監視を停止し、録画を確定しています。")
+                else:
+                    self.record_monitor_status.set(
+                        "監視を停止しました。一時録画は確認または次回整理まで保持します。")
                 self._refresh_command_monitor_tree()
                 return
             self._arm_command_monitor_recording(show_popup=True)
@@ -19999,9 +26153,24 @@ class PokeControllerApp:
             if self.record_armed:
                 self.record_armed = False
                 if self.recorder.active:
-                    self._stop_capture_recorder()
-                self.record_button.configure(text="Start recording")
-                self.record_variable_status.set("Variable segments: stopped")
+                    def finish_variable_monitor_stop(error):
+                        if error is not None:
+                            return
+                        self.record_button.configure(text="Start recording")
+                        self.record_variable_status.set(
+                            "Variable segments: stopped")
+
+                    self.record_button.configure(text="Stopping recording...")
+                    self.record_variable_status.set(
+                        "Variable segmentを確定しています。")
+                    self._request_template_recording_stop(
+                        defer_finalization=bool(
+                            self.recorder.defer_finalization),
+                        after_stop=finish_variable_monitor_stop)
+                else:
+                    self.record_button.configure(text="Start recording")
+                    self.record_variable_status.set(
+                        "Variable segments: stopped")
                 return
             legacy_complete = (self.record_variable_command.get() and self.record_variable_name.get().strip()
                                and self.record_variable_start.get().strip() and self.record_variable_stop.get().strip())
@@ -20015,7 +26184,15 @@ class PokeControllerApp:
                     "start_value": self.record_variable_start.get(), "start_seconds": 0.0,
                     "stop_value": self.record_variable_stop.get(), "stop_seconds": 0.0,
                 }]
-            if not self._recording_disk_space_ok(show_popup=True, force=True):
+            disk_ready = self._recording_disk_space_ok(
+                show_popup=True, force=True,
+                continuation_key="record-variable-arm",
+                on_ready=self.toggle_recording)
+            if disk_ready is None:
+                self.record_variable_status.set(
+                    "録画保存先の容量を確認しています。完了後に監視を開始します。")
+                return
+            if not disk_ready:
                 return
             if not self._confirm_selected_audio_for_use():
                 return
@@ -20046,7 +26223,15 @@ class PokeControllerApp:
             if configured_rules != expected_rules:
                 tkmsg.showwarning("Recording", "The template image could not be read.")
                 return
-            if not self._recording_disk_space_ok(show_popup=True, force=True):
+            disk_ready = self._recording_disk_space_ok(
+                show_popup=True, force=True,
+                continuation_key="record-template-arm",
+                on_ready=self.toggle_recording)
+            if disk_ready is None:
+                self.recording_state_text.set(
+                    "録画保存先の容量を確認しています。完了後に監視を開始します。")
+                return
+            if not disk_ready:
                 return
             if not self._confirm_selected_audio_for_use():
                 return
@@ -20057,16 +26242,33 @@ class PokeControllerApp:
             self.show_output("Analysis", text="Template recording armed: waiting for score >= threshold.")
             return
         if self.recorder.active:
-            self._stop_capture_recorder()
-            self._sync_audio_device_usage()
-            self.record_button.configure(text="Start recording")
-            self.show_output("Analysis", text="録画を停止しました。MP4はバックグラウンドで結合中です。")
+            def finish_manual_recording_stop(error):
+                if error is not None:
+                    return
+                self._sync_audio_device_usage()
+                self.record_button.configure(text="Start recording")
+                self.show_output(
+                    "Analysis",
+                    text="録画を停止しました。MP4はバックグラウンドで結合中です。")
+
+            self.record_button.configure(text="Stopping recording...")
+            self._request_template_recording_stop(
+                defer_finalization=bool(self.recorder.defer_finalization),
+                after_stop=finish_manual_recording_stop)
             return
         frame = getattr(self.camera, "image_bgr", None)
         if frame is None:
             tkmsg.showwarning("Recording", "カメラ映像を開始してから録画してください。")
             return
-        if not self._recording_disk_space_ok(show_popup=True, force=True):
+        disk_ready = self._recording_disk_space_ok(
+            show_popup=True, force=True,
+            continuation_key="record-manual-start",
+            on_ready=self.toggle_recording)
+        if disk_ready is None:
+            self.recording_state_text.set(
+                "録画保存先の容量を確認しています。完了後に録画を開始します。")
+            return
+        if not disk_ready:
             return
         if not self._confirm_selected_audio_for_use():
             return
@@ -20571,9 +26773,20 @@ class PokeControllerApp:
         """Synchronous compatibility helper; live recording uses the worker."""
         return self._compose_recording_frame(frame, self._recording_output_snapshot(frame.shape[0]))
 
+    def _recording_frame_recorders(self):
+        """Return active primary/handoff recorders for one presented frame."""
+        recorders = []
+        for recorder in (
+                getattr(self, "recorder", None),
+                getattr(self, "_youtube_handoff_recorder", None)):
+            if (recorder is not None and getattr(recorder, "active", False)
+                    and recorder not in recorders):
+                recorders.append(recorder)
+        return recorders
+
     def _queue_recording_frame(self, frame, presented_at=None,
                                presentation_mode=None):
-        if frame is None or not self.recorder.active:
+        if frame is None:
             return
         if presented_at is None:
             # Capture callbacks continue to drive triggers and cache the Tk
@@ -20594,38 +26807,66 @@ class PokeControllerApp:
                 snapshot = self._recording_latest_snapshot
             if snapshot is None:
                 snapshot = {"mode": "Video only"}
-        session = getattr(self.recorder, "session_dir", None)
         mode = str(snapshot.get("mode", "Video only"))
         if mode == "Video only":
             # The camera publishes immutable frame objects.  Video-only output
             # needs no compositor, so hand the displayed frame straight to the
             # recorder's ordered queue without blocking the 60-Hz draw thread.
             with self._record_compose_condition:
-                stopping = session in self._record_compose_closing_sessions
-            if not stopping:
-                self.recorder.add_frame(
-                    frame, presented_at=presented_at,
-                    presentation_mode=presentation_mode)
+                # Resolve primary/handoff and the closing filter atomically
+                # with segment promotion.  A boundary frame must not target a
+                # stale old recorder after the successor became primary.
+                allowed = [
+                    recorder for recorder in self._recording_frame_recorders()
+                    if getattr(recorder, "session_dir", None)
+                    not in self._record_compose_closing_sessions]
+                for recorder in allowed:
+                    recorder.add_frame(
+                        frame, presented_at=presented_at,
+                        presentation_mode=presentation_mode)
             return
         with self._record_compose_condition:
-            if session in self._record_compose_closing_sessions:
+            active_targets = tuple(
+                recorder for recorder in self._recording_frame_recorders()
+                if getattr(recorder, "session_dir", None)
+                not in self._record_compose_closing_sessions)
+            if not active_targets:
                 return
+            session = getattr(active_targets[0], "session_dir", None)
             self._record_compose_queue.append((
                 frame, snapshot, session, float(presented_at),
-                str(presentation_mode or "preview_presented")))
+                str(presentation_mode or "preview_presented"),
+                active_targets))
             self._record_compose_queue_max_depth = max(
                 self._record_compose_queue_max_depth,
                 len(self._record_compose_queue))
-            self.recorder.video_compositor_queue_max_depth = max(
-                getattr(self.recorder,
-                        "video_compositor_queue_max_depth", 0),
-                self._record_compose_queue_max_depth)
+            for recorder in active_targets:
+                recorder.video_compositor_queue_max_depth = max(
+                    getattr(recorder,
+                            "video_compositor_queue_max_depth", 0),
+                    self._record_compose_queue_max_depth)
             self._record_compose_condition.notify()
 
     def process_presented_recording_frame(
             self, frame, _frame_sequence, presented_at):
         """Feed recording from the image the user actually saw."""
-        if frame is None or not self.recorder.active:
+        if frame is None:
+            return
+        start_lock = getattr(self, "_command_monitor_lock", None)
+        if start_lock is None:
+            request = getattr(self, "_command_monitor_start_request", None)
+            if request is not None and not request.get("cancelled"):
+                request["latest_frame"] = frame
+                request["latest_presented_at"] = float(presented_at)
+        else:
+            with start_lock:
+                request = getattr(self, "_command_monitor_start_request", None)
+                if request is not None and not request.get("cancelled"):
+                    # Camera frames are published as immutable objects.
+                    # Retaining only this newest reference bounds memory.
+                    request["latest_frame"] = frame
+                    request["latest_presented_at"] = float(presented_at)
+        if not self._recording_frame_recorders():
             return
         self._recording_last_presentation_at = float(presented_at)
         self._queue_recording_frame(
@@ -20639,12 +26880,17 @@ class PokeControllerApp:
                     self._record_compose_condition.wait()
                 pending = self._record_compose_queue.popleft()
                 self._record_compose_active_session = pending[2]
-            frame, snapshot, session, presented_at, presentation_mode = pending
+                targets = pending[5] if len(pending) > 5 else (self.recorder,)
+                self._record_compose_active_sessions = {
+                    getattr(recorder, "session_dir", None)
+                    for recorder in targets}
+            frame, snapshot, session, presented_at, presentation_mode = pending[:5]
             try:
                 composed = self._compose_recording_frame(frame, snapshot)
-                if (self.recorder.active
-                        and getattr(self.recorder, "session_dir", None) == session):
-                    self.recorder.add_frame(
+                for recorder in targets:
+                    if not getattr(recorder, "active", False):
+                        continue
+                    recorder.add_frame(
                         composed, presented_at=presented_at,
                         presentation_mode=presentation_mode)
             except Exception as error:
@@ -20652,23 +26898,118 @@ class PokeControllerApp:
             finally:
                 with self._record_compose_condition:
                     self._record_compose_active_session = None
+                    self._record_compose_active_sessions = set()
                     self._record_compose_condition.notify_all()
 
     def _template_finalize_candidates(self):
-        candidates = self.recorder.deferred_finalize_manifests()
+        recorders = [self.recorder]
+        handoff = getattr(self, "_youtube_handoff_recorder", None)
+        if handoff is not None:
+            recorders.append(handoff)
+        recorders.extend(getattr(self, "_youtube_retiring_recorders", ()))
+        candidates = []
+        for recorder in recorders:
+            getter = getattr(recorder, "deferred_finalize_manifests", None)
+            if callable(getter):
+                candidates.extend(getter())
         return [
-            path for path in candidates
-            if path not in self._template_finalize_launched_paths
+            path for path in dict.fromkeys(candidates)
+            if (path not in self._template_finalize_launched_paths
+                and not PokeControllerApp.
+                _command_youtube_merge_owns_finalize_manifest(path))
         ]
 
-    def _launch_deferred_template_finalizer(self, wait_for_exit=False):
-        jobs = self._template_finalize_candidates()
+    def _template_finalize_manifest_reserved(self, manifest_path):
+        """Check in-memory owners without rescanning disk on Tk."""
+        path = os.path.abspath(str(manifest_path or ""))
+        if path in getattr(self, "_template_finalize_launched_paths", set()):
+            return True
+        recorders = [getattr(self, "recorder", None)]
+        handoff = getattr(self, "_youtube_handoff_recorder", None)
+        if handoff is not None:
+            recorders.append(handoff)
+        recorders.extend(getattr(self, "_youtube_retiring_recorders", ()))
+        for recorder in recorders:
+            if recorder is None:
+                continue
+            lock = getattr(recorder, "lock", None)
+            if lock is None:
+                inprocess = set(getattr(
+                    recorder, "_inprocess_finalize_manifests", ()))
+            else:
+                with lock:
+                    inprocess = set(getattr(
+                        recorder, "_inprocess_finalize_manifests", ()))
+            if path in {os.path.abspath(item) for item in inprocess}:
+                return True
+            active_manifest = str(getattr(
+                recorder, "_active_finalize_manifest", "") or "")
+            writer = getattr(recorder, "writer_thread", None)
+            writer_alive = bool(
+                writer is not None and callable(getattr(writer, "is_alive", None))
+                and writer.is_alive())
+            live_owner = bool(
+                getattr(recorder, "active", False)
+                or getattr(recorder, "video_close_pending", False)
+                or writer_alive
+                or (recorder is getattr(self, "recorder", None)
+                    and (getattr(
+                        self, "_template_recording_stop_in_progress", False)
+                         or getattr(
+                             self, "_youtube_recording_rotation_in_progress",
+                             False))))
+            if (live_owner and active_manifest
+                    and os.path.abspath(active_manifest) == path):
+                return True
+        return False
+
+    @staticmethod
+    def _command_youtube_merge_owns_finalize_manifest(manifest_path):
+        """Keep raw Commands chunks out of the per-clip MP4 worker.
+
+        Older builds already wrote a recovery manifest for every 30-second
+        YouTube Commands chunk.  Those files are still valid merge sources,
+        but encoding each one before the two-hour encode duplicates work and
+        can grow an unbounded backlog.  ``command_monitor.json`` is the durable
+        owner for these raw chunks; the merge queue deletes the whole source
+        folder only after its combined MP4 has been durably queued.
+        """
+        path = os.path.abspath(str(manifest_path or ""))
+        metadata_path = os.path.join(
+            os.path.dirname(path), "command_monitor.json")
+        if not os.path.isfile(metadata_path):
+            return False
+        try:
+            with open(metadata_path, "r", encoding="utf-8") as stream:
+                metadata = json.load(stream)
+        except (OSError, TypeError, ValueError):
+            # A Commands folder with unreadable metadata needs manual/reconcile
+            # recovery.  Do not race a generic MP4 worker against its raw AVI.
+            return True
+        archive = dict(metadata.get("youtube_archive", {}) or {}) \
+            if isinstance(metadata, dict) else {}
+        return bool(
+            archive.get("enabled") and not metadata.get("merged", False))
+
+    def _launch_deferred_template_finalizer(
+            self, wait_for_exit=False, jobs=None, jobs_reserved=False):
+        jobs = (self._template_finalize_candidates()
+                if jobs is None else list(dict.fromkeys(
+                    os.path.abspath(path) for path in jobs)))
+        if not jobs_reserved:
+            jobs = [
+                path for path in jobs
+                if not PokeControllerApp._template_finalize_manifest_reserved(
+                    self, path)]
         if not jobs:
             return True
+        if not jobs_reserved:
+            self._template_finalize_launched_paths.update(jobs)
         try:
             launch_recording_finalize_worker(
                 jobs, wait_pid=os.getpid() if wait_for_exit else 0)
         except Exception as error:
+            self._template_finalize_launched_paths.difference_update(jobs)
             self._logger.exception("Deferred MP4 worker launch failed")
             tkmsg.showerror(
                 "MP4一括作成",
@@ -20690,6 +27031,9 @@ class PokeControllerApp:
     def _complete_template_recording_stop(self, error=None):
         launch_after = self._template_finalize_after_stop
         exit_after = self._template_exit_after_stop
+        callbacks = list(getattr(self, "_recording_stop_callbacks", ()))
+        self._recording_stop_callbacks = []
+        self._recording_stop_discard_requested = False
         self._template_recording_stop_in_progress = False
         self._template_finalize_after_stop = False
         self._template_exit_after_stop = False
@@ -20697,10 +27041,17 @@ class PokeControllerApp:
             self.record_armed = False
             self._preview_shutdown_mode = False
             self._refresh_preview_priority_status()
-            message = "Template録画の停止に失敗しました: {}".format(error)
+            message = "録画の停止に失敗しました: {}".format(error)
             self._logger.error(message)
             self.show_output("Analysis", text=message)
             tkmsg.showerror("Recording", message, parent=self.root)
+            for callback in callbacks:
+                try:
+                    callback(error)
+                except Exception as callback_error:
+                    self._logger.warning(
+                        "Recording stop completion callback failed: %s",
+                        callback_error)
             return False
         if hasattr(self, "record_button"):
             self.record_button.configure(
@@ -20710,32 +27061,137 @@ class PokeControllerApp:
         if launch_after or exit_after:
             launched = self._launch_deferred_template_finalizer(
                 wait_for_exit=exit_after)
+        for callback in callbacks:
+            try:
+                callback(None)
+            except Exception as callback_error:
+                self._logger.warning(
+                    "Recording stop completion callback failed: %s",
+                    callback_error)
         if exit_after:
             if launched:
-                self._exit_now(confirm=False)
+                # A previous YouTube segment may still be finalizing inside
+                # this process while the just-stopped segment is handed to the
+                # external worker.  Keep the GUI process alive until that
+                # in-process manifest is removed; killing its daemon thread
+                # here would strand the job at status=processing.
+                if self._recording_background_work_active():
+                    self._exit_waiting = True
+                    self.show_output(
+                        "Analysis",
+                        text="進行中のMP4確定完了後にPokeConを閉じます。")
+                    self._wait_for_recording_finalization()
+                else:
+                    self._exit_now(confirm=False)
             else:
                 self._preview_shutdown_mode = False
                 self._refresh_preview_priority_status()
         return launched
 
+    def _retire_youtube_recorder(self, recorder):
+        """Release a rotated segment after all of its file owners finish."""
+        if recorder is None:
+            return
+
+        def remove_retired():
+            with self._record_compose_condition:
+                retired = getattr(self, "_youtube_retiring_recorders", [])
+                if recorder in retired:
+                    retired.remove(recorder)
+                self._record_compose_condition.notify_all()
+
+        retire = getattr(recorder, "retire_finalize_worker", None)
+        finalizer_thread = retire() if callable(retire) else None
+
+        def owner_threads():
+            unique = []
+            seen = set()
+            for thread in (
+                    finalizer_thread,
+                    getattr(recorder, "writer_thread", None),
+                    getattr(recorder, "_video_late_close_thread", None)):
+                if (thread is None
+                        or not callable(getattr(thread, "join", None))
+                        or id(thread) in seen):
+                    continue
+                seen.add(id(thread))
+                unique.append(thread)
+            return unique
+
+        threads = owner_threads()
+        live_threads = []
+        for thread in threads:
+            is_alive = getattr(thread, "is_alive", None)
+            if not callable(is_alive) or is_alive():
+                live_threads.append(thread)
+        if not live_threads:
+            if not getattr(recorder, "is_finalizing", False):
+                remove_retired()
+            return
+
+        def wait_for_file_owners():
+            joined = set()
+            for thread in live_threads:
+                thread.join()
+                joined.add(id(thread))
+            # A Stop timeout publishes its late-close watcher immediately
+            # before returning, but re-read both handles after the first joins
+            # so even an unusual scheduling handoff cannot remove the recorder
+            # while a newly published watcher is still persisting its journal.
+            for thread in owner_threads():
+                if id(thread) not in joined:
+                    thread.join()
+            remove_retired()
+
+        threading.Thread(
+            target=wait_for_file_owners, daemon=True,
+            name="YouTubeRetiredRecordingFinalizer").start()
+
     def _request_template_recording_stop(
-            self, launch_after=False, exit_after=False):
-        """Drain AVI/WAV off Tk and defer every MP4 job to another process."""
+            self, launch_after=False, exit_after=False, discard=False,
+            defer_finalization=None, after_stop=None):
+        """Drain AVI/WAV off Tk and complete UI state on the Tk callback."""
         self._template_finalize_after_stop = bool(
             self._template_finalize_after_stop or launch_after)
         self._template_exit_after_stop = bool(
             self._template_exit_after_stop or exit_after)
+        if callable(after_stop):
+            callbacks = getattr(self, "_recording_stop_callbacks", None)
+            if callbacks is None:
+                callbacks = []
+                self._recording_stop_callbacks = callbacks
+            callbacks.append(after_stop)
+        self._recording_stop_discard_requested = bool(
+            getattr(self, "_recording_stop_discard_requested", False)
+            or discard)
+        if getattr(self, "_youtube_recording_rotation_in_progress", False):
+            # The rotation owns the current and handoff recorders.  Ask it to
+            # stop at the boundary; its completion callback will re-enter this
+            # method for the promoted recorder when necessary.
+            self._youtube_recording_rotation_continue = False
+            return True
         if self._template_recording_stop_in_progress:
             return True
         if not getattr(self.recorder, "active", False):
             return self._complete_template_recording_stop()
         self._template_recording_stop_in_progress = True
-        self.recorder.defer_finalization = True
+        youtube_enabled = bool(dict(getattr(
+            self, "_active_recording_youtube_config", {}) or {}).get(
+                "enabled"))
+        if defer_finalization is None:
+            self.recorder.defer_finalization = bool(
+                exit_after or not youtube_enabled)
+        else:
+            self.recorder.defer_finalization = bool(defer_finalization)
+        discard_requested = bool(self._recording_stop_discard_requested)
 
         def stop_recorder():
             error = None
             try:
-                self._stop_capture_recorder()
+                if discard_requested:
+                    self._stop_capture_recorder(discard=True)
+                else:
+                    self._stop_capture_recorder()
             except Exception as stop_error:
                 error = stop_error
             self._gui_action_queue.put(
@@ -20747,18 +27203,378 @@ class PokeControllerApp:
             name="TemplateRecordingStop").start()
         return True
 
+    def _youtube_recording_rotation_due(self, now=None):
+        """Return whether a non-Commands YouTube segment is ready to close."""
+        current = time.monotonic() if now is None else float(now)
+        config = dict(getattr(
+            self, "_active_recording_youtube_config", {}) or {})
+        if (not config.get("enabled")
+                or config.get("record_mode") == "CommandMonitor"
+                or not getattr(self.recorder, "active", False)
+                or getattr(
+                    self, "_youtube_recording_rotation_in_progress", False)):
+            return False
+        if current < float(getattr(
+                self, "_youtube_recording_rotation_retry_after", 0.0) or 0.0):
+            return False
+        try:
+            target = max(1.0, float(config.get(
+                "segment_seconds", 7200) or 7200))
+            started = float(getattr(self.recorder, "started_at", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return False
+        return started > 0.0 and current - started >= target
+
+    def _request_youtube_recording_rotation(self, now=None):
+        """Overlap recorders at a segment boundary, then retire the old one."""
+        if not self._youtube_recording_rotation_due(now=now):
+            return False
+        mode = self.record_mode.get()
+        if mode not in ("Manual", "Template", "Variable"):
+            return False
+        old_recorder = self.recorder
+        current = time.monotonic() if now is None else float(now)
+        elapsed = max(
+            0.0, current - float(getattr(
+                old_recorder, "started_at", current) or current))
+        # This recording has already been bounded at the configured interval.
+        # Give the upload worker a slightly larger split value so timestamp
+        # jitter cannot create an extra one-second YouTube part.
+        successor_config = dict(getattr(
+            self, "_active_recording_youtube_config", {}) or {})
+        try:
+            configured = int(successor_config.get(
+                "segment_seconds", 7200) or 7200)
+        except (TypeError, ValueError):
+            configured = 7200
+        upload_config = dict(successor_config)
+        upload_config["segment_seconds"] = min(
+            11 * 3600, max(configured, int(elapsed) + 2))
+        frame = getattr(self.camera, "image_bgr", None)
+        if frame is None:
+            return False
+        frame = frame.copy()
+        fps = self.fps.get()
+        audio_device = self._selected_audio_device_name()
+        audio_gain = self.audio_gain.get()
+        audio_options = self._audio_level_options()
+        captured_output_dir = getattr(old_recorder, "output_dir", None)
+        if not captured_output_dir:
+            # Resolve Tk-backed output settings on the Tk thread, before the
+            # rotation worker starts.
+            captured_output_dir = self._effective_record_output_dir()
+        config_identity_keys = (
+            "enabled", "channel_profile", "channel_profile_resolved",
+            "channel_id_resolved", "delete_local",
+            "segment_seconds", "input_set", "record_mode")
+        expected_config_identity = tuple(
+            (key, successor_config.get(key)) for key in config_identity_keys)
+        self._youtube_recording_rotation_in_progress = True
+        self._youtube_recording_rotation_continue = True
+        self.recording_state_text.set(
+            "YouTube用の次区間を重ねて開始し、旧区間を確定します。")
+
+        def rotate_segment():
+            successor = CaptureRecorder(captured_output_dir)
+            successor.audio_monitor = getattr(self, "audio_monitor", None)
+            successor.template = getattr(old_recorder, "template", None)
+            successor.template_path = str(getattr(
+                old_recorder, "template_path", "") or "")
+            successor.trigger_rules = list(getattr(
+                old_recorder, "trigger_rules", ()) or ())
+            successor.cleanup_rules = list(getattr(
+                old_recorder, "cleanup_rules", ()) or ())
+            successor.minimum_duration = float(getattr(
+                old_recorder, "minimum_duration", 0.0) or 0.0)
+            for attribute in (
+                    "last_detection", "last_check", "last_score",
+                    "last_scores", "last_detection_details",
+                    "last_detection_checked_at", "last_found", "last_roi"):
+                if hasattr(old_recorder, attribute):
+                    setattr(successor, attribute, getattr(old_recorder, attribute))
+            # The crash-recovery journal must exist during preparation too.
+            successor.durable_finalization = True
+            error = None
+            promoted = False
+            successor_upload_job = {"path": ""}
+
+            def retire_recorder(recorder):
+                retire = getattr(self, "_retire_youtube_recorder", None)
+                if callable(retire):
+                    retire(recorder)
+                    return
+                with self._record_compose_condition:
+                    retired = getattr(self, "_youtube_retiring_recorders", [])
+                    if recorder in retired:
+                        retired.remove(recorder)
+
+            def queue_successor_upload_intent(recorder):
+                job_path = self._queue_youtube_path(
+                    recorder.mp4_path, recorder.session_dir, "normal",
+                    config=successor_config)
+                successor_upload_job["path"] = str(job_path or "")
+                return job_path
+
+            def cancel_successor_upload_intent(reason):
+                job_path = successor_upload_job.get("path", "")
+                if not job_path:
+                    return True
+                try:
+                    return bool(cancel_upload_job(job_path, reason))
+                except (OSError, TypeError, ValueError) as cancel_error:
+                    self._logger.warning(
+                        "YouTube successor intent cancellation failed: %s",
+                        cancel_error)
+                    return False
+
+            try:
+                # This runs off Tk.  Keep the old recorder live while a slow
+                # PortAudio/application-loopback open completes.  Synchronous
+                # audio setup here is intentional: promotion is forbidden
+                # until the successor can receive the same audio source.
+                successor.start(
+                    frame, fps, audio_device, audio_gain,
+                    cleanup_rules=successor.cleanup_rules,
+                    minimum_duration=successor.minimum_duration,
+                    audio_level_options=audio_options,
+                    async_audio_start=False,
+                    defer_timeline_activation=True,
+                    session_started_callback=queue_successor_upload_intent)
+                audio_ready = bool(
+                    not audio_device
+                    or getattr(successor, "audio", None) is not None
+                    or getattr(successor, "audio_stream", None) is not None
+                    or getattr(successor, "process_audio", None) is not None
+                    or getattr(
+                        successor, "audio_monitor_listener_token", None)
+                    is not None)
+                if not getattr(successor, "active", False) or not audio_ready:
+                    raise RuntimeError(
+                        "次区間の映像・音声を開始できませんでした。旧区間の録画を継続します。")
+                activate_timeline = getattr(successor, "activate_timeline", None)
+                if callable(activate_timeline):
+                    activate_timeline(frame, started_at=time.monotonic())
+                with self._record_compose_condition:
+                    self._youtube_handoff_recorder = successor
+                # Allow at least one presented frame to reach both recorders.
+                # The timeout is only a promotion delay; the successor's
+                # initial frame still fills CFR slots if preview is momentarily
+                # idle, so the old recorder never stops first.
+                handoff_deadline = time.monotonic() + 2.0
+                while (getattr(successor, "active", False)
+                       and getattr(successor, "video_presentation_frames", 0) < 1
+                       and self._youtube_recording_rotation_continue
+                       and time.monotonic() < handoff_deadline):
+                    time.sleep(0.01)
+
+                decision = {"promote": False}
+                decided = threading.Event()
+
+                def decide_handoff():
+                    snapshot = getattr(
+                        self, "_youtube_recording_config_snapshot", None)
+                    current_config = snapshot() if callable(snapshot) \
+                        else successor_config
+                    current_identity = tuple(
+                        (key, current_config.get(key))
+                        for key in config_identity_keys)
+                    current_output = self._effective_record_output_dir()
+                    with self._record_compose_condition:
+                        configuration_unchanged = bool(
+                            current_identity == expected_config_identity
+                            and os.path.normcase(os.path.abspath(current_output))
+                            == os.path.normcase(os.path.abspath(
+                                captured_output_dir)))
+                        if not configuration_unchanged:
+                            # Finish the old segment under its original channel
+                            # snapshot. A newly applied InputSet must never
+                            # inherit or overwrite that ownership.
+                            self._youtube_recording_rotation_continue = False
+                            decision["configuration_changed"] = True
+                        should_continue = bool(
+                            not decision.get("cancelled", False)
+                            and configuration_unchanged
+                            and self._youtube_recording_rotation_continue
+                            and self._record_storage_destination_key() == "youtube"
+                            and self.record_mode.get() == mode
+                            and (mode == "Manual" or self.record_armed)
+                            and (mode != "Variable"
+                                 or self._record_variable_active_rule_id))
+                        if (should_continue and self.recorder is old_recorder
+                                and getattr(old_recorder, "active", False)
+                                and getattr(successor, "active", False)):
+                            self.recorder = successor
+                            self._active_recording_youtube_config = dict(
+                                successor_config)
+                            if old_recorder not in self._youtube_retiring_recorders:
+                                self._youtube_retiring_recorders.append(
+                                    old_recorder)
+                            decision["promote"] = True
+                        self._youtube_handoff_recorder = None
+                        self._record_compose_condition.notify_all()
+                        decided.set()
+
+                self._gui_action_queue.put(decide_handoff)
+                if not decided.wait(10.0):
+                    timed_out = False
+                    with self._record_compose_condition:
+                        if not decided.is_set():
+                            decision["cancelled"] = True
+                            timed_out = True
+                    if timed_out:
+                        raise RuntimeError("次区間への切替をGUIで確定できませんでした。")
+                promoted = bool(decision["promote"])
+                if promoted:
+                    old_recorder.defer_finalization = False
+                    actual_elapsed = max(
+                        0.0, time.monotonic() - float(getattr(
+                            old_recorder, "started_at", time.monotonic())
+                            or time.monotonic()))
+                    upload_config["segment_seconds"] = min(
+                        11 * 3600,
+                        max(configured, int(actual_elapsed) + 2))
+                    try:
+                        self._stop_capture_recorder_instance(
+                            old_recorder, youtube_config=upload_config)
+                    finally:
+                        retire_recorder(old_recorder)
+                else:
+                    discard_successor = cancel_successor_upload_intent(
+                        "YouTube segment handoff was not promoted")
+                    successor.durable_finalization = not discard_successor
+                    try:
+                        self._stop_capture_recorder_instance(
+                            successor,
+                            youtube_config=(successor_config
+                                            if not discard_successor else {}),
+                            discard=discard_successor)
+                    finally:
+                        retire_recorder(successor)
+                    if getattr(old_recorder, "active", False) and not bool(
+                            self._youtube_recording_rotation_continue):
+                        old_recorder.defer_finalization = False
+                        actual_elapsed = max(
+                            0.0, time.monotonic() - float(getattr(
+                                old_recorder, "started_at", time.monotonic())
+                                or time.monotonic()))
+                        upload_config["segment_seconds"] = min(
+                            11 * 3600,
+                            max(configured, int(actual_elapsed) + 2))
+                        try:
+                            self._stop_capture_recorder_instance(
+                                old_recorder, youtube_config=upload_config)
+                        finally:
+                            retire_recorder(old_recorder)
+            except Exception as caught:
+                error = caught
+                with self._record_compose_condition:
+                    if self._youtube_handoff_recorder is successor:
+                        self._youtube_handoff_recorder = None
+                    self._record_compose_condition.notify_all()
+                discard_successor = cancel_successor_upload_intent(
+                    "YouTube segment handoff failed before promotion")
+                if (successor is not self.recorder
+                        and getattr(successor, "active", False)):
+                    try:
+                        successor.durable_finalization = not discard_successor
+                        self._stop_capture_recorder_instance(
+                            successor,
+                            youtube_config=(successor_config
+                                            if not discard_successor else {}),
+                            discard=discard_successor)
+                    except Exception:
+                        pass
+                    finally:
+                        retire_recorder(successor)
+
+            def finished(failure=error, recording_mode=mode,
+                         did_promote=promoted):
+                stop_requested = not bool(
+                    self._youtube_recording_rotation_continue)
+                self._youtube_recording_rotation_in_progress = False
+                self._youtube_recording_rotation_continue = False
+                self._youtube_recording_rotation_thread = None
+                self._youtube_recording_rotation_retry_after = (
+                    time.monotonic() + 60.0 if failure is not None
+                    and not stop_requested else 0.0)
+                try:
+                    self._sync_audio_device_usage()
+                except Exception as sync_error:
+                    self._logger.warning(
+                        "YouTube segment audio usage refresh failed: %s",
+                        sync_error)
+                if stop_requested:
+                    if failure is not None:
+                        message = (
+                            "YouTube区間の切替中に停止要求を受けました。"
+                            "切替エラーを記録し、現在の録画を安全に閉じます: {}"
+                        ).format(failure)
+                        self._logger.error(message)
+                        self.show_output("Analysis", text=message)
+                    if getattr(self.recorder, "active", False):
+                        if recording_mode in ("Template", "Variable"):
+                            self.record_armed = False
+                        self._request_template_recording_stop(
+                            launch_after=True)
+                    else:
+                        # Rotation may have failed after the old recorder was
+                        # already closed.  Complete any pending launch/exit
+                        # continuation instead of leaving Exit latched forever.
+                        self._complete_template_recording_stop(
+                            error=failure)
+                    self.recording_state_text.set(
+                        "YouTube用区間を確定し、録画を停止しています。")
+                    return
+                if failure is not None:
+                    if (recording_mode in ("Template", "Variable")
+                            and not getattr(self.recorder, "active", False)):
+                        self.record_armed = False
+                    message = (
+                        "YouTube区間の安全な切替を完了できませんでした。"
+                        "旧区間が有効なら録画を継続します: {}"
+                    ).format(failure)
+                    self._logger.error(message)
+                    self.recording_state_text.set(message)
+                    self.show_output("Analysis", text=message)
+                    return
+                if did_promote:
+                    self.recording_state_text.set(
+                        "前区間をアップロードキューへ登録し、"
+                        "切れ目なく次区間を録画中です。")
+
+            self._gui_action_queue.put(finished)
+
+        self._youtube_recording_rotation_thread = threading.Thread(
+            target=rotate_segment, daemon=True,
+            name="YouTubeRecordingRotation")
+        self._youtube_recording_rotation_thread.start()
+        return True
+
     def _youtube_recording_config_snapshot(self):
         try:
             segment_minutes = int(float(
                 self.record_youtube_segment_minutes.get()))
         except (tk.TclError, TypeError, ValueError):
             segment_minutes = 120
+        requested_profile = self.record_youtube_channel_profile.get().strip()
+        store = dict(getattr(
+            self, "_youtube_channel_store_cache", {}) or {})
+        resolved_profile = requested_profile or str(
+            store.get("default_profile", "") or "").strip()
+        profile = dict(store.get("profiles", {}).get(
+            resolved_profile, {}) or {})
+        resolved_channel_id = str(
+            profile.get("channel_id", "") or "").strip()
         return {
             "enabled": self._record_storage_destination_key() == "youtube",
-            "channel_profile": self.record_youtube_channel_profile.get().strip(),
+            "channel_profile": requested_profile,
+            "channel_profile_resolved": resolved_profile,
+            "channel_id_resolved": resolved_channel_id,
             "delete_local": bool(self.record_youtube_delete_local.get()),
             "commands_video_mode": normalize_commands_video_mode(
                 self.record_youtube_commands_video_mode.get()),
+            "allow_low_presentations": bool(
+                self.record_youtube_commands_allow_low_presentations.get()),
             "segment_seconds": max(
                 600, min(11 * 3600,
                          segment_minutes * 60)),
@@ -20767,8 +27583,37 @@ class PokeControllerApp:
             "record_mode": self.record_mode.get(),
         }
 
+    def _launch_youtube_upload_worker(self, config, job_path=""):
+        """Start the uploader after all local recovery metadata is durable."""
+        config = dict(config or {})
+        try:
+            store = load_channel_store(self._youtube_channel_store_path())
+            requested = str(config.get(
+                "channel_profile_resolved", "")
+                or config.get("channel_profile", "") or "")
+            resolved = requested or store.get("default_profile", "")
+            if resolved and resolved in store.get("profiles", {}):
+                launch_upload_worker(
+                    self._youtube_upload_queue_dir(),
+                    self._youtube_channel_store_path())
+                return True
+            self._logger.warning(
+                "YouTube upload queued, but channel authentication is missing: %s",
+                requested or "(default)")
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            if job_path:
+                self._logger.warning(
+                    "YouTube upload worker launch failed; queued job remains at %s: %s",
+                    job_path, error)
+            else:
+                self._logger.warning(
+                    "YouTube upload worker launch failed; queued jobs remain: %s",
+                    error)
+        return False
+
     def _queue_youtube_path(self, media_path, session_dir, recording_kind,
-                            command="", config=None):
+                            command="", config=None, launch_worker=True,
+                            hold_for_local_commit=False):
         config = dict(config or {})
         if not config.get("enabled") or not media_path:
             return ""
@@ -20781,24 +27626,62 @@ class PokeControllerApp:
                  delete_local=config.get("delete_local", True),
                  commands_video_mode=config.get("commands_video_mode", "")
                  if recording_kind == "commands_monitor" else "",
-                 segment_seconds=config.get("segment_seconds", 7200))
-            store = load_channel_store(self._youtube_channel_store_path())
-            requested = str(config.get("channel_profile", "") or "")
-            resolved = requested or store.get("default_profile", "")
-            if resolved and resolved in store.get("profiles", {}):
-                launch_upload_worker(
-                    self._youtube_upload_queue_dir(),
-                    self._youtube_channel_store_path())
-            else:
-                self._logger.warning(
-                    "YouTube upload queued, but channel authentication is missing: %s",
-                    requested or "(default)")
-            return job_path
+                 segment_seconds=config.get("segment_seconds", 7200),
+                  channel_profile_resolved=config.get(
+                      "channel_profile_resolved", ""),
+                  channel_id_resolved=config.get("channel_id_resolved", ""),
+                  hold_for_local_commit=hold_for_local_commit)
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             self._logger.warning("YouTube upload queue failed: %s", error)
             return ""
+        if launch_worker and not hold_for_local_commit:
+            PokeControllerApp._launch_youtube_upload_worker(
+                self, config, job_path=job_path)
+        return job_path
 
-    def _queue_command_monitor_youtube_upload(self, chunk, background=True):
+    def _queue_youtube_upload_intent_async(self, recorder, config):
+        """Create and bind a session-start upload intent without blocking Tk."""
+        ready = threading.Event()
+        recorder._youtube_upload_intent_ready = ready
+        session_dir = os.path.abspath(str(recorder.session_dir or ""))
+        media_path = os.path.abspath(str(recorder.mp4_path or ""))
+
+        def queue_intent():
+            job_path = ""
+            try:
+                job_path = self._queue_youtube_path(
+                    media_path, session_dir, "normal",
+                    config=dict(config or {}), launch_worker=False)
+                if (job_path
+                        and getattr(
+                            recorder, "_youtube_upload_intent_ready", None)
+                        is ready
+                        and os.path.normcase(os.path.abspath(str(
+                            getattr(recorder, "session_dir", "") or "")))
+                        == os.path.normcase(session_dir)):
+                    recorder.bind_youtube_upload_job(job_path)
+            except (OSError, RuntimeError, TypeError, ValueError) as error:
+                self._logger.warning(
+                    "YouTube upload intent binding failed; the durable queue "
+                    "job will be recovered by the watchdog: %s", error)
+            finally:
+                ready.set()
+            # Binding the exact session manifest is the durability boundary
+            # Stop waits for. Authentication lookup/process launch may be slow,
+            # but it cannot be allowed to delay that boundary or later attach
+            # this old session's job to a reused recorder instance.
+            if job_path:
+                PokeControllerApp._launch_youtube_upload_worker(
+                    self, dict(config or {}), job_path=job_path)
+
+        threading.Thread(
+            target=queue_intent, daemon=True,
+            name="YouTubeUploadIntent").start()
+        return ""
+
+    def _queue_command_monitor_youtube_upload(
+            self, chunk, background=True, launch_worker=True,
+            hold_for_local_commit=False, persist_metadata=True):
         if not isinstance(chunk, dict):
             return ""
         config = dict(chunk.get("youtube_archive", {}) or {})
@@ -20815,7 +27698,7 @@ class PokeControllerApp:
             try:
                 self._command_trace_queue.join()
                 self._command_step_frame_queue.join()
-                if groups:
+                if groups and persist_metadata:
                     duration = max(
                         0.0, float(chunk.get("ended", 0.0) or 0.0)
                         - float(chunk.get("started", 0.0) or 0.0))
@@ -20829,11 +27712,15 @@ class PokeControllerApp:
                 job_path = self._queue_youtube_path(
                     media_path, session_dir, "commands_monitor",
                     command=str(chunk.get("command", "") or ""),
-                    config=config)
+                    config=config, launch_worker=launch_worker,
+                    hold_for_local_commit=hold_for_local_commit)
                 if job_path:
                     chunk["youtube_upload"] = {
-                        "status": "queued", "job_path": job_path}
-                    self._write_command_monitor_metadata(chunk)
+                        "status": ("local_commit_pending"
+                                   if hold_for_local_commit else "queued"),
+                        "job_path": job_path}
+                    if persist_metadata:
+                        self._write_command_monitor_metadata(chunk)
                 return job_path
             except (OSError, TypeError, ValueError) as error:
                 self._logger.warning(
@@ -20847,25 +27734,73 @@ class PokeControllerApp:
             name="CommandYouTubeArchiveQueue").start()
         return ""
 
-    def _stop_capture_recorder(self, discard=False):
-        """Stop after every already-presented frame reaches the AVI queue."""
-        session = getattr(self.recorder, "session_dir", None)
-        if session is None or not getattr(self.recorder, "active", False):
-            return self.recorder.stop(discard=discard)
+    def _stop_capture_recorder_instance(
+            self, recorder, youtube_config=None, discard=False):
+        """Stop one recorder after its already-presented frames reach AVI."""
+        youtube_config = dict(youtube_config or {})
+        if youtube_config.get("record_mode") == "CommandMonitor":
+            # The rolling two-hour merge consumes the closed AVI/WAV directly.
+            # Keep a crash-recovery manifest, but do not enqueue a redundant
+            # MP4 encode for every short internal chunk.
+            recorder.defer_finalization = bool(
+                youtube_config.get("enabled"))
+        recorder.durable_finalization = bool(
+            youtube_config.get("enabled"))
+        session = getattr(recorder, "session_dir", None)
+        if session is None or not getattr(recorder, "active", False):
+            return recorder.stop(discard=discard)
+
+        def queued_for_session(item):
+            if len(item) > 5:
+                return any(getattr(target, "session_dir", None) == session
+                           for target in item[5])
+            return item[2] == session
+
         with self._record_compose_condition:
             self._record_compose_closing_sessions.add(session)
-            while (self._record_compose_active_session == session
-                   or any(item[2] == session
+            while (session in getattr(
+                        self, "_record_compose_active_sessions", set())
+                   or self._record_compose_active_session == session
+                   or any(queued_for_session(item)
                           for item in self._record_compose_queue)):
                 # Do not close the AVI on a partial queue.  Stopping may wait
                 # briefly for overlay composition, but displayed frames are
                 # never discarded merely because a deadline elapsed.
                 self._record_compose_condition.wait()
-        youtube_config = dict(getattr(
-            self, "_active_recording_youtube_config", {}) or {})
         try:
-            result = self.recorder.stop(discard=discard)
-            if (result and not discard
+            intent_ready = getattr(
+                recorder, "_youtube_upload_intent_ready", None)
+            intent_wait_timed_out = False
+            if isinstance(intent_ready, threading.Event):
+                # Session-start queue creation is intentionally asynchronous so
+                # Tk/capture start never waits on shared queue I/O. Stop already
+                # runs on a worker and must observe that intent before deciding
+                # whether a discard needs to cancel it.
+                intent_wait_timed_out = not intent_ready.wait(30.0)
+                if intent_wait_timed_out:
+                    self._logger.warning(
+                        "YouTube upload intent did not finish within 30s; "
+                        "retaining the recording and continuing Stop.")
+            effective_discard = bool(discard and not intent_wait_timed_out)
+            upload_job_path = str(getattr(
+                recorder, "youtube_upload_job_path", "") or "")
+            if effective_discard and upload_job_path:
+                try:
+                    effective_discard = bool(cancel_upload_job(
+                        upload_job_path,
+                        "Recording discarded before MP4 finalization"))
+                except (OSError, TypeError, ValueError) as error:
+                    effective_discard = False
+                    self._logger.warning(
+                        "YouTube upload intent cancellation failed; "
+                        "recording will be finalized instead: %s", error)
+            result = recorder.stop(discard=effective_discard)
+            expected_mp4 = os.path.normcase(os.path.abspath(str(
+                getattr(recorder, "mp4_path", "") or "")))
+            result_path = os.path.normcase(os.path.abspath(str(
+                result or ""))) if result else ""
+            if (result_path and result_path == expected_mp4
+                    and not effective_discard
                     and youtube_config.get("record_mode") != "CommandMonitor"):
                 self._queue_youtube_path(
                     result, session, "normal", config=youtube_config)
@@ -20874,12 +27809,20 @@ class PokeControllerApp:
             with self._record_compose_condition:
                 self._record_compose_closing_sessions.discard(session)
 
+    def _stop_capture_recorder(self, discard=False):
+        youtube_config = dict(getattr(
+            self, "_active_recording_youtube_config", {}) or {})
+        return self._stop_capture_recorder_instance(
+            self.recorder, youtube_config=youtube_config, discard=discard)
+
     def _start_capture_recorder(self, *args, **kwargs):
         with self._record_compose_condition:
             self._record_compose_queue_max_depth = 0
             self._recording_latest_snapshot = None
             self._recording_last_presentation_at = 0.0
         config = self._youtube_recording_config_snapshot()
+        if config.get("record_mode") == "CommandMonitor":
+            self.recorder.defer_finalization = bool(config.get("enabled"))
         if (config.get("enabled")
                 and config.get("record_mode") == "CommandMonitor"
                 and config.get("commands_video_mode")
@@ -20892,6 +27835,20 @@ class PokeControllerApp:
                 # explicitly marked as the established composite fallback.
                 config["commands_video_mode"] = COMMANDS_VIDEO_MODE_COMPOSITE
         self._active_recording_youtube_config = config
+        self.recorder.durable_finalization = bool(
+            config.get("enabled"))
+        if (config.get("enabled")
+                and config.get("record_mode") != "CommandMonitor"):
+            existing_callback = kwargs.get("session_started_callback")
+
+            def queue_upload_intent(recorder):
+                if callable(existing_callback):
+                    existing_callback(recorder)
+                return (
+                    PokeControllerApp._queue_youtube_upload_intent_async(
+                        self, recorder, config))
+
+            kwargs["session_started_callback"] = queue_upload_intent
         return self.recorder.start(*args, **kwargs)
 
     def process_recording_frame(self, frame):
@@ -20914,9 +27871,10 @@ class PokeControllerApp:
         # Operation authoring is an independent clean-video pipeline.  Feed it
         # before the normal recording mode returns from this callback.
         self._process_operation_capture_frame(frame)
-        if (self.recorder.active or self.record_armed) and not self._recording_disk_space_ok(show_popup=True):
-            self._interrupt_recording_for_disk_space()
-            return
+        if self.recorder.active or self.record_armed:
+            disk_ready = self._recording_disk_space_ok(show_popup=True)
+            if disk_ready is not True:
+                return
         if self.record_mode.get() == "CommandMonitor":
             try:
                 self._process_command_monitor_frame(frame)
@@ -20926,6 +27884,20 @@ class PokeControllerApp:
                 # preview callback while Commands keeps running invisibly.
                 self.record_armed = False
                 self._stop_command_record_window_capture()
+                if getattr(
+                        self, "_command_monitor_start_request", None) is not None:
+                    self._cancel_command_monitor_chunk_start()
+                if (getattr(self, "_command_monitor_current_chunk", None)
+                        is not None
+                        and not getattr(
+                            self, "_command_monitor_stop_in_progress", False)):
+                    try:
+                        self._finish_command_monitor_chunk(
+                            "monitor_error", background=True)
+                    except Exception as stop_error:
+                        self._logger.exception(
+                            "Commands monitor emergency recording close failed: %s",
+                            stop_error)
                 message = (
                     "Commands監視録画でエラーが発生したため監視録画を停止しました。"
                     "PokeCon画面とCommands安全監視は継続します: {}"
@@ -20934,8 +27906,12 @@ class PokeControllerApp:
                 self.record_monitor_status.set(message)
                 self.show_output("Analysis", text=message)
             return
+        if getattr(self, "_template_recording_stop_in_progress", False):
+            return
         if self.record_mode.get() == "Manual":
             if not self.recorder.active:
+                return
+            if self._request_youtube_recording_rotation():
                 return
             # Detection metadata is useful evidence even when detection is not
             # what starts/stops the recording.
@@ -20966,6 +27942,9 @@ class PokeControllerApp:
                 audio_level_options=self._audio_level_options(),
             )
             now = time.monotonic()
+            if (self.recorder.active
+                    and self._request_youtube_recording_rotation(now=now)):
+                return
             # Camera callbacks may run at 60 FPS; scalar condition checks need
             # only 4 Hz and should never make recording or control sluggish.
             if now - self._record_variable_last_check < 0.25:
@@ -20982,8 +27961,9 @@ class PokeControllerApp:
                                   "seconds": rule.get("start_seconds", 0.0)}
                     result = self._record_variable_evaluator.evaluate(start_rule, command, command_name, now)
                     if result["triggered"]:
-                        if not self._recording_disk_space_ok(show_popup=True, force=True):
-                            self._interrupt_recording_for_disk_space()
+                        disk_ready = self._recording_disk_space_ok(
+                            show_popup=True)
+                        if disk_ready is not True:
                             return
                         self._start_capture_recorder(
                             frame, self.fps.get(), self._selected_audio_device_name(),
@@ -21008,12 +27988,23 @@ class PokeControllerApp:
                         discard_result = self._record_variable_evaluator.evaluate(
                             discard_rule, command, command_name, now)
                         if discard_result["triggered"]:
-                            self._stop_capture_recorder(discard=True)
+                            def finish_variable_discard(error):
+                                if error is not None:
+                                    return
+                                self.record_variable_status.set(
+                                    "Segment discarded: {} == {}. Waiting for next start.".format(
+                                        active.get("variable", ""),
+                                        discard_result.get("value")))
+                                self._record_variable_active_rule_id = None
+                                self._record_variable_evaluator.reset()
+
                             self.record_variable_status.set(
-                                "Segment discarded: {} == {}. Waiting for next start.".format(
-                                    active.get("variable", ""), discard_result.get("value")))
-                            self._record_variable_active_rule_id = None
-                            self._record_variable_evaluator.reset()
+                                "Discard対象区間の録画を確定しています。")
+                            self._request_template_recording_stop(
+                                discard=True,
+                                defer_finalization=bool(
+                                    self.recorder.defer_finalization),
+                                after_stop=finish_variable_discard)
                             return
                     stop_rule = {"id": str(active.get("id")) + ":stop",
                                  "command": active.get("command", "すべて"),
@@ -21022,23 +28013,44 @@ class PokeControllerApp:
                                  "seconds": active.get("stop_seconds", 0.0)}
                     result = self._record_variable_evaluator.evaluate(stop_rule, command, command_name, now)
                     if result["triggered"]:
-                        self._stop_capture_recorder()
-                        self.record_variable_status.set("Segment completed: {} == {}. Waiting for next start.".format(
-                            active.get("variable", ""), result.get("value")))
-                        self._record_variable_active_rule_id = None
-                        self._record_variable_evaluator.reset()
                         assist_rule_id = str(active.get("assist_rule_id", ""))
-                        if assist_rule_id:
-                            self._gui_action_queue.put(
-                                lambda rule_id=assist_rule_id:
-                                self._run_recording_commands_assist(rule_id))
+
+                        def finish_variable_segment(error):
+                            if error is not None:
+                                return
+                            self.record_variable_status.set(
+                                "Segment completed: {} == {}. Waiting for next start.".format(
+                                    active.get("variable", ""),
+                                    result.get("value")))
+                            self._record_variable_active_rule_id = None
+                            self._record_variable_evaluator.reset()
+                            if assist_rule_id:
+                                self._run_recording_commands_assist(
+                                    assist_rule_id)
+
+                        self.record_variable_status.set(
+                            "Variable segmentの録画を確定しています。")
+                        self._request_template_recording_stop(
+                            defer_finalization=bool(
+                                self.recorder.defer_finalization),
+                            after_stop=finish_variable_segment)
+                        return
             return
         if not self.record_armed and not self.record_debug.get():
             return
         if self._template_recording_stop_in_progress:
             self.update_recording_debug(frame)
             return
-        self.recorder.defer_finalization = True
+        self.recorder.defer_finalization = (
+            self._record_storage_destination_key() != "youtube")
+        if not self.recorder.active:
+            # Template detection starts CaptureRecorder directly, bypassing
+            # _start_capture_recorder. Snapshot the destination beforehand so
+            # its completed segment is queued with the owning InputSet.
+            self._active_recording_youtube_config = (
+                self._youtube_recording_config_snapshot())
+            self.recorder.durable_finalization = bool(
+                self._active_recording_youtube_config.get("enabled"))
         if not self.record_trigger_rules and self.recorder.template_path != self.record_template_path.get():
             self.recorder.configure_template(self.record_template_path.get())
         result = self.recorder.process_detection(
@@ -21046,12 +28058,22 @@ class PokeControllerApp:
             self.record_threshold.get(), self._recording_roi(),
             self.record_interval.get(), self.record_release.get(), allow_start=self.record_armed,
             audio_level_options=self._audio_level_options(),
+            session_started_callback=(
+                (lambda recorder:
+                 PokeControllerApp._queue_youtube_upload_intent_async(
+                     self, recorder,
+                     dict(self._active_recording_youtube_config)))
+                if self._active_recording_youtube_config.get("enabled")
+                else None),
         )
         self.update_recording_debug(frame)
         if result == DETECTION_STOP_REQUESTED:
             if hasattr(self, "record_button"):
                 self.record_button.configure(text="Saving AVI/WAV...")
             self._request_template_recording_stop()
+            return
+        if (self.recorder.active
+                and self._request_youtube_recording_rotation()):
             return
         # A detected segment must receive every camera frame, not merely the
         # low-frequency frames that are used for template matching.
@@ -21402,6 +28424,588 @@ class PokeControllerApp:
 
         self.changeAreaSize()
 
+    def _command_debug_status(self, text, error=False, busy=None):
+        panel = getattr(self, "command_debug_panel", None)
+        if panel is not None:
+            if busy is not None:
+                panel.set_busy(busy)
+            panel.set_status(text, error=error)
+
+    def _command_debug_binding(self):
+        """Non-Tk identity check, safe on the existing controller worker."""
+        sender = getattr(self, "ser", None)
+        port = getattr(sender, "ser", None)
+        return (id(sender), id(port), str(getattr(port, "port", "")),
+                bool(getattr(port, "is_open", False)),
+                str(getattr(self, "_active_input_set_name", "") or ""))
+
+    def _command_debug_save_maximize(self, enabled):
+        data = self._read_input_sets()
+        data.setdefault("command_debug_tools", {})["maximize"] = bool(enabled)
+        try:
+            self._write_input_sets(data)
+        except OSError as error:
+            self._command_debug_status("最大化設定を保存できません: " + str(error), error=True)
+            return False
+        return True
+
+    def _command_debug_maximize(self):
+        # Only an explicit debug action may resize this app. No polling,
+        # foreground activation, FPS override or other PokeCon is involved.
+        if self.command_debug_panel.maximize_var.get():
+            try:
+                self.root.state("zoomed")
+                self.root.update_idletasks()
+            except tk.TclError:
+                self.root.attributes("-zoomed", True)
+
+    def _cancel_command_debug_pulse(self):
+        job = getattr(self, "_command_debug_pulse_job", None)
+        if job is not None:
+            job.cancel()
+
+    def _command_debug_wait_for_release(self, after_release=None):
+        """Never close/rebind a transport before its pulse finally releases it.
+
+        Reconnect/InputSet/format edits are rejected for an explicit retry.
+        Shutdown alone is retried on Tk after the worker acknowledges cleanup.
+        """
+        job = getattr(self, "_command_debug_pulse_job", None)
+        if job is None:
+            command = getattr(self, "cur_command", None)
+            worker = getattr(command, "thread", None)
+            fresh_progress = getattr(command, "_vision_fresh_start_progress", None)
+            fresh_pending = (isinstance(fresh_progress, dict)
+                             and fresh_progress.get("phase") not in (None, "DONE")
+                             and not fresh_progress.get("failed"))
+            fresh_reset = (getattr(command, "_pokecon_fresh_start_requested", None) is True
+                           or getattr(command, "_vision_fresh_start_active", False) or fresh_pending)
+            if after_release is None and fresh_reset and worker is not None and worker.is_alive():
+                # The same reconnect/InputSet/camera/format entry points that
+                # protect timed pulses must not retarget a reset mid-press.
+                PokeControllerApp._command_debug_status(
+                    self, "はじめからの画面確認中は接続／設定を変更できません。停止後に再試行してください", error=True)
+                return True
+            return False
+        job.cancel()
+        if after_release is not None:
+            self.root.after(25, after_release)
+        else:
+            PokeControllerApp._command_debug_status(
+                self, "入力の解放待ちです。完了後に接続／設定変更を再試行してください", error=True)
+        return True
+
+    def _command_debug_cancelled_before_send(self, job):
+        if getattr(self, "_command_debug_pulse_job", None) is job:
+            self._command_debug_pulse_job = None
+            self._command_debug_status("別の手動操作を優先し、未送信の時間指定入力を取り消しました", busy=False)
+
+    def _command_debug_pulse(self, control, duration_ms):
+        if (getattr(self, "_command_debug_pulse_job", None) is not None
+                or getattr(self, "_command_debug_retest_request", None) is not None
+                or getattr(self, "_command_debug_restart_request", None) is not None
+                or getattr(self, "_command_debug_fresh_start_request", None) is not None):
+            return False
+        if not self.ser.isOpened():
+            self._command_debug_status("Serial接続を確認してください（新しい接続は開きません）", error=True)
+            return False
+        _, held = self._software_controller_state.latest_snapshot()
+        if held or self._software_controller_override_active:
+            self._command_debug_status("既存の手動保持入力を解放してから実行してください", error=True)
+            return False
+        self._command_debug_maximize()
+        command = getattr(self, "cur_command", None)
+        if self._pokecon_studio_commands_busy():
+            if str(self.start_button.cget("text")) != "Stop" or not callable(getattr(command, "request_pause", None)):
+                self._command_debug_status("停止処理中または非Python Commandsです。停止完了後に操作してください", error=True)
+                return False
+            # Existing pause UI remains Restart; the pulse NEVER auto-resumes.
+            if not (getattr(command, "pause_requested", False) or Command.isPause):
+                self.pausePlay()
+        binding = self._command_debug_binding()
+        context = {"input_binding": binding, "command": getattr(command, "NAME", ""),
+                   "command_id": id(command), "recording_session": getattr(self, "_command_monitor_session_id", None)}
+        try:
+            job = TimedPulseJob([control], duration_ms, binding, context=context)
+            enqueue_timed_pulse(self._software_controller_queue, job)
+        except (ValueError, TypeError, queue.Full) as error:
+            self._command_debug_status("入力を予約できません: " + str(error), error=True)
+            return False
+        self._command_debug_pulse_job = job
+        self._command_debug_status("{} {}ms → 入力後は停止／一時停止を維持".format(control, duration_ms), busy=True)
+        return True
+
+    def _execute_command_debug_pulse(self, job):
+        def record(event):
+            context = event.get("context") or {}
+            if (event["binding_signature"] == self._command_debug_binding()
+                    and context.get("command_id") == id(getattr(self, "cur_command", None))
+                    and context.get("recording_session") == getattr(self, "_command_monitor_session_id", None)):
+                self._record_operation_input(event["message"], event["time"], source="software_controller")
+
+        result = execute_timed_pulse(
+            job, self.keys_software_controller, current_binding=self._command_debug_binding,
+            is_cancelled=lambda: bool(getattr(self, "_preview_shutdown_mode", False)
+                or (job.context or {}).get("command_id") != id(getattr(self, "cur_command", None))
+                or (job.context or {}).get("recording_session") != getattr(self, "_command_monitor_session_id", None)),
+            worker_ident=self._software_controller_thread.ident, record=record)
+
+        def complete():
+            if getattr(self, "_command_debug_pulse_job", None) is job:
+                self._command_debug_pulse_job = None
+                self._command_debug_status("時間指定入力: {} / {:.1f}ms{}".format(
+                    result.status, result.elapsed_seconds * 1000,
+                    " / " + result.error if result.error else ""), error=not result.success, busy=False)
+        self._gui_action_queue.put(complete)
+
+    def stop_command_debug_tools(self):
+        self._cancel_command_debug_pulse()
+        self._command_debug_fresh_start_request = None
+        self._command_debug_fresh_start_launch = None
+        self._command_debug_retest_request = None
+        self._command_debug_restart_request = None
+        self._restart_requested_snapshot = None
+        self.holdForceEnd()
+        if str(self.start_button.cget("text")) == "Stop":
+            self.stopPlay()
+        self._command_debug_status("中断しました。保持入力を解放し、自動再開しません", busy=False)
+
+    @staticmethod
+    def _command_debug_source_positions(command):
+        positions = {}
+        plans = getattr(command, "_vision_plans", {})
+        for state, live in getattr(command, "_vision_step_progress", {}).copy().items():
+            progress = live.copy()
+            actions = plans.get(state, {}).get("actions", [])
+            index = int(progress.get("index", 0))
+            action = actions[index] if 0 <= index < len(actions) else None
+            elapsed = float(progress.get("elapsed", 0.0))
+            position = (float(action.get("t0", 0.0)) + elapsed / float(action.get("time_scale", 1.0))) if action else None
+            positions[state] = {"index": index, "elapsed": elapsed, "source_time": position,
+                                "source_t0": action.get("t0") if action else None}
+        return positions
+
+    def capture_command_debug_evidence(self):
+        if getattr(self, "_command_debug_restart_request", None) is not None:
+            return False
+        if getattr(self, "_command_debug_capture_busy", False):
+            return False
+        self._command_debug_maximize()
+        command = getattr(self, "cur_command", None)
+        binding = self._command_debug_binding()
+        camera = self.camera
+        sequence = camera.frameSequence()
+        targets = copy.deepcopy(getattr(command, "IMAGE_DETECTION_TARGETS", {}))
+        operators = copy.deepcopy(getattr(command, "IMAGE_DETECTION_OPERATORS", {}))
+        with self._record_detection_events_lock:
+            recent = list(self._record_detection_events)
+        # Prefer the active wait and all its AND crops, not stale scores from
+        # a different frame. Names are re-evaluated independently by the exporter.
+        names = [name for name in recent if name in targets]
+        for name in list(getattr(command, "_vision_detection_scores", {}).copy()):
+            if name in targets and name not in names:
+                names.append(name)
+        metadata = {"input_binding": binding, "command": getattr(command, "NAME", ""),
+                    "request_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "command_version": getattr(command, "VISION_RUNTIME_VERSION", None),
+                    "runtime_version": getattr(command, "VISION_RUNTIME_VERSION", None),
+                    "source": command_source_descriptor(command) if command is not None else {},
+                    "execution": runtime_execution_snapshot(command, os.path.dirname(os.path.dirname(__file__))),
+                    "wait_target": getattr(command, "_vision_last_wait_status", None),
+                    "states": runtime_state_snapshot(command),
+                    "request_source_positions": self._command_debug_source_positions(command)}
+        self._command_debug_capture_busy = True
+        self._command_debug_status("新しいCamera映像と同一フレームの判定を保存しています", busy=True)
+
+        def worker():
+            result, error = None, None
+            try:
+                current, frame = camera.waitForFrame(sequence, timeout=.75)
+                if current == sequence or frame is None:
+                    raise RuntimeError("新しいCamera映像がありません（キャッシュ画像は保存しません）")
+                if camera is not self.camera or binding != self._command_debug_binding():
+                    raise RuntimeError("取得中に入力先またはCameraが変更されました")
+                if command is not getattr(self, "cur_command", None):
+                    raise RuntimeError("取得中にCommandsが変更されました")
+                metadata["request_execution"] = metadata.pop("execution")
+                metadata["request_states"] = metadata.pop("states")
+                metadata["observed_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                metadata["execution"] = runtime_execution_snapshot(command, os.path.dirname(os.path.dirname(__file__)))
+                metadata["states"] = runtime_state_snapshot(command)
+                metadata["source_position"] = self._command_debug_source_positions(command)
+                source_path = (metadata.get("source") or {}).get("file")
+                if source_path and os.path.isfile(source_path):
+                    with open(source_path, "rb") as source_stream:
+                        metadata["source_sha256"] = hashlib.sha256(source_stream.read()).hexdigest()
+                    metadata["source_sha256_scope"] = "on-disk source at evidence capture, not a loaded-code attestation"
+                serial_root = os.path.dirname(os.path.abspath(__file__))
+                result = save_debug_evidence(os.path.join(serial_root, "Captures", "CommandDebug"),
+                    frame, current, targets, operators, metadata, target_names=names or None, serial_root=serial_root)
+            except Exception as exc:
+                error = str(exc)
+
+            def complete():
+                self._command_debug_capture_busy = False
+                self._command_debug_status("保存失敗: " + error if error else "保存完了: " + result["json_path"],
+                                           error=bool(error), busy=False)
+            self._gui_action_queue.put(complete)
+        threading.Thread(target=worker, daemon=True, name="CommandDebugEvidence").start()
+        return True
+
+    def _command_debug_retest_location(self, command, name, locations):
+        """Ignore constructor defaults; retry only an observed or saved Step."""
+        current = getattr(command, "_vision_current_state", None)
+        worker = getattr(command, "thread", None)
+        executed = (str(self.start_button.cget("text")) == "Stop"
+                    or (worker is not None and getattr(worker, "ident", None) is not None))
+
+        def allowed(item):
+            if item.get("mode") != "state":
+                return False
+            value = str(item.get("value", "") or "")
+            if not value or value == "MAIN_STATE_INIT" or value.endswith("_STATE_INIT"):
+                return False
+            if getattr(command, "VISION_RUNTIME_VERSION", None):
+                # SSR's public dispatcher entries are not playable Steps.
+                return re.fullmatch(r"[1-9][0-9]*_STORY_[0-9]{3}", value) is not None
+            return True
+
+        path = relevant_state_path(runtime_state_snapshot(command)) if executed else []
+        candidates = ([current] if current else []) + list(reversed(path))
+        location = next((item for value in candidates for item in locations
+                         if item.get("value") == value and allowed(item)), None)
+        if location is not None:
+            return location
+        saved = self.command_start_overrides.get(name, {}).get("start", {})
+        return next((item for item in locations
+                     if item.get("id") == saved.get("id") and allowed(item)
+                     and all(item.get(key) == saved[key]
+                             for key in ("mode", "variable", "value", "kind") if key in saved)), None)
+
+    def retest_current_command_step(self):
+        if (getattr(self, "_command_debug_retest_request", None) is not None
+                or getattr(self, "_command_debug_pulse_job", None) is not None
+                or getattr(self, "_command_debug_restart_request", None) is not None
+                or getattr(self, "_command_debug_fresh_start_request", None) is not None):
+            return False
+        command = getattr(self, "cur_command", None)
+        name = self._selected_command_name()
+        if command is not None and name != getattr(command, "NAME", ""):
+            self._command_debug_status("選択Commandsと実行中Commandsが異なるため、再試験しません", error=True)
+            return False
+        options = self._command_run_options(name)
+        locations = options.get("locations", [])
+        location = self._command_debug_retest_location(command, name, locations)
+        if not name or not location:
+            self._command_debug_status("再試験するStepを特定できません。Step実行設定で開始場所を指定してください", error=True)
+            return False
+        self._command_debug_maximize()
+        request = {"binding": self._command_debug_binding(), "name": name,
+                   "location_id": location["id"], "started": time.monotonic(),
+                   "location_contract": {key: location.get(key) for key in ("mode", "variable", "value", "kind")},
+                   "source_file": (command_source_descriptor(command) or {}).get("file")}
+        self._command_debug_retest_request = request
+        self._command_debug_status("録画保護 → 停止完了を待機（次にReload／開始位置を確認）", busy=True)
+        if str(self.start_button.cget("text")) == "Stop":
+            if getattr(self, "_command_monitor_chunks", []):
+                self.stop_command_for_adjustment_with_recordings()
+            else:
+                self.stopPlay()
+        self.root.after(100, lambda: self._command_debug_retest_poll(request))
+        return True
+
+    def _command_debug_retest_poll(self, request):
+        if getattr(self, "_command_debug_retest_request", None) is not request:
+            return
+        if (request["binding"] != self._command_debug_binding()
+                or request["name"] != self._selected_command_name()
+                or time.monotonic() - request["started"] > 120
+                or getattr(self, "_preview_shutdown_mode", False)):
+            self._command_debug_retest_request = None
+            self._command_debug_status("再試験を中断しました（接続／選択変更または停止待機期限）。自動Startしません", error=True, busy=False)
+            return
+        worker = getattr(getattr(self, "cur_command", None), "thread", None)
+        if (self._pokecon_studio_commands_busy() or (worker is not None and worker.is_alive())
+                or getattr(self, "_command_monitor_adjustment_protect_request", None) is not None):
+            self.root.after(100, lambda: self._command_debug_retest_poll(request))
+            return
+        if not self._reload_pokecon_studio_commands():
+            self._command_debug_retest_request = None
+            self._command_debug_status("Reload失敗。停止を維持します", error=True, busy=False)
+            return
+        options = self._command_run_options(request["name"])
+        location = next((item for item in options.get("locations", []) if item.get("id") == request["location_id"]), None)
+        descriptor = command_source_descriptor(getattr(self, "cur_command", None)) or {}
+        self._command_debug_retest_request = None
+        if (location is None or request["binding"] != self._command_debug_binding()
+                or {key: location.get(key) for key in ("mode", "variable", "value", "kind")} != request["location_contract"]
+                or request["name"] != self._selected_command_name()
+                or descriptor.get("file") != request["source_file"]):
+            self._command_debug_status("Reload後のCommands／Step／接続先が一致しません。開始しません", error=True, busy=False)
+            return
+        config = copy.deepcopy(self.command_start_overrides.get(request["name"], {}))
+        config.update(start=copy.deepcopy(location), end=copy.deepcopy(location), confirm=True,
+                      variable=location.get("variable", ""), state=location.get("value", ""),
+                      retry_on_failure=False, save_delete_user_number=0, debug={}, max_retries=1)
+        self.command_start_overrides[request["name"]] = config
+        self._refresh_command_start_status()
+        version = getattr(getattr(self, "cur_command", None), "VISION_RUNTIME_VERSION", "")
+        self._command_debug_status("Reload完了 {}。同Stepだけの開始確認を開きます".format(version), busy=False)
+        # The normal range-confirmation dialog is mandatory. It can be cancelled;
+        # no Pause hot-swap, save deletion, title reset or hidden auto-Start.
+        self.startPlay()
+
+    def _command_debug_fresh_start_location(self, owner, locations):
+        """Opt-in metadata only; never infer a reset from an arbitrary Step."""
+        capability = getattr(owner, "POKECON_FRESH_START", None)
+        if (not isinstance(capability, dict) or type(capability.get("data_slot")) is not int
+                or capability.get("data_slot") != 1
+                or capability.get("requires_user_confirmation") is not True):
+            return None
+        return next((item for item in locations
+                     if item.get("id") == capability.get("location_id")
+                     and item.get("mode") == "state" and item.get("kind") == "state"
+                     and all(item.get(key) == capability.get(key)
+                             for key in ("mode", "variable", "value"))), None)
+
+    def fresh_start_current_command(self):
+        """Explicit reset/new-game run, guarded by the Commands' image runtime."""
+        if any(getattr(self, field, None) is not None for field in (
+                "_command_debug_fresh_start_request", "_command_debug_fresh_start_launch",
+                "_command_debug_retest_request", "_command_debug_restart_request", "_command_debug_pulse_job")):
+            return False
+        name = self._selected_command_name()
+        classes = self._command_classes(name)
+        options = self._command_run_options(name)
+        owner = classes[0] if len(classes) == 1 else None
+        location = self._command_debug_fresh_start_location(owner, options.get("locations", []))
+        command = getattr(self, "cur_command", None)
+        _, held = self._software_controller_state.latest_snapshot()
+        binding = self._command_debug_binding()
+        if (not location or not binding[3] or not binding[4]
+                or held or self._software_controller_override_active
+                or getattr(self, "_preview_shutdown_mode", False)
+                or (str(self.start_button.cget("text")) == "Stop"
+                    and getattr(command, "NAME", None) != name)):
+            self._command_debug_status("対応Commands・入力先・手動入力の解放を確認してください。開始しません", error=True)
+            return False
+        saved_end = self.command_start_overrides.get(name, {}).get("end") or {}
+        end = next((item for item in options.get("locations", [])
+                    if item.get("id") == saved_end.get("id") and item.get("variable") == location["variable"]
+                    and item.get("mode") == "state" and item.get("kind") == "state"
+                    and all(item.get(key) == saved_end.get(key) for key in ("mode", "variable", "value", "kind"))), {})
+        source_file = inspect.getsourcefile(owner)
+        if not source_file:
+            return False
+        request = {"name": name, "binding": binding, "camera": self.camera,
+                   "camera_capture": getattr(self.camera, "camera", None),
+                   "started": time.monotonic(), "source_file": os.path.abspath(source_file),
+                   "capability": copy.deepcopy(owner.POKECON_FRESH_START),
+                   "location": copy.deepcopy(location), "end": copy.deepcopy(end)}
+        if not tkmsg.askyesno("タイトル→はじめから実行",
+                "入力先: {}\nCommands: {}\n\n停止・録画保護・Reloadの後、ゲーム内タイトルへ戻り、"
+                "データ1を『はじめから』で実行します。既存オートセーブは上書きされます。\n"
+                "開始: {}\n終了: {}\n\nHOMEは使用せず、画像判定できなければ停止します。実行しますか？".format(
+                    binding[4], name, location.get("label", location["value"]),
+                    end.get("label", "指定なし")), parent=self.root):
+            return False
+        self._command_debug_maximize()
+        self._command_debug_fresh_start_request = request
+        self._command_debug_status("はじめから: 録画保護 → 停止完了 → Reloadを待機", busy=True)
+        if str(self.start_button.cget("text")) == "Stop":
+            if getattr(self, "_command_monitor_chunks", []):
+                self.stop_command_for_adjustment_with_recordings()
+            else:
+                self.stopPlay()
+        self.root.after(100, lambda: self._command_debug_fresh_start_poll(request))
+        return True
+
+    def _command_debug_fresh_start_matches(self, command, request):
+        descriptor = command_source_descriptor(command) or {}
+        _, held = self._software_controller_state.latest_snapshot()
+        return bool(getattr(self, "_command_debug_fresh_start_launch", None) is request
+                    and time.monotonic() - request["started"] <= 120
+                    and request["binding"] == self._command_debug_binding()
+                    and request["camera"] is self.camera
+                    and request.get("camera_capture") is getattr(self.camera, "camera", None)
+                    and request["name"] == self._selected_command_name() == getattr(command, "NAME", None)
+                    and request["source_file"] == descriptor.get("file")
+                    and request["capability"] == getattr(command, "POKECON_FRESH_START", None)
+                    and not held and not self._software_controller_override_active
+                    and not getattr(self, "_preview_shutdown_mode", False))
+
+    def _command_debug_prepare_fresh_start(self, command, request):
+        if not self._command_debug_fresh_start_matches(command, request):
+            self._command_debug_status("はじめから要求の接続先／ソースが変わりました。開始しません", error=True)
+            return False
+        options = self._command_run_options(request["name"])
+        location = self._command_debug_fresh_start_location(command, options.get("locations", []))
+        if location != request["location"] or (request["end"] and request["end"] not in options.get("locations", [])):
+            self._command_debug_status("Reload後の実行範囲が変わりました。開始しません", error=True)
+            return False
+        config = {"start": copy.deepcopy(location), "end": copy.deepcopy(request["end"]),
+                  "confirm": False, "debug": {}, "retry_on_failure": False,
+                  "save_delete_user_number": 0, "max_retries": 1}
+        try:
+            assignments = apply_command_run_options(command, config)
+        except (AttributeError, TypeError, ValueError) as error:
+            self._command_debug_status("はじめから範囲の適用失敗: " + str(error), error=True)
+            return False
+        command._command_start_override_context = {
+            "variable": location["variable"], "state": location["value"], "assignments": assignments,
+            "start": copy.deepcopy(location), "end": copy.deepcopy(request["end"]), "end_seen": False}
+        return True
+
+    def _command_debug_fresh_start_poll(self, request):
+        if getattr(self, "_command_debug_fresh_start_request", None) is not request:
+            return
+        if (request["binding"] != self._command_debug_binding() or request["camera"] is not self.camera
+                or request.get("camera_capture") is not getattr(self.camera, "camera", None)
+                or request["name"] != self._selected_command_name()
+                or time.monotonic() - request["started"] > 120 or getattr(self, "_preview_shutdown_mode", False)):
+            self._command_debug_fresh_start_request = None
+            self._command_debug_status("はじめから要求を中断しました。自動再開しません", error=True, busy=False)
+            return
+        worker = getattr(getattr(self, "cur_command", None), "thread", None)
+        if (self._pokecon_studio_commands_busy() or (worker is not None and worker.is_alive())
+                or getattr(self, "_command_monitor_adjustment_protect_request", None) is not None):
+            self.root.after(100, lambda: self._command_debug_fresh_start_poll(request))
+            return
+        self._command_debug_fresh_start_request = None
+        self._command_debug_fresh_start_launch = request
+        try:
+            if not self._reload_pokecon_studio_commands():
+                self._command_debug_status("Reload失敗。停止を維持します", error=True, busy=False)
+                return
+            self._command_debug_status("はじめから: 画像確認付きでデータ1／Step001を実行", busy=False)
+            self.startPlay(_fresh_start_request=request)
+        except Exception as error:
+            self._command_debug_status("はじめから準備に失敗しました。自動再開しません: " + str(error),
+                                       error=True, busy=False)
+        finally:
+            self._command_debug_fresh_start_launch = None
+
+    def _confirm_start_after_app_restart(self):
+        # A restored timer/assist or shortcut cannot silently start Commands.
+        # This is session-only; saved run options/InputSet remain unchanged.
+        if not getattr(self, "_restart_needs_start_confirmation", False):
+            return True
+        if not tkmsg.askyesno("再起動後のCommands実行確認",
+                             "再起動後はCommandsを停止したままにしています。\n"
+                             "現在選択中のCommandsを実行してよいですか？", parent=self.root):
+            return False
+        self._restart_needs_start_confirmation = False
+        return True
+
+    def restart_pokecon_same_settings(self):
+        """Explicit, confirmed restart of this process only; never resume play.
+
+        AI callers must additionally have the human user's authorization. The
+        modal is not a stored grant and no automatic retry uses this action.
+        """
+        if (getattr(self, "_command_debug_restart_request", None) is not None
+                or getattr(self, "_command_debug_retest_request", None) is not None
+                or getattr(self, "_command_debug_fresh_start_request", None) is not None
+                or getattr(self, "_command_debug_capture_busy", False)
+                or getattr(self, "_preview_shutdown_mode", False)):
+            return False
+        for field in ("_initial_serial_open_thread", "_initial_video_open_thread", "_camera_name_open_thread"):
+            worker = getattr(self, field, None)
+            if worker is not None and worker.is_alive():
+                self._command_debug_status("機器の接続処理中です。完了後に再起動してください", error=True)
+                return False
+        if PokeControllerApp._command_debug_wait_for_release(self):
+            return False
+        name = str(getattr(self, "_active_input_set_name", "") or "").strip()
+        if not name:
+            self._command_debug_status("現在のInputSetを特定できないため、再起動しません", error=True)
+            return False
+        if not tkmsg.askyesno(
+                "このPokeConの再起動許可", "現在の「{}」だけを同じ設定で再起動しますか？\n\n"
+                "Commandsを停止し、録画を保護して通常終了してから起動し直します。\n"
+                "ゲーム・他のPokeConは終了せず、HOME入力やCommandsの自動再開もしません。\n"
+                "AIによる実行は、ユーザーから使用許可がある場合だけ行ってください。".format(name),
+                parent=self.root):
+            return False
+        snapshot = {"input_set": name,
+                    "combined_set": str(self.input_recording_set_name.get() or ""),
+                    "maximized": str(self.root.state()) == "zoomed",
+                    "input_set_data": copy.deepcopy(self._current_input_set_data())}
+        camera = snapshot["input_set_data"]["camera"]
+        camera_is_open = getattr(getattr(self, "camera", None), "isOpened", None)
+        camera["enabled"] = bool(callable(camera_is_open) and camera_is_open())
+        snapshot["input_set_data"]["all_tabs"]["camera"] = copy.deepcopy(camera)
+        # Identical USB-serial devices can share their description and even
+        # serial number. Bind this handoff to the actual open transport, not
+        # the first descriptive match or a staged Serial-tab selection.
+        serial = snapshot["input_set_data"]["serial"]
+        if self.ser.isOpened():
+            opened_port = str(getattr(getattr(self.ser, "ser", None), "port", "") or "")
+            exact = [port for port in list_ports.comports()
+                     if str(getattr(port, "device", "")).casefold() == opened_port.casefold()]
+            if not opened_port or len(exact) != 1:
+                self._command_debug_status("実接続のSerialポートを特定できないため、再起動しません", error=True)
+                return False
+            port = exact[0]
+            serial.update(enabled=True, port=opened_port, device_name=str(port.description),
+                          description=str(port.description), vid=getattr(port, "vid", None),
+                          pid=getattr(port, "pid", None), serial_number=str(getattr(port, "serial_number", "") or ""),
+                          baud_rate=str(getattr(self.ser.ser, "baudrate", self.baud_rate.get())),
+                          data_format=KeyPress.serial_data_format_name)
+        else:
+            serial = {"enabled": False}  # a disconnected tool stays disconnected
+            snapshot["input_set_data"]["serial"] = serial
+        snapshot["input_set_data"]["all_tabs"]["serial"] = copy.deepcopy(serial)
+        manual = snapshot["input_set_data"].get("all_tabs", {}).get("manual_control", {})
+        manual["input_permission"] = False  # authorization is session-only
+        request = {"binding": self._command_debug_binding(), "snapshot": snapshot,
+                   "started": time.monotonic()}
+        self._command_debug_restart_request = request
+        self._command_debug_status("このPokeConだけ再起動：録画保護・停止完了を待機", busy=True)
+        if str(self.start_button.cget("text")) == "Stop":
+            if getattr(self, "_command_monitor_chunks", []):
+                self.stop_command_for_adjustment_with_recordings()
+            else:
+                self.stopPlay()
+        self.root.after(100, lambda: self._command_debug_restart_poll(request))
+        return True
+
+    def _command_debug_restart_poll(self, request):
+        if getattr(self, "_command_debug_restart_request", None) is not request:
+            return
+        if (request["binding"] != self._command_debug_binding()
+                or time.monotonic() - request["started"] > 120):
+            self._command_debug_restart_request = None
+            self._command_debug_status("再起動を中断しました（接続変更または停止待機期限）", error=True, busy=False)
+            return
+        worker = getattr(getattr(self, "cur_command", None), "thread", None)
+        if (self._pokecon_studio_commands_busy() or (worker is not None and worker.is_alive())
+                or getattr(self, "_command_monitor_adjustment_protect_request", None) is not None
+                or getattr(self, "_command_debug_pulse_job", None) is not None):
+            self.root.after(100, lambda: self._command_debug_restart_poll(request))
+            return
+        self._restart_requested_snapshot = request["snapshot"]
+        try:
+            self.exit()  # Existing recording finalization and exit confirmations.
+        except Exception:
+            self._restart_requested_snapshot = None
+            self._command_debug_restart_request = None
+            self._restart_launch_argv = None
+            self._command_debug_status("通常終了に失敗したため、再起動しません", error=True, busy=False)
+            raise
+        if not getattr(self, "_process_exit_ready", False):
+            self._command_debug_restart_exit_watch(request)
+
+    def _command_debug_restart_exit_watch(self, request):
+        if getattr(self, "_command_debug_restart_request", None) is not request:
+            return
+        if not getattr(self, "_preview_shutdown_mode", False):
+            self._restart_requested_snapshot = None
+            self._command_debug_restart_request = None
+            self._command_debug_status("再起動はキャンセルされました。自動起動しません", busy=False)
+            return
+        self.root.after(100, lambda: self._command_debug_restart_exit_watch(request))
+
     def hold(self, event, buttons: Button | Hat | Stick | Direction):
         """
         ボタンを押す。
@@ -21452,6 +29056,8 @@ class PokeControllerApp:
     def _queue_software_controller(self, action, buttons):
         """Keep serial I/O out of Tk callbacks and supersede stale input."""
         try:
+            # A new physical/manual action supersedes a timed debug pulse.
+            self._cancel_command_debug_pulse()
             self._note_resource_interaction()
             # Manual input temporarily owns the controller.  Pausing at the
             # command's next 10-20 ms checkpoint prevents its next packet from
@@ -21478,22 +29084,37 @@ class PokeControllerApp:
                 return
             except queue.Full:
                 try:
-                    self._software_controller_queue.get_nowait()
+                    old = self._software_controller_queue.get_nowait()
                     self._software_controller_queue.task_done()
+                    if isinstance(old, TimedPulseJob):
+                        old.cancel()
+                        self._gui_action_queue.put(lambda job=old: self._command_debug_cancelled_before_send(job))
                 except queue.Empty:
                     # The sender consumed it between Full and get_nowait.
                     continue
 
     def _software_controller_loop(self):
+        pending_pulse = None
         while True:
-            version = self._software_controller_queue.get()
+            version = pending_pulse if pending_pulse is not None else self._software_controller_queue.get()
+            pending_pulse = None
+            if isinstance(version, TimedPulseJob):
+                try:
+                    self._execute_command_debug_pulse(version)
+                finally:
+                    self._software_controller_queue.task_done()
+                continue
             pending_count = 1
             try:
                 # Collapse queued mouse events before touching the serial port.
                 # Only the newest complete state is useful after any backlog.
                 while True:
                     try:
-                        version = self._software_controller_queue.get_nowait()
+                        newer = self._software_controller_queue.get_nowait()
+                        if isinstance(newer, TimedPulseJob):
+                            pending_pulse = newer
+                            break
+                        version = newer
                         pending_count += 1
                     except queue.Empty:
                         break
@@ -21683,6 +29304,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--start-maximized", action="store_true",
         help="maximize the main window before Camera, Audio, and Serial start")
+    parser.add_argument(
+        "--open-pokecon-studio", action="store_true",
+        help="open PokeConStudio after the main window has initialized")
+    parser.add_argument("--restart-state", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     logger = PokeConLogger.root_logger()
@@ -21721,6 +29346,19 @@ if __name__ == "__main__":
 
     def report_tk_callback_exception(exception_type, exception, traceback_object):
         """Log Tk callback failures without writing to an invalid console handle."""
+        current_app = globals().get("app")
+        if getattr(current_app, "_command_debug_restart_request", None) is not None:
+            # Recording shutdown can finish in a later Tk callback, outside
+            # the restart button's try/except. A failure revokes that one-use
+            # intent so a later ordinary close cannot unexpectedly restart.
+            current_app._restart_requested_snapshot = None
+            current_app._command_debug_restart_request = None
+            current_app._restart_launch_argv = None
+            try:
+                current_app._command_debug_status(
+                    "終了処理エラーのため、再起動予約を取り消しました", error=True, busy=False)
+            except Exception:
+                pass
         logger.error("Tk callback failed", exc_info=(exception_type, exception, traceback_object))
         try:
             tkmsg.showerror(
@@ -21733,10 +29371,30 @@ if __name__ == "__main__":
 
     root.report_callback_exception = report_tk_callback_exception
     try:
+        restart_state = (consume_restart_state(args.restart_state, args.profile)
+                         if args.restart_state else None)
         app = PokeControllerApp(
-            root, args.profile, start_maximized=args.start_maximized)
+            root, args.profile, start_maximized=args.start_maximized,
+            restart_state=restart_state)
+        if args.open_pokecon_studio:
+            root.after(750, app.open_pokecon_studio)
         app.run()
         if getattr(app, "_process_exit_ready", False):
+            restart_argv = getattr(app, "_restart_launch_argv", None)
+            if restart_argv:
+                try:
+                    # Device shutdown and active-InputSet deregistration have
+                    # completed. Replace this process, never launch a second
+                    # PokeCon beside a still-open camera or serial connection.
+                    os.execv(restart_argv[0], [restart_argv[0], "-B"] + restart_argv[1:])
+                except Exception as error:
+                    try:
+                        discard_restart_state(restart_argv[-1], args.profile)
+                    except Exception:
+                        logger.exception("Could not discard failed restart handoff")
+                    logger.exception("PokeCon restart exec failed; no retry")
+                    tkmsg.showerror("再起動失敗", "再起動できませんでした。自動で再試行しません。\n\n" + str(error))
+                    terminate_after_gui_shutdown(1)
             # A few device backends can leave native/non-daemon workers alive
             # after their normal close calls.  End only this PokeCon process so
             # its waiting PowerShell/Cmd launcher can close as well.

@@ -98,6 +98,7 @@ INPUT_SET_VARIABLES = (
     "record_monitor_chunk_seconds", "record_monitor_keep_steps",
     "record_monitor_loop_cycles", "record_monitor_long_seconds",
     "record_monitor_failure_tail_seconds",
+    "record_monitor_retention_mode",
     "record_monitor_auto_arm", "record_monitor_confirm_delete_on_stop",
     "record_focus_repair_enabled", "record_focus_repair_functions",
     # Long-form PC-controller + video authoring session
@@ -262,9 +263,10 @@ def sync_command_start_overrides(data, input_set_name, overrides, favorites=None
     return True
 
 
-def sync_command_recovery_scripts(data, input_set_name, favorites,
-                                  auto_open=True):
-    """Continuously save recovery snippets into the active Commands InputSet."""
+def sync_command_recovery_scripts(
+        data, input_set_name, favorites, auto_open=None,
+        auto_pause_disabled=None):
+    """Continuously save recovery snippets and automatic-pause preference."""
     if (not isinstance(data, dict) or not input_set_name
             or not isinstance(favorites, list)):
         return False
@@ -272,11 +274,18 @@ def sync_command_recovery_scripts(data, input_set_name, favorites,
     if not isinstance(item, dict) or not input_set_commands_enabled(item):
         return False
     saved = copy.deepcopy(favorites)
+    if auto_pause_disabled is None:
+        auto_pause_disabled = True if auto_open is None else not bool(auto_open)
+    auto_pause_disabled = bool(auto_pause_disabled)
     top = item.setdefault("commands_assist", {})
     top["recovery_scripts"] = saved
-    top["recovery_auto_open"] = bool(auto_open)
+    top["recovery_auto_pause_disabled"] = auto_pause_disabled
+    # Keep the former positive key for older PokeCon builds.  The new
+    # negative key is authoritative in current builds and defaults to True.
+    top["recovery_auto_open"] = not auto_pause_disabled
     if isinstance(item.get("all_tabs"), dict):
         tab = item["all_tabs"].setdefault("commands_assist", {})
         tab["recovery_scripts"] = copy.deepcopy(saved)
-        tab["recovery_auto_open"] = bool(auto_open)
+        tab["recovery_auto_pause_disabled"] = auto_pause_disabled
+        tab["recovery_auto_open"] = not auto_pause_disabled
     return True

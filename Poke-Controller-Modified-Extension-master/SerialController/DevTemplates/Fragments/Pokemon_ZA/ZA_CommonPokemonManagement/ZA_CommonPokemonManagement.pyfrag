@@ -21,7 +21,11 @@ def ZA_common_skill_change_function(self,selectpokemonnum,target1,target2,machin
     return self.common_skill_change_current_state
 def ZA_common_skill_change_start(self):
     return "COMMON_SKILL_CHANGE_START_CHECK"
-def ZA_common_skill_change_start_check(self):
+def ZA_common_skill_change_start_check(self,detected_action_wait=0.0):
+    try:
+        detected_action_wait = max(0.0, float(detected_action_wait))
+    except (TypeError, ValueError):
+        detected_action_wait = 0.0
     if self.check_picture==1:
         if self.image_check("POKEMON_ZA_X_MENU_OPEN"):
             print("POKEMON_ZA_X_MENU_OPEN")
@@ -45,18 +49,29 @@ def ZA_common_skill_change_start_check(self):
             print("POKEMON_ZA_SKILL_PAGE_SIDE_SELECT_B")
         self.wait(2.0)
     else:
+        # 共通メニューへ入る前に、直前の戦闘から残ったZLを解除する。
+        # 進化・技変更・BOX・アイテム付与のX/Aを複合入力にしない。
+        self.ZA_ZL_ACTION("END")
         if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"): #FIELDから変更
+            if detected_action_wait > 0.0:
+                self.wait(detected_action_wait)
             self.pressRep(Button.X, repeat=1, duration=0.15, wait=0.5, interval=0.1)
             self.wait(1.0)
         elif self.image_check("POKEMON_ZA_X_MENU_OPEN"):
             self.wait(1.0)
             return "COMMON_SKILL_CHANGE_POKEMON_SELECT"
         elif self.image_check("POKEMON_ZA_HELP_MARKER"):
+            if detected_action_wait > 0.0:
+                self.wait(detected_action_wait)
             self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
             self.wait(1.0)
 
     return "COMMON_SKILL_CHANGE_START_CHECK"
-def ZA_common_skill_change_pokemon_select(self,selectnum):
+def ZA_common_skill_change_pokemon_select(self,selectnum,detected_action_wait=0.0):
+    try:
+        detected_action_wait = max(0.0, float(detected_action_wait))
+    except (TypeError, ValueError):
+        detected_action_wait = 0.0
     if self.image_check("POKEMON_ZA_X_MENU_OPEN"):
         if self.image_check("POKEMON_ZA_SIDE_SELECT_X_MENU_W"):
             self.wait(0.5)
@@ -68,6 +83,8 @@ def ZA_common_skill_change_pokemon_select(self,selectnum):
             self.wait(0.5)
             return "COMMON_SKILL_CHANGE_SKILL_WINDOW_OPEN"
         elif self.image_check("POKEMON_ZA_POKEMON_MENU_X_MENU_W"):
+            if detected_action_wait > 0.0:
+                self.wait(detected_action_wait)
             for i in range(7):
                 self.etc_sendCommand("Lbutton_left")
             self.wait(0.5)
@@ -421,13 +438,15 @@ def ZA_common_item_give_function(self,selectnum,target1,target2):
         else:
             self.common_item_give_current_state = "COMMON_ITEM_GIVE_START"
     elif self.common_item_give_current_state == "COMMON_ITEM_GIVE_START_CHECK":
-        ret = self.ZA_common_skill_change_start_check()
+        ret = self.ZA_common_skill_change_start_check(
+            detected_action_wait=0.5)
         if ret == "COMMON_SKILL_CHANGE_POKEMON_SELECT":
             self.common_item_give_current_state = "COMMON_ITEM_GIVE_POKEMON_SELECT"
         else:
             self.common_item_give_current_state = "COMMON_ITEM_GIVE_START_CHECK" 
     elif self.common_item_give_current_state == "COMMON_ITEM_GIVE_POKEMON_SELECT":
-        ret = self.ZA_common_skill_change_pokemon_select(selectnum)
+        ret = self.ZA_common_skill_change_pokemon_select(
+            selectnum, detected_action_wait=0.5)
         if ret == "COMMON_SKILL_CHANGE_SKILL_WINDOW_OPEN":
             self.common_item_give_current_state = "COMMON_ITEM_GIVE_WINDOW_OPEN"
         else:
@@ -444,6 +463,7 @@ def ZA_common_item_give_function(self,selectnum,target1,target2):
 def ZA_common_item_give_window_open(self):
     if self.image_check("POKEMON_ZA_X_MENU_OPEN"):
         if self.image_check("POKEMON_ZA_POKEMON_MENU_X_MENU_W"):
+            self.wait(0.5)
             for i in range(2):
                 self.etc_sendCommand("Lbutton_up")
                 self.wait(0.5)
@@ -453,6 +473,7 @@ def ZA_common_item_give_window_open(self):
     return "COMMON_ITEM_GIVE_WINDOW_OPEN"
 def ZA_common_item_give_target_side(self,target1):
     if self.image_check("POKEMON_ZA_ITEM_WINDOW"):
+        self.wait(0.5)
         for i in range(target1):
             self.keys.input(Button.R)
             self.wait(0.15)
@@ -462,6 +483,7 @@ def ZA_common_item_give_target_side(self,target1):
     return "COMMON_ITEM_GIVE_TARGET_SIDE"
 def ZA_common_item_give_target_high(self,target2,use=1):
     if self.image_check("POKEMON_ZA_ITEM_WINDOW"):
+        self.wait(0.5)
         for i in range(target2):
             self.etc_sendCommand("Lbutton_down")
             self.wait(0.5)
@@ -480,19 +502,23 @@ def ZA_common_item_give_end(self):
 ######################################################
 def ZA_common_evolution_function(self,selectnum):
     if self.common_evolution_current_state == "COMMON_EVOLUTION_START":
+        # 新しい進化対象では、前回の進化開始済み状態を引き継がない。
+        self._za_common_evolution_exec_started = False
         ret = self.ZA_common_skill_change_start()
         if ret == "COMMON_SKILL_CHANGE_START_CHECK":
             self.common_evolution_current_state = "COMMON_EVOLUTION_START_CHECK"
         else:
             self.common_evolution_current_state = "COMMON_EVOLUTION_START"
     elif self.common_evolution_current_state == "COMMON_EVOLUTION_START_CHECK":
-        ret = self.ZA_common_skill_change_start_check()
+        ret = self.ZA_common_skill_change_start_check(
+            detected_action_wait=0.5)
         if ret == "COMMON_SKILL_CHANGE_POKEMON_SELECT":
             self.common_evolution_current_state = "COMMON_EVOLUTION_POKEMON_SELECT"
         else:
             self.common_evolution_current_state = "COMMON_EVOLUTION_START_CHECK" 
     elif self.common_evolution_current_state == "COMMON_EVOLUTION_POKEMON_SELECT":
-        ret = self.ZA_common_skill_change_pokemon_select(selectnum)
+        ret = self.ZA_common_skill_change_pokemon_select(
+            selectnum, detected_action_wait=0.5)
         if ret == "COMMON_SKILL_CHANGE_SKILL_WINDOW_OPEN":
             self.common_evolution_current_state = "COMMON_EVOLUTION_EXEC"
         else:
@@ -505,20 +531,40 @@ def ZA_common_evolution_function(self,selectnum):
 def ZA_common_evolution_exec(self):
     # 3_SELECTはステータス／Xメニューの白枠を拾う場合がある。
     # 専用画面を先に処理し、誤検知したAでメニューへ入り直さない。
-    if self.image_check("POKEMON_ZA_EVOLUTION_CONFIRM"):
-        # 「そのまま見守る／やめる」は汎用2_SELECTより形が異なる。
-        button = Button.A
-    elif self.image_check("POKEMON_ZA_X_MENU_EVO_MENU"):
-        # 先頭の「進化する」を選択する画面だけはAで進める。
-        button = Button.A
-    elif self.image_check("POKEMON_ZA_2_SELECT"):
-        # 「進化する」の次の確認は背後のXメニューより優先する。
-        button = Button.A
-    elif (self.image_check("POKEMON_ZA_SKILL_PAGE_WINDOW")
+    def evolution_confirm_visible():
+        return (
+            self.image_check("POKEMON_ZA_EVOLUTION_CONFIRM")
+            or self.image_check("POKEMON_ZA_X_MENU_EVO_MENU")
+            or self.image_check("POKEMON_ZA_2_SELECT"))
+
+    def close_target_visible():
+        return (
+            self.image_check("POKEMON_ZA_SKILL_PAGE_WINDOW")
             or self.image_check(
                 "POKEMON_ZA_POKEMON_MENU_X_MENU_W_SELECT_SKILL")
-            or self.image_check("POKEMON_ZA_POKEMON_MENU_X_MENU_W")
-            or self.image_check("POKEMON_ZA_X_MENU_OPEN")):
+            or self.image_check("POKEMON_ZA_POKEMON_MENU_X_MENU_W"))
+
+    def other_a_target_visible():
+        return (
+            self.image_check("POKEMON_ZA_HELP_MARKER")
+            or self.image_check("POKEMON_ZA_3_SELECT")
+            or self.image_check("POKEMON_ZA_4_SELECT")
+            or self.image_check("POKEMON_ZA_MORNING")
+            or self.image_check("POKEMON_ZA_NIGHT"))
+
+    evolution_action_started = bool(
+        getattr(self, "_za_common_evolution_exec_started", False))
+
+    if evolution_confirm_visible():
+        # 「そのまま見守る／やめる」は汎用2_SELECTより形が異なる。
+        button = Button.A
+        evolution_action_started = True
+    elif close_target_visible():
+        # 「進化する」へのA送信後も背景のXメニューはしばらく残る。
+        # ここでBを送ると「……おや！／様子が……！」を取り消すため、
+        # 進化開始後は閉じる画像が一致してもEXEC内では無入力にする。
+        if evolution_action_started:
+            return "COMMON_EVOLUTION_EXEC"
         button = Button.B
         # 確認画面の表示アニメーション中は、背後のXメニューだけが
         # 先に一致することがある。すぐBを送らず短時間だけ再確認し、
@@ -526,23 +572,26 @@ def ZA_common_evolution_exec(self):
         # Xメニューで誤一致する3_SELECTは再確認対象にしない。
         for _ in range(3):
             self.wait(0.1)
-            if (self.image_check("POKEMON_ZA_EVOLUTION_CONFIRM")
-                    or self.image_check("POKEMON_ZA_X_MENU_EVO_MENU")
-                    or self.image_check("POKEMON_ZA_2_SELECT")):
+            if evolution_confirm_visible():
                 button = Button.A
+                evolution_action_started = True
                 break
+    elif self.image_check("POKEMON_ZA_X_MENU_OPEN"):
+        # Xメニュー単独は進化メニューの背景でも成立するため、
+        # Bにも汎用SELECTのAにも使わず次周期の専用画像を待つ。
+        return "COMMON_EVOLUTION_EXEC"
     elif self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT"):
         if not self.image_check("POKEMON_ZA_ZA_ROYALE"):
             return "COMMON_EVOLUTION_LOOP"
         button = Button.A
-    elif (self.image_check("POKEMON_ZA_HELP_MARKER")
-            or self.image_check("POKEMON_ZA_3_SELECT")
-            or self.image_check("POKEMON_ZA_4_SELECT")
-            or self.image_check("POKEMON_ZA_MORNING")
-            or self.image_check("POKEMON_ZA_NIGHT")):
+    elif other_a_target_visible():
         button = Button.A
     else:
-        button = Button.B
+        # 描画途中やFIELDで画像が取れない周期にBを送ると、直後に
+        # 表示された2_SELECTを取り消すため、確実な対象がない時は無入力。
+        return "COMMON_EVOLUTION_EXEC"
+
+    self._za_common_evolution_exec_started = evolution_action_started
     self.pressRep(
         button, repeat=1, duration=0.04,
         wait=0.0, interval=0.1)
@@ -559,17 +608,22 @@ def ZA_common_evolution_loop(self):
                 "POKEMON_ZA_POKEMON_MENU_X_MENU_W_SELECT_SKILL")
             or self.image_check("POKEMON_ZA_POKEMON_MENU_X_MENU_W")
             or self.image_check("POKEMON_ZA_X_MENU_EVO_MENU")):
+        self.wait(0.5)
         self.pressRep(
             Button.B, repeat=1, duration=0.15,
             wait=0.5, interval=0.1)
         return "COMMON_EVOLUTION_LOOP"
     if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_1"):
         return "COMMON_EVOLUTION_END"
-    self.pressRep(
-        Button.B, repeat=1, duration=0.15,
-        wait=0.5, interval=0.1)
+    if self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT"):
+        self.pressRep(
+            Button.B, repeat=1, duration=0.15,
+            wait=0.5, interval=0.1)
+    # LOOPはZA_renda_buttonではないため、既知のメニュー／Comment以外は
+    # Bを送らず次周期で再検知する。描画途中の進化取消を防ぐ。
     return "COMMON_EVOLUTION_LOOP"
 def ZA_common_evolution_end(self):
+    self._za_common_evolution_exec_started = False
     return "COMMON_EVOLUTION_START"
 
 ######################################################
@@ -583,7 +637,8 @@ def ZA_common_item_use_function(self,target1,target2=-1,item_pic="POKEMON_ZA_TRU
         else:
             self.common_item_use_current_state = "COMMON_ITEM_USE_START"
     elif self.common_item_use_current_state == "COMMON_ITEM_USE_START_CHECK":
-        ret = self.ZA_common_skill_change_start_check()
+        ret = self.ZA_common_skill_change_start_check(
+            detected_action_wait=0.5)
         if ret == "COMMON_SKILL_CHANGE_POKEMON_SELECT":
             self.common_item_use_current_state = "COMMON_ITEM_USE_WINDOW_OPEN"
         else:
@@ -607,6 +662,7 @@ def ZA_common_item_use_window_open(self):
             self.wait(0.5)
             return "COMMON_ITEM_USE_TARGET_SIDE"
         elif self.image_check("POKEMON_ZA_POKEMON_MENU_X_MENU_W"):
+            self.wait(0.5)
             for i in range(7):
                 self.etc_sendCommand("Lbutton_left")
             self.wait(0.5)
@@ -667,7 +723,8 @@ def ZA_common_item_use_window_close(self):
     if self.ZA_renda_button(rendabutton="B",
                         endpicture="POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK", #FIELDから変更
                         not_endpicture="POKEMON_ZA_ZA_ROYALE",
-                        sub_button="A",sub_picture="POKEMON_ZA_TEXT_BLACK_COMMENT",):
+                        sub_button="A",sub_picture="POKEMON_ZA_TEXT_BLACK_COMMENT",
+                        detected_action_wait=0.5):
         return "COMMON_ITEM_USE_END"
     return "COMMON_ITEM_GIVE_WINDOW_CLOSE"
 def ZA_common_item_use_end(self):

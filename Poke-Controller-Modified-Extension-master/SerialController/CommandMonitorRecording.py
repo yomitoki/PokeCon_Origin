@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import linecache
 import os
 import re
@@ -16,7 +17,14 @@ def runtime_state_snapshot(command):
     if command is None:
         return {}
     snapshot = {}
-    values = vars(command)
+    # Commands runs on its own worker and many existing scripts lazily add
+    # cache/state attributes while this 4-Hz monitor is sampling them.  Never
+    # iterate the live ``__dict__``: a concurrent setattr/delattr otherwise
+    # raises ``RuntimeError: dictionary changed size during iteration`` and
+    # disables monitoring recording.  ``dict.copy`` takes one shallow
+    # C-level snapshot while the GIL is held; the scalar/state references used
+    # below are then read from that stable top-level mapping.
+    values = vars(command).copy()
     # Older Commands contain mixed-case names such as
     # ``Common_current_state``.  Resolve candidates case-insensitively while
     # preserving the actual attribute name used by the command instance.
@@ -290,6 +298,27 @@ def temporary_chunk_ids_for_session(chunks, session_id):
     session_id = str(session_id or "")
     if not session_id:
         return set()
+
+    def youtube_upload_incomplete(chunk):
+        raw_upload = chunk.get("youtube_upload", {}) or {}
+        if not raw_upload:
+            return False
+        if not isinstance(raw_upload, dict):
+            return True
+        upload = dict(raw_upload)
+        status = str(upload.get("status", "") or "").strip().lower()
+        job_path = str(upload.get("job_path", "") or "").strip()
+        if job_path:
+            try:
+                with open(job_path, "r", encoding="utf-8") as stream:
+                    job = json.load(stream)
+                status = str(job.get("status", status) or status).strip().lower()
+            except (OSError, TypeError, ValueError):
+                # An unreadable/missing durable job is not evidence that the
+                # upload finished. Keep its only local media conservatively.
+                return status != "completed"
+        return bool(status) and status != "completed"
+
     return {
         str(chunk.get("id", ""))
         for chunk in chunks
@@ -297,7 +326,11 @@ def temporary_chunk_ids_for_session(chunks, session_id):
             and not chunk.get("pinned")
             and not chunk.get("historical")
             and not chunk.get("delete_pending")
+            and not chunk.get("recording_close_pending")
+            and not chunk.get("recording_close_failed")
+            and not chunk.get("youtube_roll_pending")
             and not chunk.get("merge_pending")
+            and not youtube_upload_incomplete(chunk)
             and not chunk.get("youtube_rolling_committed")
             and chunk.get("id") not in (None, ""))
     }
@@ -314,23 +347,65 @@ def youtube_rolling_chunk_ids(chunks, session_id, force=False):
     session_id = str(session_id or "")
     if not session_id:
         return []
-    candidates = []
+    ordered = []
     for chunk in chunks:
         archive = dict(chunk.get("youtube_archive", {}) or {})
+        attention = bool(chunk.get("youtube_merge_attention_required"))
+        close_pending = bool(chunk.get("recording_close_pending"))
+        close_failed = bool(chunk.get("recording_close_failed"))
+        boundary = bool(attention or close_pending or close_failed)
         if (str(chunk.get("command_session_id", "")) != session_id
                 or not archive.get("enabled")
-                or chunk.get("historical")
+                or (chunk.get("historical")
+                    and not chunk.get("youtube_roll_pending")
+                    and not boundary)
                 or chunk.get("merged")
                 or chunk.get("youtube_rolling_committed")
                 or chunk.get("merge_pending")
-                or chunk.get("delete_pending")
+                # A quarantined/unfinished source remains a hard timeline
+                # boundary even if an older retention pass left a deletion
+                # intent on it. Dropping that row here would silently join
+                # good footage from opposite sides of the missing interval.
+                or (chunk.get("delete_pending") and not boundary)
                 or chunk.get("ended") is None
                 or chunk.get("id") in (None, "")):
             continue
-        candidates.append(chunk)
-    candidates.sort(key=lambda chunk: (
+        ordered.append(chunk)
+    ordered.sort(key=lambda chunk: (
         float(chunk.get("started", 0.0) or 0.0),
         str(chunk.get("id", ""))))
+    # A source that requires attention is a hard timeline boundary. Finalize a
+    # shorter good prefix before it, and on the next pass start after it. This
+    # never silently joins video from opposite sides of a missing interval.
+    candidates = []
+    boundary_after = False
+    candidate_policy = None
+    for chunk in ordered:
+        close_pending = bool(chunk.get("recording_close_pending"))
+        boundary = bool(
+            chunk.get("youtube_merge_attention_required")
+            or close_pending or chunk.get("recording_close_failed"))
+        if boundary:
+            if candidates:
+                boundary_after = True
+                break
+            if close_pending:
+                # The file may become mergeable shortly. Do not move later
+                # footage ahead of it until close completion publishes state.
+                return []
+            continue
+        # The low-presentation decision is captured when each recording is
+        # created. Treat a setting change like a segment boundary so an ON
+        # source is never reinterpreted using an adjacent OFF source's policy
+        # (and vice versa). Legacy recordings predate the field and use ON.
+        archive = dict(chunk.get("youtube_archive", {}) or {})
+        policy = bool(archive.get("allow_low_presentations", True))
+        if candidates and policy != candidate_policy:
+            boundary_after = True
+            break
+        if not candidates:
+            candidate_policy = policy
+        candidates.append(chunk)
     if not candidates:
         return []
 
@@ -354,7 +429,7 @@ def youtube_rolling_chunk_ids(chunks, session_id, force=False):
         duration += max(0.0, saved)
         if duration >= target_seconds:
             return selected
-    return selected if force else []
+    return selected if force or boundary_after else []
 
 
 def ensure_stopped_session_recording_candidate(chunks, session_id):
@@ -371,6 +446,7 @@ def ensure_stopped_session_recording_candidate(chunks, session_id):
         chunk for chunk in chunks
         if (str(chunk.get("command_session_id", "")) == session_id
             and not chunk.get("historical")
+            and not chunk.get("explicit_delete_pending")
             and chunk.get("id") not in (None, ""))
     ]
     if not candidates or any(
@@ -401,6 +477,7 @@ def apply_stopped_session_recording_choice(chunks, session_id, save):
             continue
         chunk["pinned"] = bool(save)
         chunk["delete_pending"] = not bool(save)
+        chunk["explicit_delete_pending"] = not bool(save)
     return target_ids
 
 
@@ -584,13 +661,19 @@ class CommandStateTimeline:
         self.active_loop = None
         self.completed_loop = None
 
-    def add(self, snapshot, now):
+    def add(self, snapshot, now, detect_loops=True):
+        detect_loops = bool(detect_loops)
+        if not detect_loops:
+            # Keep state/Step history for source comparison while explicitly
+            # disabling every recording-retention loop decision.
+            self.active_loop = None
+            self.completed_loop = None
         key = snapshot_key(snapshot)
         if not key or (self.events and self.events[-1]["key"] == key):
             return {"changed": False, "loop_started": False,
                     "loop_ended": False, "event": None}
         loop_ended = False
-        if self.active_loop:
+        if detect_loops and self.active_loop:
             offset = len(self.events) - self.active_loop["anchor_index"]
             expected = self.active_loop["signature"][offset % self.active_loop["period"]]
             if key != expected:
@@ -618,7 +701,7 @@ class CommandStateTimeline:
                     0, int(self.completed_loop.get(
                         "exit_event_index", 0)) - removed)
         loop_started = False
-        if self.active_loop is None:
+        if detect_loops and self.active_loop is None:
             detected = self._detect_loop()
             if detected:
                 self.active_loop = detected

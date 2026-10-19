@@ -140,7 +140,7 @@ def register_profiles(profiles):
         }
         member = {"type": "target", "id": name}
         all_members.append(member)
-        folder = os.path.dirname(variants[0]["template_path"]).replace("Template/ZA_Story/", "").replace("Template/ZA_Story", "ROOT")
+        folder = os.path.dirname(variants[0]["template_path"]).replace("Template/ZA_Story_PIC/", "").replace("Template/ZA_Story_PIC", "ROOT")
         folder_members.setdefault(folder or "ROOT", []).append(member)
     child_members = []
     for folder, members in sorted(folder_members.items()):

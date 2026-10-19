@@ -16,7 +16,8 @@ import uuid
 from ProcessShutdown import (FINALIZE_WORKER_REGISTRY,
                              FINALIZE_WORKER_STARTING,
                              process_is_alive)
-from Recording import finalize_recording_manifest
+from Recording import (FinalizeJobAlreadyRunning,
+                       finalize_recording_manifest)
 from InputSetRuntimeRegistry import (default_window_activity_registry_path,
                                      read_active_input_sets)
 
@@ -238,10 +239,12 @@ class FinalizeProgressWindow:
                     self.events.put(("added", len(additions)))
                     last_state = None
 
+                now = time.monotonic()
                 ready_index = next((
                     index for index, job in enumerate(pending)
-                    if not job["wait_pid"] or
-                    not process_is_alive(job["wait_pid"])), None)
+                    if now >= float(job.get("retry_after", 0.0) or 0.0)
+                    and (not job["wait_pid"] or
+                         not process_is_alive(job["wait_pid"]))), None)
                 if ready_index is not None:
                     force_next = getattr(self, "force_next_job", None)
                     force_all = getattr(self, "force_all_jobs", None)
@@ -273,6 +276,18 @@ class FinalizeProgressWindow:
                     try:
                         result = finalize_recording_manifest(manifest)
                         self.events.put(("completed", folder, result))
+                    except FinalizeJobAlreadyRunning:
+                        # A PokeCon in-process finalizer and this deferred
+                        # worker may discover the same durable manifest.  The
+                        # lock is normal coordination, not a failed video.
+                        # Keep the request until the owner removes the
+                        # manifest; then count it as completed exactly once.
+                        if os.path.isfile(manifest):
+                            job["retry_after"] = time.monotonic() + 1.0
+                            pending.append(job)
+                            self.events.put(("claim_wait", folder))
+                        else:
+                            self.events.put(("completed", folder, None))
                     except Exception as error:
                         self.events.put(("failed", folder, str(error)))
                     if force_all_active and not pending:
@@ -374,6 +389,13 @@ class FinalizeProgressWindow:
                     self.force_all_button.configure(state="normal")
                     self.close_button.configure(state="disabled")
                     self.status.set(event[1])
+                elif kind == "claim_wait":
+                    self.busy = True
+                    self.force_next_button.configure(state="disabled")
+                    self.force_all_button.configure(state="disabled")
+                    self.close_button.configure(state="disabled")
+                    self.status.set(
+                        "別の録画確定処理を待っています: {}".format(event[1]))
                 elif kind == "idle":
                     self.busy = False
                     self.force_next_button.configure(state="disabled")

@@ -504,6 +504,12 @@ class KeyPress:
         self._pushing = dict(self.format.format)
         if not isinstance(btns, list):
             btns = [btns]
+        else:
+            # input() adds held controls to the working collection.  Keep the
+            # caller's list immutable because press() passes that same list to
+            # inputEnd(); otherwise held sticks/Hats are accidentally released
+            # after a simultaneous multi-button pulse.
+            btns = list(btns)
 
         for btn in self.holdButton:
             if not any(type(active) is type(btn) and active == btn for active in btns):
@@ -538,6 +544,12 @@ class KeyPress:
         self.ed = time.perf_counter()
         if not isinstance(btns, list):
             btns = [btns]
+        # Releasing an unrelated Button/Direction must not clear a Hat which
+        # is still registered as held.  Readable operation recordings use
+        # hold(Hat...) together with press()/holdEnd() for overlapping input.
+        if unset_hat and not any(type(btn) is Hat for btn in btns) \
+                and any(type(held) is Hat for held in self.holdButton):
+            unset_hat = False
         # self._logger.debug(btns)
 
         # get tilting direction from angles
@@ -577,23 +589,72 @@ class KeyPress:
         if not isinstance(btns, list):
             btns = [btns]
 
-        flag_isTouchscreen = False
+        # Normalize the requested batch first.  This keeps the update
+        # transactional even if a caller includes a control which is already
+        # held, or more than one value for the same physical stick/D-pad.
+        normalized = []
         for btn in btns:
-            if type(btn) is Touchscreen:
-                flag_isTouchscreen = True
-        if flag_isTouchscreen:
-            for btn in self.holdButton:
-                if type(btn) is Touchscreen:
-                    self.holdButton.remove(btn)
-        for btn in btns:
-            if any(type(held) is type(btn) and held == btn for held in self.holdButton):
+            if type(btn) is Direction:
+                normalized = [
+                    held for held in normalized
+                    if not (type(held) is Direction
+                            and held.stick == btn.stick)
+                ]
+            elif type(btn) is Hat:
+                normalized = [
+                    held for held in normalized if type(held) is not Hat
+                ]
+            elif type(btn) is Touchscreen:
+                normalized = [
+                    held for held in normalized
+                    if type(held) is not Touchscreen
+                ]
+            elif any(type(held) is type(btn) and held == btn
+                     for held in normalized):
+                continue
+            normalized.append(btn)
+
+        if not normalized:
+            self.input([])
+            return
+
+        updated = list(self.holdButton)
+        changed = False
+        for btn in normalized:
+            # A controller can have only one direction per physical stick and
+            # one D-pad/touch position.  Replacing it before a single input()
+            # call avoids an intermediate neutral packet.  Do not use
+            # Direction.__eq__ here: it intentionally ignores magnitude, so
+            # an equal-angle strength change must still replace the old value.
+            if type(btn) is Direction:
+                updated = [
+                    held for held in updated
+                    if not (type(held) is Direction
+                            and held.stick == btn.stick)
+                ]
+            elif type(btn) is Hat:
+                updated = [
+                    held for held in updated if type(held) is not Hat
+                ]
+            elif type(btn) is Touchscreen:
+                updated = [
+                    held for held in updated
+                    if type(held) is not Touchscreen
+                ]
+            elif any(type(held) is type(btn) and held == btn
+                     for held in updated):
                 name = getattr(btn, "name", repr(btn))
                 print("Warning: " + name + " is already in holding state")
-                self._logger.warning(f"Warning: {name} is already in holding state")
-                return
+                self._logger.warning(
+                    f"Warning: {name} is already in holding state")
+                continue
+            updated.append(btn)
+            changed = True
 
-            self.holdButton.append(btn)
-        self.input(btns)
+        if not changed:
+            return
+        self.holdButton = updated
+        self.input([])
 
     def holdEnd(self, btns: Button | Hat | Stick | Direction):
         if not isinstance(btns, list):

@@ -189,27 +189,76 @@ def analyse_operation_video(session_dir, session, inputs, mappings, video_path,
 
 
 def generate_vision_sample(session_dir, session, metadata, support_timeout=300.0):
-    """Generate standalone, pasteable transition checks plus support logging."""
+    """Generate ZA_story-style logical image checks plus support logging."""
     paths = vision_output_paths(session_dir)
     candidates = metadata.get("candidates", []) if isinstance(metadata, dict) else []
     support_log = paths["support_log"]
     session_id = str(session.get("session_id", "operation"))
+    targets = {}
+    operators = {}
+    descriptions = {"targets": {}}
+    for candidate in candidates:
+        logical_name = str(candidate.get("logical_name", ""))
+        shared_path = os.path.abspath(str(candidate.get("template_path", "")))
+        platform_templates = candidate.get("platform_templates", {})
+        if not isinstance(platform_templates, dict):
+            platform_templates = {}
+        targets[logical_name] = [{
+            "template_path": shared_path,
+            "platform_templates": {
+                platform: os.path.abspath(str(
+                    platform_templates.get(platform) or shared_path))
+                for platform in ("switch", "steam", "ps4")
+            },
+            "crop": [int(value) for value in candidate.get("roi", [])],
+            "threshold": float(candidate.get("threshold", 0.82)),
+            "use_gray": True,
+        }]
+        operators[logical_name] = "OR"
+        descriptions["targets"][logical_name] = str(
+            candidate.get("reason", "") or "")
     lines = [
         "# POKECON_OPERATION_VISION_SAMPLE:{}:BEGIN".format(session_id),
         "# 動画と操作記録から作った疑似サンプルです。通常の中間コードとは別表示・別管理です。",
         "# 自動抽出した画像・範囲・閾値は候補です。実機で確認してから利用してください。",
+        "# ZA_storyと同じ self.image_check('論理名') 形式で編集できます。",
         "# 同じクラスに通常の中間コードを置くと、対応Stepを実行してから完了画面を判定します。",
         "# 指定画面が出れば次Stepへ進み、出なければサポート待ちへ入り、その利用をJSONLへ記録します。",
         "",
-        "def _operation_sample_detect(self, template_path, crop, threshold=0.82):",
-        "    try:",
-        "        return bool(self.isContainTemplate(",
-        "            template_path, threshold=threshold, use_gray=True,",
-        "            show_value=True, show_position=True, crop_fmt=1, crop=crop,",
-        "        ))",
-        "    except Exception as error:",
-        "        print('[動画判断サンプル] 画像判定失敗:', error)",
+        "IMAGE_DETECTION_TARGETS = {!r}".format(targets),
+        "IMAGE_DETECTION_OPERATORS = {!r}".format(operators),
+        "IMAGE_DETECTION_DESCRIPTIONS = {!r}".format(descriptions),
+        "",
+        "def _image_check_target(self, targetimage):",
+        "    variants = self.IMAGE_DETECTION_TARGETS.get(str(targetimage), [])",
+        "    if not variants:",
+        "        print('[動画判断サンプル] 未登録の画像検知名:', targetimage)",
         "        return False",
+        "    platform = str(getattr(self, 'game_input_target', 'switch')).lower()",
+        "    results = []",
+        "    for settings in variants:",
+        "        templates = settings.get('platform_templates', {})",
+        "        template_path = templates.get(",
+        "            platform, templates.get('switch', settings.get('template_path', '')))",
+        "        try:",
+        "            results.append(bool(self.isContainTemplate(",
+        "                template_path, threshold=float(settings.get('threshold', 0.82)),",
+        "                use_gray=bool(settings.get('use_gray', True)),",
+        "                show_value=True, show_position=True, crop_fmt=1,",
+        "                crop=list(settings.get('crop', [])),",
+        "            )))",
+        "        except Exception as error:",
+        "            print('[動画判断サンプル] 画像判定失敗:', error)",
+        "            results.append(False)",
+        "    operator = self.IMAGE_DETECTION_OPERATORS.get(str(targetimage), 'OR')",
+        "    return all(results) if str(operator).upper() == 'AND' else any(results)",
+        "",
+        "def image_check(self, targetimage, nocheckflag=1):",
+        "    # ZA_story互換: 検知名からテンプレート設定を引く。",
+        "    result = self._image_check_target(targetimage)",
+        "    if not result and int(nocheckflag) == 0:",
+        "        print('[動画判断サンプル] 必須画像を検知できません:', targetimage)",
+        "    return bool(result)",
         "",
         "def _operation_sample_support_memo(self, log_path, event, step_name, next_step, image_name, note):",
         "    import datetime",
@@ -226,7 +275,7 @@ def generate_vision_sample(session_dir, session, metadata, support_timeout=300.0
         "        stream.write(json.dumps(record, ensure_ascii=False) + '\\n')",
         "",
         "def _operation_sample_wait_for_support(self, step_name, next_step, image_name,",
-        "                                       template_path, crop, threshold, log_path,",
+        "                                       log_path,",
         "                                       timeout=300.0, interval=1.0):",
         "    import time",
         "    note = '自動画像判定で次Stepへ進めなかったためサポートを要求'",
@@ -238,7 +287,7 @@ def generate_vision_sample(session_dir, session, metadata, support_timeout=300.0
         "        callback(step_name=step_name, next_step=next_step, image_name=image_name)",
         "    deadline = time.monotonic() + max(0.0, float(timeout))",
         "    while time.monotonic() < deadline:",
-        "        if self._operation_sample_detect(template_path, crop, threshold):",
+        "        if self.image_check(image_name):",
         "            self._operation_sample_support_memo(",
         "                log_path, 'support_completed', step_name, next_step, image_name,",
         "                'サポート後に指定画面を検知して通過')",
@@ -259,35 +308,22 @@ def generate_vision_sample(session_dir, session, metadata, support_timeout=300.0
         step_name = _identifier(candidate.get("step_name"), "RECORDED_STEP")
         method_name = "VISION_SAMPLE_{}".format(step_name)
         next_step = str(candidate.get("next_step", "")).strip()
-        shared_path = os.path.abspath(str(candidate.get("template_path", "")))
-        platform_templates = candidate.get("platform_templates", {})
-        if not isinstance(platform_templates, dict):
-            platform_templates = {}
-        platform_templates = {
-            platform: os.path.abspath(str(platform_templates.get(platform) or shared_path))
-            for platform in ("switch", "steam", "ps4")
-        }
         lines.extend([
             "def {}(self):".format(method_name),
             "    # 候補時刻: {:.3f}秒 / 自動信頼度: {:.2f} / 要レビュー".format(
                 float(candidate.get("video_time", 0.0)),
                 float(candidate.get("confidence", 0.0))),
             "    image_name = {!r}".format(str(candidate.get("logical_name", ""))),
-            "    platform_templates = {!r}".format(platform_templates),
-            "    platform = str(getattr(self, 'game_input_target', 'switch')).lower()",
-            "    template_path = platform_templates.get(platform, platform_templates['switch'])",
-            "    crop = {!r}".format([int(value) for value in candidate.get("roi", [])]),
-            "    threshold = {!r}".format(float(candidate.get("threshold", 0.82))),
-            "    if self._operation_sample_detect(template_path, crop, threshold):",
+            "    if self.image_check(image_name):",
             "        return {!r} or None".format(next_step),
             "    recorded_step = getattr(self, {!r}, None)".format(step_name),
             "    if callable(recorded_step):",
             "        recorded_step()",
             "        self.wait(0.4)",
-            "    if self._operation_sample_detect(template_path, crop, threshold):",
+            "    if self.image_check(image_name):",
             "        return {!r} or None".format(next_step),
             "    return self._operation_sample_wait_for_support(",
-            "        {!r}, {!r}, image_name, template_path, crop, threshold,".format(
+            "        {!r}, {!r}, image_name,".format(
                 step_name, next_step),
             "        {!r}, timeout={!r},".format(support_log, float(support_timeout)),
             "    )",

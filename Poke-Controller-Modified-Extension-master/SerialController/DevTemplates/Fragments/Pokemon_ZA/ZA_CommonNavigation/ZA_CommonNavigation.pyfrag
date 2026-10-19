@@ -555,17 +555,25 @@ def ZA_Common_check_time(self,check_timing):
 
     # (時間切り替わりの補足ができない？その場合は朝扱いで一度抜ける(夜だった場合再度、朝・夜の切り替えを行う))
     #必ずMORNING、NIGHT判定できる時間以上のカウント数にしてください。
-      
+
     if self.image_check("POKEMON_ZA_MORNING") or (check_timing != "POKEMON_ZA_MORNING" and self.timecount > 200):
         print("朝")
         self.timecount=0
         while True:
+            self.checkIfAlive()
+            recovery_deadline = getattr(
+                self, "_za_story_timechange_recovery_deadline", None)
+            if (recovery_deadline is not None
+                    and time.monotonic() >= float(recovery_deadline)):
+                # Return to the shared pre-action handler for its cleanup/failure.
+                return "COMMON_CHECK_TIME"
             #ジャスティス会への話しかけが発生する可能性があるので、ループしてしまう場合はBボタンが必要になる場合がある                
             self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-            if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or self.image_check("POKEMON_ZA_DEAD"): #FIELDから変更
+            if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_1") or self.image_check("POKEMON_ZA_DEAD"): #FIELDから変更
                 self.timecount=0
                 self.changetimecount+=1
-                if check_timing != "POKEMON_ZA_MORNING":
+                if check_timing not in (
+                        "POKEMON_ZA_MORNING", "POKEMON_ZA_OTHER"):
                     self.sleepcount=1
                     return "COMMON_CHANGE_TIME"
                 else:
@@ -576,12 +584,20 @@ def ZA_Common_check_time(self,check_timing):
         self.inactioncount=0
         print("夜")
         while True:
+            self.checkIfAlive()
+            recovery_deadline = getattr(
+                self, "_za_story_timechange_recovery_deadline", None)
+            if (recovery_deadline is not None
+                    and time.monotonic() >= float(recovery_deadline)):
+                # Return to the shared pre-action handler for its cleanup/failure.
+                return "COMMON_CHECK_TIME"
             #ジャスティス会への話しかけが発生する可能性があるので、ループしてしまう場合はBボタンが必要になる場合がある       
             self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-            if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK") or self.image_check("POKEMON_ZA_DEAD"): #FIELDから変更
+            if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_1") or self.image_check("POKEMON_ZA_DEAD"): #FIELDから変更
                 self.timecount=0
                 self.changetimecount+=1
-                if check_timing != "POKEMON_ZA_NIGHT":
+                if check_timing not in (
+                        "POKEMON_ZA_NIGHT", "POKEMON_ZA_OTHER"):
                     self.sleepcount=1
                     return "COMMON_CHANGE_TIME"
                 else:
@@ -639,6 +655,12 @@ def ZA_Common_goto(
         battle_recovery_mode=0,
         use_text_box2=True):
     #type=0:ポケセンブルーにて実施(バトルゾーンに影響あり)
+    mapping_goto_black_recovery = getattr(
+        self, "ZA_Common_mapping_goto_black_recovery", None)
+    if (callable(mapping_goto_black_recovery)
+            and mapping_goto_black_recovery(
+                movepoint_check=movepoint_check)):
+        return "EXEC"
     if self.Common_current_state == "COMMON_MAP_OPEN":
         self.Common_current_state = self.ZA_Common_map_open(
             check_pic1=check_pic1, check_pic2=check_pic2,
@@ -665,12 +687,19 @@ def ZA_Common_goto(
         return "START"
     else:
         return "EXEC"
-def ZA_Common_pokemon_recovery(self):  
+def ZA_Common_pokemon_recovery(self,timeout_seconds=0.0,require_entry_picture=False):  
+    renda_options = {}
+    if float(timeout_seconds) > 0.0:
+        renda_options["timeout_seconds"] = float(timeout_seconds)
+    if require_entry_picture:
+        renda_options["require_entry_picture"] = True
     if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"): #FIELDから変更
         self.press(Direction(Stick.LEFT, 90), duration=2.0, wait=0.1)
         self.pressRep(Button.A, repeat=10, duration=0.15, wait=0.2, interval=0.1)
-        if self.ZA_renda_button(rendabutton="B",endpicture="POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",sub_button="A",sub_picture="POKEMON_ZA_TEXT_BLACK_COMMENT",sub2_button="A",sub2_picture="POKEMON_ZA_HELP_MARKER"): #FIELDから変更
+        if self.ZA_renda_button(rendabutton="B",endpicture="POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",sub_button="A",sub_picture="POKEMON_ZA_TEXT_BLACK_COMMENT",sub2_button="A",sub2_picture="POKEMON_ZA_HELP_MARKER",**renda_options): #FIELDから変更
             return True
+        if renda_options:
+            return False
     else:
         return False
 def ZA_Common_mappic_check(self,pic1="NULL",pic2="NULL"):

@@ -237,13 +237,56 @@ def compose_preview(fragment_root, data, list_name):
 
 
 def image_targets_from_bodies(bodies):
-    """Return literal image_check target names used by sample functions."""
+    """Return image_check targets, including literal tuple loop aliases."""
     targets = []
     for body in bodies:
         try:
             tree = ast.parse(body)
         except SyntaxError:
             continue
+
+        # Functions such as ZA_battle_coCp_noloop keep SELECT targets in a
+        # literal tuple and call image_check(picture) from a nested loop.  A
+        # literal-call-only scan omitted 1_SELECT/4_SELECT from generated
+        # DevStudio commands, so resolve this small, deterministic data flow.
+        literal_collections = {}
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Assign):
+                continue
+            values = []
+            if isinstance(node.value, (ast.Tuple, ast.List, ast.Set)):
+                values = [
+                    value for value in (
+                        _literal_string(element)
+                        for element in node.value.elts)
+                    if value is not None
+                ]
+            if not values:
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    literal_collections[target.id] = tuple(values)
+
+        loop_aliases = {}
+        for node in ast.walk(tree):
+            if (not isinstance(node, (ast.For, ast.comprehension))
+                    or not isinstance(node.target, ast.Name)):
+                continue
+            if isinstance(node.iter, ast.Name):
+                values = literal_collections.get(node.iter.id, ())
+            elif isinstance(node.iter, (ast.Tuple, ast.List, ast.Set)):
+                values = tuple(
+                    value for value in (
+                        _literal_string(element)
+                        for element in node.iter.elts)
+                    if value is not None)
+            else:
+                values = ()
+            if values:
+                existing = loop_aliases.get(node.target.id, ())
+                loop_aliases[node.target.id] = tuple(dict.fromkeys(
+                    existing + tuple(values)))
+
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call) or not node.args:
                 continue
@@ -253,10 +296,12 @@ def image_targets_from_bodies(bodies):
             if not is_image_check:
                 continue
             name = _literal_string(node.args[0])
-            if name is None:
-                continue
-            if name not in targets:
-                targets.append(name)
+            names = ((name,) if name is not None
+                     else loop_aliases.get(
+                         getattr(node.args[0], "id", ""), ()))
+            for resolved_name in names:
+                if resolved_name not in targets:
+                    targets.append(resolved_name)
     return targets
 
 

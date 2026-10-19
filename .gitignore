@@ -5,3 +5,6 @@
 # Codex local state, temporary files, and backups
 .codex*
 _codex_tmp/
+artifacts/
+ZA_STORY_RESET_AUDIT_*
+tests/

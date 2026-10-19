@@ -190,8 +190,13 @@ def _explicit_locations(command):
     return result
 
 
-def _debug_options(command):
-    explicit = _class_literal(command, "COMMAND_DEBUG_OPTIONS", [])
+def _normalize_debug_options(explicit):
+    """Normalize Commands-owned debug metadata from source or runtime.
+
+    Keeping this independent from the AST lets the Start dialog use the exact
+    same metadata when the on-disk source is temporarily invalid and it has to
+    fall back to the already loaded Commands instance.
+    """
     if isinstance(explicit, (list, tuple)) and explicit:
         result = []
         for item in explicit:
@@ -206,6 +211,14 @@ def _debug_options(command):
             row.setdefault("default", False)
             result.append(row)
         return result
+    return []
+
+
+def _debug_options(command):
+    explicit = _normalize_debug_options(
+        _class_literal(command, "COMMAND_DEBUG_OPTIONS", []))
+    if explicit:
+        return explicit
     found = {}
     for statement in ast.walk(command):
         if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
@@ -220,6 +233,32 @@ def _debug_options(command):
             "default": bool(default),
         }
     return [found[name] for name in sorted(found, key=str.casefold)]
+
+
+def discover_runtime_debug_options(command):
+    """Read debug metadata from an already loaded Commands instance.
+
+    This is deliberately metadata-driven rather than knowing individual
+    options such as ``ResetDebug``.  The legacy attribute scan remains as the
+    compatibility path for Commands that do not publish
+    ``COMMAND_DEBUG_OPTIONS`` yet.
+    """
+    explicit = _normalize_debug_options(
+        getattr(command, "COMMAND_DEBUG_OPTIONS", []))
+    if explicit:
+        return explicit
+    result = []
+    for attribute in (
+            "DEBUG", "debug", "TESTADDCODE", "testcode", "fastread"):
+        if not hasattr(command, attribute):
+            continue
+        result.append({
+            "id": attribute, "attribute": attribute,
+            "label": attribute,
+            "description": "Commands内で検出したデバッグ設定",
+            "default": bool(getattr(command, attribute)),
+        })
+    return result
 
 
 def discover_command_run_options(source, class_name=""):

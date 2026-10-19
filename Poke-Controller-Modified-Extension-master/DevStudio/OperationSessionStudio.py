@@ -6,6 +6,7 @@ from __future__ import print_function
 import ast
 import bisect
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -54,7 +55,7 @@ KIND_LABELS = {
 }
 KIND_NAMES = {value: key for key, value in KIND_LABELS.items()}
 GENERATION_TARGET_LABELS = {
-    "Switchのみ": GENERATION_TARGET_SWITCH,
+    "Switch（ZA_story可読形式）": GENERATION_TARGET_SWITCH,
     "Switch＋Steam/PS4流用": GENERATION_TARGET_PORTABLE,
 }
 GENERATION_TARGET_NAMES = {value: key for key, value in GENERATION_TARGET_LABELS.items()}
@@ -75,6 +76,357 @@ def _write_text_atomic(path, text):
     with open(temporary, "w", encoding="utf-8", newline="\n") as stream:
         stream.write(text)
     os.replace(temporary, path)
+
+
+def _optional_file_bytes(path):
+    if not os.path.isfile(path):
+        return None
+    with open(path, "rb") as stream:
+        return stream.read()
+
+
+def _restore_file_bytes(path, payload):
+    """Restore one pre-transaction file snapshot (``None`` means absent)."""
+    if payload is None:
+        if os.path.exists(path):
+            os.remove(path)
+        return
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    temporary = path + ".rollback-" + uuid.uuid4().hex
+    try:
+        with open(temporary, "wb") as stream:
+            stream.write(payload)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.remove(temporary)
+
+
+def _capture_file_name(value, fallback="OPERATION"):
+    """Return one portable filename while keeping the logical name explicit."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_",
+                  str(value or "").strip())
+    name = re.sub(r"\s+", "_", name).strip(" ._")
+    if not name:
+        name = fallback
+    stem = name.split(".", 1)[0].upper()
+    reserved = {"CON", "PRN", "AUX", "NUL"}
+    reserved.update("COM{}".format(index) for index in range(1, 10))
+    reserved.update("LPT{}".format(index) for index in range(1, 10))
+    return "_" + name if stem in reserved else name
+
+
+def _default_capture_name(session, video_time):
+    """Build a readable default which is unique across recording sessions."""
+    session_id = str((session or {}).get("session_id", "operation") or
+                     "operation")
+    label = _capture_file_name(session_id, "operation")[:24]
+    digest = hashlib.sha1(session_id.encode("utf-8")).hexdigest()[:6]
+    return "OPERATION_{}_{}_{}".format(
+        label, digest, int(float(video_time) * 1000))
+
+
+def _frame_capture_template_root(session, image_root=""):
+    session_id = str((session or {}).get("session_id", "operation") or
+                     "operation")
+    if image_root:
+        return os.path.abspath(str(image_root))
+    return os.path.abspath(os.path.join(
+        os.path.dirname(__file__), "..", "SerialController", "Template",
+        "OperationCaptures", _capture_file_name(session_id, "operation")))
+
+
+def _frame_capture_lock_path(session, image_root=""):
+    return os.path.join(
+        _frame_capture_template_root(session, image_root),
+        ".pokecon-studio-imagecheck.lock")
+
+
+class _FrameCaptureLock(object):
+    """Cross-process lock covering path choice, save, and optional rollback."""
+
+    def __init__(self, path, timeout=10.0):
+        self.path = os.path.abspath(path)
+        self.timeout = float(timeout)
+        self.stream = None
+        self.locked = False
+
+    def __enter__(self):
+        directory = os.path.dirname(self.path)
+        os.makedirs(directory, exist_ok=True)
+        self.stream = open(self.path, "a+b")
+        self.stream.seek(0, os.SEEK_END)
+        if self.stream.tell() == 0:
+            self.stream.write(b"\0")
+            self.stream.flush()
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                self.stream.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(self.stream.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(
+                        self.stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                self.locked = True
+                return self
+            except (IOError, OSError):
+                if time.monotonic() >= deadline:
+                    self.stream.close()
+                    self.stream = None
+                    raise TimeoutError(
+                        "画像フォルダをほかのPokeConStudioが更新中です。")
+                time.sleep(0.05)
+
+    def __exit__(self, exception_type, exception_value, traceback_value):
+        if self.stream is None:
+            return
+        if self.locked:
+            try:
+                self.stream.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(self.stream.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(self.stream.fileno(), fcntl.LOCK_UN)
+            except (IOError, OSError):
+                pass
+        self.stream.close()
+        self.stream = None
+        self.locked = False
+
+
+def frame_capture_paths(session_dir, session, name, image_root=""):
+    """Resolve collision-safe PNG and sidecar paths for one logical name."""
+    logical_name = str(name or "").strip()
+    file_name = _capture_file_name(logical_name, "OPERATION")
+    if not logical_name:
+        logical_name = file_name
+    session_id = str((session or {}).get("session_id", "operation") or "operation")
+    template_root = _frame_capture_template_root(session, image_root)
+    captures = os.path.join(os.path.abspath(session_dir), "captures")
+    root_key = os.path.normcase(os.path.normpath(template_root))
+    root_digest = hashlib.sha1(root_key.encode("utf-8")).hexdigest()[:10]
+
+    def candidates(stem):
+        return (os.path.join(template_root, stem + ".png"),
+                os.path.join(
+                    captures, "{}__root_{}.json".format(stem, root_digest)))
+
+    def belongs_to_current_capture(path, metadata_path, stem):
+        # The root-specific sidecar prevents folder A/B from overwriting one
+        # another.  The legacy unsuffixed candidate is read only for migration
+        # and is accepted solely when its absolute template path also matches.
+        legacy_path = os.path.join(captures, stem + ".json")
+        for candidate in (metadata_path, legacy_path):
+            if not os.path.isfile(candidate):
+                continue
+            try:
+                with open(candidate, "r", encoding="utf-8") as stream:
+                    existing = json.load(stream)
+                existing_name = str(
+                    existing.get("logical_name") or existing.get("name") or "")
+                existing_session = str(existing.get("session_id", "") or "")
+                existing_path = str(existing.get("template_path", "") or "")
+            except (OSError, UnicodeError, ValueError, AttributeError):
+                continue
+            if (existing_name == logical_name and
+                    existing_session == session_id and existing_path and
+                    os.path.normcase(os.path.abspath(existing_path)) ==
+                    os.path.normcase(os.path.abspath(path))):
+                return True
+        return False
+
+    path, metadata_path = candidates(file_name)
+    if os.path.exists(path) and not belongs_to_current_capture(
+            path, metadata_path, file_name):
+        # A selected image folder is normally shared by many recordings.  A
+        # file is overwrite-eligible only when this session's sidecar proves
+        # that it owns the exact logical target.  This also protects manually
+        # managed PNGs and names collapsed by Windows filename sanitisation.
+        identity = "{}\0{}".format(session_id, logical_name)
+        suffix = hashlib.sha1(identity.encode("utf-8")).hexdigest()
+        base_name = file_name
+        for length in (8, 12, 20, 40):
+            file_name = "{}__{}".format(base_name, suffix[:length])
+            path, metadata_path = candidates(file_name)
+            if (not os.path.exists(path) or
+                    belongs_to_current_capture(
+                        path, metadata_path, file_name)):
+                break
+        else:  # pragma: no cover - a full SHA-1 collision is not practical.
+            raise FileExistsError(path)
+    return {
+        "logical_name": logical_name,
+        "file_name": file_name,
+        "template_root": template_root,
+        "template_path": path,
+        "metadata_path": metadata_path,
+        "session_id": session_id,
+    }
+
+
+def _persist_frame_capture(frame, crop, width, height, paths, video_time,
+                           threshold, use_gray, overwrite, extra_metadata):
+    """Write one already-resolved capture while its image-root lock is held."""
+    x1, y1, x2, y2 = crop
+    logical_name = paths["logical_name"]
+    session_id = paths["session_id"]
+    template_root = paths["template_root"]
+    os.makedirs(template_root, exist_ok=True)
+    path = paths["template_path"]
+    replaced_existing = os.path.exists(path)
+    if replaced_existing and not overwrite:
+        raise FileExistsError(path)
+
+    captures = os.path.dirname(paths["metadata_path"])
+    metadata_path = paths["metadata_path"]
+    previous_image = _optional_file_bytes(path)
+    previous_metadata = _optional_file_bytes(metadata_path)
+
+    crop_image = frame[y1:y2, x1:x2]
+    ok, encoded = cv2.imencode(".png", crop_image)
+    if not ok:
+        raise OSError("画像をPNGへ変換できませんでした。")
+    temporary = path + ".tmp-" + uuid.uuid4().hex
+    try:
+        with open(temporary, "wb") as stream:
+            stream.write(encoded.tobytes())
+        os.replace(temporary, path)
+        metadata = dict(extra_metadata) if isinstance(extra_metadata, dict) else {}
+        metadata.update({
+            "schema_version": 2,
+            "session_id": session_id,
+            "video_time": float(video_time),
+            "source_frame_size": [int(width), int(height)],
+            "crop": [x1, y1, x2, y2],
+            "template_path": path,
+            "metadata_path": metadata_path,
+            "name": logical_name,
+            "logical_name": logical_name,
+            "threshold": threshold,
+            "use_gray": bool(use_gray),
+            "replaced_existing": bool(replaced_existing),
+            # All platforms intentionally share the captured image initially.
+            "platform_templates": {
+                "switch": path, "steam": path, "ps4": path,
+            },
+            "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        })
+        os.makedirs(captures, exist_ok=True)
+        atomic_json(metadata_path, metadata)
+    except Exception as error:
+        rollback_failures = []
+        for restore_path, payload in (
+                (path, previous_image),
+                (metadata_path, previous_metadata)):
+            try:
+                _restore_file_bytes(restore_path, payload)
+            except OSError as restore_error:
+                rollback_failures.append("{}: {}".format(
+                    os.path.basename(restore_path), restore_error))
+        if rollback_failures:
+            raise RuntimeError(
+                "画像保存に失敗し、更新前の状態も完全には復元できませんでした。"
+                "\n保存エラー: {}\n復元エラー:\n{}".format(
+                    error, "\n".join(rollback_failures))) from error
+        raise
+    finally:
+        if os.path.exists(temporary):
+            try:
+                os.remove(temporary)
+            except OSError:
+                pass
+    return metadata
+
+
+def save_frame_capture(frame, crop, session_dir, session, video_time, name,
+                       image_root="", threshold=0.8, use_gray=True,
+                       overwrite=False, extra_metadata=None,
+                       _resolved_paths=None):
+    """Persist a recording-frame ROI and its provenance without altering evidence.
+
+    ``image_root`` is used directly when supplied (normally one of the active
+    PokeConStudio profile's image folders).  The historical DevStudio location
+    remains the fallback so existing callers retain their current layout.
+    """
+    if cv2 is None:
+        raise RuntimeError("OpenCVがないため画像を保存できません。")
+    if frame is None or not hasattr(frame, "shape") or len(frame.shape) < 2:
+        raise ValueError("保存する映像フレームがありません。")
+    if not isinstance(crop, (list, tuple)) or len(crop) != 4:
+        raise ValueError("切り出し範囲が不正です。")
+    try:
+        x1, y1, x2, y2 = [int(value) for value in crop]
+        threshold = float(threshold)
+    except (TypeError, ValueError):
+        raise ValueError("切り出し範囲または閾値が不正です。")
+    height, width = frame.shape[:2]
+    x1, x2 = sorted((max(0, min(width, x1)), max(0, min(width, x2))))
+    y1, y2 = sorted((max(0, min(height, y1)), max(0, min(height, y2))))
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        raise ValueError("2px以上の範囲を囲んでください。")
+    if not 0.0 <= threshold <= 1.0:
+        raise ValueError("閾値は0.0～1.0で指定してください。")
+    coordinates = [x1, y1, x2, y2]
+    if _resolved_paths is not None:
+        return _persist_frame_capture(
+            frame, coordinates, width, height, _resolved_paths, video_time,
+            threshold, use_gray, overwrite, extra_metadata)
+    with _FrameCaptureLock(_frame_capture_lock_path(session, image_root)):
+        paths = frame_capture_paths(
+            session_dir, session, name, image_root=image_root)
+        return _persist_frame_capture(
+            frame, coordinates, width, height, paths, video_time, threshold,
+            use_gray, overwrite, extra_metadata)
+
+
+def frame_capture_detection_row(metadata):
+    """Convert capture provenance to ``add_detection_to_source`` input."""
+    value = metadata if isinstance(metadata, dict) else {}
+    raw_path = str(value.get("template_path", "") or "")
+    if not raw_path:
+        raise ValueError("登録する画像パスがありません。")
+    path = os.path.abspath(raw_path)
+    crop = value.get("crop", [0, 0, 0, 0])
+    if not isinstance(crop, (list, tuple)) or len(crop) != 4:
+        crop = [0, 0, 0, 0]
+    crop = [int(item) for item in crop]
+    width = max(0, crop[2] - crop[0])
+    height = max(0, crop[3] - crop[1])
+    threshold = float(value.get("threshold", 0.8))
+    use_gray = bool(value.get("use_gray", True))
+    name = str(value.get("logical_name") or value.get("name") or
+               os.path.splitext(os.path.basename(path))[0])
+    label = str(value.get("source_video_label", "") or "操作記録")
+    return {
+        "name": name,
+        "template_path": path,
+        "threshold": threshold,
+        "use_gray": use_gray,
+        "crop": crop,
+        "operator": "OR",
+        "description": "{}の映像フレームから作成".format(label),
+        "variant_index": 0,
+        "template_width": width,
+        "template_height": height,
+        "detection_width": width,
+        # A confirmed recapture of the same PNG supersedes old crop settings
+        # for that file.  Ordinary catalog additions keep their multi-variant
+        # merge behavior because they do not set this capture-only flag.
+        "replace_template_path_variants": bool(
+            value.get("replaced_existing", False)),
+        "variant_settings": {
+            "template_path": path,
+            "threshold": threshold,
+            "use_gray": use_gray,
+            "crop": crop,
+        },
+    }
 
 
 class OperationSessionWorkspace(ttk.Frame):
@@ -143,7 +495,7 @@ class OperationSessionWorkspace(ttk.Frame):
         self.source_path = tk.StringVar()
         self.source_class = tk.StringVar()
         self.mapping_progress = tk.StringVar(value="未割当 0 / 全0行")
-        self.generation_target = tk.StringVar(value="Switchのみ")
+        self.generation_target = tk.StringVar(value="Switch（ZA_story可読形式）")
         self.stick_angle_mode = tk.StringVar(value="記録角度を保持（既定）")
         self.debug_command_path = tk.StringVar(value="")
 
@@ -479,7 +831,7 @@ class OperationSessionWorkspace(ttk.Frame):
         saved_stick_mode = generation.get("stick_angle_mode", STICK_MODE_EXACT) \
             if isinstance(generation, dict) else STICK_MODE_EXACT
         self.generation_target.set(GENERATION_TARGET_NAMES.get(
-            saved_target, "Switchのみ"))
+            saved_target, "Switch（ZA_story可読形式）"))
         self.stick_angle_mode.set(STICK_MODE_NAMES.get(
             saved_stick_mode, "記録角度を保持（既定）"))
         self.source_path.set(str(session.get("final_source", "") or ""))
@@ -627,8 +979,15 @@ class OperationSessionWorkspace(ttk.Frame):
         if len(self.video_sources) <= 1:
             return
         value = float(session_time)
-        for label, (start, end) in self.video_source_ranges.items():
-            if start <= value <= end + 0.001:
+        ranges = sorted(self.video_source_ranges.items(),
+                        key=lambda item: item[1][0])
+        for index, (label, (start, end)) in enumerate(ranges):
+            # Segment boundaries are half-open so the first frame of the next
+            # segment does not select the final frame of the previous one.
+            inside = start <= value < end
+            if index == len(ranges) - 1:
+                inside = start <= value <= end + 0.001
+            if inside:
                 if self.video_choice.get() != label:
                     self.video_choice.set(label)
                     self.open_selected_video()
@@ -1214,7 +1573,7 @@ class OperationSessionWorkspace(ttk.Frame):
             self.open_source_callback(path)
 
     def refresh_video_sources(self):
-        sources = operation_video_sources(self.session)
+        sources = operation_video_sources(self.session, self.session_dir)
         self.video_sources = {item["label"]: item["path"] for item in sources}
         self.video_source_origins = {
             item["label"]: float(item.get("timeline_start", 0.0))
@@ -1436,9 +1795,12 @@ class OperationSessionWorkspace(ttk.Frame):
 
 
 class FrameCaptureDialog(tk.Toplevel):
-    """Select an exact 1280x720 ROI and hand it to DevStudio image detection."""
+    """Select an exact source-frame ROI and hand it to image detection."""
 
-    def __init__(self, parent, frame, session_dir, session, video_time, callback):
+    def __init__(self, parent, frame, session_dir, session, video_time, callback,
+                 image_roots=None, details_callback=None,
+                 allow_step_registration=False, extra_metadata=None,
+                 register_button_text=""):
         tk.Toplevel.__init__(self, parent)
         self.title("現在フレームから画像検知を作成")
         self.transient(parent.winfo_toplevel())
@@ -1447,8 +1809,29 @@ class FrameCaptureDialog(tk.Toplevel):
         self.session = session
         self.video_time = float(video_time)
         self.callback = callback
-        self.name = tk.StringVar(value="OPERATION_{}".format(int(self.video_time * 1000)))
+        self.details_callback = details_callback
+        self.extra_metadata = dict(extra_metadata or {})
+        self.name = tk.StringVar(
+            value=_default_capture_name(session, self.video_time))
+        self.threshold = tk.StringVar(value="0.800")
+        self.use_gray = tk.BooleanVar(value=True)
+        self.add_to_step = tk.BooleanVar(value=bool(allow_step_registration))
         self.coords = tk.StringVar()
+        self.image_root = tk.StringVar()
+        self.image_roots = {}
+        for root in image_roots or ():
+            absolute = os.path.abspath(str(root or "")) if root else ""
+            if not absolute:
+                continue
+            base = os.path.basename(os.path.normpath(absolute)) or "画像フォルダ"
+            label = base
+            number = 2
+            while label in self.image_roots:
+                label = "{} ({})".format(base, number)
+                number += 1
+            self.image_roots[label] = absolute
+        if self.image_roots:
+            self.image_root.set(next(iter(self.image_roots)))
         self.start = None
         self.rectangle = None
         self.scale = min(960.0 / frame.shape[1], 540.0 / frame.shape[0])
@@ -1464,6 +1847,19 @@ class FrameCaptureDialog(tk.Toplevel):
         ttk.Label(form, text="検知名:").pack(side="left")
         ttk.Entry(form, textvariable=self.name, width=34).pack(side="left", padx=3)
         ttk.Label(form, textvariable=self.coords).pack(side="right")
+        options = ttk.Frame(self)
+        options.pack(fill="x", padx=8, pady=(4, 0))
+        ttk.Label(options, text="閾値:").pack(side="left")
+        ttk.Entry(options, textvariable=self.threshold, width=7).pack(
+            side="left", padx=(3, 8))
+        ttk.Checkbutton(options, text="グレースケール", variable=self.use_gray).pack(
+            side="left")
+        if self.image_roots:
+            ttk.Label(options, text="保存先:").pack(side="left", padx=(12, 2))
+            ttk.Combobox(
+                options, textvariable=self.image_root,
+                values=list(self.image_roots), state="readonly", width=24).pack(
+                    side="left", fill="x", expand=True)
         self.canvas = tk.Canvas(self, width=width, height=height, highlightthickness=0)
         self.canvas.pack(padx=8, pady=6)
         self.canvas.create_image(0, 0, image=self.photo, anchor="nw")
@@ -1476,9 +1872,25 @@ class FrameCaptureDialog(tk.Toplevel):
         actions = ttk.Frame(self)
         actions.pack(fill="x", padx=8, pady=(0, 8))
         ttk.Button(actions, text="画像だけ保存", command=lambda: self.save(False)).pack(side="left")
-        ttk.Button(actions, text="保存して画像検知タブで調整", command=lambda: self.save(True)).pack(
+        register_text = register_button_text or (
+            "保存してimagecheck登録" if self.details_callback is not None
+            else "保存して画像検知タブで調整")
+        ttk.Button(actions, text=register_text, command=lambda: self.save(True)).pack(
             side="left", padx=4)
+        if self.details_callback is not None and allow_step_registration:
+            ttk.Checkbutton(
+                actions, text="選択中のStepへ画像条件も追加",
+                variable=self.add_to_step).pack(side="left", padx=(8, 0))
         ttk.Button(actions, text="閉じる", command=self.destroy).pack(side="right")
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.update_idletasks()
+        try:
+            # Keep the frame/session/source selection stable while this ROI is
+            # being named.  The callback also validates a frozen context for
+            # safety if a platform cannot establish the Tk grab.
+            self.grab_set()
+        except tk.TclError:
+            pass
 
     def begin_drag(self, event):
         self.start = (event.x, event.y)
@@ -1510,38 +1922,116 @@ class FrameCaptureDialog(tk.Toplevel):
         if x2 - x1 < 2 or y2 - y1 < 2:
             messagebox.showwarning("画像検知", "2px以上の範囲を囲んでください。", parent=self)
             return
-        name = re.sub(r"[^0-9A-Za-z_.-]+", "_", self.name.get().strip()).strip("._")
-        if not name:
+        logical_name = self.name.get().strip()
+        if not logical_name:
             messagebox.showwarning("画像検知", "検知名を入力してください。", parent=self)
             return
-        session_id = str(self.session.get("session_id", "operation"))
-        template_root = os.path.abspath(os.path.join(
-            os.path.dirname(__file__), "..", "SerialController", "Template",
-            "OperationCaptures", session_id))
-        os.makedirs(template_root, exist_ok=True)
-        path = os.path.join(template_root, name + ".png")
-        if os.path.exists(path) and not messagebox.askyesno(
-                "画像を更新", "同名画像を更新しますか？", parent=self):
+        try:
+            threshold = float(self.threshold.get())
+        except (tk.TclError, TypeError, ValueError):
+            messagebox.showwarning("画像検知", "閾値は0.0～1.0で入力してください。", parent=self)
             return
-        crop_image = self.frame[y1:y2, x1:x2]
-        if not cv2.imwrite(path, crop_image):
-            messagebox.showerror("画像検知", "画像を保存できませんでした。", parent=self)
-            return
-        metadata = {
-            "schema_version": 2, "session_id": session_id, "video_time": self.video_time,
-            "source_frame_size": [int(self.frame.shape[1]), int(self.frame.shape[0])],
-            "crop": [x1, y1, x2, y2], "template_path": path, "name": name,
-            # All platforms intentionally share the captured image initially.
-            # A later editor can replace just one entry without renaming the
-            # logical detection used by generated Commands code.
-            "logical_name": name,
-            "platform_templates": {
-                "switch": path, "steam": path, "ps4": path,
-            },
-            "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
-        }
-        captures = os.path.join(self.session_dir, "captures")
-        os.makedirs(captures, exist_ok=True)
-        atomic_json(os.path.join(captures, name + ".json"), metadata)
-        self.callback(path, [x1, y1, x2, y2], name, open_library)
+        root = self.image_roots.get(self.image_root.get(), "")
+        def save_locked(paths, overwrite):
+            target = paths["template_path"]
+            metadata_target = paths["metadata_path"]
+            transactional = bool(
+                open_library and self.details_callback is not None)
+            previous_files = None
+            if transactional:
+                try:
+                    previous_files = {
+                        target: _optional_file_bytes(target),
+                        metadata_target: _optional_file_bytes(metadata_target),
+                    }
+                except OSError as error:
+                    messagebox.showerror(
+                        "画像検知",
+                        "更新前の画像を退避できませんでした。\n" + str(error),
+                        parent=self)
+                    return False
+
+            def rollback_capture():
+                failures = []
+                if previous_files is None:
+                    return failures
+                for restore_path, payload in previous_files.items():
+                    try:
+                        _restore_file_bytes(restore_path, payload)
+                    except OSError as error:
+                        failures.append("{}: {}".format(
+                            os.path.basename(restore_path), error))
+                return failures
+
+            metadata = save_frame_capture(
+                self.frame, [x1, y1, x2, y2], self.session_dir,
+                self.session, self.video_time, logical_name,
+                image_root=root, threshold=threshold,
+                use_gray=self.use_gray.get(), overwrite=overwrite,
+                extra_metadata=self.extra_metadata,
+                _resolved_paths=paths)
+            if self.details_callback is not None:
+                try:
+                    completed = self.details_callback(
+                        metadata, bool(open_library),
+                        bool(open_library and self.add_to_step.get()))
+                except Exception as error:
+                    failures = rollback_capture()
+                    recovery = (
+                        "\n自動復元できないファイルがあります:\n" +
+                        "\n".join(failures)) if failures else (
+                            "\n画像と由来情報は元に戻しました。")
+                    messagebox.showerror(
+                        "imagecheck登録",
+                        "imagecheckへ登録できませんでした。" + recovery +
+                        "\n" + str(error), parent=self)
+                    return False
+                if completed is False:
+                    failures = rollback_capture()
+                    if failures:
+                        messagebox.showerror(
+                            "imagecheck登録",
+                            "登録を中止しましたが、自動復元できないファイルがあります:\n" +
+                            "\n".join(failures), parent=self)
+                    return False
+            elif self.callback is not None:
+                self.callback(
+                    metadata["template_path"], metadata["crop"],
+                    metadata["logical_name"], open_library)
+            return True
+
+        approved_overwrite = ""
+        while True:
+            prompt_target = ""
+            try:
+                # The human confirmation happens after releasing this lock.
+                # On re-entry the path is resolved again; if another Studio
+                # changed the target, the loop asks for the new path instead.
+                with _FrameCaptureLock(
+                        _frame_capture_lock_path(self.session, root)):
+                    paths = frame_capture_paths(
+                        self.session_dir, self.session, logical_name,
+                        image_root=root)
+                    target = paths["template_path"]
+                    target_key = os.path.normcase(os.path.abspath(target))
+                    target_exists = os.path.exists(target)
+                    if target_exists and target_key != approved_overwrite:
+                        prompt_target = target
+                    elif not save_locked(paths, target_exists):
+                        return
+            except (OSError, TypeError, ValueError, RuntimeError) as error:
+                messagebox.showerror(
+                    "画像検知", "画像を保存できませんでした。\n" + str(error),
+                    parent=self)
+                return
+            if not prompt_target:
+                break
+            if not messagebox.askyesno(
+                    "画像を更新",
+                    "同名画像を更新しますか？\n"
+                    "この画像を参照する現在ソースの旧crop設定は置換されます。",
+                    parent=self):
+                return
+            approved_overwrite = os.path.normcase(
+                os.path.abspath(prompt_target))
         self.destroy()

@@ -29,7 +29,7 @@ from ImageProcessing import ImageProcessing, crop_image, getImage, opneImage
 from LineNotify import Line_Notify
 from DiscordNotify import Discord_Notify
 from Commands import CommandBase
-from Commands.Keys import KeyPress
+from Commands.Keys import Hat, KeyPress
 from ThreadCancellation import raise_in_thread, request_stop_flags
 
 if TYPE_CHECKING:
@@ -765,6 +765,45 @@ class PythonCommand(CommandBase.Command):
         """
         self._interruptible_sleep(wait)
         self.checkIfAlive()
+
+    def etc_sendCommand(self, command_name, wait: float = 0.04,
+                        duration: Optional[float] = None):
+        """Send a readable D-pad command used by generated story sources.
+
+        ``duration`` is explicit for operation-recording output.  Omitting it
+        retains the familiar ZA_story rhythm: hold for ``wait`` seconds and
+        wait the same amount once more after release.
+        """
+        hats = {
+            "Lbutton_up": Hat.TOP,
+            "Lbutton_up_right": Hat.TOP_RIGHT,
+            "Lbutton_right": Hat.RIGHT,
+            "Lbutton_down_right": Hat.BTM_RIGHT,
+            "Lbutton_down": Hat.BTM,
+            "Lbutton_down_left": Hat.BTM_LEFT,
+            "Lbutton_left": Hat.LEFT,
+            "Lbutton_up_left": Hat.TOP_LEFT,
+        }
+        command_name = str(command_name)
+        if command_name.endswith("_push"):
+            base_name = command_name[:-5]
+            if base_name in hats:
+                self.hold(hats[base_name], wait=wait)
+                return
+        if command_name.endswith("_pull") or command_name.endswith("_release"):
+            suffix = "_pull" if command_name.endswith("_pull") else "_release"
+            base_name = command_name[:-len(suffix)]
+            if base_name in hats:
+                self.holdEnd(hats[base_name])
+                self.wait(wait)
+                return
+        if command_name not in hats:
+            raise ValueError("Unknown Switch command: " + command_name)
+        explicit_duration = duration is not None
+        duration = max(0.0, float(wait if duration is None else duration))
+        self.press(
+            hats[command_name], duration=duration,
+            wait=max(0.0, float(wait)) if explicit_duration else duration)
 
     def _interruptible_sleep(self, seconds: float):
         """Yield the GIL while retaining prompt pause/stop checkpoints."""

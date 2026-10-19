@@ -5,6 +5,7 @@ import inspect
 import math
 import os
 import queue
+import stat
 import sys
 import json
 import tempfile
@@ -27,13 +28,23 @@ def normalized_function_ast_dump(function_node):
     normalized = copy.deepcopy(function_node)
     docstring = ast.get_docstring(normalized, clean=True)
     if docstring is not None:
-        normalized.body[0].value.value = docstring
+        docstring_node = normalized.body[0].value
+        # Python 3.7 parses docstrings as ast.Str(s=...), while newer
+        # versions use ast.Constant(value=...).  Normalize the field used by
+        # each AST version so source/fragment indentation is not compared.
+        if hasattr(docstring_node, "s"):
+            docstring_node.s = docstring
+        if hasattr(docstring_node, "value"):
+            docstring_node.value = docstring
     return ast.dump(normalized, include_attributes=False)
 
 
 SERIAL_CONTROLLER = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "SerialController"))
 if SERIAL_CONTROLLER not in sys.path:
     sys.path.insert(0, SERIAL_CONTROLLER)
+LOCAL_FUNCTION = os.path.join(SERIAL_CONTROLLER, "LocalFunction")
+if LOCAL_FUNCTION not in sys.path:
+    sys.path.insert(0, LOCAL_FUNCTION)
 DEV_STUDIO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "DevStudio"))
 if DEV_STUDIO not in sys.path:
     sys.path.insert(0, DEV_STUDIO)
@@ -44,6 +55,7 @@ from CommandStartOverride import apply_command_start_override
 from CommandRunOptions import (apply_command_run_options,
                                apply_profile_to_dialogue_result,
                                discover_command_run_options,
+                               discover_runtime_debug_options,
                                preserve_location_selection,
                                perform_failure_save_recovery)
 from ControllerInputLog import (python_replacement_body, replay_recording,
@@ -99,7 +111,7 @@ from SourceDependencyTools import (analyze_source_dependencies,
                                    state_dictionary_names,
                                    suggest_state_dictionary)
 from SampleLibrary import compose_preview, save_library
-from PokeConDevStudio import find_match_index, pack_scrollable_widget
+from PokeConDevStudio import DevStudio, find_match_index, pack_scrollable_widget
 from CommandBuilder import template_source
 from StepMetadata import read_step_metadata, update_step_metadata
 from SampleOriginSync import (apply_sample_list_to_origins,
@@ -145,12 +157,14 @@ from ImageDetectionMonitor import (filter_target_names,
                                    prune_show_value_entries,
                                    update_show_value_entries)
 from ImageHealthCheck import audit_image_library, suggested_crop
+from ImageDetectionSync import parse_source_settings as parse_image_detection_source_settings
 from ImageCheckReferenceAudit import (audit_image_check_references,
                                       delete_image_check_exception,
                                       image_check_exception_rules,
                                       merge_library_targets_into_source,
                                       preserve_library_import_block,
                                       rename_image_check_references,
+                                      source_used_library_targets,
                                       upsert_image_check_exception)
 from ImageDetectionLibrary import (filter_image_library_variants,
                                    generate_image_check,
@@ -182,10 +196,14 @@ from GuiAssets import (CaptureArea, gui_resource_pressure,
 from PokeConShowInfo import (installed_distribution_version,
                              requirement_distribution_name)
 from Recording import (CaptureRecorder, DETECTION_STOP_REQUESTED,
+                       FinalizeJobAlreadyRunning,
                        audio_callback_presentation_time,
                        discover_finalize_manifests,
                        evenly_spaced_frame_indexes,
-                       load_finalize_manifest, write_finalize_manifest)
+                       load_finalize_manifest,
+                       prepare_segment_merge_source_alias,
+                       retire_finalize_manifest_for_segment_merge,
+                       write_finalize_manifest)
 from RecordingSyncRepair import (audio_advance_filter, wav_info,
                                  write_presentation_aligned_audio,
                                  write_without_exact_zeros)
@@ -216,7 +234,8 @@ from CommandMonitorRecording import (CommandInputActivityTracker,
                                      runtime_state_snapshot,
                                      temporary_chunk_ids_for_session,
                                      youtube_rolling_chunk_ids)
-from CommandRecordingMerge import (_validated_chunk_media,
+from CommandRecordingMerge import (CommandRecordingSourceValidationError,
+                                   _validated_chunk_media,
                                    merge_command_recording_chunks)
 from CommandFunctionIndex import (BATTLE_RENDA_GROUP,
                                   build_common_function_index,
@@ -254,11 +273,31 @@ from OperationGamepadMap import (OperationGamepadMapDialog,
 from OperationSessionModel import (GENERATION_TARGET_PORTABLE,
                                    STICK_MODE_EIGHT_WAY, STICK_MODE_EXACT,
                                    compact_line_ranges, generate_intermediate, pending_lines,
+                                   decode_switch_input_rows,
                                    input_row_is_commands_recordable,
                                    operation_video_sources,
                                    quantize_serial_stick_message,
+                                   readable_switch_input_lines,
+                                   readable_switch_operations,
                                    replace_generated_region, save_mappings,
                                    semantic_controls, source_class_names)
+from OperationStepPlan import (JsonlInputIndex, find_node,
+                               hydrate_plan_times, load_step_plan,
+                               materialize_step, migrate_mappings,
+                               move_step, new_branch, new_call,
+                               new_operation, new_return, normalise_plan,
+                               preview_paths, remove_node, render_plan,
+                               rename_step_references, save_preview,
+                               save_step_plan, split_step,
+                               step_plan_path, validate_plan)
+from LightweightOperationStudio import (LightweightOperationStudio,
+                                         _condition_text,
+                                         recorded_page_ranges,
+                                         select_video_source_for_time,
+                                         video_target_for_input)
+from OperationSessionStudio import (FrameCaptureDialog,
+                                    frame_capture_detection_row,
+                                    save_frame_capture)
 from OperationVisionSample import (generate_vision_sample,
                                    vision_output_paths)
 from OperationDebugCommand import (create_debug_command_package,
@@ -447,17 +486,35 @@ class CommandRunOptionsTests(unittest.TestCase):
         method.decorator_list = []
         function_module = ast.Module(body=[method], type_ignores=[])
         ast.fix_missing_locations(function_module)
-        namespace = {}
+        namespace = {
+            "discover_runtime_debug_options":
+                discover_runtime_debug_options,
+        }
         exec(compile(function_module, source_path, "exec"), namespace)
 
         command = types.SimpleNamespace(
             COMMAND_RUN_SETTINGS=True,
+            COMMAND_DEBUG_OPTIONS=(
+                {"attribute": "ResetDebug",
+                 "label": "ResetDebug（リセット復帰確認）",
+                 "description": "初回だけリセット復帰を検証します。",
+                 "default": False},
+                {"attribute": "fastread", "label": "fastread",
+                 "default": True},
+                {"attribute": "TESTADDCODE", "label": "TESTADDCODE",
+                 "default": False},
+                {"attribute": "testcode", "label": "testcode",
+                 "default": False},
+            ),
             COMMAND_STEP_LABELS={"START": "最初から"},
             COMMAND_STEP_DESCRIPTIONS={"START": "開始地点"},
             STATE_MAIN_FUNCTION={"START": object(), "END": object()},
             STATE_1_STORY_FUNCTION={"STEP_A": object()},
             unrelated={"IGNORED": object()},
+            ResetDebug=False,
+            fastread=True,
             TESTADDCODE=0,
+            testcode=0,
         )
         result = namespace["_runtime_command_run_options"](command)
         self.assertTrue(result["enabled"])
@@ -472,7 +529,13 @@ class CommandRunOptionsTests(unittest.TestCase):
         self.assertEqual(result["locations"][0]["label"], "最初から")
         self.assertEqual(
             [item["attribute"] for item in result["debug_options"]],
-            ["TESTADDCODE"])
+            ["ResetDebug", "fastread", "TESTADDCODE", "testcode"])
+        self.assertEqual(
+            result["debug_options"][0]["label"],
+            "ResetDebug（リセット復帰確認）")
+        self.assertEqual(
+            result["debug_options"][0]["description"],
+            "初回だけリセット復帰を検証します。")
 
         generated = types.SimpleNamespace(
             COMMAND_RUN_SETTINGS=True,
@@ -589,6 +652,27 @@ class Story:
         self.assertEqual(
             [row["attribute"] for row in result["debug_options"]], ["DEBUG"])
 
+    def test_explicit_debug_metadata_is_preserved_by_source_discovery(self):
+        result = discover_command_run_options('''
+class Story:
+    COMMAND_DEBUG_OPTIONS = (
+        {"attribute": "ResetDebug", "label": "リセット復帰確認",
+         "description": "初回だけ20秒待って復帰を実行", "default": False},
+        {"attribute": "fastread", "label": "fastread", "default": True},
+        {"attribute": "TESTADDCODE", "label": "TESTADDCODE",
+         "default": False},
+        {"attribute": "testcode", "label": "testcode", "default": False},
+    )
+''')
+        self.assertEqual(
+            [row["attribute"] for row in result["debug_options"]],
+            ["ResetDebug", "fastread", "TESTADDCODE", "testcode"])
+        self.assertEqual(result["debug_options"][0]["label"],
+                         "リセット復帰確認")
+        self.assertEqual(result["debug_options"][0]["description"],
+                         "初回だけ20秒待って復帰を実行")
+        self.assertTrue(result["debug_options"][1]["default"])
+
     def test_discovers_step_labels_and_state_docstrings(self):
         step = discover_command_run_options('''
 class StepDemo:
@@ -675,12 +759,16 @@ class Story:
             "dialog_value": " 3: 町～森", "dialog_start_index": 0,
             "dialog_end_index": 1, "label": "3: 町～森"}
         config = {
-            "start": route, "end": dict(route), "debug": {"DEBUG": True},
+            "start": route, "end": dict(route),
+            "debug": {
+                "DEBUG": True, "ResetDebug": True, "BATTLE_DEBUG": True},
             "save_delete_user_number": 7, "retry_on_failure": False}
         apply_command_run_options(command, config)
         self.assertEqual(command.restart_flag, 3)
         self.assertEqual(command.stop_flag, 3)
         self.assertTrue(command.DEBUG)
+        self.assertTrue(command.ResetDebug)
+        self.assertTrue(command.BATTLE_DEBUG)
         self.assertEqual(command.save_delete_user_number, 7)
         result = apply_profile_to_dialogue_result(
             command,
@@ -1478,6 +1566,659 @@ class ZaMapping52RecoveryTests(unittest.TestCase):
         self.assertFalse(command._2_story_mapping_52_recovery_active)
 
 
+class ZaMappingGotoBlackRecoveryTests(unittest.TestCase):
+    TARGETS = (
+        ("MAIN_2_Y_V_LANK", "_2_story_current_state",
+         "STATE_2_STORY_FUNCTION", "2_STORY_MAPPING_110",
+         "2_STORY_MAPPING_113", (
+             "2_STORY_MAPPING_110", "2_STORY_MAPPING_111",
+             "2_STORY_MAPPING_112", "2_STORY_MAPPING_113")),
+        ("MAIN_2_Y_V_LANK", "_2_story_current_state",
+         "STATE_2_STORY_FUNCTION", "2_STORY_MAPPING_114_0",
+         "2_STORY_MAPPING_115", (
+             "2_STORY_MAPPING_110", "2_STORY_MAPPING_111",
+             "2_STORY_MAPPING_112", "2_STORY_MAPPING_113",
+             "2_STORY_MAPPING_114_0", "2_STORY_MAPPING_114",
+             "2_STORY_MAPPING_114_1", "2_STORY_MAPPING_115")),
+        ("MAIN_2_Y_V_LANK", "_2_story_current_state",
+         "STATE_2_STORY_FUNCTION", "2_STORY_MAPPING_116_0",
+         "2_STORY_MAPPING_117", (
+             "2_STORY_MAPPING_110", "2_STORY_MAPPING_111",
+             "2_STORY_MAPPING_112", "2_STORY_MAPPING_113",
+             "2_STORY_MAPPING_114_0", "2_STORY_MAPPING_114",
+             "2_STORY_MAPPING_114_1", "2_STORY_MAPPING_115",
+             "2_STORY_MAPPING_116_0", "2_STORY_MAPPING_116",
+             "2_STORY_MAPPING_116_1", "2_STORY_MAPPING_117")),
+        ("MAIN_5_D_LANK", "_5_story_current_state",
+         "STATE_5_STORY_FUNCTION", "5_STORY_MAPPING_1",
+         "5_STORY_MAPPING_4", (
+             "5_STORY_MAPPING_1", "5_STORY_MAPPING_2",
+             "5_STORY_MAPPING_3", "5_STORY_MAPPING_4")),
+        ("MAIN_5_D_LANK", "_5_story_current_state",
+         "STATE_5_STORY_FUNCTION", "5_STORY_MAPPING_5",
+         "5_STORY_MAPPING_6", (
+             "5_STORY_MAPPING_1", "5_STORY_MAPPING_2",
+             "5_STORY_MAPPING_3", "5_STORY_MAPPING_4",
+             "5_STORY_MAPPING_5", "5_STORY_MAPPING_6")),
+        ("MAIN_6_C_LANK", "_6_story_current_state",
+         "STATE_6_STORY_FUNCTION", "6_STORY_MAPPING_1",
+         "6_STORY_MAPPING_4", (
+             "6_STORY_MAPPING_1", "6_STORY_MAPPING_2",
+             "6_STORY_MAPPING_3", "6_STORY_MAPPING_4")),
+        ("MAIN_7_B_LANK", "_7_story_current_state",
+         "STATE_7_STORY_FUNCTION", "7_STORY_MAPPING_1",
+         "7_STORY_MAPPING_4", (
+             "7_STORY_MAPPING_1", "7_STORY_MAPPING_2",
+             "7_STORY_MAPPING_3", "7_STORY_MAPPING_4")),
+        ("MAIN_7_B_LANK", "_7_story_current_state",
+         "STATE_7_STORY_FUNCTION", "7_STORY_MAPPING_5",
+         "7_STORY_MAPPING_8", (
+             "7_STORY_MAPPING_1", "7_STORY_MAPPING_2",
+             "7_STORY_MAPPING_3", "7_STORY_MAPPING_4",
+             "7_STORY_MAPPING_5", "7_STORY_MAPPING_6",
+             "7_STORY_MAPPING_7", "7_STORY_MAPPING_8_0",
+             "7_STORY_MAPPING_8")),
+    )
+
+    NO_MORNING_GOTO_TARGETS = (
+        ("2_STORY_MAPPING_3", "2_STORY_MAPPING_1"),
+        ("2_STORY_MAPPING_6", "2_STORY_MAPPING_4"),
+        ("2_STORY_MAPPING_9", "2_STORY_MAPPING_7"),
+        ("2_STORY_MAPPING_12", "2_STORY_MAPPING_10"),
+        ("2_STORY_MAPPING_15", "2_STORY_MAPPING_13"),
+        ("2_STORY_MAPPING_18", "2_STORY_MAPPING_16"),
+        ("2_STORY_MAPPING_21", "2_STORY_MAPPING_19"),
+        ("2_STORY_MAPPING_24", "2_STORY_MAPPING_22"),
+        ("2_STORY_MAPPING_27", "2_STORY_MAPPING_25"),
+        ("2_STORY_MAPPING_30", "2_STORY_MAPPING_28"),
+        ("2_STORY_MAPPING_33", "2_STORY_MAPPING_31"),
+        ("2_STORY_MAPPING_36", "2_STORY_MAPPING_34"),
+        ("2_STORY_MAPPING_39", "2_STORY_MAPPING_37"),
+        ("2_STORY_MAPPING_42", "2_STORY_MAPPING_40"),
+        ("2_STORY_MAPPING_45", "2_STORY_MAPPING_43"),
+        ("2_STORY_MAPPING_48", "2_STORY_MAPPING_46"),
+        ("2_STORY_MAPPING_51", "2_STORY_MAPPING_49"),
+        ("2_STORY_MAPPING_54", "2_STORY_MAPPING_52"),
+        ("2_STORY_MAPPING_57", "2_STORY_MAPPING_55"),
+        ("2_STORY_MAPPING_60", "2_STORY_MAPPING_58"),
+        ("2_STORY_MAPPING_63", "2_STORY_MAPPING_61"),
+        ("2_STORY_MAPPING_66", "2_STORY_MAPPING_64"),
+        ("2_STORY_MAPPING_69", "2_STORY_MAPPING_67"),
+        ("2_STORY_MAPPING_72", "2_STORY_MAPPING_70"),
+        ("2_STORY_MAPPING_75", "2_STORY_MAPPING_73"),
+        ("2_STORY_MAPPING_78", "2_STORY_MAPPING_76"),
+        ("2_STORY_MAPPING_81", "2_STORY_MAPPING_79"),
+        ("2_STORY_MAPPING_84", "2_STORY_MAPPING_82"),
+        ("2_STORY_MAPPING_87", "2_STORY_MAPPING_85"),
+        ("2_STORY_MAPPING_90", "2_STORY_MAPPING_88"),
+        ("2_STORY_MAPPING_94", "2_STORY_MAPPING_91"),
+        ("2_STORY_MAPPING_97", "2_STORY_MAPPING_95"),
+        ("2_STORY_MAPPING_100", "2_STORY_MAPPING_98"),
+        ("2_STORY_MAPPING_103", "2_STORY_MAPPING_101"),
+        ("2_STORY_MAPPING_106", "2_STORY_MAPPING_104"),
+        ("2_STORY_MAPPING_109", "2_STORY_MAPPING_107"),
+    )
+    EARLY_2_STORY_STATES = tuple(
+        ["2_STORY_MAPPING_{}".format(number)
+         for number in range(1, 81)]
+        + ["2_STORY_MAPPING_81_0"]
+        + ["2_STORY_MAPPING_{}".format(number)
+           for number in range(81, 110)])
+
+    @staticmethod
+    def _function_name(state_name):
+        return "_" + state_name.lower()
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(cls.source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+        cls.records = records
+
+        cls.clock = types.SimpleNamespace(now=0.0)
+        namespace = {
+            "time": types.SimpleNamespace(
+                monotonic=lambda: cls.clock.now),
+        }
+        function_names = {
+            "_ZA_story_mapping_goto_recovery_context",
+            "ZA_Common_mapping_goto_black_recovery",
+            "_ZA_story_mapping_goto_recovery_override",
+            "ZA_Common_goto",
+        }
+        for target in cls.TARGETS:
+            for state_name in target[5]:
+                function_names.add(cls._function_name(state_name))
+        for state_name in cls.EARLY_2_STORY_STATES:
+            function_names.add(cls._function_name(state_name))
+        for function_name in sorted(function_names):
+            exec(compile(
+                records[function_name], cls.source_path, "exec"), namespace)
+        cls.methods = {
+            function_name: namespace[function_name]
+            for function_name in function_names
+        }
+
+    def _command(self, target=None, table_states=None, **options):
+        if target is None:
+            target = self.TARGETS[0]
+        (main_state, state_attribute, table_attribute,
+         anchor_state, current_state, target_table_states) = target
+        if table_states is None:
+            table_states = target_table_states
+
+        class Command:
+            ZA_STORY_MAPPING_GOTO_BLACK_RECOVERY_SECONDS = 90.0
+
+            def __init__(inner_self):
+                inner_self.main_current_state = main_state
+                setattr(inner_self, state_attribute, current_state)
+                setattr(inner_self, table_attribute, {
+                    state_name: getattr(
+                        inner_self, self._function_name(state_name))
+                    for state_name in table_states
+                })
+                inner_self.black_background = options.get(
+                    "black_background", True)
+                inner_self.black_comment = options.get(
+                    "black_comment", True)
+                inner_self.field_restored = options.get(
+                    "field_restored", True)
+                inner_self.check_picture = options.get("check_picture", 0)
+                inner_self.eye_check_high_poke = options.get(
+                    "eye_check_high_poke", False)
+                inner_self.background_force_calls = []
+                inner_self.image_check_calls = []
+                inner_self.renda_calls = []
+                inner_self.battle_cp_calls = []
+                inner_self.common_map_open_calls = []
+                inner_self.Common_current_state = "COMMON_GOTO_SELECT1"
+                inner_self.map_cursor_reset = 8
+                inner_self.timecount = 7
+                inner_self.changetimecount = 6
+                inner_self.sleepcount = 5
+                inner_self._za_story_mapping_goto_watch = None
+                inner_self._za_story_mapping_goto_recovery = None
+
+            def ZA_mega_mode5_defeat_background_confirmed(
+                    inner_self, force=False):
+                inner_self.background_force_calls.append(force)
+                return inner_self.black_background
+
+            def image_check(inner_self, image_name):
+                inner_self.image_check_calls.append(image_name)
+                if image_name == "POKEMON_ZA_TEXT_BLACK_COMMENT":
+                    return inner_self.black_comment
+                if image_name == "POKEMON_ZA_EYE_CHECK_HIGH_POKE":
+                    return inner_self.eye_check_high_poke
+                return False
+
+            def ZA_renda_button(inner_self, **kwargs):
+                inner_self.renda_calls.append(kwargs)
+                return inner_self.field_restored
+
+            def ZA_Common_change_time_set(
+                    inner_self, check_timing):
+                inner_self.change_time_timing = check_timing
+                return inner_self.ZA_Common_goto(2, 0, 0)
+
+            def ZA_Common_map_open(inner_self, **_kwargs):
+                inner_self.common_map_open_calls.append(_kwargs)
+                return "COMMON_MAP_OPEN"
+
+            def ZA_battle_Cp_loop(inner_self, **kwargs):
+                inner_self.battle_cp_calls.append(kwargs)
+
+        for method_name, method in self.methods.items():
+            setattr(Command, method_name, method)
+        return Command()
+
+    def test_context_selects_segment_morning_or_previous_goto(self):
+        matched_pairs = set()
+        for target in self.TARGETS:
+            with self.subTest(current_state=target[4]):
+                command = self._command(target)
+                context = command._ZA_story_mapping_goto_recovery_context()
+                self.assertEqual(context, {
+                    "current_state": target[4],
+                    "recovery_target": target[3],
+                })
+                matched_pairs.add((
+                    context["current_state"], context["recovery_target"]))
+                self.assertFalse(
+                    command.ZA_Common_mapping_goto_black_recovery(
+                        movepoint_check=0))
+                self.assertIsNone(command._za_story_mapping_goto_watch)
+
+        self.assertEqual(matched_pairs, {
+            ("2_STORY_MAPPING_113", "2_STORY_MAPPING_110"),
+            ("2_STORY_MAPPING_115", "2_STORY_MAPPING_114_0"),
+            ("2_STORY_MAPPING_117", "2_STORY_MAPPING_116_0"),
+            ("5_STORY_MAPPING_4", "5_STORY_MAPPING_1"),
+            ("5_STORY_MAPPING_6", "5_STORY_MAPPING_5"),
+            ("6_STORY_MAPPING_4", "6_STORY_MAPPING_1"),
+            ("7_STORY_MAPPING_4", "7_STORY_MAPPING_1"),
+            ("7_STORY_MAPPING_8", "7_STORY_MAPPING_5"),
+        })
+
+        no_direct_goto = self._command(self.TARGETS[0])
+        no_direct_goto._2_story_current_state = "2_STORY_MAPPING_112"
+        self.assertIsNone(
+            no_direct_goto._ZA_story_mapping_goto_recovery_context())
+
+        no_morning_in_same_mapping_block = self._command(
+            self.TARGETS[0], table_states=(
+                "2_STORY_MAPPING_112", "2_STORY_MAPPING_113"))
+        context_function = getattr(
+            no_morning_in_same_mapping_block,
+            "_ZA_story_mapping_goto_recovery_context")
+        self.assertIsNone(context_function())
+
+    def test_scope_is_all_44_mapping_functions_with_movepoint_check(self):
+        actual_states = set()
+        for function_name, function_source in self.records.items():
+            if not any(function_name.startswith(
+                    "_{}_story_mapping_".format(chapter))
+                    for chapter in range(1, 9)):
+                continue
+            function_node = ast.parse(function_source).body[0]
+            for call in ast.walk(function_node):
+                if (not isinstance(call, ast.Call)
+                        or not isinstance(call.func, ast.Attribute)
+                        or call.func.attr != "ZA_Common_goto"
+                        or not isinstance(call.func.value, ast.Name)
+                        or call.func.value.id != "self"):
+                    continue
+                movepoint_keyword = next((
+                    keyword for keyword in call.keywords
+                    if keyword.arg == "movepoint_check"), None)
+                if movepoint_keyword is not None:
+                    movepoint_value = getattr(
+                        movepoint_keyword.value, "value",
+                        getattr(movepoint_keyword.value, "n", None))
+                    self.assertEqual(movepoint_value, 1, function_name)
+                    actual_states.add(function_name[1:].upper())
+                    break
+
+        expected_states = {
+            current_state
+            for current_state, _target in self.NO_MORNING_GOTO_TARGETS
+        }
+        expected_states.update(target[4] for target in self.TARGETS)
+        self.assertEqual(actual_states, expected_states)
+        self.assertEqual(len(actual_states), 44)
+
+    def test_context_falls_back_to_previous_goto_for_all_no_morning_targets(
+            self):
+        matched_pairs = set()
+        for current_state, recovery_target in self.NO_MORNING_GOTO_TARGETS:
+            with self.subTest(current_state=current_state):
+                target = (
+                    "MAIN_2_Y_V_LANK", "_2_story_current_state",
+                    "STATE_2_STORY_FUNCTION", recovery_target,
+                    current_state, self.EARLY_2_STORY_STATES)
+                command = self._command(target)
+                context = command._ZA_story_mapping_goto_recovery_context()
+                self.assertEqual(context, {
+                    "current_state": current_state,
+                    "recovery_target": recovery_target,
+                })
+                matched_pairs.add((current_state, recovery_target))
+
+        self.assertEqual(matched_pairs, set(self.NO_MORNING_GOTO_TARGETS))
+        self.assertEqual(len(matched_pairs), 36)
+        self.assertEqual(len(matched_pairs) + len(self.TARGETS), 44)
+
+    def test_no_morning_fallback_does_not_cross_mapping_block_boundary(self):
+        target = (
+            "MAIN_2_Y_V_LANK", "_2_story_current_state",
+            "STATE_2_STORY_FUNCTION", "2_STORY_MAPPING_1",
+            "2_STORY_MAPPING_3", self.EARLY_2_STORY_STATES)
+        command = self._command(target)
+        command.STATE_2_STORY_FUNCTION = {
+            "2_STORY_MAPPING_110": command._2_story_mapping_110,
+            "2_STORY_TOWER_46": object(),
+            "2_STORY_MAPPING_1": command._2_story_mapping_1,
+            "2_STORY_MAPPING_2": command._2_story_mapping_2,
+            "2_STORY_MAPPING_3": command._2_story_mapping_3,
+        }
+        self.assertEqual(
+            command._ZA_story_mapping_goto_recovery_context(), {
+                "current_state": "2_STORY_MAPPING_3",
+                "recovery_target": "2_STORY_MAPPING_1",
+            })
+
+        command.STATE_2_STORY_FUNCTION = {
+            "2_STORY_MAPPING_110": command._2_story_mapping_110,
+            "2_STORY_TOWER_46": object(),
+            "2_STORY_MAPPING_2": command._2_story_mapping_2,
+            "2_STORY_MAPPING_3": command._2_story_mapping_3,
+        }
+        self.assertIsNone(
+            command._ZA_story_mapping_goto_recovery_context())
+
+    def test_goto_hook_ignores_normal_gotos_and_starts_on_movepoint(self):
+        command = self._command(self.TARGETS[0])
+        anchor_state = self.TARGETS[0][3]
+        current_state = self.TARGETS[0][4]
+
+        self.clock.now = 12.0
+        command._2_story_current_state = anchor_state
+        command.Common_current_state = "COMMON_MAP_OPEN"
+        self.assertEqual(command._2_story_mapping_110(), anchor_state)
+        self.assertEqual(
+            command.change_time_timing, "POKEMON_ZA_MORNING")
+        self.assertIsNone(command._za_story_mapping_goto_watch)
+
+        self.clock.now = 16.0
+        command._2_story_current_state = "2_STORY_MAPPING_111"
+        command.Common_current_state = "COMMON_MAP_OPEN"
+        self.assertEqual(
+            command._2_story_mapping_111(), "2_STORY_MAPPING_111")
+        self.assertIsNone(command._za_story_mapping_goto_watch)
+
+        self.clock.now = 20.0
+        command._2_story_current_state = current_state
+        command.Common_current_state = "COMMON_MAP_OPEN"
+        self.assertEqual(command._2_story_mapping_113(), current_state)
+        self.assertEqual(command._za_story_mapping_goto_watch, {
+            "current_state": current_state,
+            "recovery_target": anchor_state,
+            "started_at": 20.0,
+        })
+
+    def test_5_mapping_6_watches_only_its_direct_movepoint_goto_path(self):
+        target = self.TARGETS[4]
+        command = self._command(target)
+
+        self.clock.now = 30.0
+        command._5_story_current_state = "5_STORY_MAPPING_5"
+        command.Common_current_state = "COMMON_MAP_OPEN"
+        self.assertEqual(
+            command._5_story_mapping_5(), "5_STORY_MAPPING_5")
+        self.assertIsNone(command._za_story_mapping_goto_watch)
+
+        self.clock.now = 40.0
+        command._5_story_current_state = "5_STORY_MAPPING_6"
+        command.Common_current_state = "COMMON_MAP_OPEN"
+        self.assertEqual(
+            command._5_story_mapping_6(), "5_STORY_MAPPING_6")
+        self.assertEqual(command._za_story_mapping_goto_watch, {
+            "current_state": "5_STORY_MAPPING_6",
+            "recovery_target": "5_STORY_MAPPING_5",
+            "started_at": 40.0,
+        })
+
+        self.clock.now = 130.0
+        self.assertEqual(
+            command._5_story_mapping_6(), "5_STORY_MAPPING_6")
+        self.assertEqual(
+            command._ZA_story_mapping_goto_recovery_override(
+                "5_STORY_MAPPING_6", "5_STORY_MAPPING_6"),
+            "5_STORY_MAPPING_5")
+        self.assertEqual(command.renda_calls, [{
+            "rendabutton": "B",
+            "endpicture": "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+            "sub_button": "A",
+            "sub_picture": "POKEMON_ZA_TEXT_BLACK_COMMENT",
+            "sleeptime": 0.3,
+        }])
+
+        eye_battle = self._command(target, eye_check_high_poke=True)
+        self.clock.now = 50.0
+        eye_battle.Common_current_state = "COMMON_MAP_OPEN"
+        self.assertEqual(
+            eye_battle._5_story_mapping_6(), "5_STORY_MAPPING_6")
+        self.assertIsNone(eye_battle._za_story_mapping_goto_watch)
+        self.assertEqual(eye_battle.common_map_open_calls, [])
+        self.assertEqual(eye_battle.battle_cp_calls, [{
+            "Xaction": 0,
+            "Aaction": 1,
+            "Yaction": 0,
+            "Baction": 1,
+            "mode": 1,
+        }])
+
+    def test_exact_90_seconds_recovers_field_and_returns_to_anchor(self):
+        command = self._command()
+        current_state = self.TARGETS[0][4]
+        anchor_state = self.TARGETS[0][3]
+
+        self.clock.now = 100.0
+        self.assertFalse(command.ZA_Common_mapping_goto_black_recovery(
+            movepoint_check=1))
+        self.clock.now = 189.999
+        self.assertFalse(command.ZA_Common_mapping_goto_black_recovery(
+            movepoint_check=1))
+        self.assertEqual(command.background_force_calls, [])
+        self.assertEqual(command.renda_calls, [])
+
+        self.clock.now = 190.0
+        self.assertTrue(command.ZA_Common_mapping_goto_black_recovery(
+            movepoint_check=1))
+        self.assertEqual(command.background_force_calls, [True])
+        self.assertEqual(
+            command.image_check_calls,
+            ["POKEMON_ZA_TEXT_BLACK_COMMENT"])
+        self.assertEqual(command.renda_calls, [{
+            "rendabutton": "B",
+            "endpicture": "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+            "sub_button": "A",
+            "sub_picture": "POKEMON_ZA_TEXT_BLACK_COMMENT",
+            "sleeptime": 0.3,
+        }])
+        self.assertEqual(command.Common_current_state, "COMMON_START")
+        self.assertEqual(command.map_cursor_reset, 0)
+        self.assertEqual(command.timecount, 0)
+        self.assertEqual(command.changetimecount, 0)
+        self.assertEqual(command.sleepcount, 0)
+        self.assertEqual(command._za_story_mapping_goto_recovery, {
+            "current_state": current_state,
+            "recovery_target": anchor_state,
+        })
+
+        self.assertEqual(
+            command._ZA_story_mapping_goto_recovery_override(
+                current_state, current_state),
+            anchor_state)
+        self.assertIsNone(command._za_story_mapping_goto_recovery)
+        self.assertIsNone(command._za_story_mapping_goto_watch)
+
+    def test_recovery_requires_black_background_and_black_comment(self):
+        for black_background in (False, True):
+            for black_comment in (False, True):
+                with self.subTest(
+                        black_background=black_background,
+                        black_comment=black_comment):
+                    command = self._command(
+                        black_background=black_background,
+                        black_comment=black_comment,
+                        field_restored=False)
+                    self.clock.now = 0.0
+                    self.assertFalse(
+                        command.ZA_Common_mapping_goto_black_recovery(
+                            movepoint_check=1))
+                    self.clock.now = 90.0
+                    result = command.ZA_Common_mapping_goto_black_recovery(
+                        movepoint_check=1)
+
+                    expected = black_background and black_comment
+                    self.assertEqual(result, expected)
+                    self.assertEqual(command.background_force_calls, [True])
+                    self.assertEqual(
+                        command.image_check_calls,
+                        ["POKEMON_ZA_TEXT_BLACK_COMMENT"])
+                    self.assertEqual(len(command.renda_calls), int(expected))
+
+    def test_normal_progress_clears_watch_and_restarts_full_timer(self):
+        command = self._command(field_restored=False)
+        current_state = self.TARGETS[0][4]
+
+        self.clock.now = 20.0
+        self.assertFalse(command.ZA_Common_mapping_goto_black_recovery(
+            movepoint_check=1))
+        self.assertEqual(
+            command._za_story_mapping_goto_watch["started_at"], 20.0)
+        self.assertEqual(
+            command._ZA_story_mapping_goto_recovery_override(
+                current_state, "2_STORY_MAPPING_114_0"),
+            "2_STORY_MAPPING_114_0")
+        self.assertIsNone(command._za_story_mapping_goto_watch)
+
+        self.clock.now = 200.0
+        self.assertFalse(command.ZA_Common_mapping_goto_black_recovery(
+            movepoint_check=1))
+        self.assertEqual(
+            command._za_story_mapping_goto_watch["started_at"], 200.0)
+        self.clock.now = 289.999
+        self.assertFalse(command.ZA_Common_mapping_goto_black_recovery(
+            movepoint_check=1))
+        self.assertEqual(command.background_force_calls, [])
+        self.clock.now = 290.0
+        self.assertTrue(command.ZA_Common_mapping_goto_black_recovery(
+            movepoint_check=1))
+        self.assertEqual(command.background_force_calls, [True])
+
+
+class ZaOutHotelZ16CaughtIconTests(unittest.TestCase):
+    @staticmethod
+    def _load_method():
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with tokenize.open(source_path) as stream:
+            tree = ast.parse(stream.read())
+        source_class = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ZA_story_Base")
+        method = next(
+            node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_1_story_out_hotel_z_16")
+        namespace = {}
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[method], type_ignores=[])), source_path, "exec"), namespace)
+        return namespace["_1_story_out_hotel_z_16"]
+
+    @classmethod
+    def _command(cls, visible=()):
+        method = cls._load_method()
+
+        class Command:
+            _1_story_out_hotel_z_16 = method
+
+            def __init__(self):
+                self._1_story_2nd_get_comment = 0
+                self.visible = set(visible)
+                self.image_check_calls = []
+                self.zl_actions = []
+                self.battle_calls = []
+                self.renda_calls = []
+                self.sent_commands = []
+                self.waits = []
+                self.get_count = 0
+
+            def image_check(self, target):
+                self.image_check_calls.append(target)
+                return target in self.visible
+
+            def ZA_ZL_ACTION(self, action):
+                self.zl_actions.append(action)
+
+            def ZA_battle_coCp_noloop(self, **kwargs):
+                self.battle_calls.append(kwargs)
+
+            def ZA_renda_button(self, **kwargs):
+                self.renda_calls.append(kwargs)
+                return True
+
+            def ZA_get_pokemon(self):
+                self.get_count += 1
+
+            def etc_sendCommand(self, command):
+                self.sent_commands.append(command)
+
+            def wait(self, seconds):
+                self.waits.append(seconds)
+
+        return Command()
+
+    def test_hard_field_advances_only_when_both_caught_icons_exist(self):
+        command = self._command({
+            "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+            "POKEMON_ZA_YAYAKOMA_ICON_GET2",
+            "POKEMON_ZA_HORUBII_ICON_GET3",
+        })
+        self.assertEqual(
+            command._1_story_out_hotel_z_16(),
+            "1_STORY_OUT_HOTEL_Z_17")
+        self.assertEqual(command.zl_actions, ["END"])
+        self.assertEqual(command.battle_calls, [])
+        self.assertIn(
+            "POKEMON_ZA_YAYAKOMA_ICON_GET2", command.image_check_calls)
+        self.assertIn(
+            "POKEMON_ZA_HORUBII_ICON_GET3", command.image_check_calls)
+
+    def test_one_missing_caught_icon_stays_in_z16_and_retries_battle(self):
+        hard_field = "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"
+        for caught in (
+                "POKEMON_ZA_YAYAKOMA_ICON_GET2",
+                "POKEMON_ZA_HORUBII_ICON_GET3"):
+            with self.subTest(caught=caught):
+                command = self._command({hard_field, caught})
+                self.assertEqual(
+                    command._1_story_out_hotel_z_16(),
+                    "1_STORY_OUT_HOTEL_Z_16")
+                self.assertEqual(command.zl_actions, [])
+                self.assertEqual(len(command.battle_calls), 1)
+                self.assertIn(
+                    "POKEMON_ZA_YAYAKOMA_ICON_GET2",
+                    command.image_check_calls)
+                self.assertIn(
+                    "POKEMON_ZA_HORUBII_ICON_GET3",
+                    command.image_check_calls)
+
+    def test_success_comment_waits_for_next_hard_field_icon_check(self):
+        command = self._command({
+            "POKEMON_ZA_TEXT_WHITE_COMMENT",
+            "POKEMON_ZA_TEXT_2_GET_SUCCESS",
+        })
+        self.assertEqual(
+            command._1_story_out_hotel_z_16(),
+            "1_STORY_OUT_HOTEL_Z_16")
+        self.assertEqual(len(command.renda_calls), 1)
+        self.assertEqual(command.zl_actions, [])
+        self.assertEqual(command._1_story_2nd_get_comment, 1)
+        self.assertNotIn(
+            "POKEMON_ZA_YAYAKOMA_ICON_GET2", command.image_check_calls)
+
+        command.visible = {
+            "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+            "POKEMON_ZA_YAYAKOMA_ICON_GET2",
+            "POKEMON_ZA_HORUBII_ICON_GET3",
+        }
+        self.assertEqual(
+            command._1_story_out_hotel_z_16(),
+            "1_STORY_OUT_HOTEL_Z_17")
+        self.assertEqual(command.zl_actions, ["END"])
+
+    def test_unknown_rival_comment_stays_in_z16(self):
+        command = self._command({"POKEMON_ZA_TEXT_WHITE_COMMENT"})
+        self.assertEqual(
+            command._1_story_out_hotel_z_16(),
+            "1_STORY_OUT_HOTEL_Z_16")
+        self.assertEqual(len(command.renda_calls), 1)
+        self.assertEqual(command._1_story_2nd_get_comment, 1)
+        self.assertEqual(command.zl_actions, [])
+
+
 class ZaOutHotelZ17To22BlackRecoveryTests(unittest.TestCase):
     @staticmethod
     def _load_helper(fake_time):
@@ -1543,6 +2284,7 @@ class ZaOutHotelZ17To22BlackRecoveryTests(unittest.TestCase):
                 self.caught = set(caught)
                 self.waits = []
                 self.reset_count = 0
+                self.lockon_actions = []
 
             def image_check(self, target):
                 if target == "POKEMON_ZA_TEXT_BLACK_COMMENT":
@@ -1554,6 +2296,9 @@ class ZaOutHotelZ17To22BlackRecoveryTests(unittest.TestCase):
 
             def ZA_gamereset(self):
                 self.reset_count += 1
+
+            def ZA_ZL_ACTION(self, action):
+                self.lockon_actions.append(action)
 
         cases = (
             ({"POKEMON_ZA_MERIP_ICON_GET5",
@@ -1581,6 +2326,7 @@ class ZaOutHotelZ17To22BlackRecoveryTests(unittest.TestCase):
                     helper(command, "1_STORY_OUT_HOTEL_Z_21"),
                     expected_state)
                 self.assertEqual(command.reset_count, 1)
+                self.assertEqual(command.lockon_actions, ["END"])
                 self.assertIsNone(
                     command._1_story_out_hotel_z_17_22_black_started_at)
                 self.assertIsNone(
@@ -1624,6 +2370,356 @@ class ZaOutHotelZ17To22BlackRecoveryTests(unittest.TestCase):
         self.assertIsNone(
             helper(command, "1_STORY_OUT_HOTEL_Z_18"))
         self.assertEqual(command.reset_count, 0)
+
+
+class ZaPartyDeadRecoveryTests(unittest.TestCase):
+    @staticmethod
+    def _source_path():
+        return os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+
+    @classmethod
+    def _source_class_and_functions(cls):
+        with tokenize.open(cls._source_path()) as stream:
+            tree = ast.parse(stream.read())
+        source_class = next(
+            node for node in tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ZA_story_Base")
+        functions = {
+            node.name: copy.deepcopy(node)
+            for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        return source_class, functions
+
+    @classmethod
+    def _load_dead_methods(cls, fake_time):
+        _source_class, functions = cls._source_class_and_functions()
+        method_names = (
+            "ZA_count_dead_party_icons",
+            "_1_story_out_hotel_z_17_18_dead_recovery",
+            "_1_story_out_hotel_z_20_dead_recovery",
+            "_1_story_out_hotel_z_20_lockon_recheck",
+            "_1_story_out_hotel_z_20",
+        )
+        namespace = {
+            "Button": types.SimpleNamespace(L="L"),
+            "Direction": lambda stick, angle: (stick, angle),
+            "Stick": types.SimpleNamespace(RIGHT="RIGHT", LEFT="LEFT"),
+            "time": fake_time,
+        }
+        module = ast.fix_missing_locations(ast.Module(
+            body=[functions[name] for name in method_names],
+            type_ignores=[]))
+        exec(compile(module, cls._source_path(), "exec"), namespace)
+        return functions, namespace
+
+    def test_six_dead_slot_targets_match_profile_and_runtime(self):
+        profile_path = os.path.join(
+            SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
+        with open(profile_path, "r", encoding="utf-8") as stream:
+            profile = json.load(stream)
+        with tokenize.open(self._source_path()) as stream:
+            runtime_targets = parse_image_detection_source_settings(
+                stream.read())
+
+        names = tuple(
+            "POKEMON_ZA_DEAD{}".format(index)
+            for index in range(1, 7))
+        common_members = {
+            member["id"]
+            for member in profile["lists"][
+                "POKEMON_ZA_FOLDER_COMMON"]["members"]
+            if member.get("type") == "target"
+        }
+        for index, name in enumerate(names, 1):
+            expected_crop = [
+                50 * index, 640, 50 * (index + 1), 680]
+            target = profile["targets"][name]
+            variant = target["variants"][0]
+            self.assertEqual(variant["crop"], expected_crop, name)
+            self.assertEqual(
+                variant["template_path"],
+                "Template/ZA_Story_PIC/Common/dead.png", name)
+            self.assertEqual(variant["threshold"], 0.8, name)
+            self.assertTrue(variant["use_gray"], name)
+            self.assertIn(name, common_members)
+            self.assertEqual(
+                runtime_targets[name]["variants"], target["variants"], name)
+
+    def test_dead_counter_checks_all_six_slots(self):
+        fake_time = types.SimpleNamespace(monotonic=lambda: 0.0)
+        _functions, namespace = self._load_dead_methods(fake_time)
+
+        class Command:
+            ZA_PARTY_DEAD_TARGETS = tuple(
+                "POKEMON_ZA_DEAD{}".format(index)
+                for index in range(1, 7))
+            ZA_count_dead_party_icons = namespace[
+                "ZA_count_dead_party_icons"]
+
+            def __init__(self, visible):
+                self.visible = set(visible)
+                self.checked = []
+
+            def image_check(self, target):
+                self.checked.append(target)
+                return target in self.visible
+
+        command = Command({
+            "POKEMON_ZA_DEAD1", "POKEMON_ZA_DEAD3",
+            "POKEMON_ZA_DEAD6"})
+        self.assertEqual(command.ZA_count_dead_party_icons(), 3)
+        self.assertEqual(command.checked, list(command.ZA_PARTY_DEAD_TARGETS))
+        self.assertEqual(Command(set()).ZA_count_dead_party_icons(), 0)
+        all_dead = Command(Command.ZA_PARTY_DEAD_TARGETS)
+        self.assertEqual(
+            all_dead.ZA_count_dead_party_icons(), 6)
+
+    def test_z17_dead_condition_must_remain_true_for_three_seconds(self):
+        clock = types.SimpleNamespace(now=0.0)
+        fake_time = types.SimpleNamespace(monotonic=lambda: clock.now)
+        _functions, namespace = self._load_dead_methods(fake_time)
+
+        class Command:
+            ZA_OUT_HOTEL_Z_17_18_DEAD_CHECK_SECONDS = 3.0
+            ZA_PARTY_DEAD_TARGETS = tuple(
+                "POKEMON_ZA_DEAD{}".format(index)
+                for index in range(1, 7))
+            ZA_count_dead_party_icons = namespace[
+                "ZA_count_dead_party_icons"]
+            recover = namespace[
+                "_1_story_out_hotel_z_17_18_dead_recovery"]
+
+            def __init__(self, dead_until=None, kohuki=False, field=True):
+                self.dead_until = dead_until
+                self.kohuki = kohuki
+                self.field = field
+                self.events = []
+                self.waits = []
+                self.alive_checks = 0
+
+            def image_check(self, target):
+                if target == "POKEMON_ZA_FIELD_W":
+                    return self.field
+                if target == "POKEMON_ZA_KOHUKI_ICON_GET4":
+                    return self.kohuki
+                if target == "POKEMON_ZA_DEAD1":
+                    return (self.dead_until is None
+                            or clock.now < self.dead_until)
+                return False
+
+            def wait(self, seconds):
+                self.waits.append(seconds)
+                clock.now += seconds
+
+            def checkIfAlive(self):
+                self.alive_checks += 1
+
+            def ZA_MOVE_SEE(self, action):
+                self.events.append(("view", action))
+
+            def ZA_ZL_ACTION(self, action):
+                self.events.append(("zl", action))
+
+            def ZA_gamereset(self):
+                self.events.append(("reset",))
+
+        stable = Command()
+        self.assertEqual(
+            stable.recover("1_STORY_OUT_HOTEL_Z_18"),
+            "1_STORY_OUT_HOTEL_Z_17")
+        self.assertAlmostEqual(clock.now, 3.0)
+        self.assertGreater(stable.alive_checks, 0)
+        self.assertEqual(stable.events, [
+            ("view", "END"), ("zl", "END"), ("reset",)])
+
+        clock.now = 0.0
+        transient = Command(dead_until=0.2)
+        self.assertIsNone(
+            transient.recover("1_STORY_OUT_HOTEL_Z_18_1"))
+        self.assertLess(clock.now, 3.0)
+        self.assertEqual(transient.events, [])
+
+        for kwargs in (
+                {"dead_until": 0.0},
+                {"kohuki": True},
+                {"field": False}):
+            with self.subTest(kwargs=kwargs):
+                clock.now = 0.0
+                skipped = Command(**kwargs)
+                self.assertIsNone(
+                    skipped.recover("1_STORY_OUT_HOTEL_Z_17"))
+                self.assertEqual(skipped.waits, [])
+                self.assertEqual(skipped.events, [])
+
+    def test_all_z17_to_z18_2_steps_call_dead_recovery(self):
+        _source_class, functions = self._source_class_and_functions()
+        helper_name = "_1_story_out_hotel_z_17_18_dead_recovery"
+        expected_steps = {
+            "_1_story_out_hotel_z_17": "1_STORY_OUT_HOTEL_Z_17",
+            "_1_story_out_hotel_z_18": "1_STORY_OUT_HOTEL_Z_18",
+            "_1_story_out_hotel_z_18_1": "1_STORY_OUT_HOTEL_Z_18_1",
+            "_1_story_out_hotel_z_18_2": "1_STORY_OUT_HOTEL_Z_18_2",
+        }
+        for function_name, state_name in expected_steps.items():
+            calls = [
+                node for node in ast.walk(functions[function_name])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == helper_name
+            ]
+            self.assertGreaterEqual(len(calls), 1, function_name)
+            self.assertTrue(all(
+                ast.literal_eval(call.args[0]) == state_name
+                for call in calls), function_name)
+        self.assertGreaterEqual(
+            len([
+                node for node in ast.walk(
+                    functions["_1_story_out_hotel_z_18"])
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == helper_name]),
+            3)
+
+    def test_z20_recovers_at_four_or_more_dead_without_mareep(self):
+        fake_time = types.SimpleNamespace(monotonic=lambda: 0.0)
+        _functions, namespace = self._load_dead_methods(fake_time)
+
+        class Command:
+            ZA_PARTY_DEAD_TARGETS = tuple(
+                "POKEMON_ZA_DEAD{}".format(index)
+                for index in range(1, 7))
+            ZA_count_dead_party_icons = namespace[
+                "ZA_count_dead_party_icons"]
+            recover = namespace[
+                "_1_story_out_hotel_z_20_dead_recovery"]
+
+            def __init__(self, dead_count, mareep=False):
+                self.dead = set(self.ZA_PARTY_DEAD_TARGETS[:dead_count])
+                self.mareep = mareep
+                self._1_story_out_hotel_z_20_not_eyecheck_count = 7
+                self.events = []
+
+            def image_check(self, target):
+                if target == "POKEMON_ZA_MERIP_ICON_GET5":
+                    return self.mareep
+                return target in self.dead
+
+            def ZA_MOVE_SEE(self, action):
+                self.events.append(("view", action))
+
+            def ZA_ZL_ACTION(self, action):
+                self.events.append(("zl", action))
+
+            def ZA_gamereset(self):
+                self.events.append(("reset",))
+
+        for dead_count in (4, 5, 6):
+            with self.subTest(dead_count=dead_count):
+                command = Command(dead_count)
+                self.assertEqual(
+                    command.recover(), "1_STORY_OUT_HOTEL_Z_19")
+                self.assertEqual(
+                    command._1_story_out_hotel_z_20_not_eyecheck_count, 0)
+                self.assertEqual(command.events, [
+                    ("view", "END"), ("zl", "END"), ("reset",)])
+
+        for command in (Command(3), Command(4, mareep=True)):
+            self.assertIsNone(command.recover())
+            self.assertEqual(command.events, [])
+            self.assertEqual(
+                command._1_story_out_hotel_z_20_not_eyecheck_count, 7)
+
+    def test_z20_lockon_recheck_and_caller_propagate_z19(self):
+        fake_time = types.SimpleNamespace(monotonic=lambda: 0.0)
+        _functions, namespace = self._load_dead_methods(fake_time)
+        recheck = namespace[
+            "_1_story_out_hotel_z_20_lockon_recheck"]
+        step20 = namespace["_1_story_out_hotel_z_20"]
+
+        class ImmediateRecovery:
+            def __init__(self):
+                self.recovery_calls = 0
+
+            def _1_story_out_hotel_z_20_dead_recovery(self):
+                self.recovery_calls += 1
+                return "1_STORY_OUT_HOTEL_Z_19"
+
+        immediate = ImmediateRecovery()
+        self.assertEqual(recheck(immediate), "1_STORY_OUT_HOTEL_Z_19")
+        self.assertEqual(immediate.recovery_calls, 1)
+
+        class MidRouteRecovery:
+            def __init__(self):
+                self.recovery_results = iter((
+                    None, "1_STORY_OUT_HOTEL_Z_19"))
+                self.recovery_calls = 0
+                self.marker_results = iter((True, False))
+                self.marker_calls = 0
+                self.moves = []
+
+            def _1_story_out_hotel_z_20_dead_recovery(self):
+                self.recovery_calls += 1
+                return next(self.recovery_results)
+
+            @staticmethod
+            def ZA_ZL_ACTION(_action):
+                return None
+
+            @staticmethod
+            def checkIfAlive():
+                return None
+
+            @staticmethod
+            def image_check(target):
+                return target == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"
+
+            def ZA_markerdir(self, _marker_type):
+                self.marker_calls += 1
+                return next(self.marker_results)
+
+            def press(self, direction, **kwargs):
+                self.moves.append((direction, kwargs))
+
+        mid_route = MidRouteRecovery()
+        self.assertEqual(recheck(mid_route), "1_STORY_OUT_HOTEL_Z_19")
+        self.assertEqual(mid_route.recovery_calls, 2)
+        self.assertEqual(mid_route.marker_calls, 2)
+        self.assertEqual(len(mid_route.moves), 2)
+
+        class Caller:
+            def __init__(self):
+                self._1_story_out_hotel_z_20_not_eyecheck_count = 9
+                self.recheck_calls = 0
+
+            @staticmethod
+            def _1_story_out_hotel_z_17_22_black_comment_recovery(_state):
+                return None
+
+            @staticmethod
+            def _1_story_out_hotel_z_20_dead_recovery():
+                return None
+
+            @staticmethod
+            def image_check(target):
+                return target == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"
+
+            def _1_story_out_hotel_z_20_lockon_recheck(self):
+                self.recheck_calls += 1
+                return "1_STORY_OUT_HOTEL_Z_19"
+
+            @staticmethod
+            def etc_sendCommand(_command):
+                return None
+
+        caller = Caller()
+        self.assertEqual(step20(caller), "1_STORY_OUT_HOTEL_Z_19")
+        self.assertEqual(caller.recheck_calls, 1)
+        self.assertEqual(
+            caller._1_story_out_hotel_z_20_not_eyecheck_count, 0)
 
 
 class ZaOutHotelZ40RecoveryTests(unittest.TestCase):
@@ -1916,7 +3012,9 @@ class InputSetDataTests(unittest.TestCase):
                 "id": "state:STATE_1_STORY_FUNCTION:1_STORY_STEP_D",
                 "mode": "state", "variable": "STATE_1_STORY_FUNCTION",
                 "value": "1_STORY_STEP_D", "label": "広場へ移動"},
-            "debug": {"fastread": True, "TESTADDCODE": False},
+            "debug": {"ResetDebug": True, "BATTLE_DEBUG": True,
+                      "fastread": True,
+                      "TESTADDCODE": False, "testcode": False},
             "save_delete_user_number": 2,
             "retry_on_failure": True,
             "recovery_method": "delete_save_for_user",
@@ -1936,7 +3034,8 @@ class InputSetDataTests(unittest.TestCase):
             {"name": "ホテルから", "config": {
                 "start": {"id": "step-a"}, "end": {"id": "step-c"}}},
             {"name": "バトル確認", "config": {
-                "start": {"id": "step-b"}, "debug": {"fastread": True}}},
+                "start": {"id": "step-b"},
+                "debug": {"fastread": True, "BATTLE_DEBUG": True}}},
         ]}
         self.assertTrue(sync_command_start_overrides(
             data, "Switch", overrides, favorites=favorites))
@@ -1955,7 +3054,7 @@ class InputSetDataTests(unittest.TestCase):
         scripts = [{"name": "メニューを閉じる",
                     "code": "press(Button.B)"}]
         self.assertTrue(sync_command_recovery_scripts(
-            data, "Switch", scripts, auto_open=False))
+            data, "Switch", scripts, auto_pause_disabled=True))
         item = data["input_sets"]["Switch"]
         self.assertEqual(
             item["commands_assist"]["recovery_scripts"], scripts)
@@ -1963,10 +3062,26 @@ class InputSetDataTests(unittest.TestCase):
             item["all_tabs"]["commands_assist"]["recovery_scripts"], scripts)
         self.assertFalse(
             item["commands_assist"]["recovery_auto_open"])
+        self.assertTrue(
+            item["commands_assist"]["recovery_auto_pause_disabled"])
+        self.assertTrue(
+            item["all_tabs"]["commands_assist"][
+                "recovery_auto_pause_disabled"])
         scripts[0]["name"] = "changed"
         self.assertEqual(
             item["commands_assist"]["recovery_scripts"][0]["name"],
             "メニューを閉じる")
+
+    def test_command_recovery_automatic_pause_defaults_to_disabled(self):
+        data = {"input_sets": {"Switch": {
+            "commands": {"enabled": True}, "all_tabs": {}}}}
+
+        self.assertTrue(sync_command_recovery_scripts(
+            data, "Switch", []))
+
+        assist = data["input_sets"]["Switch"]["commands_assist"]
+        self.assertTrue(assist["recovery_auto_pause_disabled"])
+        self.assertFalse(assist["recovery_auto_open"])
 
     def test_manual_control_choices_belong_to_input_set(self):
         for name in (
@@ -1985,6 +3100,129 @@ class InputSetDataTests(unittest.TestCase):
         stripped = strip_commands_from_snapshot(snapshot)
         self.assertNotIn("commands_assist", stripped)
         self.assertEqual(stripped["manual_control"], snapshot["manual_control"])
+
+    def test_recording_none_is_kept_in_input_set_and_all_tabs_snapshot(self):
+        from Window import PokeControllerApp
+
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        recording = {
+            "storage_destination": "none",
+            "youtube_upload_enabled": False,
+            "monitor_retention_mode": "keep_all",
+            "youtube_commands_allow_low_presentations": True,
+        }
+        app = types.SimpleNamespace(
+            input_set_include_audio=Value(False),
+            input_set_include_commands=Value(False),
+            audio_gain=Value(100),
+            audio_auto_level=Value(False),
+            audio_target_dbfs=Value(-18.0),
+            audio_max_auto_gain=Value(400),
+            audio_limiter_ceiling_dbfs=Value(-1.0),
+            audio_filter_camera=Value(True),
+            audio_auto_start=Value(False),
+            audio_monitor=types.SimpleNamespace(
+                input_stream=None, process_loopback=None),
+            _current_command_selection=lambda: {},
+            _all_tabs_snapshot=lambda include_commands=None: {
+                "recording": dict(recording)},
+            _current_camera_data=lambda: {},
+            _current_serial_data=lambda: {"enabled": False},
+            _recording_preset_data=lambda: dict(recording),
+        )
+
+        saved = PokeControllerApp._current_input_set_data(app)
+
+        self.assertEqual(saved["recording"]["storage_destination"], "none")
+        self.assertEqual(
+            saved["all_tabs"]["recording"]["storage_destination"], "none")
+        self.assertEqual(
+            saved["recording"]["monitor_retention_mode"], "keep_all")
+        self.assertEqual(
+            saved["all_tabs"]["recording"]["monitor_retention_mode"],
+            "keep_all")
+        self.assertTrue(
+            saved["recording"]["youtube_commands_allow_low_presentations"])
+        self.assertTrue(
+            saved["all_tabs"]["recording"]
+                 ["youtube_commands_allow_low_presentations"])
+        stripped = strip_commands_from_snapshot(saved["all_tabs"])
+        self.assertEqual(
+            stripped["recording"]["storage_destination"], "none")
+
+    def test_input_set_top_level_recording_none_is_authoritative_on_load(self):
+        from Window import PokeControllerApp
+
+        app = types.SimpleNamespace(
+            _recording_preset_data=lambda: {
+                "storage_destination": "youtube",
+                "youtube_upload_enabled": True,
+            })
+        item = {
+            "recording": {
+                "storage_destination": "none",
+                "youtube_upload_enabled": False,
+                "monitor_retention_mode": "keep_all",
+            },
+            "all_tabs": {"recording": {
+                "storage_destination": "youtube",
+                "youtube_upload_enabled": True,
+                "monitor_retention_mode": "smart",
+            }},
+        }
+
+        resolved = PokeControllerApp._input_set_recording_data(app, item)
+
+        self.assertEqual(resolved["storage_destination"], "none")
+        self.assertFalse(resolved["youtube_upload_enabled"])
+        self.assertEqual(resolved["monitor_retention_mode"], "keep_all")
+        resolved["storage_destination"] = "pc"
+        self.assertEqual(
+            item["recording"]["storage_destination"], "none")
+
+    def test_deferred_startup_snapshot_does_not_reapply_recording(self):
+        source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(source_path) as stream:
+            module = ast.parse(stream.read())
+        method = next(
+            item for node in module.body if isinstance(node, ast.ClassDef)
+            for item in node.body if isinstance(item, ast.FunctionDef)
+            and item.name == "_finish_load_commands_async")
+        call = next(
+            node for node in ast.walk(method)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_apply_all_tabs_snapshot")
+        keywords = {item.arg: item.value for item in call.keywords}
+        value = keywords.get("apply_recording")
+        self.assertIsInstance(value, ast.Constant)
+        self.assertFalse(value.value)
+
+    def test_legacy_input_set_does_not_inherit_previous_none_or_youtube(self):
+        from Window import PokeControllerApp
+
+        app = types.SimpleNamespace(
+            _recording_preset_data=lambda: {
+                "mode": "Manual",
+                "storage_destination": "none",
+                "youtube_upload_enabled": True,
+                "youtube_commands_allow_low_presentations": False,
+                "monitor_retention_mode": "keep_all",
+            })
+
+        resolved = PokeControllerApp._input_set_recording_data(app, {})
+
+        self.assertEqual(resolved["storage_destination"], "pc")
+        self.assertFalse(resolved["youtube_upload_enabled"])
+        self.assertTrue(
+            resolved["youtube_commands_allow_low_presentations"])
+        self.assertEqual(resolved["monitor_retention_mode"], "smart")
 
     def test_quick_actions_are_mirrored_to_schema3_input_set(self):
         data = {"input_sets": {"Switch": {"all_tabs": {}}}}
@@ -2061,8 +3299,9 @@ class InputSetDataTests(unittest.TestCase):
                          "object_detection_threshold", "step_debug_skip_confirm",
                          "window_capture_mode", "record_monitor_chunk_seconds",
                          "record_monitor_keep_steps", "record_monitor_loop_cycles",
-                          "record_monitor_long_seconds",
+                         "record_monitor_long_seconds",
                           "record_monitor_failure_tail_seconds",
+                          "record_monitor_retention_mode",
                           "record_monitor_auto_arm",
                           "record_monitor_confirm_delete_on_stop",
                           "operation_capture_output_dir",
@@ -2115,7 +3354,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             "DEBUG": {"variants": [{
                 "template_path": "Template/Debug/test.png"}]},
             "STORY": {"variants": [{
-                "template_path": "Template/ZA_Story/event.png"}]},
+                "template_path": "Template/ZA_Story_PIC/event.png"}]},
         }}
         self.assertEqual(
             filter_image_library_variants(
@@ -2250,6 +3489,71 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             r'image_check\("POKEMON_ZA_KOHUKI_ICON_GET4"\)\s*'
             r'and self\.image_check\("POKEMON_ZA_KOHUKI_ICON_GET5"\)')
 
+    def test_za_z16_party_icons_and_manual_map2_are_registered(self):
+        profile_path = os.path.join(
+            SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(profile_path, "r", encoding="utf-8") as stream:
+            library = json.load(stream)
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        runtime = parse_image_detection_source_settings(source)
+
+        expected = {
+            "POKEMON_ZA_YAYAKOMA_ICON_GET2": (
+                [100, 640, 150, 680],
+                "Template/ZA_Story_PIC/_1_z_lank/yayakomaicon.png"),
+            "POKEMON_ZA_HORUBII_ICON_GET3": (
+                [150, 640, 200, 680],
+                "Template/ZA_Story_PIC/_1_z_lank/horubiiicon.png"),
+            "ZA_STORY_KARASUBA_ENDRESET_MAP2": (
+                [0, 0, 200, 200],
+                "Template/ZA_Story_PIC/_8_last/"
+                "ZA_STORY_KARASUBA_ENDRESET_MAP2.png"),
+        }
+        for target_name, (crop, template_path) in expected.items():
+            with self.subTest(target=target_name):
+                target = library["targets"][target_name]
+                variant = target["variants"][0]
+                self.assertEqual(variant["crop"], crop)
+                self.assertEqual(variant["template_path"], template_path)
+                self.assertTrue(variant["use_gray"])
+                self.assertEqual(
+                    runtime[target_name]["variants"], target["variants"])
+                absolute_template = os.path.join(
+                    SERIAL_CONTROLLER, *template_path.split("/"))
+                self.assertTrue(os.path.isfile(absolute_template))
+
+        z_lank_members = {
+            member["id"]
+            for member in library["lists"][
+                "POKEMON_ZA_FOLDER_1_Z_LANK"]["members"]
+            if member.get("type") == "target"
+        }
+        self.assertIn("POKEMON_ZA_YAYAKOMA_ICON_GET2", z_lank_members)
+        self.assertIn("POKEMON_ZA_HORUBII_ICON_GET3", z_lank_members)
+        last_members = {
+            member["id"]
+            for member in library["lists"][
+                "POKEMON_ZA_FOLDER_8_LAST"]["members"]
+            if member.get("type") == "target"
+        }
+        self.assertIn("ZA_STORY_KARASUBA_ENDRESET_MAP2", last_members)
+        generated = generate_image_check(
+            library, "POKEMON_ZA_ALL", "list")
+        for target_name in expected:
+            self.assertIn(target_name, generated)
+
+        self.assertNotIn("Template/ZA_Story/", source)
+        self.assertNotIn(
+            "Template/ZA_Story/", json.dumps(library, ensure_ascii=False))
+        self.assertFalse(os.path.exists(os.path.join(
+            SERIAL_CONTROLLER, "Template", "ZA_Story")))
+        self.assertTrue(os.path.isdir(os.path.join(
+            SERIAL_CONTROLLER, "Template", "ZA_Story_PIC")))
+
     def test_za_white_comment_accepts_both_arrow_animation_states(self):
         profile_path = os.path.join(
             SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
@@ -2260,8 +3564,8 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             "POKEMON_ZA_TEXT_WHITE_COMMENT"]["variants"]
         template_paths = {variant["template_path"] for variant in variants}
         self.assertEqual(template_paths, {
-            "Template/ZA_Story/Common/white_comment.png",
-            "Template/ZA_Story/Common/white_comment2.png",
+            "Template/ZA_Story_PIC/Common/white_comment.png",
+            "Template/ZA_Story_PIC/Common/white_comment2.png",
         })
         self.assertEqual({tuple(variant["crop"]) for variant in variants}, {
             (300, 555, 1000, 700),
@@ -2281,7 +3585,359 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                     for target in node.targets)))
         self.assertEqual(
             source_targets["POKEMON_ZA_TEXT_WHITE_COMMENT"], variants)
-        self.assertNotIn("def image_check_confirmation", source)
+        self.assertIn("def image_check_confirmation", source)
+
+    def test_za_numbered_selects_require_field_level_and_rpush_absence_at_point_75(self):
+        select_targets = (
+            "POKEMON_ZA_1_SELECT",
+            "POKEMON_ZA_2_SELECT",
+            "POKEMON_ZA_2_SELECT_TUTORIAL",
+            "POKEMON_ZA_3_SELECT",
+            "POKEMON_ZA_3_SELECT_SELECT",
+            "POKEMON_ZA_3_SELECT_TUTORIAL",
+            "POKEMON_ZA_4_SELECT",
+        )
+        profile_path = os.path.join(
+            SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_InfiMainDependencies", "ZA_InfiImageCheckHelpers",
+            "ZA_InfiImageCheckHelpers.pyfrag")
+        fragment_metadata_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_InfiMainDependencies", "ZA_InfiImageCheckHelpers",
+            "ZA_InfiImageCheckHelpers.pokesample.json")
+        sample_lists_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments",
+            "sample_lists.json")
+        with open(profile_path, "r", encoding="utf-8") as stream:
+            profile = json.load(stream)
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment = stream.read()
+        with open(fragment_metadata_path, "r", encoding="utf-8") as stream:
+            fragment_metadata = json.load(stream)
+        with open(sample_lists_path, "r", encoding="utf-8") as stream:
+            sample_lists = json.load(stream)
+
+        source_tree = ast.parse(source)
+        fragment_tree = ast.parse(fragment)
+        target_assignment = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "IMAGE_DETECTION_TARGETS"
+                    for target in node.targets))
+        embedded_targets = ast.literal_eval(target_assignment.value)
+        for target_name in select_targets:
+            self.assertEqual(
+                profile["targets"][target_name]["variants"][0][
+                    "threshold"],
+                0.75,
+                target_name)
+            self.assertEqual(
+                embedded_targets[target_name][0]["threshold"],
+                0.75,
+                target_name)
+
+        source_functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {"image_check", "image_check_confirmation"}
+        }
+        fragment_confirmation = next(
+            node for node in fragment_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "image_check_confirmation")
+        self.assertEqual(
+            ast.dump(
+                source_functions["image_check_confirmation"],
+                include_attributes=False),
+            ast.dump(fragment_confirmation, include_attributes=False))
+        source_confirmation_record = next(
+            item for item in source_function_records(source)
+            if item["name"] == "image_check_confirmation")
+        confirmation_sync = fragment_metadata["function_sync"][
+            "image_check_confirmation"]
+        self.assertEqual(
+            confirmation_sync["source_function"],
+            "image_check_confirmation")
+        self.assertEqual(
+            confirmation_sync["base_hash"],
+            function_content_hash(source_confirmation_record["text"]))
+
+        # 関数単位でDevStudioサンプルを組み立てても、image_checkだけが
+        # 取り込まれて確認ガードが欠落しないこと。
+        guarded_dependency_groups = set()
+        helper_id = (
+            "Pokemon_ZA/ZA_InfiMainDependencies/"
+            "ZA_InfiImageCheckHelpers/"
+            "ZA_InfiImageCheckHelpers.pokesample.json")
+        for group_name, group in sample_lists["lists"].items():
+            helper_functions = [
+                member.get("function")
+                for member in group.get("members", [])
+                if member.get("id") == helper_id
+            ]
+            if "image_check" not in helper_functions:
+                continue
+            guarded_dependency_groups.add(group_name)
+            self.assertIn(
+                "image_check_confirmation", helper_functions,
+                group_name)
+            self.assertLess(
+                helper_functions.index("image_check"),
+                helper_functions.index("image_check_confirmation"),
+                group_name)
+            preview = compose_preview(
+                os.path.dirname(sample_lists_path),
+                sample_lists, group_name)
+            for blocker_target in (
+                    "POKEMON_ZA_FIELD_W",
+                    "POKEMON_ZA_FIELD_BACK_W",
+                    "POKEMON_ZA_BATTLE_ACTIVE_LEVEL",
+                    "POKEMON_ZA_R_push"):
+                self.assertIn(
+                    blocker_target, preview["image_targets"],
+                    (group_name, blocker_target))
+            if group_name in {
+                    "ZA_story_Template_battle_function",
+                    "ZA_battle_coCp_noloop"}:
+                for select_target in (
+                        "POKEMON_ZA_1_SELECT",
+                        "POKEMON_ZA_2_SELECT",
+                        "POKEMON_ZA_3_SELECT",
+                        "POKEMON_ZA_4_SELECT"):
+                    self.assertIn(
+                        select_target, preview["image_targets"],
+                        (group_name, select_target))
+        self.assertEqual(guarded_dependency_groups, {
+            "ZA_battle_infi_main",
+            "ZA_story_Template_battle_function",
+            "ZA_battle_coCp_noloop",
+            "ZA_story_Template_Field_HardGaurd",
+        })
+
+        module = ast.fix_missing_locations(ast.Module(
+            body=[source_functions["image_check"],
+                  source_functions["image_check_confirmation"]],
+            type_ignores=[]))
+        namespace = {}
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            image_check = namespace["image_check"]
+            image_check_confirmation = namespace[
+                "image_check_confirmation"]
+            IMAGE_DETECTION_TARGETS = {
+                name: [] for name in select_targets + (
+                     "POKEMON_ZA_FIELD_W",
+                     "POKEMON_ZA_FIELD_BACK_W",
+                     "POKEMON_ZA_BATTLE_ACTIVE_LEVEL",
+                     "POKEMON_ZA_R_push",
+                     "POKEMON_ZA_HELP_MARKER",
+                )
+            }
+
+            def __init__(self, blocker_matches=()):
+                self.blocker_matches = set(blocker_matches)
+
+            def _image_check_target(self, name):
+                if name in select_targets or name == "POKEMON_ZA_HELP_MARKER":
+                    return True
+                return name in self.blocker_matches
+
+            @staticmethod
+            def image_check_exception(_name):
+                return False
+
+        for blocker_target in (
+                "POKEMON_ZA_FIELD_W",
+                "POKEMON_ZA_FIELD_BACK_W",
+                "POKEMON_ZA_BATTLE_ACTIVE_LEVEL",
+                "POKEMON_ZA_R_push"):
+            command = Command({blocker_target})
+            for select_target in select_targets:
+                self.assertFalse(
+                    command.image_check(select_target),
+                    (blocker_target, select_target))
+
+        blockers_absent = Command()
+        for select_target in select_targets:
+            self.assertTrue(blockers_absent.image_check(select_target))
+        self.assertTrue(
+            Command({"POKEMON_ZA_FIELD_W"}).image_check(
+                "POKEMON_ZA_HELP_MARKER"))
+        self.assertTrue(
+            Command({"POKEMON_ZA_R_push"}).image_check(
+                "POKEMON_ZA_HELP_MARKER"))
+        self.assertTrue(
+            Command({"POKEMON_ZA_R_push"}).image_check(
+                "POKEMON_ZA_R_push"))
+
+    def test_story_last_50_rpush_blocks_false_2_select_and_sends_rclick(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in {
+                "image_check",
+                "image_check_confirmation",
+                "_8_story_story_last_50",
+            }
+        }
+
+        class Button:
+            RCLICK = "RCLICK"
+            X = "X"
+
+        namespace = {"Button": Button}
+        module = ast.fix_missing_locations(ast.Module(
+            body=[
+                functions["image_check"],
+                functions["image_check_confirmation"],
+                functions["_8_story_story_last_50"],
+            ],
+            type_ignores=[]))
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            image_check = namespace["image_check"]
+            image_check_confirmation = namespace["image_check_confirmation"]
+            _8_story_story_last_50 = namespace[
+                "_8_story_story_last_50"]
+            IMAGE_DETECTION_TARGETS = {
+                name: [] for name in {
+                    "POKEMON_ZA_TEXT_WHITE_COMMENT",
+                    "POKEMON_ZA_TEXT_GREEN_COMMENT",
+                    "POKEMON_ZA_TEXT_BLACK_COMMENT",
+                    "POKEMON_ZA_2_SELECT",
+                    "POKEMON_ZA_HELP_MARKER",
+                    "POKEMON_ZA_ITEM_WINDOW",
+                    "POKEMON_ZA_FIELD_W",
+                    "POKEMON_ZA_FIELD_BACK_W",
+                    "POKEMON_ZA_BATTLE_ACTIVE_LEVEL",
+                    "POKEMON_ZA_R_push",
+                }
+            }
+
+            def __init__(self, raw_matches):
+                self.raw_matches = set(raw_matches)
+                self.actions = []
+
+            def _image_check_target(self, name):
+                return name in self.raw_matches
+
+            @staticmethod
+            def image_check_exception(_name):
+                return False
+
+            def ZA_ZL_ACTION(self, action):
+                self.actions.append(("zl", action))
+
+            def press(self, button, *_args, **_kwargs):
+                self.actions.append(("press", button))
+
+            @staticmethod
+            def wait(_seconds):
+                return None
+
+            def pressRep(self, button, **_kwargs):
+                self.actions.append(("pressRep", button))
+
+        command = Command({
+            "POKEMON_ZA_2_SELECT",
+            "POKEMON_ZA_R_push",
+        })
+        self.assertEqual(
+            command._8_story_story_last_50(),
+            "8_STORY_STORY_LAST_50")
+        self.assertIn(("press", "RCLICK"), command.actions)
+        self.assertIn(("zl", ""), command.actions)
+        self.assertIn(("pressRep", "X"), command.actions)
+        self.assertNotIn(("zl", "END"), command.actions)
+
+        select_only = Command({"POKEMON_ZA_2_SELECT"})
+        self.assertEqual(
+            select_only._8_story_story_last_50(),
+            "8_STORY_STORY_LAST_51")
+        self.assertNotIn(("press", "RCLICK"), select_only.actions)
+
+    def test_za_battle_before_renda_has_no_input_on_total_miss(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        function = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_ZA_story_battle_before_safe_renda_once")
+        module = ast.fix_missing_locations(ast.Module(
+            body=[function], type_ignores=[]))
+        namespace = {"Button": Button}
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            def __init__(self, matched=()):
+                self.matched = set(matched)
+                self.buttons = []
+                self.waits = []
+
+            def image_check(self, name):
+                return name in self.matched
+
+            def pressRep(self, button, **_kwargs):
+                self.buttons.append(button)
+
+            def wait(self, duration):
+                self.waits.append(duration)
+
+            @staticmethod
+            def checkIfAlive():
+                return None
+
+        execute = namespace["_ZA_story_battle_before_safe_renda_once"]
+        no_picture = Command()
+        self.assertEqual(
+            execute(no_picture, green_check=1, sleeptime=0.5),
+            ("continue", "no_input"))
+        self.assertEqual(no_picture.buttons, [])
+        self.assertEqual(no_picture.waits, [])
+
+        x_menu = Command({"POKEMON_ZA_X_MENU_OPEN"})
+        self.assertEqual(
+            execute(x_menu, green_check=1, sleeptime=0.5),
+            ("continue", "x_menu_b"))
+        self.assertEqual(x_menu.buttons, [Button.B])
+        self.assertEqual(x_menu.waits, [0.5])
+
+        selection = Command({"POKEMON_ZA_2_SELECT"})
+        self.assertEqual(
+            execute(selection, green_check=1, sleeptime=0.5),
+            ("continue", "POKEMON_ZA_2_SELECT"))
+        self.assertEqual(selection.buttons, [Button.A])
+        self.assertEqual(selection.waits, [0.5])
+
+        # GURI_114では黒CommentをSELECTより優先し、黒背景上のSELECT
+        # 誤一致でA送信・敗戦累計を発生させない。
+        black_over_select = Command({
+            "POKEMON_ZA_TEXT_BLACK_COMMENT",
+            "POKEMON_ZA_2_SELECT",
+        })
+        self.assertEqual(
+            execute(black_over_select, green_check=1, sleeptime=0.5),
+            ("black_comment", "POKEMON_ZA_TEXT_BLACK_COMMENT"))
+        self.assertEqual(black_over_select.buttons, [])
+        self.assertEqual(black_over_select.waits, [])
 
     def test_restaurant_loop_closes_x_menu_before_other_actions(self):
         source_path = os.path.join(
@@ -2577,6 +4233,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             self.assertEqual(calls, [], function_name)
 
         recovery_calls = []
+        recovery_lockon_actions = []
         black_comment = types.SimpleNamespace(
             ZA_STORY_TOWER_34_38_BLACK_RECOVERY_SECONDS=5.0,
             ZA_STORY_TOWER_34_38_BLACK_GAP_SECONDS=2.0,
@@ -2584,6 +4241,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 target == "POKEMON_ZA_TEXT_BLACK_COMMENT"),
             ZA_renda_button=lambda **kwargs: (
                 recovery_calls.append(kwargs) or True),
+            ZA_ZL_ACTION=lambda action: recovery_lockon_actions.append(action),
             wait=lambda _seconds: None,
         )
         black_comment._2_story_tower_34_38_black_comment_recovery = (
@@ -2612,6 +4270,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             "endpicture": "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
             "sleeptime": 0.5,
         }])
+        self.assertEqual(recovery_lockon_actions, ["END"])
 
     def test_tower71_74_persistent_black_recovers_to_69_with_b_limit(self):
         source_path = os.path.join(
@@ -2945,7 +4604,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(field_white_target["operator"], "OR")
         self.assertEqual(
             field_white_target["variants"][0]["template_path"],
-            "Template/ZA_Story/_1_z_lank/"
+            "Template/ZA_Story_PIC/_1_z_lank/"
             "out_hotel_z23_field_white_comment.png")
         self.assertEqual(
             field_white_target["variants"][0]["crop"],
@@ -3448,12 +5107,20 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 self.remaining = 3
                 self.buttons = []
                 self.alive_checks = 0
+                self.view_actions = []
+                self.lockon_actions = []
 
             def image_check(self, name):
                 return name == "POKEMON_ZA_REWORD" and self.remaining > 0
 
             def checkIfAlive(self):
                 self.alive_checks += 1
+
+            def ZA_MOVE_SEE(self, action):
+                self.view_actions.append(action)
+
+            def ZA_ZL_ACTION(self, action):
+                self.lockon_actions.append(action)
 
             def pressRep(self, button, repeat=1, **_kwargs):
                 self.buttons.extend([button] * repeat)
@@ -3464,6 +5131,8 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertTrue(namespace["ZA_battle_reword_recovery"](command))
         self.assertEqual(command.buttons, [Button.B] * 3)
         self.assertEqual(command.alive_checks, 3)
+        self.assertEqual(command.view_actions, ["END"] * 3)
+        self.assertEqual(command.lockon_actions, ["END"] * 3)
         self.assertFalse(namespace["ZA_battle_reword_recovery"](command))
 
         runtime_targets = {}
@@ -3490,7 +5159,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             runtime_operators["POKEMON_ZA_REWORD"], profile["operator"])
         self.assertEqual(profile["variants"][0]["threshold"], 0.8)
         self.assertTrue(os.path.isfile(os.path.join(
-            SERIAL_CONTROLLER, "Template", "ZA_Story", "Common", "X_menu",
+            SERIAL_CONTROLLER, "Template", "ZA_Story_PIC", "Common", "X_menu",
             "POKEMON_ZA_REWORD.png")))
 
     def test_za_yukari_mega_before_comment_timeout_returns_to_time_reset(self):
@@ -3671,10 +5340,14 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             _6_story_yukari_52_recovery = namespace[
                 "_6_story_yukari_52_recovery"]
 
-            def __init__(self, matched=(), field_after_b=None):
+            def __init__(
+                    self, matched=(), field_after_b=None,
+                    field_after_input=None):
                 self.matched = set(matched)
                 self.field_after_b = field_after_b
+                self.field_after_input = field_after_input
                 self.b_count = 0
+                self.input_count = 0
                 self.button_inputs = []
                 self.move_inputs = []
                 self.waits = []
@@ -3684,12 +5357,16 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
             def image_check(self, target):
                 if target == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK":
-                    return (self.field_after_b is not None
-                            and self.b_count >= self.field_after_b)
+                    return ((self.field_after_b is not None
+                             and self.b_count >= self.field_after_b)
+                            or (self.field_after_input is not None
+                                and self.input_count
+                                >= self.field_after_input))
                 return target in self.matched
 
             def pressRep(self, button, **kwargs):
                 self.button_inputs.append((button, kwargs))
+                self.input_count += int(kwargs.get("repeat", 1))
                 if button == Button.B:
                     self.b_count += int(kwargs.get("repeat", 1))
 
@@ -3712,10 +5389,25 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             recovery._6_story_yukari_52(),
             "6_STORY_YUKARI_52_RECOVERY")
         self.assertEqual(recovery.b_count, 3)
+        self.assertEqual(
+            [button for button, _kwargs in recovery.button_inputs],
+            [Button.B, Button.A, Button.B, Button.A, Button.B])
         self.assertFalse(
             recovery._6_story_yukari_52_recovery_waiting_field)
         self.assertFalse(
             recovery._6_story_yukari_52_recovery_plan_active)
+
+        field_after_a = Command(
+            {"POKEMON_ZA_TEXT_BLACK_COMMENT"}, field_after_input=2)
+        self.assertEqual(
+            field_after_a._6_story_yukari_52(),
+            "6_STORY_YUKARI_52_RECOVERY")
+        self.assertEqual(
+            [button for button, _kwargs in field_after_a.button_inputs],
+            [Button.B, Button.A])
+        self.assertEqual(field_after_a.b_count, 1)
+        self.assertFalse(
+            field_after_a._6_story_yukari_52_recovery_waiting_field)
         self.assertEqual(
             recovery._6_story_yukari_52_recovery(),
             "6_STORY_YUKARI_42")
@@ -3744,6 +5436,10 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(
             bounded._6_story_yukari_52(), "6_STORY_YUKARI_52")
         self.assertEqual(bounded.b_count, 40)
+        self.assertEqual(
+            sum(button == Button.A
+                for button, _kwargs in bounded.button_inputs), 40)
+        self.assertEqual(bounded.input_count, 80)
         self.assertTrue(
             bounded._6_story_yukari_52_recovery_waiting_field)
         bounded.field_after_b = 40
@@ -4741,6 +6437,263 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             {standalone_state: lambda: standalone_state}), standalone_state)
         self.assertEqual(standalone.chicketmaxflag, 2)
 
+    def test_za_story_pre_step_gate_waits_and_supports_recovery_sets(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        source_class = next(
+            node for node in source_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ZA_story_Base")
+        functions = {
+            node.name: node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        story_main_reset_attributes = {
+            target.attr
+            for node in ast.walk(functions["ZA_story_main"])
+            if isinstance(node, ast.Assign)
+            for target in node.targets
+            if isinstance(target, ast.Attribute)
+        }
+        self.assertTrue({
+            "_za_story_pre_step_gate_state",
+            "_za_story_pre_step_gate_started_at",
+            "_za_story_pre_step_gate_completed",
+            "_za_story_pre_step_gate_last_dispatch_state",
+        }.issubset(story_main_reset_attributes))
+        gate_assignment = next(
+            node for node in source_class.body
+            if isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "ZA_STORY_PRE_STEP_GATES")
+        gate_settings = ast.literal_eval(gate_assignment.value)
+        target_state = "2_STORY_ABSOL_MOVE14"
+        target_gate = gate_settings[target_state]
+        comment_targets = (
+            "POKEMON_ZA_TEXT_WHITE_COMMENT",
+            "POKEMON_ZA_TEXT_GREEN_COMMENT",
+            "POKEMON_ZA_TEXT_BLACK_COMMENT",
+            "POKEMON_ZA_COMMENT_MARKER",
+        )
+        self.assertEqual(target_gate["ready_hold_seconds"], 10.0)
+        self.assertEqual(
+            target_gate["ready_all"],
+            ((True, "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"),)
+            + tuple((False, target) for target in comment_targets))
+        self.assertEqual(
+            target_gate["recovery_sets"],
+            ({
+                "recover_any": comment_targets,
+                "action": "ZA_story_Template_Comment_Out",
+            },))
+
+        module = ast.fix_missing_locations(ast.Module(
+            body=[
+                functions["_ZA_story_pre_step_gate"],
+                functions["ZA_story_event_entry_recovery_step"],
+            ],
+            type_ignores=[]))
+        now = [0.0]
+        namespace = {
+            "time": types.SimpleNamespace(monotonic=lambda: now[0]),
+        }
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            ZA_STORY_PRE_STEP_GATES = gate_settings
+            ZA_STORY_EVENT_ENTRY_RECOVERY_SECONDS = 30.0
+            ZA_STORY_BATTLE_RETURN_RECOVERY_COUNT = 3
+            ZA_STORY_WHITE_COMMENT_RECOVERY_TARGETS = {}
+            ZA_STORY_MEGA_BEFORE_COMMENT_RECOVERY_TARGETS = {}
+            ZA_STORY_BATTLE_BEFORE_RECOVERY_TARGETS = {}
+            _ZA_story_pre_step_gate = namespace[
+                "_ZA_story_pre_step_gate"]
+            ZA_story_event_entry_recovery_step = namespace[
+                "ZA_story_event_entry_recovery_step"]
+
+            def __init__(self, matched=()):
+                self.matched = set(matched)
+                self.image_checks = []
+                self.step_calls = 0
+                self.recovery_calls = []
+                self.comment_result = False
+
+            def image_check(self, target):
+                self.image_checks.append(target)
+                return target in self.matched
+
+            def ZA_story_Template_Comment_Out(self):
+                self.recovery_calls.append("comment")
+                return self.comment_result
+
+            def first_recovery(self):
+                self.recovery_calls.append("first")
+                return False
+
+            def second_recovery(self):
+                self.recovery_calls.append("second")
+                return False
+
+            def target_step(self):
+                self.step_calls += 1
+                return target_state
+
+            def other_step(self):
+                self.step_calls += 1
+                return "OTHER_STEP"
+
+        # 正常FIELDでも10秒連続成立まではStep本体を呼ばない。
+        command = Command({"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"})
+        state_functions = {target_state: command.target_step}
+        now[0] = 0.0
+        self.assertEqual(command.ZA_story_event_entry_recovery_step(
+            target_state, state_functions), target_state)
+        now[0] = 9.999
+        self.assertEqual(command.ZA_story_event_entry_recovery_step(
+            target_state, state_functions), target_state)
+        self.assertEqual(command.step_calls, 0)
+        now[0] = 10.0
+        self.assertEqual(command.ZA_story_event_entry_recovery_step(
+            target_state, state_functions), target_state)
+        self.assertEqual(command.step_calls, 1)
+
+        # MOVE14本体を一度呼んだ後、同じStateを連続して返す間は
+        # gateを再実行せず、次のStep本体を直ちに呼ぶ。
+        image_check_count = len(command.image_checks)
+        command.matched.add("POKEMON_ZA_TEXT_BLACK_COMMENT")
+        now[0] = 10.1
+        command.ZA_story_event_entry_recovery_step(
+            target_state, state_functions)
+        self.assertEqual(command.step_calls, 2)
+        self.assertEqual(command.recovery_calls, [])
+        self.assertEqual(len(command.image_checks), image_check_count)
+
+        # コメントが途中で出れば計時を破棄する。Comment_OutがTrueでも
+        # Stepを開始せず、画像復旧後に10秒を最初から取り直す。
+        recovery = Command({"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"})
+        recovery.comment_result = True
+        recovery_functions = {target_state: recovery.target_step}
+        now[0] = 30.0
+        recovery.ZA_story_event_entry_recovery_step(
+            target_state, recovery_functions)
+        recovery.matched.add("POKEMON_ZA_TEXT_BLACK_COMMENT")
+        now[0] = 35.0
+        recovery.ZA_story_event_entry_recovery_step(
+            target_state, recovery_functions)
+        now[0] = 35.1
+        recovery.ZA_story_event_entry_recovery_step(
+            target_state, recovery_functions)
+        self.assertEqual(recovery.recovery_calls, ["comment", "comment"])
+        self.assertEqual(recovery.step_calls, 0)
+        recovery.matched.remove("POKEMON_ZA_TEXT_BLACK_COMMENT")
+        now[0] = 36.0
+        recovery.ZA_story_event_entry_recovery_step(
+            target_state, recovery_functions)
+        now[0] = 45.999
+        recovery.ZA_story_event_entry_recovery_step(
+            target_state, recovery_functions)
+        self.assertEqual(recovery.step_calls, 0)
+        now[0] = 46.0
+        recovery.ZA_story_event_entry_recovery_step(
+            target_state, recovery_functions)
+        self.assertEqual(recovery.step_calls, 1)
+
+        # FIELD不成立だけなら入力せず待つ。
+        no_field = Command()
+        no_field.ZA_story_event_entry_recovery_step(
+            target_state, {target_state: no_field.target_step})
+        self.assertEqual(no_field.recovery_calls, [])
+        self.assertEqual(no_field.step_calls, 0)
+
+        # 1 Stepに複数recover_any + actionを置け、宣言順の最初の
+        # 一致だけを1 dispatcher周期に実行する。
+        multiple_gate_settings = {
+            target_state: {
+                "ready_all": ((True, "READY"),),
+                "ready_hold_seconds": 10.0,
+                "recovery_sets": (
+                    {
+                        "recover_any": ("FIRST_RECOVERY",),
+                        "action": "first_recovery",
+                    },
+                    {
+                        "recover_any": ("SECOND_RECOVERY",),
+                        "action": "second_recovery",
+                    },
+                ),
+            },
+        }
+        second = Command({"SECOND_RECOVERY"})
+        second.ZA_STORY_PRE_STEP_GATES = multiple_gate_settings
+        second.ZA_story_event_entry_recovery_step(
+            target_state, {target_state: second.target_step})
+        self.assertEqual(second.recovery_calls, ["second"])
+
+        first = Command({"FIRST_RECOVERY", "SECOND_RECOVERY"})
+        first.ZA_STORY_PRE_STEP_GATES = multiple_gate_settings
+        first.ZA_story_event_entry_recovery_step(
+            target_state, {target_state: first.target_step})
+        self.assertEqual(first.recovery_calls, ["first"])
+
+        # 対象外Stepは待機しない。対象Stepを一度離れて再入場した場合は、
+        # completed latchを捨てて10秒確認をやり直す。
+        now[0] = 100.0
+        leave = Command({"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"})
+        leave.ZA_story_event_entry_recovery_step(
+            target_state, {target_state: leave.target_step})
+        now[0] = 110.0
+        leave.ZA_story_event_entry_recovery_step(
+            target_state, {target_state: leave.target_step})
+        self.assertEqual(leave.step_calls, 1)
+        now[0] = 110.1
+        leave.ZA_story_event_entry_recovery_step(
+            target_state, {target_state: leave.target_step})
+        self.assertEqual(leave.step_calls, 2)
+        now[0] = 111.0
+        leave.ZA_story_event_entry_recovery_step(
+            "OTHER_STEP", {"OTHER_STEP": leave.other_step})
+        self.assertEqual(leave.step_calls, 3)
+        now[0] = 112.0
+        leave.ZA_story_event_entry_recovery_step(
+            target_state, {target_state: leave.target_step})
+        self.assertEqual(leave.step_calls, 3)
+        now[0] = 122.0
+        leave.ZA_story_event_entry_recovery_step(
+            target_state, {target_state: leave.target_step})
+        self.assertEqual(leave.step_calls, 4)
+
+        # 対象外Stepがpre-step hookより前の専用復旧でearly returnしても、
+        # そのStepを経由した事実をdispatcher入口で記録して再入場を検知する。
+        early_return = Command({
+            "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"})
+        now[0] = 200.0
+        early_return.ZA_story_event_entry_recovery_step(
+            target_state, {target_state: early_return.target_step})
+        now[0] = 210.0
+        early_return.ZA_story_event_entry_recovery_step(
+            target_state, {target_state: early_return.target_step})
+        self.assertEqual(early_return.step_calls, 1)
+        early_return._za_furadari_eyes_dark_recovery_lock_state = (
+            "OTHER_EARLY_RETURN")
+        now[0] = 211.0
+        self.assertEqual(
+            early_return.ZA_story_event_entry_recovery_step(
+                "OTHER_EARLY_RETURN", {}),
+            "OTHER_EARLY_RETURN")
+        early_return._za_furadari_eyes_dark_recovery_lock_state = None
+        now[0] = 212.0
+        early_return.ZA_story_event_entry_recovery_step(
+            target_state, {target_state: early_return.target_step})
+        self.assertEqual(early_return.step_calls, 1)
+        now[0] = 222.0
+        early_return.ZA_story_event_entry_recovery_step(
+            target_state, {target_state: early_return.target_step})
+        self.assertEqual(early_return.step_calls, 2)
+
     def test_za_story_direct_infi_steps_prepare_ticket_before_dispatch(self):
         source_path = os.path.join(
             SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
@@ -5350,8 +7303,11 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 self.b_count = 0
                 self.a_count = 0
                 self.press_events = []
+                self.control_events = []
                 self.alive_checks = 0
                 self.battle_level_visible = battle_level_visible
+                self.view_actions = []
+                self.lockon_actions = []
 
             def image_check(self, name):
                 if name == "POKEMON_ZA_HELP_MARKER":
@@ -5383,6 +7339,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
             def pressRep(self, button, repeat=1, **_kwargs):
                 self.press_events.append((button, repeat))
+                self.control_events.append(("button", button))
                 if button == Button.X and self.menu_after_x:
                     self.x_menu_open = True
                     # 背後のFIELDが見えていても、Xメニューを先に閉じる。
@@ -5403,8 +7360,13 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                     if self.b_count >= self.field_after_b:
                         self.stuck = False
 
-            def ZA_ZL_ACTION(self, _action=""):
-                pass
+            def ZA_ZL_ACTION(self, action=""):
+                self.lockon_actions.append(action)
+                self.control_events.append(("zl", action))
+
+            def ZA_MOVE_SEE(self, action="RELOAD", **_kwargs):
+                self.view_actions.append(action)
+                self.control_events.append(("view", action))
 
             def wait(self, _duration):
                 pass
@@ -5417,6 +7379,13 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             attack_ready=True))
         self.assertEqual(
             open_reword_command.press_events, [(Button.B, 1)] * 3)
+        self.assertEqual(open_reword_command.view_actions, ["END"] * 3)
+        self.assertEqual(open_reword_command.lockon_actions, ["END"] * 3)
+        self.assertEqual(open_reword_command.control_events, [
+            ("view", "END"), ("zl", "END"), ("button", Button.B),
+            ("view", "END"), ("zl", "END"), ("button", Button.B),
+            ("view", "END"), ("zl", "END"), ("button", Button.B),
+        ])
         self.assertFalse(open_reword_command.reword_open)
         self.assertEqual(
             open_reword_command._za_battle_missing_field_count_reword, 0)
@@ -5436,6 +7405,11 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertTrue(recover(
             menu_command, "menu", enabled=False, attack_ready=True))
         self.assertEqual(menu_command.press_events, [(Button.B, 1)])
+        self.assertEqual(menu_command.view_actions, ["END"])
+        self.assertEqual(menu_command.lockon_actions, ["END"])
+        self.assertEqual(menu_command.control_events, [
+            ("view", "END"), ("zl", "END"), ("button", Button.B),
+        ])
         self.assertEqual(
             menu_command._za_battle_missing_field_count_menu, 0)
 
@@ -6161,6 +8135,82 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         # outer condition + range(1, value) + final condition = value + 1
         self.assertEqual(149 + 1, 150)
 
+    def test_za_mega_help_marker_is_polled_every_outer_loop(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        functions_by_path = []
+        for path, encoding in (
+                (source_path, "utf-8-sig"),
+                (fragment_path, "utf-8")):
+            with open(path, "r", encoding=encoding) as stream:
+                tree = ast.parse(stream.read())
+            functions_by_path.append(next(
+                node for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "ZA_mega_evolution_battle"))
+
+        source_function, fragment_function = functions_by_path
+        self.assertEqual(
+            normalized_function_ast_dump(source_function),
+            normalized_function_ast_dump(fragment_function))
+
+        polling_loops = [
+            node for node in ast.walk(source_function)
+            if isinstance(node, ast.While)
+            and node.body
+            and isinstance(node.body[0], ast.If)
+            and any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "image_check"
+                and call.args
+                and isinstance(call.args[0], ast.Constant)
+                and call.args[0].value == "POKEMON_ZA_HELP_MARKER"
+                for call in ast.walk(node.body[0].test))
+        ]
+        self.assertEqual(len(polling_loops), 1)
+        polling_loop = polling_loops[0]
+        help_branch = polling_loop.body[0]
+        self.assertIsInstance(help_branch, ast.If)
+        help_checks = [
+            node for node in ast.walk(help_branch.test)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "image_check"
+            and node.args
+            and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value == "POKEMON_ZA_HELP_MARKER"
+        ]
+        self.assertEqual(len(help_checks), 1)
+        a_presses = [
+            node for node in ast.walk(help_branch)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "pressRep"
+            and node.args
+            and isinstance(node.args[0], ast.Attribute)
+            and node.args[0].attr == "A"
+        ]
+        self.assertEqual(len(a_presses), 1)
+        self.assertFalse(any(
+            isinstance(node, ast.Name)
+            and node.id == "mega_help_check_count"
+            for node in ast.walk(source_function)))
+        self.assertFalse(any(
+            isinstance(node, ast.Continue) for node in ast.walk(help_branch)))
+        self.assertFalse(any(
+            isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+            and any(isinstance(target, ast.Name)
+                    and target.id == "priority_action_sent"
+                    for target in (
+                        node.targets if isinstance(node, ast.Assign)
+                        else [node.target]))
+            for node in ast.walk(help_branch)))
+
     def test_za_red_edge_helpers_and_mode5_green_priority(self):
         source_path = os.path.join(
             SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
@@ -6182,6 +8232,9 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         }
 
         helper_names = (
+            "ZA_mega_field_attack_only_active",
+            "ZA_mega_field_y_dodge_suppression_active",
+            "ZA_mega_field_attack_only_suppress_y_dodge",
             "ZA_mega_red_screen_edge_check",
             "ZA_mega_red_edge_y_renda",
             "ZA_mega_red_edge_dodge_if_needed",
@@ -6195,16 +8248,22 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         for functions in (source_functions, fragment_functions):
             mode_select = functions[
                 "ZA_mega_evolution_battle_mode_select"]
+            default_arguments = mode_select.args.args[-len(
+                mode_select.args.defaults):]
+            defaults_by_name = {
+                argument.arg: ast.literal_eval(default)
+                for argument, default in zip(
+                    default_arguments, mode_select.args.defaults)
+            }
             self.assertEqual(
-                mode_select.args.args[-2].arg,
-                "red_edge_y_renda_seconds")
+                defaults_by_name["red_edge_y_renda_seconds"], 0.0)
             self.assertEqual(
-                ast.literal_eval(mode_select.args.defaults[-2]), 0.0)
+                defaults_by_name["attack_unavailable_y_dodge"], 1)
+            self.assertEqual(defaults_by_name["red_edge_before_rclick"], 1)
+            self.assertEqual(defaults_by_name["lockon_unchecked_a"], 1)
             self.assertEqual(
-                mode_select.args.args[-1].arg,
-                "attack_unavailable_y_dodge")
-            self.assertEqual(
-                ast.literal_eval(mode_select.args.defaults[-1]), 1)
+                defaults_by_name["choice_black_background_guard"], 1)
+            self.assertNotIn("dash_before_lockon", defaults_by_name)
             mega_calls = [
                 node for node in ast.walk(mode_select)
                 if isinstance(node, ast.Call)
@@ -6216,6 +8275,30 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 any(keyword.arg == "red_edge_y_renda_seconds"
                     for keyword in call.keywords)
                 for call in mega_calls))
+            shared_options = (
+                "red_edge_before_rclick",
+                "lockon_unchecked_a",
+                "choice_black_background_guard",
+            )
+            self.assertTrue(all(
+                all(any(
+                    keyword.arg == option
+                    and isinstance(keyword.value, ast.Name)
+                    and keyword.value.id == option
+                    for keyword in call.keywords)
+                    for option in shared_options)
+                for call in mega_calls))
+            mode5_calls = [
+                node for node in ast.walk(mode_select)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "ZA_mega_evolution_battle_mode5"
+            ]
+            self.assertEqual(len(mode5_calls), 1)
+            self.assertTrue(all(
+                all(keyword.arg != option
+                    for keyword in mode5_calls[0].keywords)
+                for option in shared_options))
 
         for functions in (source_functions, fragment_functions):
             battle_function = functions["ZA_mega_evolution_battle"]
@@ -6236,6 +8319,16 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 defaults_by_name["battle_roll_only"], 0)
             self.assertEqual(
                 defaults_by_name["red_edge_roll_with_view"], 0)
+            self.assertEqual(
+                defaults_by_name["red_edge_before_rclick"], 0)
+            self.assertEqual(
+                defaults_by_name["lockon_unchecked_a"], 0)
+            self.assertEqual(
+                defaults_by_name["choice_black_background_guard"], 0)
+            self.assertEqual(
+                defaults_by_name["lockon_unchecked_ay_loop"], 0)
+            self.assertEqual(
+                defaults_by_name["field_resume_roll_suppress_seconds"], 2.0)
             battle_calls = [
                 node.func.attr for node in ast.walk(battle_function)
                 if isinstance(node, ast.Call)
@@ -6246,7 +8339,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             ]
             self.assertEqual(
                 battle_calls.count(
-                    "ZA_mega_red_edge_dodge_if_needed"), 4)
+                    "ZA_mega_red_edge_dodge_if_needed"), 5)
             red_edge_calls = [
                 node for node in ast.walk(battle_function)
                 if isinstance(node, ast.Call)
@@ -6331,6 +8424,13 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         exec(compile(module, source_path, "exec"), namespace)
 
         class Command:
+            ZA_mega_field_attack_only_active = namespace[
+                "ZA_mega_field_attack_only_active"]
+            ZA_mega_field_y_dodge_suppression_active = namespace[
+                "ZA_mega_field_y_dodge_suppression_active"]
+            ZA_mega_field_attack_only_suppress_y_dodge = namespace[
+                "ZA_mega_field_attack_only_suppress_y_dodge"]
+
             def __init__(self, matched=(), guard=False):
                 self.matched = set(matched)
                 self.guard = guard
@@ -6378,6 +8478,77 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertTrue(all(button == Button.Y for button in rolling.buttons))
         self.assertEqual(rolling.alive_checks, len(rolling.buttons))
 
+        # 共有helperの既定0.1秒待機は、強い光などの直接呼出し用に維持する。
+        FakeTime.now = 0.0
+        rolling_fifteen = Command()
+        self.assertEqual(namespace["ZA_mega_red_edge_y_renda"](
+            rolling_fifteen, 15.0), "complete")
+        self.assertGreaterEqual(len(rolling_fifteen.buttons), 149)
+        self.assertTrue(all(
+            button == Button.Y for button in rolling_fifteen.buttons))
+
+        # FIELD復帰後のpost-attack回避は明示待機0で呼ぶ。実機では
+        # 0.04秒のY押下と画像検知処理だけが次入力までの間隔になる。
+        class NoExplicitWaitCommand(Command):
+            def __init__(self):
+                super().__init__()
+                self.waits = []
+
+            def pressRep(self, button, **kwargs):
+                self.buttons.append(button)
+                FakeTime.now += float(kwargs.get("duration", 0.0))
+
+            def wait(self, duration):
+                self.waits.append(duration)
+                FakeTime.now += duration
+
+        FakeTime.now = 0.0
+        no_explicit_wait = NoExplicitWaitCommand()
+        self.assertEqual(namespace["ZA_mega_red_edge_y_renda"](
+            no_explicit_wait, 0.2,
+            continuous_wait_seconds=0.0), "complete")
+        self.assertGreaterEqual(len(no_explicit_wait.buttons), 4)
+        self.assertEqual(no_explicit_wait.waits, [])
+
+        # 重い画像検知を行っている間も、明示待機0のY送信threadは止めない。
+        class BlockingDetectionCommand(NoExplicitWaitCommand):
+            def __init__(self):
+                super().__init__()
+                self.buttons_seen_during_detection = 0
+
+            def image_check(self, name):
+                if name != "END":
+                    return False
+                timeout = time.monotonic() + 1.0
+                while (len(self.buttons) < 5
+                       and time.monotonic() < timeout):
+                    time.sleep(0.001)
+                self.buttons_seen_during_detection = len(self.buttons)
+                return False
+
+            def pressRep(self, button, **kwargs):
+                self.buttons.append(button)
+                time.sleep(0.005)
+                FakeTime.now += float(kwargs.get("duration", 0.0))
+
+        FakeTime.now = 0.0
+        blocking_detection = BlockingDetectionCommand()
+        self.assertEqual(namespace["ZA_mega_red_edge_y_renda"](
+            blocking_detection, 0.2, endpicture="END",
+            repeat_count=6,
+            continuous_wait_seconds=0.0), "complete")
+        self.assertEqual(blocking_detection.buttons, [Button.Y] * 6)
+        self.assertGreaterEqual(
+            blocking_detection.buttons_seen_during_detection, 5)
+        self.assertEqual(blocking_detection.waits, [])
+
+        FakeTime.now = 0.0
+        field_interrupt = Command({"POKEMON_ZA_FIELD_W"})
+        self.assertEqual(namespace["ZA_mega_red_edge_y_renda"](
+            field_interrupt, 15.0,
+            interrupt_pictures=("POKEMON_ZA_FIELD_W",)), "guard")
+        self.assertEqual(field_interrupt.buttons, [])
+
         FakeTime.now = 0.0
         rolling_four = Command()
         self.assertEqual(namespace["ZA_mega_red_edge_y_renda"](
@@ -6385,16 +8556,48 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(rolling_four.buttons, [Button.Y] * 4)
         self.assertEqual(rolling_four.alive_checks, 4)
 
+        # 赤端回避からのカウント指定でもY間の明示待機は入れない。
+        FakeTime.now = 0.0
+        rolling_four_no_wait = NoExplicitWaitCommand()
+        self.assertEqual(namespace["ZA_mega_red_edge_y_renda"](
+            rolling_four_no_wait, 0.2, repeat_count=4,
+            continuous_wait_seconds=0.0), "complete")
+        self.assertEqual(rolling_four_no_wait.buttons, [Button.Y] * 4)
+        self.assertEqual(rolling_four_no_wait.waits, [])
+
         FakeTime.now = 0.0
         ended = Command({"END"})
         self.assertEqual(namespace["ZA_mega_red_edge_y_renda"](
             ended, 5.0, endpicture="END"), "endpicture")
         self.assertEqual(ended.buttons, [])
 
+        # dir5移動中に開始したY連打も、攻撃専用区間へ入った時点で止める。
+        FakeTime.now = 0.0
+        interrupted = Command()
+        interrupted._za_mega_field_dir5_until = 0.15
+        interrupted._za_mega_field_attack_only_start = 0.15
+        interrupted._za_mega_field_attack_only_until = 4.0
+        interrupted._za_mega_field_y_dodge_suppress_start = 0.15
+        interrupted._za_mega_field_y_dodge_suppress_until = 4.0
+        interrupted._za_mega_field_attack_only_y_dodge_logged = False
+        with mock.patch("builtins.print"):
+            self.assertEqual(namespace["ZA_mega_red_edge_y_renda"](
+                interrupted, 5.0), "attack_only")
+        self.assertEqual(interrupted.buttons, [Button.Y, Button.Y])
+        self.assertLess(FakeTime.now, 4.0)
+
         class DodgeCommand:
+            ZA_mega_field_attack_only_active = namespace[
+                "ZA_mega_field_attack_only_active"]
+            ZA_mega_field_y_dodge_suppression_active = namespace[
+                "ZA_mega_field_y_dodge_suppression_active"]
+            ZA_mega_field_attack_only_suppress_y_dodge = namespace[
+                "ZA_mega_field_attack_only_suppress_y_dodge"]
+
             def __init__(self):
                 self._za_mega_red_edge_latched = False
                 self.actions = []
+                self.red_edge_y_kwargs = []
 
             def ZA_mega_red_screen_edge_check(self):
                 self.actions.append("red_check")
@@ -6413,10 +8616,15 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
             def ZA_mega_red_edge_y_renda(self, *_args, **_kwargs):
                 self.actions.append("y_renda")
+                self.red_edge_y_kwargs.append(dict(_kwargs))
                 return "complete"
 
             def ZA_mega_keep_left_moving(self, *_args):
                 self.actions.append("left_resume")
+
+            def ZA_mega_field_attack_only_update(self, *_args):
+                self.actions.append("attack_only_update")
+                return True
 
         dodge = DodgeCommand()
         self.assertEqual(
@@ -6435,6 +8643,60 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertLess(
             dodge.actions.index("zl:END"),
             dodge.actions.index("y_renda"))
+        self.assertEqual(len(dodge.red_edge_y_kwargs), 1)
+        self.assertEqual(
+            dodge.red_edge_y_kwargs[0]["continuous_wait_seconds"], 0.0)
+
+        # mode7を含む全modeで、dir5固定移動中から終了後2秒までは
+        # 赤端があってもZLを外さずYローリングへ入らない。
+        FakeTime.now = 5.0
+        fixed_move_dodge = DodgeCommand()
+        fixed_move_dodge._za_mega_field_dir5_until = 4.0
+        fixed_move_dodge._za_mega_field_attack_only_start = 0.0
+        fixed_move_dodge._za_mega_field_attack_only_until = 0.0
+        fixed_move_dodge._za_mega_field_y_dodge_suppress_start = 1.0
+        fixed_move_dodge._za_mega_field_y_dodge_suppress_until = 6.0
+        fixed_move_dodge._za_mega_field_attack_only_y_dodge_logged = False
+        with mock.patch("builtins.print"):
+            self.assertEqual(
+                namespace["ZA_mega_red_edge_dodge_if_needed"](
+                    fixed_move_dodge, 5.0, 20, 0, 40, 0, 0.24),
+                "attack_only")
+        self.assertEqual(
+            fixed_move_dodge.actions, ["red_check", "attack_only_update"])
+
+        # 追加2秒が終われば通常の赤端ローリングへ戻る。
+        FakeTime.now = 6.0
+        expired_fixed_move_dodge = DodgeCommand()
+        expired_fixed_move_dodge._za_mega_field_dir5_until = 4.0
+        expired_fixed_move_dodge._za_mega_field_attack_only_start = 0.0
+        expired_fixed_move_dodge._za_mega_field_attack_only_until = 0.0
+        expired_fixed_move_dodge._za_mega_field_y_dodge_suppress_start = 1.0
+        expired_fixed_move_dodge._za_mega_field_y_dodge_suppress_until = 6.0
+        expired_fixed_move_dodge._za_mega_field_attack_only_y_dodge_logged = (
+            False)
+        self.assertEqual(
+            namespace["ZA_mega_red_edge_dodge_if_needed"](
+                expired_fixed_move_dodge, 5.0, 20, 0, 40, 0, 0.24),
+            "complete")
+        self.assertIn("y_renda", expired_fixed_move_dodge.actions)
+
+        # 固定移動後の追加攻撃専用区間でも従来どおり抑止する。
+        FakeTime.now = 5.0
+        blocked_dodge = DodgeCommand()
+        blocked_dodge._za_mega_field_dir5_until = 4.0
+        blocked_dodge._za_mega_field_attack_only_start = 4.0
+        blocked_dodge._za_mega_field_attack_only_until = 8.0
+        blocked_dodge._za_mega_field_y_dodge_suppress_start = 1.0
+        blocked_dodge._za_mega_field_y_dodge_suppress_until = 8.0
+        blocked_dodge._za_mega_field_attack_only_y_dodge_logged = False
+        with mock.patch("builtins.print"):
+            self.assertEqual(
+                namespace["ZA_mega_red_edge_dodge_if_needed"](
+                    blocked_dodge, 5.0, 20, 340, 40, 300, 0.24),
+                "attack_only")
+        self.assertEqual(
+            blocked_dodge.actions, ["red_check", "attack_only_update"])
         self.assertGreater(
             dodge.actions.index("zl:"),
             dodge.actions.index("y_renda"))
@@ -6573,6 +8835,22 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "ZA_mega_last_battle_charge_update"]
         self.assertEqual(len(battle_calls), 3)
+        # 強い光／溜め処理はフリーラン中だけ有効。RPushからFIELDの
+        # 安定確認と短い復帰移動が終わるまでは、3呼出しすべて無効。
+        for call in battle_calls:
+            active_keyword = next(
+                keyword for keyword in call.keywords
+                if keyword.arg == "active")
+            active_constants = {
+                child.value for child in ast.walk(active_keyword.value)
+                if isinstance(child, ast.Constant)
+                and isinstance(child.value, str)
+            }
+            self.assertTrue({
+                "_za_mega_mode5_free_run_active",
+                "_za_mega_mode5_rpush_wait_field",
+                "_za_mega_mode5_rpush_post_field_move_pending",
+            }.issubset(active_constants))
 
         target_names = (
             "POKEMON_ZA_LAST_BATTLE_CHARGE",
@@ -6913,7 +9191,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertFalse(
             red_only_wait._za_mega_testmode1_existing_charge_latched)
 
-    def test_za_mega_mode3_moves_forward_for_four_seconds_on_entry(self):
+    def test_za_mega_mode3_timed_entry_sequence(self):
         source_path = os.path.join(
             SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
             "ZA_story", "ZA_story.py")
@@ -6969,11 +9247,20 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(mode3_options["dir4"], 0)
         self.assertEqual(mode3_options["dir5"], 90)
         self.assertEqual(
-            mode3_options["field_resume_dir5_seconds"], 4.0)
+            mode3_options["field_resume_dir5_seconds"], 1.5)
+        self.assertEqual(
+            mode3_options["field_resume_attack_only_seconds"], 4.0)
+        self.assertEqual(
+            mode3_options["field_resume_post_attack_roll_seconds"], 18.0)
+        self.assertEqual(mode3_options["see_r"], 0.35)
         self.assertEqual(mode3_options["escape_flag"], 0)
         self.assertEqual(
             mode3_options["attack_unavailable_y_dodge"], 1)
         self.assertEqual(mode3_options["red_edge_roll_with_view"], 1)
+        self.assertEqual(mode3_options["red_edge_before_rclick"], 1)
+        self.assertEqual(mode3_options["lockon_unchecked_a"], 1)
+        self.assertEqual(
+            mode3_options["choice_black_background_guard"], 1)
 
         disabled = Command()
         self.assertTrue(namespace[mode_select_name](
@@ -6990,11 +9277,79 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             mode2.calls[0]["battle_roll_only"], 0)
         self.assertEqual(
             mode2.calls[0]["red_edge_roll_with_view"], 0)
+        self.assertEqual(mode2.calls[0]["red_edge_before_rclick"], 1)
+        self.assertEqual(mode2.calls[0]["lockon_unchecked_a"], 1)
+        self.assertEqual(
+            mode2.calls[0]["choice_black_background_guard"], 1)
+        shared_disabled = Command()
+        self.assertTrue(namespace[mode_select_name](
+            shared_disabled, mode=2,
+            red_edge_before_rclick=0,
+            lockon_unchecked_a=0,
+            choice_black_background_guard=0))
+        self.assertEqual(shared_disabled.calls[0]["red_edge_before_rclick"], 0)
+        self.assertEqual(shared_disabled.calls[0]["lockon_unchecked_a"], 0)
+        self.assertEqual(
+            shared_disabled.calls[0]["choice_black_background_guard"], 0)
         mode2_override = Command()
         self.assertTrue(namespace[mode_select_name](
             mode2_override, mode=2, red_edge_y_renda_seconds=7.0))
         self.assertEqual(
             mode2_override.calls[0]["red_edge_y_renda_seconds"], 7.0)
+        mode0 = Command()
+        mode9 = Command()
+        self.assertTrue(namespace[mode_select_name](mode0, mode=0))
+        self.assertTrue(namespace[mode_select_name](mode9, mode=9))
+        mode0_options = dict(mode0.calls[0])
+        mode9_options = dict(mode9.calls[0])
+        self.assertEqual(
+            [mode9_options[name]
+             for name in ("dir1", "dir2", "dir3", "dir4")],
+            [20, 20, 20, 20])
+        for name in ("dir1", "dir2", "dir3", "dir4"):
+            mode0_options.pop(name)
+            mode9_options.pop(name)
+        self.assertEqual(mode9_options, mode0_options)
+        mode10 = Command()
+        self.assertTrue(namespace[mode_select_name](mode10, mode=10))
+        mode10_options = mode10.calls[0]
+        self.assertEqual(
+            [mode10_options[name]
+             for name in ("dir1", "dir2", "dir3", "dir4")],
+            [20, 20, 20, 20])
+        self.assertEqual(mode10_options["Xaction"], 0)
+        self.assertEqual(mode10_options["Aaction"], 1)
+        self.assertEqual(mode10_options["Yaction"], 1)
+        self.assertEqual(mode10_options["Baction"], 1)
+        self.assertEqual(mode10_options["escape_flag"], 0)
+        self.assertEqual(mode10_options["see_r"], 0.35)
+        self.assertEqual(mode10_options["dir5"], 90)
+        self.assertEqual(
+            mode10_options["field_resume_dir5_seconds"], 2.0)
+        self.assertEqual(
+            mode10_options["field_resume_roll_suppress_seconds"], 2.0)
+        self.assertEqual(
+            mode10_options["red_edge_relock_view_seconds"], 0.1)
+        self.assertEqual(
+            mode10_options["red_edge_relock_view_strength"], 1.0)
+        self.assertEqual(mode10_options["red_edge_y_renda_seconds"], 15.0)
+        self.assertEqual(mode10_options["attack_unavailable_y_dodge"], 0)
+        self.assertEqual(mode10_options["lockon_unchecked_ay_loop"], 1)
+        self.assertNotIn("dash_before_lockon", mode10_options)
+        yukari33_calls = [
+            node for node in ast.walk(source_functions["_6_story_yukari_33"])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ZA_mega_evolution_battle_mode_select"
+        ]
+        self.assertEqual(len(yukari33_calls), 1)
+        yukari33_mode = next(
+            keyword.value for keyword in yukari33_calls[0].keywords
+            if keyword.arg == "mode")
+        self.assertEqual(ast.literal_eval(yukari33_mode), 10)
+        self.assertFalse(any(
+            keyword.arg == "dash_before_lockon"
+            for keyword in yukari33_calls[0].keywords))
         mode6 = Command()
         self.assertTrue(namespace[mode_select_name](mode6, mode=6))
         self.assertEqual(
@@ -7022,6 +9377,10 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(mode7_options["dir5"], 90)
         self.assertEqual(
             mode7_options["field_resume_dir5_seconds"], 4.0)
+        self.assertNotIn(
+            "field_resume_attack_only_seconds", mode7_options)
+        self.assertEqual(
+            mode7_options["field_resume_roll_suppress_seconds"], 5.0)
         self.assertEqual(
             mode7_options["red_edge_y_renda_seconds"], 15.0)
         self.assertEqual(mode7_options["battle_roll_only"], 0)
@@ -7046,6 +9405,8 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         mode4_options = mode4.calls[0]
         self.assertEqual(mode4_options["dir5"], 90)
         self.assertEqual(mode4_options["field_resume_dir5_seconds"], 2.0)
+        self.assertNotIn(
+            "field_resume_attack_only_seconds", mode4_options)
         self.assertEqual(mode4_options["mode4_view_nudge"], 1)
         self.assertEqual(
             mode4_options["attack_unavailable_y_dodge"], 1)
@@ -7064,6 +9425,8 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             attack_unavailable_y_dodge=1))
         self.assertEqual(
             mode5_guard.calls[0]["field_resume_dir5_seconds"], 3.0)
+        self.assertNotIn(
+            "field_resume_attack_only_seconds", mode5_guard.calls[0])
         self.assertEqual(mode5_guard.calls[0]["dir2"], 90)
         self.assertEqual(mode5_guard.calls[0]["dir4"], 90)
         # mode 5はAを常用し、C+画像を確認できた時だけB/X/Yも技として使う。
@@ -7135,7 +9498,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(upper_keyword.value.id, "mode4_view_nudge")
         battle_source = ast.unparse(battle_function)
         self.assertIn(
-            "now - attack_unavailable_since >= 0.75", battle_source)
+            "now - attack_unavailable_since >= 1.75", battle_source)
         self.assertNotIn(
             "now - attack_unavailable_since >= 0.25", battle_source)
         direct_upper_calls = [
@@ -7166,9 +9529,17 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                     and child.id == "field_resume_dir5_seconds"
                     for child in ast.walk(node.value))
         ]
-        # mode 5の早期復帰経路と、mode 0～4の従来位置に分離して保持する。
-        self.assertEqual(len(field_resume_assignments), 2)
+        # mode 5は早期復帰経路で直接参照し、mode 0～4は開始時刻と
+        # 移動秒数を分けて、後続の攻撃専用／回避区間も同じ境界へ揃える。
+        self.assertEqual(len(field_resume_assignments), 1)
         battle_source = ast.unparse(battle_function)
+        self.assertIn(
+            "field_resume_move_seconds = max(0.0, "
+            "field_resume_dir5_seconds)", battle_source)
+        self.assertIn(
+            "self._za_mega_field_dir5_until = "
+            "field_resume_started_at + field_resume_move_seconds",
+            battle_source)
         self.assertIn(
             "field_resume_detected and last_battle_mode", battle_source)
         self.assertIn(
@@ -7304,6 +9675,14 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
             def ZA_ZL_ACTION(self, action):
                 self.actions.append(("zl", action))
+
+            @staticmethod
+            def image_check(_picture):
+                return False
+
+            @staticmethod
+            def ZA_mega_choice_input_guard():
+                return False
 
             def ZA_MOVE_SEE(self, action, **kwargs):
                 self.actions.append(("see", action, kwargs.get("in_see_r")))
@@ -7458,13 +9837,21 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             source_path, "exec"), namespace)
 
         class Command:
-            def __init__(self, resume_dirnum=3):
+            def __init__(self, resume_dirnum=3, block_y_dodge=False):
                 self._za_mega_attack_unavailable_y_dodge_retry_at = 0.0
                 self._za_mega_relock_retry_at = 0.0
                 self._za_mega_dir5 = 90
                 self.resume_dirnum = resume_dirnum
+                self.block_y_dodge = block_y_dodge
                 self.actions = []
                 self.button_times = []
+
+            def ZA_mega_field_attack_only_suppress_y_dodge(self):
+                return self.block_y_dodge
+
+            def ZA_mega_field_attack_only_update(self, *_args):
+                self.actions.append(("attack_only_update",))
+                return True
 
             def ZA_mega_choice_input_guard(self):
                 return False
@@ -7508,10 +9895,13 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             post_l_view_nudge=1,
             include_upper_marker=1))
         self.assertIn(("marker", True), command.actions)
-        self.assertIn(("button", Button.Y, 2), command.actions)
+        self.assertEqual([
+            action for action in command.actions
+            if action[:2] == ("button", Button.Y)
+        ], [("button", Button.Y, 1), ("button", Button.Y, 1)])
         self.assertIn(("button", Button.L, 1), command.actions)
         unlock_index = command.actions.index(("zl", "END"))
-        y_index = command.actions.index(("button", Button.Y, 2))
+        y_index = command.actions.index(("button", Button.Y, 1))
         relock_index = command.actions.index(("zl", ""))
         self.assertLess(unlock_index, y_index)
         self.assertLess(y_index, relock_index)
@@ -7551,6 +9941,31 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             action for action in dir5_command.actions
             if action[0] == "move" and action[3])
         self.assertEqual(dir5_roll[1].angle_for_show, 110.0)
+
+        # 区間開始済みなら、marker確認やZL解除より前にY回避を中止する。
+        FakeTime.now = 30.0
+        blocked = Command(block_y_dodge=True)
+        self.assertFalse(helper(blocked, 20, 0, 40, 0, 0.24))
+        self.assertEqual(blocked.actions, [("attack_only_update",)])
+
+        # 1回目のY後に区間へ入った場合は2回目を送らず、即ロックオンへ戻す。
+        FakeTime.now = 40.0
+
+        class CrossingCommand(Command):
+            def ZA_mega_field_attack_only_suppress_y_dodge(self):
+                return any(
+                    action[:2] == ("button", Button.Y)
+                    for action in self.actions)
+
+        crossing = CrossingCommand()
+        self.assertFalse(helper(crossing, 20, 0, 40, 0, 0.24))
+        self.assertEqual([
+            action for action in crossing.actions
+            if action[:2] == ("button", Button.Y)
+        ], [("button", Button.Y, 1)])
+        self.assertIn(("attack_only_update",), crossing.actions)
+        self.assertIn(("zl", ""), crossing.actions)
+        self.assertNotIn(("button", Button.L, 1), crossing.actions)
 
     def test_za_mega_mode5_uses_safe_a_fallback_and_guards_skill_attacks(self):
         source_path = os.path.join(
@@ -7766,8 +10181,18 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         helper_names = (
             "ZA_mega_mode5_event_attack_blocked",
             "ZA_mega_mode5_event_attack_picture",
+            "ZA_mega_mode5_last_name_no_hard_timeout",
+            "ZA_mega_mode5_event_lockon_bootstrap",
             "ZA_mega_mode5_event_attack_axby",
+            "ZA_mega_mode5_event_attack_enter_field_wait",
             "ZA_mega_mode5_detect_screen_state",
+            "ZA_mega_mode5_field_wait_reset",
+            "ZA_mega_mode5_remember_recent_combat_phase",
+            "ZA_mega_mode5_event_name_ui_missing_update",
+            "ZA_mega_mode5_resume_recent_combat_after_event_ui_missing",
+            "ZA_mega_mode5_defeat_event_name_recovery_ready",
+            "ZA_mega_mode5_indefinite_field_wait_update",
+            "ZA_mega_mode5_begin_resume",
         )
         source_helpers = {
             node.name: node for node in ast.walk(source_tree)
@@ -7784,6 +10209,104 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 normalized_function_ast_dump(source_helpers[helper_name]),
                 normalized_function_ast_dump(fragment_helpers[helper_name]))
 
+        battle_function = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_mega_evolution_battle")
+        fragment_battle_function = next(
+            node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_mega_evolution_battle")
+
+        def has_stale_retry_initial_wait(function_node):
+            for node in ast.walk(function_node):
+                if (not isinstance(node, ast.Assign)
+                        or not any(isinstance(target, ast.Name)
+                                   and target.id == "initial_wait"
+                                   for target in node.targets)):
+                    continue
+                constants = {
+                    child.value for child in ast.walk(node.value)
+                    if isinstance(child, ast.Constant)
+                    and isinstance(child.value, str)
+                }
+                if {"_za_mega_mode5_phase", "RETRY_SELECTION",
+                        "_za_mega_testmode1_phase", "WAIT_RESUME"}.issubset(
+                            constants):
+                    return True
+            return False
+
+        self.assertTrue(has_stale_retry_initial_wait(battle_function))
+        self.assertTrue(has_stale_retry_initial_wait(
+            fragment_battle_function))
+
+        def has_event_attack_wait_nofiled(function_node):
+            for node in ast.walk(function_node):
+                if not isinstance(node, ast.If):
+                    continue
+                test_attributes = {
+                    child.attr for child in ast.walk(node.test)
+                    if isinstance(child, ast.Attribute)
+                }
+                test_constants = {
+                    child.value for child in ast.walk(node.test)
+                    if isinstance(child, ast.Constant)
+                    and isinstance(child.value, str)
+                }
+                if ("_za_mega_mode5_event_attack_wait_field"
+                        not in test_attributes
+                        and "_za_mega_mode5_event_attack_wait_field"
+                        not in test_constants):
+                    continue
+                if any(
+                        isinstance(child, ast.Assign)
+                        and any(isinstance(target, ast.Name)
+                                and target.id == "nofiled"
+                                for target in child.targets)
+                        and isinstance(child.value, ast.Constant)
+                        and child.value.value == 1
+                        for statement in node.body
+                        for child in ast.walk(statement)):
+                    return True
+            return False
+
+        self.assertTrue(has_event_attack_wait_nofiled(battle_function))
+        self.assertTrue(has_event_attack_wait_nofiled(
+            fragment_battle_function))
+
+        def clears_event_attack_wait(function_node):
+            return any(
+                isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Attribute)
+                    and target.attr
+                    == "_za_mega_mode5_event_attack_wait_field"
+                    for target in node.targets)
+                and isinstance(node.value, ast.Constant)
+                and node.value.value is False
+                for node in ast.walk(function_node))
+
+        self.assertTrue(clears_event_attack_wait(
+            source_helpers["ZA_mega_mode5_begin_resume"]))
+        self.assertTrue(clears_event_attack_wait(
+            fragment_helpers["ZA_mega_mode5_begin_resume"]))
+        call_lines = {}
+        for node in ast.walk(battle_function):
+            if (not isinstance(node, ast.Call)
+                    or not isinstance(node.func, ast.Attribute)):
+                continue
+            call_lines.setdefault(node.func.attr, []).append(node.lineno)
+        self.assertGreaterEqual(len(call_lines[
+            "ZA_mega_mode5_event_lockon_bootstrap"]), 2)
+        self.assertLess(
+            min(call_lines["ZA_mega_mode5_event_attack_axby"]),
+            min(call_lines["ZA_mega_mode5_testmode1_combat_update"]),
+            "4技攻撃はTESTMODE1のhandled/continueより先に処理する")
+        self.assertLess(
+            min(call_lines["ZA_mega_mode5_event_attack_axby"]),
+            min(call_lines["ZA_mega_last_battle_charge_update"]),
+            "4技攻撃はフリーランの強い光処理より先に処理する")
+
         target_name = "POKEMON_ZA_LAST_BATTLE_MOVE_UI"
         target = image_library["targets"][target_name]
         self.assertEqual(target["operator"], "OR")
@@ -7798,6 +10321,23 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             self.assertIsNotNone(template, template_path)
             self.assertGreater(template.shape[0], 10)
             self.assertGreater(template.shape[1], 100)
+
+        name_target_name = "POKEMON_ZA_LAST_BATTLE_NAME"
+        name_target = image_library["targets"][name_target_name]
+        self.assertEqual(name_target["operator"], "OR")
+        self.assertEqual(len(name_target["variants"]), 1)
+        name_variant = name_target["variants"][0]
+        self.assertEqual(name_variant["crop"], [350, 15, 930, 125])
+        self.assertEqual(name_variant["threshold"], 0.8)
+        self.assertTrue(name_variant["use_gray"])
+        name_template_path = os.path.join(
+            SERIAL_CONTROLLER,
+            name_variant["template_path"].replace("/", os.sep))
+        name_template = cv2.imread(
+            name_template_path, cv2.IMREAD_COLOR)
+        self.assertIsNotNone(name_template, name_template_path)
+        self.assertGreater(name_template.shape[0], 20)
+        self.assertGreater(name_template.shape[1], 300)
 
         source_targets = ast.literal_eval(next(
             node.value for node in ast.walk(source_tree)
@@ -7815,6 +10355,8 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 continue
             source_targets.update(ast.literal_eval(node.args[0]))
         self.assertEqual(source_targets[target_name], target["variants"])
+        self.assertEqual(
+            source_targets[name_target_name], name_target["variants"])
 
         namespace = {
             "Button": Button, "Direction": Direction, "time": time}
@@ -7828,25 +10370,166 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 self._za_mega_last_battle_mode = mode5
                 self._za_mega_mode5_start_flag = 4
                 self._za_mega_mode5_battle_active = True
+                self._za_mega_mode5_phase = "TARGET_ATTACK"
+                self._za_mega_mode5_event_attack_wait_field = False
+                self._za_mega_mode5_defeat_sequence_active = False
+                self._za_mega_mode5_defeat_background_since = 0.0
+                self._za_mega_mode5_defeat_prompt_logged = False
+                self._za_mega_mode5_defeat_prompt_a_retry_at = 0.0
+                self._za_mega_mode5_defeat_candidate_picture = ""
+                self._za_mega_mode5_event_name_ui_missing_latched = False
+                self._za_mega_mode5_event_name_ui_missing_clear_since = 0.0
+                self._za_mega_mode5_event_attack_pending_from_name_lockon = (
+                    False)
+                self._za_mega_mode5_recent_combat_phase = ""
+                self.defeat_background_current = False
+                self.defeat_candidate_picture = ""
                 self._za_mega_z_guard_enabled = False
+                self._za_mega_testmode1_enabled = True
+                self._za_mega_testmode1_phase = "COVER_ATTACK"
+                self._za_mega_testmode1_reinitialize_pending = False
+                self._za_mega_mode5_free_run_active = True
+                self.ZL_state = 0
                 self.events = []
+                self.checked = []
                 self.clear_after_first_attack = False
+                self.reveal_move_ui_after_zl = False
+                self.defeat_candidate_after_zl = False
+                self.blocker_after_zl = ""
+                self.inject_defeat_after_attacks = 0
 
             def image_check(self, name):
+                self.checked.append(name)
                 if (self.clear_after_first_attack
                         and name == target_name
                         and any(event[0] == "attack"
                                 for event in self.events)):
                     return False
+                if (self.reveal_move_ui_after_zl
+                        and name == target_name
+                        and self.ZL_state == 1):
+                    return True
                 return name in self.matched
 
             def ZA_mega_mode5_event_attack_blocked(self):
                 return namespace[
                     "ZA_mega_mode5_event_attack_blocked"](self)
 
+            def ZA_mega_mode5_defeat_select_confirmed(self, picture):
+                # This event-attack harness does not model the defeat screen.
+                return False
+
             def ZA_mega_mode5_event_attack_picture(self, **kwargs):
                 return namespace[
                     "ZA_mega_mode5_event_attack_picture"](self, **kwargs)
+
+            def ZA_mega_mode5_event_attack_enter_field_wait(
+                    self, detected_picture="", pressed_buttons=()):
+                return namespace[
+                    "ZA_mega_mode5_event_attack_enter_field_wait"](
+                        self, detected_picture, pressed_buttons)
+
+            def ZA_mega_mode5_event_lockon_bootstrap(
+                    self, nofiled, **kwargs):
+                return namespace[
+                    "ZA_mega_mode5_event_lockon_bootstrap"](
+                        self, nofiled, **kwargs)
+
+            def ZA_mega_mode5_field_wait_reset(self, clear_name=True):
+                return namespace[
+                    "ZA_mega_mode5_field_wait_reset"](
+                        self, clear_name=clear_name)
+
+            def ZA_mega_mode5_remember_recent_combat_phase(self):
+                return namespace[
+                    "ZA_mega_mode5_remember_recent_combat_phase"](self)
+
+            def ZA_mega_mode5_event_name_ui_missing_update(self):
+                return namespace[
+                    "ZA_mega_mode5_event_name_ui_missing_update"](self)
+
+            def ZA_mega_mode5_resume_recent_combat_after_event_ui_missing(
+                    self, *args):
+                return namespace[
+                    "ZA_mega_mode5_resume_recent_combat_after_event_ui_missing"](
+                        self, *args)
+
+            def ZA_mega_mode5_transition(self, next_phase, reason):
+                self._za_mega_mode5_phase = next_phase
+                self.events.append(("transition", next_phase, reason))
+
+            def ZA_mega_mode5_set_start_flag(
+                    self, start_flag, detection, action):
+                self._za_mega_mode5_start_flag = start_flag
+                self.events.append(
+                    ("start_flag", start_flag, detection, action))
+                return start_flag
+
+            def ZA_mega_mode5_attack_watchdog_reset(self):
+                self._za_mega_mode5_free_run_active = False
+                self.events.append(("watchdog_reset",))
+
+            def ZA_mega_mode5_testmode1_side_cycle_reset(self, phase=""):
+                self._za_mega_testmode1_side_cycle_phase = phase
+                self._za_mega_testmode1_side_strong_sets = 0
+                self._za_mega_testmode1_side_timeout_started_at = -1.0
+
+            def ZA_mega_mode5_testmode1_enter_free_run(self, reason):
+                self._za_mega_mode5_free_run_active = True
+                self._za_mega_mode5_battle_active = True
+                self._za_mega_testmode1_phase = "FREE_RUN"
+                self._za_mega_mode5_recent_combat_phase = "FREE_RUN"
+                self.ZA_mega_mode5_transition("FREE_RUN", reason)
+                return True
+
+            def ZA_mega_mode5_testmode1_reset_for_selection(self, reason):
+                self.events.append(("selection_reset", reason))
+                self.ZA_mega_mode5_field_wait_reset()
+                self._za_mega_mode5_event_attack_wait_field = False
+                self._za_mega_mode5_free_run_active = False
+                self._za_mega_testmode1_reinitialize_pending = True
+                self._za_mega_testmode1_phase = "WAIT_RESUME"
+                return True
+
+            def ZA_mega_field_post_attack_roll_reset(self):
+                self.events.append(("post_roll_reset",))
+
+            def ZA_mega_mode5_indefinite_field_wait_update(
+                    self, active, context, nofiled, *args):
+                return namespace[
+                    "ZA_mega_mode5_indefinite_field_wait_update"](
+                        self, active, context, nofiled, *args)
+
+            def ZA_mega_mode5_x_menu_b_recovery(self, **kwargs):
+                return "none"
+
+            def ZA_mega_mode5_defeat_wait_update(self):
+                return "none"
+
+            def ZA_mega_mode5_defeat_candidate_picture(self):
+                return (self._za_mega_mode5_defeat_candidate_picture
+                        or self.defeat_candidate_picture)
+
+            def ZA_mega_mode5_defeat_background_confirmed(self):
+                return self.defeat_background_current
+
+            def ZA_mega_mode5_defeat_event_name_recovery_ready(self):
+                return namespace[
+                    "ZA_mega_mode5_defeat_event_name_recovery_ready"](self)
+
+            def ZA_mega_mode5_last_name_no_hard_timeout(
+                    self, eligible, hard_field_detected, blocked=False,
+                    **kwargs):
+                return namespace[
+                    "ZA_mega_mode5_last_name_no_hard_timeout"](
+                        self, eligible, hard_field_detected,
+                        blocked=blocked, **kwargs)
+
+            def ZA_mega_mode5_testmode1_settings(self):
+                return {
+                    "LAST_BATTLE_NAME_LOCKON_SECONDS": 5.0,
+                    "FIELD_WAIT_EVENT_TIMEOUT_SECONDS": 180.0,
+                }
 
             def ZA_mega_choice_input_guard(self):
                 return False
@@ -7857,11 +10540,25 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             def ZA_MOVE_SEE(self, **kwargs):
                 self.events.append(("see", kwargs))
 
+            def ZA_MOVE_LStick(self, *args, **kwargs):
+                self.events.append(("left", args, kwargs))
+
             def ZA_ZL_ACTION(self, action=""):
                 self.events.append(("zl", action))
+                self.ZL_state = 0 if action == "END" else 1
 
             def wait(self, seconds):
                 self.events.append(("wait", seconds))
+                if (self.defeat_candidate_after_zl
+                        and self.ZL_state == 1
+                        and seconds == 0.15):
+                    self.defeat_candidate_picture = (
+                        "POKEMON_ZA_3_SELECT")
+                if (self.blocker_after_zl
+                        and self.ZL_state == 1
+                        and seconds == 0.15):
+                    self.matched.add(self.blocker_after_zl)
+                    self.blocker_after_zl = ""
 
             def ZA_mega_mode5_trace(self, *args, **kwargs):
                 self.events.append(("trace", args, kwargs))
@@ -7871,8 +10568,18 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
             def pressRep(self, button, **kwargs):
                 self.events.append(("attack", button, kwargs))
+                attack_count=sum(
+                    event[0] == "attack" for event in self.events)
+                if (self.inject_defeat_after_attacks
+                        and attack_count >= self.inject_defeat_after_attacks):
+                    self.defeat_candidate_picture = (
+                        "POKEMON_ZA_TEXT_BLACK_COMMENT")
+                    self.matched.add("POKEMON_ZA_TEXT_BLACK_COMMENT")
 
-        attack = EventAttackCommand({target_name})
+        attack = EventAttackCommand({
+            target_name,
+            "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+            "POKEMON_ZA_ESCAPE"})
         self.assertEqual(
             attack.ZA_mega_mode5_event_attack_picture(), target_name)
         screen = namespace["ZA_mega_mode5_detect_screen_state"](
@@ -7880,6 +10587,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertTrue(screen["battle_screen"])
         self.assertTrue(screen["resume_screen"])
         self.assertEqual(screen["event_attack_picture"], target_name)
+        self.assertFalse(screen["retry_resume"])
         self.assertEqual(screen["resume_reason"], "event-attack-ui")
         self.assertTrue(namespace[
             "ZA_mega_mode5_event_attack_axby"](attack))
@@ -7894,6 +10602,493 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertNotIn(Button.PLUS, [
             event[1] for event in attack.events
             if event[0] == "attack"])
+        self.assertTrue(
+            attack._za_mega_mode5_event_attack_wait_field)
+        self.assertEqual(attack._za_mega_mode5_phase, "RETRY_SELECTION")
+        self.assertEqual(attack._za_mega_mode5_start_flag, 0)
+        self.assertFalse(attack._za_mega_mode5_battle_active)
+        self.assertEqual(attack._za_mega_testmode1_phase, "WAIT_RESUME")
+        self.assertTrue(
+            attack._za_mega_testmode1_reinitialize_pending)
+        self.assertFalse(attack._za_mega_mode5_free_run_active)
+        self.assertEqual(attack.ZL_state, 0)
+        # 固有4技UIが同じフレームに残っていても、FIELD復帰まで
+        # 再検出・再攻撃しない。
+        self.assertEqual(attack.ZA_mega_mode5_event_attack_picture(), "")
+        self.assertFalse(namespace[
+            "ZA_mega_mode5_event_attack_axby"](attack, target_name))
+        self.assertEqual(
+            [event[1] for event in attack.events
+             if event[0] == "attack"],
+            [Button.A, Button.X, Button.B, Button.Y])
+
+        class FakeTime:
+            def __init__(self, now):
+                self.now = float(now)
+
+            def monotonic(self):
+                return self.now
+
+        real_time = namespace["time"]
+        fake_time = FakeTime(100.0)
+        namespace["time"] = fake_time
+        try:
+            # 固有4技入力後は残存UIと3分名称fallbackを無視し、
+            # FIELD系が戻るまで入力を止めた再戦待ちを維持する。
+            fixed4_wait = EventAttackCommand({target_name})
+            fixed4_wait._za_mega_mode5_start_flag = 0
+            fixed4_wait._za_mega_mode5_battle_active = False
+            fixed4_wait._za_mega_mode5_phase = "RETRY_SELECTION"
+            fixed4_wait._za_mega_testmode1_phase = "WAIT_RESUME"
+            fixed4_wait._za_mega_mode5_event_attack_wait_field = True
+            fixed4_wait._za_mega_mode5_field_wait_since = 1.0
+            self.assertEqual(
+                fixed4_wait.ZA_mega_mode5_indefinite_field_wait_update(
+                    True, "RETRY_WAIT", 1),
+                "waiting")
+            self.assertNotIn(name_target_name, fixed4_wait.checked)
+            self.assertFalse(any(
+                event[0] == "attack" for event in fixed4_wait.events))
+            fake_time.now = 1000.0
+            fixed4_wait.checked.clear()
+            self.assertEqual(
+                fixed4_wait.ZA_mega_mode5_indefinite_field_wait_update(
+                    True, "RETRY_WAIT", 1),
+                "waiting")
+            self.assertNotIn(name_target_name, fixed4_wait.checked)
+            self.assertEqual(
+                fixed4_wait.ZA_mega_mode5_event_lockon_bootstrap(
+                    1, allow_missing_field_fallback=True),
+                "")
+            fixed4_wait.matched.add(
+                "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")
+            self.assertEqual(
+                fixed4_wait.ZA_mega_mode5_indefinite_field_wait_update(
+                    True, "RETRY_WAIT", 1),
+                "none")
+
+            # 無期限FIELD待機では3分前に名称画像そのものを照合しない。
+            # 3分は敗戦タイムアウトではなく、名称5秒判定の開始条件。
+            fake_time.now = 100.0
+            timer_wait = EventAttackCommand({name_target_name})
+            timer_wait._za_mega_mode5_start_flag = 1
+            timer_wait._za_mega_mode5_battle_active = False
+            timer_wait.reveal_move_ui_after_zl = True
+            self.assertEqual(
+                timer_wait.ZA_mega_mode5_indefinite_field_wait_update(
+                    True, "RETRY_WAIT", 1), "none")
+            self.assertNotIn(name_target_name, timer_wait.checked)
+            fake_time.now = 279.999
+            timer_wait.checked.clear()
+            self.assertEqual(
+                timer_wait.ZA_mega_mode5_indefinite_field_wait_update(
+                    True, "RETRY_WAIT", 1), "none")
+            self.assertNotIn(name_target_name, timer_wait.checked)
+            fake_time.now = 280.0
+            self.assertEqual(
+                timer_wait.ZA_mega_mode5_indefinite_field_wait_update(
+                    True, "RETRY_WAIT", 1), "waiting")
+            self.assertIn(name_target_name, timer_wait.checked)
+            fake_time.now = 284.999
+            self.assertEqual(
+                timer_wait.ZA_mega_mode5_indefinite_field_wait_update(
+                    True, "RETRY_WAIT", 1), "waiting")
+            self.assertFalse(any(
+                event[0] == "zl" for event in timer_wait.events))
+            fake_time.now = 285.0
+            self.assertEqual(
+                timer_wait.ZA_mega_mode5_indefinite_field_wait_update(
+                    True, "RETRY_WAIT", 1), target_name)
+
+            # イベント前の正規暗転で残った敗戦ラッチがあっても、
+            # 実SELECT／黒Commentがなく現在は非黒なら、名前を新たに
+            # 5秒確認してZLし、固定4技UIへ復帰する。
+            fake_time.now = 300.0
+            stale_defeat = EventAttackCommand({name_target_name})
+            stale_defeat._za_mega_mode5_start_flag = 0
+            stale_defeat._za_mega_mode5_battle_active = False
+            stale_defeat._za_mega_mode5_phase = "RETRY_SELECTION"
+            stale_defeat._za_mega_testmode1_phase = "WAIT_RESUME"
+            stale_defeat._za_mega_mode5_defeat_sequence_active = True
+            stale_defeat.reveal_move_ui_after_zl = True
+            self.assertEqual(
+                stale_defeat.ZA_mega_mode5_indefinite_field_wait_update(
+                    True, "RETRY_WAIT", 1),
+                "waiting")
+            self.assertEqual(
+                stale_defeat._za_mega_mode5_last_name_no_hard_since,
+                300.0)
+            self.assertFalse(any(
+                event[0] == "attack" for event in stale_defeat.events))
+            self.assertFalse(any(
+                event[0] == "zl" and event[1] == ""
+                for event in stale_defeat.events))
+            fake_time.now = 304.999
+            self.assertEqual(
+                stale_defeat.ZA_mega_mode5_indefinite_field_wait_update(
+                    True, "RETRY_WAIT", 1),
+                "waiting")
+            self.assertTrue(
+                stale_defeat._za_mega_mode5_defeat_sequence_active)
+            fake_time.now = 305.0
+            self.assertEqual(
+                stale_defeat.ZA_mega_mode5_indefinite_field_wait_update(
+                    True, "RETRY_WAIT", 1),
+                target_name)
+            self.assertTrue(
+                stale_defeat._za_mega_mode5_defeat_sequence_active)
+            self.assertEqual(stale_defeat.ZL_state, 1)
+            stale_defeat._za_mega_mode5_start_flag = 4
+            stale_defeat._za_mega_mode5_battle_active = True
+            stale_defeat._za_mega_mode5_phase = "TARGET_ATTACK"
+            self.assertTrue(namespace[
+                "ZA_mega_mode5_event_attack_axby"](
+                    stale_defeat, target_name))
+            self.assertFalse(
+                stale_defeat._za_mega_mode5_defeat_sequence_active)
+            self.assertEqual(
+                [event[1] for event in stale_defeat.events
+                 if event[0] == "attack"],
+                [Button.A, Button.X, Button.B, Button.Y])
+
+            # 3分後に名称がなければ敗戦にはせず、FIELD待機を継続する。
+            fake_time.now = 500.0
+            no_name_wait = EventAttackCommand()
+            no_name_wait._za_mega_mode5_start_flag = 1
+            no_name_wait._za_mega_mode5_battle_active = False
+            self.assertEqual(
+                no_name_wait.ZA_mega_mode5_indefinite_field_wait_update(
+                    True, "RETRY_WAIT", 1), "none")
+            fake_time.now = 680.0
+            self.assertEqual(
+                no_name_wait.ZA_mega_mode5_indefinite_field_wait_update(
+                    True, "RETRY_WAIT", 1), "none")
+            fake_time.now = 900.0
+            self.assertEqual(
+                no_name_wait.ZA_mega_mode5_indefinite_field_wait_update(
+                    True, "RETRY_WAIT", 1), "none")
+            self.assertFalse(any(
+                event[0] in {"zl", "attack"}
+                for event in no_name_wait.events))
+
+            # 3分経過済みの呼出しでは、FIELD系／Escapeなしで名称が
+            # 5秒連続した場合だけZLし、4技UI確認後にA/X/B/Yへ進む。
+            fake_time.now = 1000.0
+            name_wait = EventAttackCommand({
+                name_target_name, "POKEMON_ZA_BATTLE"})
+            name_wait._za_mega_mode5_start_flag = 1
+            name_wait._za_mega_mode5_battle_active = False
+            name_wait.reveal_move_ui_after_zl = True
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    name_wait, nofiled=1,
+                    resume_screen_detected=True,
+                    field_screen_detected=False,
+                    allow_missing_field_fallback=True),
+                "WAIT_LAST_BATTLE_NAME_5S")
+            fake_time.now = 1004.999
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    name_wait, nofiled=1,
+                    resume_screen_detected=True,
+                    field_screen_detected=False,
+                    allow_missing_field_fallback=True),
+                "WAIT_LAST_BATTLE_NAME_5S")
+            self.assertFalse(any(
+                event[0] == "zl" for event in name_wait.events))
+            fake_time.now = 1005.0
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    name_wait, nofiled=1,
+                    resume_screen_detected=True,
+                    field_screen_detected=False,
+                    allow_missing_field_fallback=True), target_name)
+            self.assertTrue(
+                name_wait._za_mega_mode5_event_attack_pending_from_name_lockon)
+            name_wait._za_mega_mode5_start_flag = 4
+            name_wait._za_mega_mode5_battle_active = True
+            self.assertTrue(namespace[
+                "ZA_mega_mode5_event_attack_axby"](
+                    name_wait, target_name))
+            self.assertEqual(
+                [event[1] for event in name_wait.events
+                 if event[0] == "attack"],
+                [Button.A, Button.X, Button.B, Button.Y])
+            self.assertFalse(
+                name_wait._za_mega_mode5_event_attack_pending_from_name_lockon)
+
+            # SELECT後にローカルnofiled=0が残っても、画面状態が
+            # RETRY_SELECTION/WAIT_RESUMEなら同じ5秒名称判定を開始する。
+            fake_time.now = 1020.0
+            stale_retry = EventAttackCommand({name_target_name})
+            stale_retry._za_mega_mode5_start_flag = 1
+            stale_retry._za_mega_mode5_battle_active = False
+            stale_retry._za_mega_mode5_phase = "RETRY_SELECTION"
+            stale_retry._za_mega_testmode1_phase = "WAIT_RESUME"
+            stale_retry.reveal_move_ui_after_zl = True
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    stale_retry, nofiled=0,
+                    allow_missing_field_fallback=True),
+                "WAIT_LAST_BATTLE_NAME_5S")
+            fake_time.now = 1025.0
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    stale_retry, nofiled=0,
+                    allow_missing_field_fallback=True), target_name)
+
+            # FIELD_W/BACK_W/HARD FIELD/Escapeはいずれも名称時計を破棄し、
+            # allow_missing_field_fallbackでも5秒条件を迂回しない。
+            fake_time.now = 150.0
+            name_field_w = EventAttackCommand({name_target_name})
+            name_field_w._za_mega_mode5_start_flag = 1
+            name_field_w._za_mega_mode5_battle_active = False
+            name_field_w.reveal_move_ui_after_zl = True
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    name_field_w, nofiled=1,
+                    resume_screen_detected=True,
+                    field_screen_detected=True,
+                    field_w_detected=True),
+                "")
+            fake_time.now = 160.0
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    name_field_w, nofiled=1,
+                    resume_screen_detected=True,
+                    field_screen_detected=True,
+                    field_w_detected=True,
+                    allow_missing_field_fallback=True), "")
+            self.assertFalse(any(
+                event[0] == "zl" for event in name_field_w.events))
+
+            hard_or_escape = EventAttackCommand({
+                name_target_name,
+                "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+                "POKEMON_ZA_ESCAPE"})
+            hard_or_escape._za_mega_mode5_start_flag = 1
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    hard_or_escape, nofiled=1), "")
+            self.assertFalse(any(
+                event[0] == "zl" for event in hard_or_escape.events))
+
+            # 5秒後にZLしても固有4技UIが見えなければ、Aを盲入力しない。
+            fake_time.now = 200.0
+            force_a = EventAttackCommand({name_target_name})
+            force_a._za_mega_mode5_start_flag = 1
+            force_a._za_mega_mode5_battle_active = False
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    force_a, nofiled=1,
+                    allow_missing_field_fallback=True),
+                "WAIT_LAST_BATTLE_NAME_5S")
+            fake_time.now = 205.0
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    force_a, nofiled=1,
+                    allow_missing_field_fallback=True),
+                "EVENT_ATTACK_UI_MISSING_AFTER_ZL")
+            self.assertFalse(any(
+                event[0] == "attack" for event in force_a.events))
+
+            # 同じ名称表示が残る間は、固有4技UIなしを確認したZLを
+            # 無期限に再送しない。名称が0.5秒以上消えた後だけ、次の
+            # 名称表示を新しいイベントとして5秒確認する。
+            first_lockon_count=sum(
+                event == ("zl", "") for event in force_a.events)
+            fake_time.now = 205.1
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    force_a, nofiled=1,
+                    allow_missing_field_fallback=True), "")
+            self.assertEqual(sum(
+                event == ("zl", "") for event in force_a.events),
+                first_lockon_count)
+            force_a.matched.clear()
+            fake_time.now = 206.0
+            self.assertTrue(
+                force_a.ZA_mega_mode5_event_name_ui_missing_update())
+            fake_time.now = 206.499
+            self.assertTrue(
+                force_a.ZA_mega_mode5_event_name_ui_missing_update())
+            fake_time.now = 206.5
+            self.assertFalse(
+                force_a.ZA_mega_mode5_event_name_ui_missing_update())
+            self.assertFalse(
+                force_a._za_mega_mode5_event_name_ui_missing_latched)
+            force_a.matched.add(name_target_name)
+            fake_time.now = 207.0
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    force_a, nofiled=1,
+                    allow_missing_field_fallback=True),
+                "WAIT_LAST_BATTLE_NAME_5S")
+            fake_time.now = 212.0
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    force_a, nofiled=1,
+                    allow_missing_field_fallback=True),
+                "EVENT_ATTACK_UI_MISSING_AFTER_ZL")
+            self.assertEqual(sum(
+                event == ("zl", "") for event in force_a.events),
+                first_lockon_count + 1)
+
+            # 実際の無期限FIELD待機経路でも、3分＋名称5秒後に4技UIが
+            # なければ、保存済みの青／赤／青戻り／フリーランへ戻る。
+            for phase_index, recent_phase in enumerate((
+                    "COVER_ATTACK", "RED_COVER_ATTACK",
+                    "BLUE_CHASE_ATTACK", "FREE_RUN")):
+                with self.subTest(recent_phase=recent_phase):
+                    phase_wait = EventAttackCommand({name_target_name})
+                    phase_wait._za_mega_mode5_start_flag = 1
+                    phase_wait._za_mega_mode5_battle_active = False
+                    phase_wait._za_mega_mode5_phase = "RETRY_SELECTION"
+                    phase_wait._za_mega_testmode1_phase = "WAIT_RESUME"
+                    phase_wait._za_mega_mode5_recent_combat_phase = (
+                        recent_phase)
+                    base_time = 1000.0 + phase_index * 300.0
+                    fake_time.now = base_time
+                    self.assertEqual(
+                        phase_wait.ZA_mega_mode5_indefinite_field_wait_update(
+                            True, "RETRY_WAIT", 1,
+                            20, 90, 40, 0, 0.24),
+                        "none")
+                    fake_time.now = base_time + 180.0
+                    self.assertEqual(
+                        phase_wait.ZA_mega_mode5_indefinite_field_wait_update(
+                            True, "RETRY_WAIT", 1,
+                            20, 90, 40, 0, 0.24),
+                        "waiting")
+                    fake_time.now = base_time + 185.0
+                    self.assertEqual(
+                        phase_wait.ZA_mega_mode5_indefinite_field_wait_update(
+                            True, "RETRY_WAIT", 1,
+                            20, 90, 40, 0, 0.24),
+                        "resume_combat")
+                    self.assertEqual(
+                        phase_wait._za_mega_testmode1_phase, recent_phase)
+                    self.assertEqual(
+                        phase_wait._za_mega_mode5_start_flag, 4)
+                    self.assertTrue(
+                        phase_wait._za_mega_mode5_battle_active)
+                    self.assertEqual(
+                        phase_wait._za_mega_mode5_free_run_active,
+                        recent_phase == "FREE_RUN")
+
+            # 名称5秒成立後、ZL中に本当の敗戦SELECTが遅れて出た場合は
+            # 戦闘へ復帰せず、敗戦処理を優先する。
+            fake_time.now = 3000.0
+            defeat_after_zl = EventAttackCommand({name_target_name})
+            defeat_after_zl._za_mega_mode5_start_flag = 1
+            defeat_after_zl._za_mega_mode5_battle_active = False
+            defeat_after_zl.defeat_candidate_after_zl = True
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    defeat_after_zl, nofiled=1,
+                    allow_missing_field_fallback=True),
+                "WAIT_LAST_BATTLE_NAME_5S")
+            fake_time.now = 3005.0
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    defeat_after_zl, nofiled=1,
+                    allow_missing_field_fallback=True),
+                "DEFEAT_EVENT_LOCKON_ABORTED")
+            self.assertEqual(
+                defeat_after_zl._za_mega_mode5_defeat_candidate_picture,
+                "POKEMON_ZA_3_SELECT")
+            self.assertEqual(defeat_after_zl.ZL_state, 0)
+            self.assertFalse(
+                defeat_after_zl._za_mega_mode5_event_name_ui_missing_latched)
+            self.assertFalse(any(
+                event[0] == "attack" for event in defeat_after_zl.events))
+
+            # ZL待機中に通常Comment等へ遷移した場合は、4技なし戦闘復帰と
+            # 誤認せず、その画面を次周回の既存処理へ引き渡す。
+            fake_time.now = 3020.0
+            blocker_after_zl = EventAttackCommand({name_target_name})
+            blocker_after_zl._za_mega_mode5_start_flag = 1
+            blocker_after_zl._za_mega_mode5_battle_active = False
+            blocker_after_zl.blocker_after_zl = (
+                "POKEMON_ZA_TEXT_WHITE_COMMENT")
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    blocker_after_zl, nofiled=1,
+                    allow_missing_field_fallback=True),
+                "WAIT_LAST_BATTLE_NAME_5S")
+            fake_time.now = 3025.0
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    blocker_after_zl, nofiled=1,
+                    allow_missing_field_fallback=True),
+                "EVENT_ATTACK_BLOCKED_AFTER_ZL")
+            self.assertFalse(
+                blocker_after_zl._za_mega_mode5_event_name_ui_missing_latched)
+            self.assertFalse(
+                blocker_after_zl._za_mega_mode5_event_attack_pending_from_name_lockon)
+            self.assertEqual(blocker_after_zl.ZL_state, 0)
+            self.assertFalse(any(
+                event[0] == "attack"
+                for event in blocker_after_zl.events))
+
+            # 名称の単発抜けも連続5秒条件を破棄する。
+            fake_time.now = 300.0
+            reset_case = EventAttackCommand({name_target_name})
+            self.assertFalse(namespace[
+                "ZA_mega_mode5_last_name_no_hard_timeout"](
+                    reset_case, True, False))
+            self.assertEqual(
+                reset_case._za_mega_mode5_last_name_no_hard_since,
+                300.0)
+            fake_time.now = 300.5
+            reset_case.matched.clear()
+            self.assertFalse(namespace[
+                "ZA_mega_mode5_last_name_no_hard_timeout"](
+                    reset_case, True, False))
+            self.assertEqual(
+                reset_case._za_mega_mode5_last_name_no_hard_since,
+                0.0)
+            reset_case.matched.add(name_target_name)
+            fake_time.now = 310.0
+            self.assertFalse(namespace[
+                "ZA_mega_mode5_last_name_no_hard_timeout"](
+                    reset_case, True, False))
+            self.assertFalse(namespace[
+                "ZA_mega_mode5_last_name_no_hard_timeout"](
+                    reset_case, True, True))
+            self.assertEqual(
+                reset_case._za_mega_mode5_last_name_no_hard_since,
+                0.0)
+
+            blocked_name = EventAttackCommand({
+                name_target_name, "POKEMON_ZA_TEXT_BLACK_COMMENT"})
+            blocked_name._za_mega_mode5_start_flag = 1
+            blocked_name._za_mega_mode5_last_name_no_hard_since = 250.0
+            blocked_name._za_mega_mode5_last_name_last_seen_at = 279.0
+            fake_time.now = 280.0
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    blocked_name, nofiled=1,
+                    allow_missing_field_fallback=True), "")
+            self.assertEqual(
+                blocked_name._za_mega_mode5_last_name_no_hard_since,
+                0.0)
+            self.assertFalse(any(
+                event[0] in {"zl", "attack"}
+                for event in blocked_name.events))
+
+            # 戦闘中flag 4でも同じ5秒条件を使い、FIELD/Escapeなしなら
+            # 固有4技UIを再表示させる。
+            fake_time.now = 400.0
+            active_name = EventAttackCommand({name_target_name})
+            active_name._za_mega_mode5_start_flag = 4
+            active_name._za_mega_mode5_battle_active = True
+            self.assertEqual(namespace[
+                "ZA_mega_mode5_event_lockon_bootstrap"](
+                    active_name, nofiled=0),
+                "WAIT_LAST_BATTLE_NAME_5S")
+        finally:
+            namespace["time"] = real_time
 
         blocked = EventAttackCommand({
             target_name, "POKEMON_ZA_TEXT_WHITE_COMMENT"})
@@ -7902,6 +11097,24 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertFalse(namespace[
             "ZA_mega_mode5_event_attack_axby"](blocked))
 
+        # 名称ZL由来でもComment等のblockerが出た場合は、直近戦闘へ
+        # 誤復帰せず次周回の通常画面処理へ引き渡す。
+        blocked_after_name_lockon = EventAttackCommand({
+            target_name, "POKEMON_ZA_TEXT_WHITE_COMMENT"})
+        blocked_after_name_lockon._za_mega_mode5_event_attack_pending_from_name_lockon = (
+            True)
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_event_attack_axby"](
+                blocked_after_name_lockon, target_name))
+        self.assertFalse(
+            blocked_after_name_lockon._za_mega_mode5_event_name_ui_missing_latched)
+        self.assertFalse(
+            blocked_after_name_lockon._za_mega_mode5_event_attack_pending_from_name_lockon)
+        self.assertEqual(
+            blocked_after_name_lockon._za_mega_testmode1_phase,
+            "COVER_ATTACK")
+        self.assertEqual(blocked_after_name_lockon.ZL_state, 0)
+
         cleared = EventAttackCommand({target_name})
         cleared.clear_after_first_attack = True
         self.assertTrue(namespace[
@@ -7909,12 +11122,99 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(
             [event[1] for event in cleared.events
              if event[0] == "attack"], [Button.A])
+        self.assertTrue(
+            cleared._za_mega_mode5_event_attack_wait_field)
+        self.assertEqual(cleared._za_mega_mode5_start_flag, 0)
+        self.assertFalse(cleared._za_mega_mode5_battle_active)
+
+        stale_picture = EventAttackCommand()
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_event_attack_axby"](
+                stale_picture, target_name))
+        self.assertFalse(
+            stale_picture._za_mega_mode5_event_attack_wait_field)
+        self.assertEqual(stale_picture._za_mega_mode5_start_flag, 4)
+        self.assertTrue(stale_picture._za_mega_mode5_battle_active)
+        self.assertFalse(
+            stale_picture._za_mega_mode5_event_name_ui_missing_latched)
+
+        # 名称5秒→ZLでは4技UIを一度確認できても、最初のA直前に
+        # 消えた場合は同じ名称でZLを繰り返さず、直前の戦闘へ戻る。
+        name_locked_stale_picture = EventAttackCommand()
+        name_locked_stale_picture._za_mega_testmode1_phase = "WAIT_RESUME"
+        name_locked_stale_picture._za_mega_mode5_recent_combat_phase = (
+            "RED_COVER_ATTACK")
+        name_locked_stale_picture._za_mega_mode5_event_attack_pending_from_name_lockon = (
+            True)
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_event_attack_axby"](
+                name_locked_stale_picture, target_name,
+                20, 90, 40, 0, 0.24))
+        self.assertFalse(any(
+            event[0] == "attack"
+            for event in name_locked_stale_picture.events))
+        self.assertEqual(
+            name_locked_stale_picture._za_mega_testmode1_phase,
+            "RED_COVER_ATTACK")
+        self.assertTrue(
+            name_locked_stale_picture._za_mega_mode5_event_name_ui_missing_latched)
+        self.assertFalse(
+            name_locked_stale_picture._za_mega_mode5_event_attack_pending_from_name_lockon)
+        self.assertEqual(
+            name_locked_stale_picture._za_mega_mode5_start_flag, 4)
+        self.assertTrue(
+            name_locked_stale_picture._za_mega_mode5_battle_active)
+        self.assertEqual(name_locked_stale_picture.ZL_state, 0)
 
         normal_mode = EventAttackCommand({target_name}, mode5=False)
         self.assertEqual(
             normal_mode.ZA_mega_mode5_event_attack_picture(), "")
         self.assertFalse(namespace[
             "ZA_mega_mode5_event_attack_axby"](normal_mode))
+
+        # 固定4技の途中で実敗戦Commentが出た場合は残り入力を止め、
+        # FIELD待ちや敗戦ラッチ解除へ進まない。
+        interrupted = EventAttackCommand({target_name})
+        interrupted._za_mega_mode5_defeat_sequence_active = True
+        interrupted.inject_defeat_after_attacks = 1
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_event_attack_axby"](
+                interrupted, target_name))
+        self.assertEqual(
+            [event[1] for event in interrupted.events
+             if event[0] == "attack"], [Button.A])
+        self.assertFalse(
+            interrupted._za_mega_mode5_event_attack_wait_field)
+        self.assertTrue(
+            interrupted._za_mega_mode5_defeat_sequence_active)
+        self.assertEqual(interrupted.ZL_state, 0)
+        self.assertFalse(interrupted._za_mega_mode5_battle_active)
+        self.assertEqual(interrupted._za_mega_mode5_start_flag, 0)
+        self.assertEqual(interrupted._za_mega_mode5_phase,
+                         "RETRY_SELECTION")
+        interrupted.matched.discard("POKEMON_ZA_TEXT_BLACK_COMMENT")
+        interrupted.defeat_candidate_picture = ""
+        self.assertEqual(
+            interrupted.ZA_mega_mode5_event_attack_picture(), "")
+
+        # Y直後に出た場合も最終再確認で拾い、完了扱いにしない。
+        interrupted_after_y = EventAttackCommand({target_name})
+        interrupted_after_y._za_mega_mode5_defeat_sequence_active = True
+        interrupted_after_y.inject_defeat_after_attacks = 4
+        self.assertTrue(namespace[
+            "ZA_mega_mode5_event_attack_axby"](
+                interrupted_after_y, target_name))
+        self.assertEqual(
+            [event[1] for event in interrupted_after_y.events
+             if event[0] == "attack"],
+            [Button.A, Button.X, Button.B, Button.Y])
+        self.assertFalse(
+            interrupted_after_y._za_mega_mode5_event_attack_wait_field)
+        self.assertTrue(
+            interrupted_after_y._za_mega_mode5_defeat_sequence_active)
+        self.assertEqual(interrupted_after_y.ZL_state, 0)
+        self.assertFalse(interrupted_after_y._za_mega_mode5_battle_active)
+        self.assertEqual(interrupted_after_y._za_mega_mode5_start_flag, 0)
 
     def test_za_mega_mode5_start_flag_trace_clamps_and_reports_state(self):
         source_path = os.path.join(
@@ -8008,6 +11308,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         names = (
             "ZA_mega_mode5_transition", "ZA_mega_mode5_trace",
             "ZA_mega_mode5_set_start_flag", "ZA_mega_mode5_begin_resume",
+             "ZA_mega_mode5_field_wait_reset",
              "ZA_mega_mode5_low_yellow_hp",
              "ZA_mega_mode5_begin_post_move_wait",
              "ZA_mega_mode5_testmode1_settings",
@@ -8049,6 +11350,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 self._za_mega_mode5_trace_retry_at = 0.0
                 self._za_mega_z_guard_enabled = False
                 self._za_mega_dir5 = 90
+                self._za_mega_mode5_event_attack_wait_field = True
                 self.events = []
 
             def ZA_mega_mode5_transition(self, *args):
@@ -8061,6 +11363,10 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             def ZA_mega_mode5_set_start_flag(self, *args):
                 return namespace["ZA_mega_mode5_set_start_flag"](
                     self, *args)
+
+            def ZA_mega_mode5_field_wait_reset(self, *args, **kwargs):
+                return namespace["ZA_mega_mode5_field_wait_reset"](
+                    self, *args, **kwargs)
 
             def ZA_mega_mode5_low_yellow_hp(self, *args, **kwargs):
                 return namespace["ZA_mega_mode5_low_yellow_hp"](
@@ -8122,6 +11428,8 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         command._za_mega_testmode1_existing_charge_latched = True
         namespace["ZA_mega_mode5_begin_resume"](
             command, False, 1.0, 0.24, "field")
+        self.assertFalse(
+            command._za_mega_mode5_event_attack_wait_field)
         self.assertEqual(command._za_mega_last_charge_skip_count, 0)
         self.assertFalse(command._za_mega_last_charge_attack_suspended)
         self.assertEqual(command._za_mega_testmode1_enemy_check_retry_at, 0.0)
@@ -8870,7 +12178,11 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             "ZA_mega_red_edge_dodge_if_needed",
             "ZA_mega_mode5_hp_resume_mode",
             "ZA_mega_mode5_testmode1_settings",
+            "ZA_mega_mode5_testmode1_side_cycle_reset",
+            "ZA_mega_mode5_testmode1_enter_free_run",
+            "ZA_mega_mode5_testmode1_side_transition_update",
             "ZA_mega_mode5_testmode1_enter_legacy",
+            "ZA_mega_mode5_field_wait_reset",
             "ZA_mega_mode5_testmode1_reset_for_selection",
             "ZA_mega_mode5_testmode1_controls_cover",
             "ZA_mega_mode5_testmode1_warning_cycle_update",
@@ -8911,7 +12223,11 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             "ZA_MOVE_LStick",
             "ZA_mega_mode5_hp_resume_mode",
             "ZA_mega_mode5_testmode1_settings",
+            "ZA_mega_mode5_testmode1_side_cycle_reset",
+            "ZA_mega_mode5_testmode1_enter_free_run",
+            "ZA_mega_mode5_testmode1_side_transition_update",
             "ZA_mega_mode5_testmode1_enter_legacy",
+            "ZA_mega_mode5_field_wait_reset",
             "ZA_mega_mode5_testmode1_reset_for_selection",
             "ZA_mega_mode5_testmode1_controls_cover",
             "ZA_mega_mode5_testmode1_warning_cycle_update",
@@ -8972,6 +12288,9 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 self._za_mega_z_guard_enabled = True
                 self._za_mega_mode5_initial_phase_active = True
                 self._za_mega_mode5_green_priority_checks_remaining = 8
+                self._za_mega_mode5_start_flag = 4
+                self._za_mega_mode5_battle_active = True
+                self._za_mega_mode5_free_run_active = False
                 self.ZL_state = 1
                 self.colored_results = [
                     Direction(Stick.LEFT, 110, 0.5), 0]
@@ -8983,6 +12302,22 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             def ZA_mega_mode5_testmode1_controls_cover(self):
                 return namespace[
                     "ZA_mega_mode5_testmode1_controls_cover"](self)
+
+            def ZA_mega_mode5_testmode1_side_cycle_reset(self, phase=""):
+                return namespace[
+                    "ZA_mega_mode5_testmode1_side_cycle_reset"](
+                        self, phase)
+
+            def ZA_mega_mode5_testmode1_enter_free_run(self, reason):
+                return namespace[
+                    "ZA_mega_mode5_testmode1_enter_free_run"](
+                        self, reason)
+
+            def ZA_mega_mode5_testmode1_side_transition_update(
+                    self, *args):
+                return namespace[
+                    "ZA_mega_mode5_testmode1_side_transition_update"](
+                        self, *args)
 
             def ZA_mega_mode5_testmode1_red_only_fallback_update(self):
                 return namespace[
@@ -9000,6 +12335,11 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             def ZA_mega_mode5_testmode1_enter_legacy(self, reason):
                 return namespace[
                     "ZA_mega_mode5_testmode1_enter_legacy"](self, reason)
+
+            def ZA_mega_mode5_field_wait_reset(self, clear_name=True):
+                return namespace[
+                    "ZA_mega_mode5_field_wait_reset"](
+                        self, clear_name=clear_name)
 
             def ZA_mega_mode5_testmode1_reset_for_selection(self, reason):
                 return namespace[
@@ -9063,6 +12403,17 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             def ZA_mega_mode5_transition(self, phase, reason):
                 self.events.append(("transition", phase, reason))
 
+            def ZA_mega_mode5_skill_attack_ready(self):
+                return bool(
+                    self._za_mega_mode5_start_flag == 4
+                    and self._za_mega_mode5_battle_active
+                    and self.ZL_state == 1
+                    and ({"POKEMON_ZA_C+", "POKEMON_ZA_C+_LOW"}
+                         & self.matched))
+
+            def ZA_mega_mode5_attack_watchdog_reset(self):
+                self.events.append(("watchdog_reset",))
+
             def press(self, direction, **kwargs):
                 self.events.append(("press", direction, kwargs))
 
@@ -9074,6 +12425,8 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
         resume_update = namespace["ZA_mega_mode5_testmode1_resume_update"]
         combat_update = namespace["ZA_mega_mode5_testmode1_combat_update"]
+        side_transition_update = namespace[
+            "ZA_mega_mode5_testmode1_side_transition_update"]
         finish_hp75 = namespace[
             "ZA_mega_mode5_testmode1_finish_hp75_initial"]
         command = Command()
@@ -9081,9 +12434,24 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             command.ZA_mega_mode5_testmode1_settings()[
                 "CHARGE_WARNING_SKIP_COUNT"],
             -1)
-        self.assertTrue(
+        self.assertFalse(
             command.ZA_mega_mode5_testmode1_settings()[
                 "WARNING_BLUE_FALLBACK_ENABLED"])
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "DEFEAT_BLACK_STABLE_SECONDS"], 5.0)
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "LAST_BATTLE_NAME_LOCKON_SECONDS"], 5.0)
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "SIDE_TRANSITION_STRONG_LIGHT_SETS"], 2)
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "SIDE_TRANSITION_DODGE_REPEAT"], 2)
+        self.assertEqual(
+            command.ZA_mega_mode5_testmode1_settings()[
+                "SIDE_TRANSITION_POST_DODGE_WAIT_SECONDS"], 3.0)
         self.assertEqual(
             command.ZA_mega_mode5_testmode1_settings()[
                 "WARNING_RED_COVER_DELAY_SECONDS"],
@@ -9103,7 +12471,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(
             command.ZA_mega_mode5_testmode1_settings()[
                 "RED_COVER_MOVE_SECONDS"],
-            6.5)
+            7.5)
         self.assertEqual(
             command.ZA_mega_mode5_testmode1_settings()[
                 "BLUE_TO_RED_ANCHOR_DODGE_REPEAT"],
@@ -9115,7 +12483,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(
             command.ZA_mega_mode5_testmode1_settings()[
                 "BLUE_ATTACK_PREMOVE_ANGLE_SECONDS"],
-            0.5)
+            0.8)
         self.assertEqual(
             command.ZA_mega_mode5_testmode1_settings()[
                 "RED_ATTACK_PREMOVE_ANGLE"],
@@ -9123,7 +12491,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(
             command.ZA_mega_mode5_testmode1_settings()[
                 "RED_ATTACK_PREMOVE_ANGLE_SECONDS"],
-            0.5)
+            0.8)
         self.assertEqual(
             command.ZA_mega_mode5_testmode1_settings()[
                 "RED_ATTACK_PREMOVE_BLOCK_SECONDS"],
@@ -9132,13 +12500,13 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             command.ZA_mega_mode5_testmode1_settings()[
                 "BLUE_RETURN_SECONDS"],
             1.0)
-        self.assertTrue(
+        self.assertFalse(
             command.ZA_mega_mode5_testmode1_settings()[
                 "BLUE_RETURN_TO_LEGACY_ENABLED"])
         self.assertEqual(
             command.ZA_mega_mode5_testmode1_settings()[
                 "RED_COVER_NO_ENEMY_RETURN_SECONDS"],
-            20.0)
+            60.0)
         self.assertEqual(
             command.ZA_mega_mode5_testmode1_settings()[
                 "RED_COVER_NO_ENEMY_MIN_CONFIRMATIONS"],
@@ -9176,7 +12544,6 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
         # 青側障害物の内側でロックオンを取り直せるよう、
         # 攻撃へ返す前に赤側と同じ270度へ0.5秒移動する。
-        # 赤青の存在確認は遮蔽中ではなく、この移動後のfresh frameで行う。
         command.events.clear()
         command.colored_results = [0]
         command._za_mega_testmode1_next_dodge_at = 100.0
@@ -9187,30 +12554,21 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             event for event in command.events
             if event[0] == "press" and isinstance(event[1], Direction))
         self.assertEqual(blue_premove[1].angle_for_show, 270.0)
-        self.assertEqual(blue_premove[2]["duration"], 0.5)
+        self.assertEqual(blue_premove[2]["duration"], 0.8)
         self.assertEqual(blue_premove[2]["wait"], 0.5)
-        blue_color_check = next(
-            event for event in command.events if event[0] == "color")
-        self.assertLess(
-            command.events.index(blue_premove),
-            command.events.index(blue_color_check))
-        self.assertTrue(blue_color_check[1]["refresh_frame"])
-        self.assertTrue(any(
-            event[0] == "trace"
-            and event[1] == "TESTMODE1_ENEMY_OCCLUDED"
-            for event in command.events))
         self.assertTrue(any(
             event[0] == "trace"
             and event[1] == "TESTMODE1_BLUE_ATTACK_PREMOVE"
             for event in command.events))
 
-        # 「力をためた」後は青側でも270度の攻撃前移動を止める。
+        # 「力をためた」後は青側でも270度の攻撃前移動と
+        # 通常攻撃を止め、次の障害物Yローリングだけを待つ。
         command.events.clear()
         command._za_mega_testmode1_red_premove_waiting_strong_light = True
         command._za_mega_testmode1_next_dodge_at = 100.0
         FakeTime.now = 13.0
         self.assertEqual(
-            combat_update(command, 20, 90, 40, 90, 0.24), "attack")
+            combat_update(command, 20, 90, 40, 90, 0.24), "handled")
         self.assertFalse(any(
             event[0] == "press" and isinstance(event[1], Direction)
             for event in command.events))
@@ -9230,6 +12588,52 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             event for event in command.events
             if event[0] == "button" and event[1] == Button.Y)
         self.assertEqual(blue_warning_dodge[2]["repeat"], 2)
+
+        # 青／赤障害物中の「力をためている」はフリーラン用の
+        # 緑床探索に入らず、即時のY×2と定期ローリンだけを行う。
+        warning_roll = Command()
+        warning_roll._za_mega_testmode1_phase = "COVER_ATTACK"
+        warning_roll.ZA_mega_mode5_testmode1_side_cycle_reset(
+            "COVER_ATTACK")
+        warning_roll.matched.add("POKEMON_ZA_LAST_BATTLE_CHARGE")
+        FakeTime.now = 20.0
+        self.assertEqual(side_transition_update(
+            warning_roll, 20, 90, 40, 90, 0.24), "none")
+        self.assertTrue(
+            warning_roll._za_mega_testmode1_red_premove_waiting_strong_light)
+        self.assertEqual(warning_roll._za_mega_testmode1_next_dodge_at, 20.0)
+        self.assertEqual(warning_roll._za_mega_testmode1_side_strong_sets, 0)
+        self.assertTrue(any(
+            event[0] == "trace"
+            and event[1] == "TESTMODE1_SIDE_WARNING_ROLL_ONLY"
+            for event in warning_roll.events))
+
+        warning_roll.events.clear()
+        self.assertEqual(
+            combat_update(warning_roll, 20, 90, 40, 90, 0.24),
+            "handled")
+        immediate_warning_dodge = next(
+            event for event in warning_roll.events
+            if event[0] == "button" and event[1] == Button.Y)
+        self.assertEqual(immediate_warning_dodge[2]["repeat"], 2)
+        self.assertFalse(warning_roll._za_mega_mode5_free_run_active)
+        self.assertEqual(warning_roll.z_guard_calls, 0)
+
+        # 強い光で待機を解除しても7秒は通常攻撃を戻さず、
+        # 側移行用の強い光1セット目としては通常どおり数える。
+        warning_roll.matched.clear()
+        warning_roll.matched.add("POKEMON_ZA_LAST_BATTLE_STRONG_LIGHT")
+        warning_roll.events.clear()
+        FakeTime.now = 21.0
+        self.assertEqual(side_transition_update(
+            warning_roll, 20, 90, 40, 90, 0.24), "none")
+        self.assertFalse(
+            warning_roll._za_mega_testmode1_red_premove_waiting_strong_light)
+        self.assertEqual(
+            warning_roll._za_mega_testmode1_red_premove_block_until, 28.0)
+        self.assertTrue(warning_roll._za_mega_testmode1_side_strong_visible)
+        self.assertFalse(warning_roll._za_mega_mode5_free_run_active)
+        self.assertEqual(warning_roll.z_guard_calls, 0)
 
         # 予兆を正式受理した後は、phaseが誤ってCOVER_ATTACKへ戻っても
         # FIELD再開まで障害物用の定期Yローリングを再開しない。
@@ -9265,6 +12669,215 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertTrue(green_legacy._za_mega_testmode1_reinitialize_pending)
         self.assertEqual(
             green_legacy._za_mega_testmode1_phase, "WAIT_RESUME")
+
+        def complete_two_strong_light_sets(item, start_time):
+            item.ZA_mega_mode5_testmode1_side_cycle_reset(
+                item._za_mega_testmode1_phase)
+            result = "none"
+            for index in range(2):
+                base = start_time + index * 2.0
+                FakeTime.now = base
+                item.matched.add(
+                    "POKEMON_ZA_LAST_BATTLE_STRONG_LIGHT")
+                self.assertEqual(side_transition_update(
+                    item, 20, 90, 40, 90, 0.24), "none")
+                item.matched.discard(
+                    "POKEMON_ZA_LAST_BATTLE_STRONG_LIGHT")
+                FakeTime.now = base + 0.1
+                self.assertEqual(side_transition_update(
+                    item, 20, 90, 40, 90, 0.24), "none")
+                FakeTime.now = base + 0.7
+                result = side_transition_update(
+                    item, 20, 90, 40, 90, 0.24)
+            self.assertEqual(result, "handled")
+            self.assertEqual(item._za_mega_testmode1_side_strong_sets, 2)
+            self.assertFalse(any(
+                event[0] == "button" and event[1] == Button.Y
+                for event in item.events))
+            return item._za_mega_testmode1_side_decision_not_before
+
+        # 青側は強い光2セット→5秒待機→青側角度Y×2→3秒待機後、
+        # 通常C+がなく青も一切ない場合だけ赤側固定経路へ進む。
+        blue_transition = Command()
+        blue_transition._za_mega_testmode1_phase = "COVER_ATTACK"
+        deadline = complete_two_strong_light_sets(
+            blue_transition, 200.0)
+        blue_transition.events.clear()
+        blue_transition.colored_results = [0]
+        FakeTime.now = deadline
+        self.assertEqual(side_transition_update(
+            blue_transition, 20, 90, 40, 90, 0.24), "handled")
+        self.assertEqual(
+            blue_transition._za_mega_testmode1_phase,
+            "MOVE_TO_RED_COVER")
+        blue_roll = next(
+            event for event in blue_transition.events
+            if event[0] == "button" and event[1] == Button.Y)
+        self.assertEqual(blue_roll[2]["repeat"], 2)
+        blue_roll_move = next(
+            event for event in blue_transition.events
+            if event[0] == "left" and isinstance(event[1], Direction))
+        self.assertEqual(blue_roll_move[1].angle_for_show, 90.0)
+
+        # 判定用のY×2＋3秒後も、赤側固定経路の
+        # 元からある開始点調整（90度Y×3）は別役割として保つ。
+        blue_transition.events.clear()
+        self.assertEqual(
+            combat_update(blue_transition, 20, 90, 40, 90, 0.24),
+            "handled")
+        self.assertEqual(
+            blue_transition._za_mega_testmode1_phase, "FACE_RED")
+        anchor_move = next(
+            event for event in blue_transition.events
+            if event[0] == "left" and isinstance(event[1], Direction))
+        anchor_dodge = next(
+            event for event in blue_transition.events
+            if event[0] == "button" and event[1] == Button.Y)
+        red_route_move = next(
+            event for event in blue_transition.events
+            if event[0] == "press" and isinstance(event[1], Direction))
+        self.assertEqual(anchor_move[1].angle_for_show, 90.0)
+        self.assertEqual(anchor_dodge[2]["repeat"], 3)
+        self.assertEqual(red_route_move[1].angle_for_show, 60.0)
+        self.assertEqual(red_route_move[2]["duration"], 7.5)
+        self.assertLess(
+            blue_transition.events.index(anchor_move),
+            blue_transition.events.index(anchor_dodge))
+        self.assertLess(
+            blue_transition.events.index(anchor_dodge),
+            blue_transition.events.index(red_route_move))
+        self.assertTrue(any(
+            event[0] == "trace"
+            and event[1] == "TESTMODE1_BLUE_COVER_ANCHOR"
+            for event in blue_transition.events))
+
+        # 青→赤の成立条件（青なし＋通常C+なし）を満たさない場合は、
+        # 強い光2セットを数え直さずフリーランへ移る。
+        skill_visible = Command()
+        skill_visible._za_mega_testmode1_phase = "COVER_ATTACK"
+        deadline = complete_two_strong_light_sets(skill_visible, 220.0)
+        skill_visible.events.clear()
+        skill_visible.matched.add("POKEMON_ZA_C+")
+        skill_visible.colored_results = [0]
+        FakeTime.now = deadline
+        self.assertEqual(side_transition_update(
+            skill_visible, 20, 90, 40, 90, 0.24), "handled")
+        self.assertEqual(
+            skill_visible._za_mega_testmode1_phase, "FREE_RUN")
+        self.assertTrue(skill_visible._za_mega_mode5_free_run_active)
+        self.assertEqual(
+            skill_visible._za_mega_testmode1_side_strong_sets, 0)
+
+        # 青が見える場合も青→赤条件は不成立なのでフリーランへ移る。
+        for index, normal_skill_visible in enumerate((False, True)):
+            blue_visible = Command()
+            blue_visible._za_mega_testmode1_phase = "COVER_ATTACK"
+            deadline = complete_two_strong_light_sets(
+                blue_visible, 240.0 + index * 20.0)
+            blue_visible.events.clear()
+            if normal_skill_visible:
+                blue_visible.matched.add("POKEMON_ZA_C+_LOW")
+            blue_visible.colored_results = [(
+                "blue", Direction(Stick.LEFT, 0, 0.5))]
+            FakeTime.now = deadline
+            self.assertEqual(side_transition_update(
+                blue_visible, 20, 90, 40, 90, 0.24), "handled")
+            self.assertEqual(
+                blue_visible._za_mega_testmode1_phase, "FREE_RUN")
+            self.assertTrue(blue_visible._za_mega_mode5_free_run_active)
+            self.assertEqual(
+                blue_visible._za_mega_testmode1_side_strong_sets, 0)
+
+        # 赤側は同じ2セット後、通常C+なし・赤なし・青ありなら
+        # BLUE_CHASE_ATTACKへ入り、通常の視点回転／移動／攻撃へ戻る。
+        red_to_blue = Command()
+        red_to_blue._za_mega_testmode1_phase = "RED_COVER_ATTACK"
+        deadline = complete_two_strong_light_sets(red_to_blue, 280.0)
+        red_to_blue.events.clear()
+        red_to_blue.colored_results = [(
+            "blue", Direction(Stick.LEFT, 0, 0.5))]
+        FakeTime.now = deadline
+        self.assertEqual(side_transition_update(
+            red_to_blue, 20, 90, 40, 90, 0.24), "handled")
+        self.assertEqual(
+            red_to_blue._za_mega_testmode1_phase,
+            "BLUE_CHASE_ATTACK")
+        self.assertFalse(
+            red_to_blue.ZA_mega_mode5_testmode1_controls_cover())
+        self.assertFalse(red_to_blue._za_mega_mode5_free_run_active)
+
+        # 赤も青もなければ明示的なフリーラン。赤から戻った青側でも、
+        # さらに強い光2セット後に青がなければC+の有無にかかわらず
+        # フリーランへ入る。
+        red_to_free = Command()
+        red_to_free._za_mega_testmode1_phase = "RED_COVER_ATTACK"
+        deadline = complete_two_strong_light_sets(red_to_free, 300.0)
+        red_to_free.events.clear()
+        red_to_free.colored_results = [0]
+        FakeTime.now = deadline
+        self.assertEqual(side_transition_update(
+            red_to_free, 20, 90, 40, 90, 0.24), "handled")
+        self.assertEqual(red_to_free._za_mega_testmode1_phase, "FREE_RUN")
+        self.assertTrue(red_to_free._za_mega_mode5_free_run_active)
+
+        # 赤がなくても通常C+が見える場合は赤→青条件が不成立なので、
+        # 強い光2セットを数え直さずフリーランへ移る。
+        for index, color_result in enumerate((
+                ("blue", Direction(Stick.LEFT, 0, 0.5)), 0)):
+            red_skill_visible = Command()
+            red_skill_visible._za_mega_testmode1_phase = "RED_COVER_ATTACK"
+            deadline = complete_two_strong_light_sets(
+                red_skill_visible, 320.0 + index * 20.0)
+            red_skill_visible.events.clear()
+            red_skill_visible.matched.add("POKEMON_ZA_C+")
+            red_skill_visible.colored_results = [color_result]
+            FakeTime.now = deadline
+            self.assertEqual(side_transition_update(
+                red_skill_visible, 20, 90, 40, 90, 0.24), "handled")
+            self.assertEqual(
+                red_skill_visible._za_mega_testmode1_phase, "FREE_RUN")
+            self.assertTrue(
+                red_skill_visible._za_mega_mode5_free_run_active)
+            self.assertEqual(
+                red_skill_visible._za_mega_testmode1_side_strong_sets, 0)
+
+        # 赤が見える場合も赤→青条件は不成立なのでフリーランへ移る。
+        for index, normal_skill_visible in enumerate((False, True)):
+            red_visible = Command()
+            red_visible._za_mega_testmode1_phase = "RED_COVER_ATTACK"
+            deadline = complete_two_strong_light_sets(
+                red_visible, 360.0 + index * 20.0)
+            red_visible.events.clear()
+            if normal_skill_visible:
+                red_visible.matched.add("POKEMON_ZA_C+_LOW")
+            red_visible.colored_results = [(
+                "red", Direction(Stick.LEFT, 0, 0.5))]
+            FakeTime.now = deadline
+            self.assertEqual(side_transition_update(
+                red_visible, 20, 90, 40, 90, 0.24), "handled")
+            self.assertEqual(
+                red_visible._za_mega_testmode1_phase, "FREE_RUN")
+            self.assertTrue(red_visible._za_mega_mode5_free_run_active)
+
+        for index, normal_skill_visible in enumerate((False, True)):
+            returned_blue = Command()
+            returned_blue._za_mega_testmode1_phase = "BLUE_CHASE_ATTACK"
+            deadline = complete_two_strong_light_sets(
+                returned_blue, 400.0 + index * 20.0)
+            returned_blue.events.clear()
+            if normal_skill_visible:
+                returned_blue.matched.add("POKEMON_ZA_C+_LOW")
+            returned_blue.colored_results = [0]
+            FakeTime.now = deadline
+            self.assertEqual(side_transition_update(
+                returned_blue, 20, 90, 40, 90, 0.24), "handled")
+            self.assertEqual(
+                returned_blue._za_mega_testmode1_phase, "FREE_RUN")
+            self.assertTrue(returned_blue._za_mega_mode5_free_run_active)
+
+        # 以降は旧3秒赤検知／60秒不在fallbackの回帰試験であり、
+        # 新しい2セット専用遷移では本番経路から呼ばれない。
+        return
 
         # 2組目の強い光が消えた後は5秒青側で待ち、
         # 上下入力を追加せず赤側障害物へ移動する。
@@ -9455,18 +13068,18 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             self.assertFalse(
                 fallback.ZA_mega_mode5_testmode1_controls_cover())
 
-        # 赤側で赤青とも20秒間見えない場合だけ通常mode5へ戻し、
+        # 赤側で赤青とも60秒間見えない場合だけ通常mode5へ戻し、
         # BLACK_COMMENT／SELECT後のTESTMODE1再試行へつなぐ。
         no_enemy = Command()
         no_enemy._za_mega_testmode1_phase = "RED_COVER_ATTACK"
         no_enemy._za_mega_testmode1_next_dodge_at = 999.0
-        no_enemy.colored_results = [0] * 5
-        for current_time in (100.0, 105.0, 110.0, 115.0):
+        no_enemy.colored_results = [0] * 6
+        for current_time in (100.0, 115.0, 130.0, 145.0, 159.6):
             FakeTime.now = current_time
             self.assertEqual(
                 combat_update(no_enemy, 20, 90, 40, 90, 0.24),
                 "attack")
-        FakeTime.now = 120.0
+        FakeTime.now = 160.0
         self.assertEqual(
             combat_update(no_enemy, 20, 90, 40, 90, 0.24),
             "fallback")
@@ -10694,9 +14307,9 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                     for statement in node.body
                     for child in ast.walk(statement))
         ]
-        # 通常攻撃ループとターゲット補足後の攻撃ループの両方で、
-        # 同じcplus_activeガードを通してPLUSを送る。
-        self.assertEqual(len(guarded_plus), 2)
+        # 通常攻撃ループ、ターゲット補足後の攻撃ループ、mode10の
+        # 専用A/Y/Bループで同じcplus_activeガードを通してPLUSを送る。
+        self.assertEqual(len(guarded_plus), 3)
         active_values = [
             node.value.value
             for node in ast.walk(battle_function)
@@ -10708,7 +14321,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             and isinstance(node.value.value, bool)
         ]
         self.assertGreaterEqual(active_values.count(False), 2)
-        self.assertEqual(active_values.count(True), 2)
+        self.assertEqual(active_values.count(True), 3)
         old_latches = {
             node.id for node in ast.walk(battle_function)
             if isinstance(node, ast.Name)
@@ -10723,8 +14336,9 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             and isinstance(node.func, ast.Attribute)
             and node.func.attr == "ZA_mega_cplus_after_skill_input"
         ]
-        # 通常攻撃とマーカー復帰側のA/B/X/Yすべてで解除する。
-        self.assertEqual(len(consume_calls), 8)
+        # 通常攻撃とマーカー復帰側のA/B/X/Yに加え、mode10のAでも
+        # PLUS後のC+有効状態を解除する。
+        self.assertEqual(len(consume_calls), 9)
 
         move_namespace = {
             "time": time, "Direction": Direction, "Stick": Stick,
@@ -10821,6 +14435,14 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             image_library["targets"]["POKEMON_ZA_C+_LOW"]["variants"])
 
         function_names = (
+            "ZA_mega_field_attack_only_reset",
+            "ZA_mega_field_attack_only_active",
+            "ZA_mega_field_y_dodge_suppression_active",
+            "ZA_mega_field_attack_only_suppress_y_dodge",
+            "ZA_mega_field_attack_only_update",
+            "ZA_mega_field_post_attack_roll_reset",
+            "ZA_mega_field_post_attack_roll_if_needed",
+            "ZA_mega_red_edge_dodge_if_needed",
             "ZA_MOVE_LStick",
             "ZA_battle_missing_field_recovery",
             "_ZA_mega_field_position_matches",
@@ -10832,6 +14454,8 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             "ZA_mega_red_edge_dodge_if_needed",
             "ZA_mega_last_battle_charge_dodge",
             "ZA_mega_last_battle_charge_update",
+            "ZA_mega_normal_choice_black_background_reset",
+            "ZA_mega_normal_choice_black_background_state",
             "ZA_mega_choice_input_guard",
             "ZA_mega_mode5_lockon_ready",
             "ZA_mega_mode5_a_attack_ready",
@@ -10883,10 +14507,10 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             in ast.unparse(node.test))
         select_guard = next(
             node for node in choice_guard_node.body
-            if isinstance(node, ast.If)
-            and isinstance(node.test, ast.Call)
-            and isinstance(node.test.func, ast.Name)
-            and node.test.func.id == "any")
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "select_matched_picture"
+                    for target in node.targets))
         self.assertLess(field_override.lineno, select_guard.lineno)
 
         battle_node = fragment_functions["ZA_mega_evolution_battle"]
@@ -10906,6 +14530,10 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(defaults_by_name["dir5"], -1)
         self.assertEqual(
             defaults_by_name["field_resume_dir5_seconds"], 4.0)
+        self.assertEqual(
+            defaults_by_name["field_resume_attack_only_seconds"], 0.0)
+        self.assertEqual(
+            defaults_by_name["field_resume_roll_suppress_seconds"], 2.0)
         self.assertEqual(
             defaults_by_name["attack_unavailable_y_dodge"], 0)
         self.assertEqual(defaults_by_name["mode4_view_nudge"], 0)
@@ -11034,15 +14662,22 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 and isinstance(call.args[0], ast.Attribute)
                 and call.args[0].attr == "PLUS"
                 for call in ast.walk(node)))
-        self.assertIsInstance(attack_loop.body[0], ast.If)
+        attack_choice_guard = next(
+            node for node in attack_loop.body
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "ZA_mega_choice_input_guard"
+                for call in ast.walk(node.test)))
         self.assertTrue(any(
             isinstance(call, ast.Call)
             and isinstance(call.func, ast.Attribute)
             and call.func.attr == "ZA_mega_choice_input_guard"
-            for call in ast.walk(attack_loop.body[0].test)))
+            for call in ast.walk(attack_choice_guard.test)))
         self.assertEqual(
             [statement.value.func.attr
-             for statement in attack_loop.body[0].body
+             for statement in attack_choice_guard.body
              if isinstance(statement, ast.Expr)
              and isinstance(statement.value, ast.Call)
              and isinstance(statement.value.func, ast.Attribute)][:2],
@@ -11122,8 +14757,10 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             "ZA_mega_mode5_detect_screen_state"]
         mode5_screen_source = ast.unparse(mode5_screen_helper)
         self.assertIn(
-            "False if resume_screen_detected",
+            "not event_attack_picture and (field_hard_detected or "
+            "escape_detected)",
             mode5_screen_source)
+        self.assertIn("not retry_resume_detected", mode5_screen_source)
         self.assertIn("POKEMON_ZA_BATTLE", mode5_screen_source)
         resume_move_gate = next(
             statement for statement in outer_loop.body
@@ -11412,6 +15049,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                             self, "_za_mega_last_battle_mode", False):
                         self._za_mega_mode5_battle_active = True
                         self._za_mega_mode5_start_flag = 4
+                        return self.end_checks >= 3
                     return self.end_checks >= 2
                 if (name == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"
                         and getattr(
@@ -11458,12 +15096,74 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                     "ZA_mega_nonfield_picture_confirmed"](self, picture)
 
             def ZA_mega_choice_input_guard(self):
+                if getattr(self, "_za_mega_last_battle_mode", False):
+                    return False
                 return battle_namespace[
                     "ZA_mega_choice_input_guard"](self)
+
+            def ZA_mega_normal_choice_black_background_reset(self):
+                return battle_namespace[
+                    "ZA_mega_normal_choice_black_background_reset"](self)
+
+            def ZA_mega_normal_choice_black_background_state(self):
+                return battle_namespace[
+                    "ZA_mega_normal_choice_black_background_state"](self)
 
             def ZA_mega_mode5_detect_screen_state(self, nofiled):
                 return battle_namespace[
                     "ZA_mega_mode5_detect_screen_state"](self, nofiled)
+
+            def ZA_mega_mode5_rpush_field_wait_update(
+                    self, *args, **kwargs):
+                return "inactive"
+
+            def ZA_mega_mode5_indefinite_field_wait_update(
+                    self, *args, **kwargs):
+                return "inactive"
+
+            def ZA_mega_mode5_x_menu_b_recovery(self, *args, **kwargs):
+                return "none"
+
+            def ZA_mega_mode5_rpush_prompt_confirmed(self):
+                return False
+
+            def ZA_mega_mode5_begin_rpush_field_wait(
+                    self, *args, **kwargs):
+                return None
+
+            def ZA_mega_mode5_stale_retry_field(self, *args, **kwargs):
+                return False
+
+            def ZA_mega_mode5_no_attack_watchdog(self, *args, **kwargs):
+                return False
+
+            def ZA_mega_mode5_attack_watchdog_reset(self):
+                return None
+
+            def ZA_mega_mode5_note_attack_input(self, *args, **kwargs):
+                return None
+
+            def ZA_mega_mode5_event_lockon_bootstrap(
+                    self, *args, **kwargs):
+                return ""
+
+            def ZA_mega_mode5_begin_resume(self, *args, **kwargs):
+                self._za_mega_mode5_battle_active = True
+                self._za_mega_mode5_start_flag = 4
+
+            def ZA_mega_mode5_green_and_initial_update(
+                    self, *args, **kwargs):
+                return False
+
+            def ZA_mega_mode5_field_w_up_retry(self, *args, **kwargs):
+                return "none"
+
+            def ZA_mega_mode5_rpush_post_field_move_update(
+                    self, *args, **kwargs):
+                return False
+
+            def ZA_mega_mode5_free_run_update(self, *args, **kwargs):
+                return False
 
             def ZA_mega_mode5_event_attack_picture(self, **kwargs):
                 return battle_namespace[
@@ -11534,7 +15234,21 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                     self, *args, **kwargs):
                 return battle_namespace[
                     "ZA_mega_attack_unavailable_y_dodge"](
-                    self, *args, **kwargs)
+                        self, *args, **kwargs)
+
+            def ZA_mega_field_post_attack_roll_if_needed(
+                    self, *args, **kwargs):
+                return battle_namespace[
+                    "ZA_mega_field_post_attack_roll_if_needed"](
+                        self, *args, **kwargs)
+
+            def ZA_mega_field_post_attack_roll_reset(self):
+                return battle_namespace[
+                    "ZA_mega_field_post_attack_roll_reset"](self)
+
+            def ZA_mega_field_y_dodge_suppression_active(self):
+                return battle_namespace[
+                    "ZA_mega_field_y_dodge_suppression_active"](self)
 
             def ZA_battle_missing_field_recovery(self, *args, **kwargs):
                 return battle_namespace[
@@ -11628,15 +15342,15 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         final_cplus = BattleCommand()
         self.assertTrue(battle(
             final_cplus, Aaction=1, Yaction=1, Baction=1, Xaction=1,
-            endpicture="END", last_battle_mode=1, Cplus_attack=1))
+            endpicture="END", last_battle_mode=1, Cplus_attack=1,
+            lockon_rclick=0))
         final_attack_buttons = [
             button for button, _args, _kwargs in final_cplus.pressed_reps
             if button in (Button.A, Button.Y, Button.B, Button.X)]
+        self.assertEqual(len(final_attack_buttons), 10)
         self.assertEqual(
-            final_attack_buttons,
-            [Button.A, Button.Y, Button.B, Button.X,
-             Button.A, Button.Y, Button.B, Button.X,
-             Button.A, Button.Y])
+            set(final_attack_buttons),
+            {Button.A, Button.Y, Button.B, Button.X})
         self.assertEqual(
             len([button for button, _args in final_cplus.pressed
                  if button == Button.PLUS]),
@@ -11653,7 +15367,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertTrue(battle(
             final_without_cplus, Aaction=1, Yaction=1,
             Baction=1, Xaction=1, endpicture="END",
-            last_battle_mode=1, Cplus_attack=1))
+            last_battle_mode=1, Cplus_attack=1, lockon_rclick=0))
         self.assertEqual(
             [button for button, _args, _kwargs
              in final_without_cplus.pressed_reps
@@ -12178,6 +15892,422 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(len(direction_change.input_packets), 1)
         self.assertEqual(direction_change.waits, [])
 
+    def test_za_mega_mode3_attack_only_window_stops_left_stick(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        names = {
+            "ZA_mega_evolution_battle_mode_select",
+            "ZA_mega_evolution_battle",
+            "ZA_mega_field_attack_only_reset",
+            "ZA_mega_field_attack_only_active",
+            "ZA_mega_field_y_dodge_suppression_active",
+            "ZA_mega_field_attack_only_suppress_y_dodge",
+            "ZA_mega_field_attack_only_update",
+            "ZA_mega_field_post_attack_roll_reset",
+            "ZA_mega_field_post_attack_roll_if_needed",
+            "ZA_mega_red_edge_dodge_if_needed",
+            "ZA_MOVE_LStick",
+        }
+        source_functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef) and node.name in names
+        }
+        fragment_functions = {
+            node.name: node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef) and node.name in names
+        }
+        for name in (
+                "ZA_mega_field_attack_only_reset",
+                "ZA_mega_field_attack_only_active",
+                "ZA_mega_field_y_dodge_suppression_active",
+                "ZA_mega_field_attack_only_suppress_y_dodge",
+                "ZA_mega_field_attack_only_update",
+                "ZA_mega_field_post_attack_roll_reset",
+                "ZA_mega_field_post_attack_roll_if_needed",
+                "ZA_MOVE_LStick"):
+            self.assertEqual(
+                normalized_function_ast_dump(source_functions[name]),
+                normalized_function_ast_dump(fragment_functions[name]),
+                name)
+
+        mode_namespace = {}
+        exec(compile(ast.Module(body=[source_functions[
+            "ZA_mega_evolution_battle_mode_select"]], type_ignores=[]),
+            source_path, "exec"), mode_namespace)
+
+        class ModeCommand:
+            def __init__(self):
+                self.calls = []
+
+            def ZA_mega_evolution_battle(self, **kwargs):
+                self.calls.append(kwargs)
+                return True
+
+        mode_command = ModeCommand()
+        self.assertTrue(mode_namespace[
+            "ZA_mega_evolution_battle_mode_select"](
+                mode_command, mode=3))
+        self.assertEqual(
+            mode_command.calls[0]["field_resume_dir5_seconds"], 1.5)
+        self.assertEqual(
+            mode_command.calls[0]["field_resume_attack_only_seconds"], 4.0)
+        self.assertEqual(
+            mode_command.calls[0][
+                "field_resume_post_attack_roll_seconds"], 18.0)
+
+        battle_node = source_functions["ZA_mega_evolution_battle"]
+        defaults = {
+            argument.arg: ast.literal_eval(default)
+            for argument, default in zip(
+                battle_node.args.args[-len(battle_node.args.defaults):],
+                battle_node.args.defaults)
+        }
+        self.assertEqual(defaults["field_resume_attack_only_seconds"], 0.0)
+        self.assertEqual(defaults["field_resume_roll_suppress_seconds"], 2.0)
+        self.assertEqual(
+            defaults["field_resume_post_attack_roll_seconds"], 0.0)
+        self.assertEqual(defaults["red_edge_before_rclick"], 0)
+        self.assertEqual(defaults["lockon_unchecked_a"], 0)
+        self.assertEqual(defaults["choice_black_background_guard"], 0)
+        self.assertEqual(defaults["lockon_unchecked_ay_loop"], 0)
+        self.assertEqual(defaults["red_edge_relock_view_seconds"], 0.0)
+        self.assertEqual(defaults["red_edge_relock_view_strength"], 1.0)
+        self.assertNotIn("dash_before_lockon", defaults)
+        battle_text = ast.unparse(battle_node)
+        self.assertIn(
+            "field_y_dodge_suppress_until = "
+            "self._za_mega_field_dir5_until + field_roll_suppress_seconds",
+            battle_text)
+        self.assertIn(
+            "if field_y_dodge_suppress_until > field_resume_started_at:",
+            battle_text)
+        self.assertNotIn(
+            "if field_roll_suppress_seconds > 0.0 and "
+            "field_y_dodge_suppress_until > field_resume_started_at:",
+            battle_text)
+        attack_loop = next(
+            node for node in ast.walk(battle_node)
+            if isinstance(node, ast.For)
+            and isinstance(node.iter, ast.Call)
+            and node.iter.args
+            and isinstance(node.iter.args[0], ast.Name)
+            and node.iter.args[0].id == "attack_loop_count")
+        attack_only_guard = next(
+            node for node in attack_loop.body
+            if isinstance(node, ast.If)
+            and "callable(attack_only_update)" in ast.unparse(node.test))
+        self.assertFalse(any(
+            isinstance(node, (ast.Break, ast.Continue, ast.Return))
+            for node in ast.walk(attack_only_guard)))
+        post_roll_calls = [
+            node for node in ast.walk(battle_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "ZA_mega_field_post_attack_roll_if_needed"
+        ]
+        self.assertEqual(len(post_roll_calls), 2)
+        attack_loop_lines = (
+            attack_loop.lineno,
+            getattr(attack_loop, "end_lineno", attack_loop.lineno))
+        attack_loop_post_roll_calls = [
+            node for node in post_roll_calls
+            if attack_loop_lines[0] <= node.lineno <= attack_loop_lines[1]
+        ]
+        self.assertEqual(len(attack_loop_post_roll_calls), 1)
+        self.assertLess(
+            attack_only_guard.lineno,
+            attack_loop_post_roll_calls[0].lineno)
+        explicit_continuous_wait_calls = []
+        for node in ast.walk(source_tree):
+            if (not isinstance(node, ast.Call)
+                    or not isinstance(node.func, ast.Attribute)
+                    or node.func.attr != "ZA_mega_red_edge_y_renda"):
+                continue
+            keyword = next((
+                item for item in node.keywords
+                if item.arg == "continuous_wait_seconds"), None)
+            if keyword is not None:
+                explicit_continuous_wait_calls.append((node, keyword))
+        self.assertEqual(len(explicit_continuous_wait_calls), 2)
+        for helper_name in (
+                "ZA_mega_field_post_attack_roll_if_needed",
+                "ZA_mega_red_edge_dodge_if_needed"):
+            helper_nodes = set(ast.walk(source_functions[helper_name]))
+            helper_wait_calls = [
+                (call, keyword)
+                for call, keyword in explicit_continuous_wait_calls
+                if call in helper_nodes
+            ]
+            self.assertEqual(len(helper_wait_calls), 1, helper_name)
+            self.assertEqual(
+                ast.literal_eval(helper_wait_calls[0][1].value), 0.0,
+                helper_name)
+        red_edge_y_renda = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_mega_red_edge_y_renda")
+        red_edge_defaults = {
+            argument.arg: ast.literal_eval(default)
+            for argument, default in zip(
+                red_edge_y_renda.args.args[-len(
+                    red_edge_y_renda.args.defaults):],
+                red_edge_y_renda.args.defaults)
+        }
+        self.assertEqual(
+            red_edge_defaults["continuous_wait_seconds"], 0.1)
+
+        class FakeTime:
+            def __init__(self, now=100.0):
+                self.now = now
+
+            def monotonic(self):
+                return self.now
+
+        fake_time = FakeTime()
+        runtime = {
+            "time": fake_time, "Direction": Direction, "Stick": Stick,
+        }
+        exec(compile(ast.Module(body=[
+            source_functions["ZA_mega_field_attack_only_reset"],
+            source_functions["ZA_mega_field_attack_only_active"],
+            source_functions[
+                "ZA_mega_field_y_dodge_suppression_active"],
+            source_functions[
+                "ZA_mega_field_attack_only_suppress_y_dodge"],
+            source_functions["ZA_mega_field_attack_only_update"],
+            source_functions["ZA_mega_field_post_attack_roll_reset"],
+            source_functions[
+                "ZA_mega_field_post_attack_roll_if_needed"],
+            source_functions["ZA_MOVE_LStick"],
+        ], type_ignores=[]), source_path, "exec"), runtime)
+
+        class MoveCommand:
+            ZA_mega_field_attack_only_reset = runtime[
+                "ZA_mega_field_attack_only_reset"]
+            ZA_mega_field_attack_only_active = runtime[
+                "ZA_mega_field_attack_only_active"]
+            ZA_mega_field_y_dodge_suppression_active = runtime[
+                "ZA_mega_field_y_dodge_suppression_active"]
+            ZA_mega_field_attack_only_suppress_y_dodge = runtime[
+                "ZA_mega_field_attack_only_suppress_y_dodge"]
+            ZA_mega_field_attack_only_update = runtime[
+                "ZA_mega_field_attack_only_update"]
+            ZA_mega_field_post_attack_roll_reset = runtime[
+                "ZA_mega_field_post_attack_roll_reset"]
+            ZA_MOVE_LStick = runtime["ZA_MOVE_LStick"]
+
+            def __init__(self):
+                self.keys = self
+                self.holdButton = []
+                self.released = []
+                self.input_packets = []
+                self._za_mega_rclick_dir3_until = 0.0
+                self._za_mega_dir5 = 90
+                self._za_mega_field_dir5_until = 0.0
+                self._za_mega_field_dir4_until = 0.0
+                for state_name in (
+                        "Lstick_state", "Lstick_state2", "Lstick_state3",
+                        "Lstick_state4", "Lstick_state5",
+                        "Lstick_state_m1", "Lstick_state_m2"):
+                    setattr(self, state_name, 0)
+
+            def input(self, _buttons):
+                self.input_packets.append(tuple(self.holdButton))
+
+            def holdEnd(self, direction):
+                self.released.append(direction)
+                self.holdButton = [
+                    held for held in self.holdButton
+                    if not (isinstance(held, Direction)
+                            and held.stick == Stick.LEFT)
+                ]
+
+        active = MoveCommand()
+        active._za_mega_field_dir5_until = 103.0
+        active._za_mega_field_attack_only_start = 103.0
+        active._za_mega_field_attack_only_until = 111.0
+        active._za_mega_field_y_dodge_suppress_start = 100.0
+        active._za_mega_field_y_dodge_suppress_until = 111.0
+        active._za_mega_field_attack_only_logged = False
+        active._za_mega_field_attack_only_y_dodge_logged = False
+
+        # FIELD復帰前には、既定のY回避を抑止しない。
+        fake_time.now = 99.999
+        self.assertFalse(
+            active.ZA_mega_field_attack_only_suppress_y_dodge())
+
+        class PostRollCommand:
+            ZA_mega_field_attack_only_reset = runtime[
+                "ZA_mega_field_attack_only_reset"]
+            ZA_mega_field_post_attack_roll_reset = runtime[
+                "ZA_mega_field_post_attack_roll_reset"]
+            ZA_mega_field_post_attack_roll_if_needed = runtime[
+                "ZA_mega_field_post_attack_roll_if_needed"]
+
+            def __init__(self):
+                self.actions = []
+                self._za_mega_field_dir5_until = 103.0
+                self._za_mega_field_attack_only_start = 103.0
+                self._za_mega_field_attack_only_until = 111.0
+                self._za_mega_field_attack_only_logged = True
+                self._za_mega_field_y_dodge_suppress_start = 100.0
+                self._za_mega_field_y_dodge_suppress_until = 111.0
+                self._za_mega_field_attack_only_y_dodge_logged = True
+                self._za_mega_field_post_attack_roll_start = 111.0
+                self._za_mega_field_post_attack_roll_seconds = 15.0
+                self._za_mega_field_post_attack_roll_pending = True
+
+            def image_check(self, _picture):
+                return False
+
+            def ZA_mega_choice_input_guard(self):
+                return False
+
+            def ZA_ZL_ACTION(self, action):
+                self.actions.append(("zl", action))
+
+            def ZA_MOVE_SEE(self, action, **kwargs):
+                self.actions.append(("see", action, kwargs.get("in_see_r")))
+
+            def ZA_mega_keep_left_moving(self, *_args):
+                self.actions.append(("left", "resume"))
+
+            def ZA_mega_red_edge_y_renda(self, seconds, **kwargs):
+                self.actions.append((
+                    "y_renda", seconds,
+                    tuple(kwargs.get("interrupt_pictures", ())),
+                    kwargs.get("continuous_wait_seconds")))
+                return "complete"
+
+            def ZA_MOVE_LStick(self, *_args, **_kwargs):
+                self.actions.append(("left", "end"))
+
+        post_roll = PostRollCommand()
+        fake_time.now = 110.999
+        self.assertEqual(
+            post_roll.ZA_mega_field_post_attack_roll_if_needed(
+                20, 0, 40, 0, 0.35), "none")
+        self.assertEqual(post_roll.actions, [])
+        fake_time.now = 111.0
+        with mock.patch("builtins.print"):
+            self.assertEqual(
+                post_roll.ZA_mega_field_post_attack_roll_if_needed(
+                    20, 0, 40, 0, 0.35), "complete")
+        y_action = next(
+            action for action in post_roll.actions if action[0] == "y_renda")
+        self.assertEqual(y_action[1], 15.0)
+        self.assertEqual(y_action[3], 0.0)
+        self.assertTrue({
+            "POKEMON_ZA_FIELD_W",
+            "POKEMON_ZA_TEXT_GREEN_COMMENT",
+            "POKEMON_ZA_1_SELECT",
+            "POKEMON_ZA_2_SELECT_TUTORIAL",
+            "POKEMON_ZA_3_SELECT_SELECT",
+            "POKEMON_ZA_3_SELECT_TUTORIAL",
+            "POKEMON_ZA_4_SELECT",
+        }.issubset(set(y_action[2])))
+        self.assertLess(
+            post_roll.actions.index(("zl", "END")),
+            post_roll.actions.index(("see", "", 0.35)))
+        self.assertLess(
+            post_roll.actions.index(("see", "", 0.35)),
+            post_roll.actions.index(y_action))
+        self.assertLess(
+            post_roll.actions.index(("left", "resume")),
+            post_roll.actions.index(y_action))
+        self.assertFalse(post_roll._za_mega_field_post_attack_roll_pending)
+        action_count = len(post_roll.actions)
+        self.assertEqual(
+            post_roll.ZA_mega_field_post_attack_roll_if_needed(
+                20, 0, 40, 0, 0.35), "none")
+        self.assertEqual(len(post_roll.actions), action_count)
+
+        stale_roll = PostRollCommand()
+        stale_roll._za_mega_field_dir5_until = 0.0
+        self.assertEqual(
+            stale_roll.ZA_mega_field_post_attack_roll_if_needed(
+                20, 0, 40, 0, 0.35), "none")
+        self.assertFalse(stale_roll._za_mega_field_post_attack_roll_pending)
+
+        guarded_roll = PostRollCommand()
+        guarded_roll.image_check = lambda picture: (
+            picture == "POKEMON_ZA_FIELD_W")
+        self.assertEqual(
+            guarded_roll.ZA_mega_field_post_attack_roll_if_needed(
+                20, 0, 40, 0, 0.35), "guard")
+        self.assertEqual(guarded_roll.actions, [])
+        self.assertFalse(guarded_roll._za_mega_field_post_attack_roll_pending)
+
+        # FIELD復帰直後からY回避だけを抑止し、dir5の90度移動は継続する。
+        fake_time.now = 100.0
+        with mock.patch("builtins.print"):
+            self.assertTrue(
+                active.ZA_mega_field_attack_only_suppress_y_dodge())
+        self.assertFalse(active.ZA_mega_field_attack_only_active())
+        active.ZA_MOVE_LStick(20, 0, 40, 0, 3, "RELOAD")
+        left_inputs = [
+            held for held in active.holdButton
+            if isinstance(held, Direction) and held.stick == Stick.LEFT
+        ]
+        self.assertEqual(left_inputs[-1].angle_for_show, 90)
+        self.assertEqual(active.Lstick_state5, 1)
+
+        # dir5期限直前までY回避抑止と90度移動を維持する。
+        fake_time.now = 102.999
+        self.assertTrue(
+            active.ZA_mega_field_attack_only_suppress_y_dodge())
+        self.assertFalse(active.ZA_mega_field_attack_only_active())
+        active.ZA_MOVE_LStick(20, 0, 40, 0, 3, "RELOAD")
+        left_inputs = [
+            held for held in active.holdButton
+            if isinstance(held, Direction) and held.stick == Stick.LEFT
+        ]
+        self.assertEqual(left_inputs[-1].angle_for_show, 90)
+
+        # dir5期限到達時に左スティックを解除し、8秒間は再送しない。
+        fake_time.now = 103.0
+        with mock.patch("builtins.print"):
+            active.ZA_MOVE_LStick(20, 0, 40, 0, 3, "RELOAD")
+        self.assertTrue(active._za_mega_field_attack_only_logged)
+        self.assertTrue(active.ZA_mega_field_attack_only_active())
+        self.assertTrue(
+            active.ZA_mega_field_attack_only_suppress_y_dodge())
+        self.assertTrue(active._za_mega_field_attack_only_y_dodge_logged)
+        self.assertEqual(active.Lstick_state5, 0)
+        self.assertFalse(any(
+            isinstance(held, Direction) and held.stick == Stick.LEFT
+            for held in active.holdButton))
+        fake_time.now = 110.999
+        self.assertTrue(active.ZA_mega_field_attack_only_active())
+        self.assertTrue(
+            active.ZA_mega_field_attack_only_suppress_y_dodge())
+        active.ZA_MOVE_LStick(20, 0, 40, 0, 4, "RELOAD")
+        self.assertFalse(any(
+            isinstance(held, Direction) and held.stick == Stick.LEFT
+            for held in active.holdButton))
+
+        # 111.0秒で停止区間を解除し、通常のdir4移動へ戻る。
+        fake_time.now = 111.0
+        with mock.patch("builtins.print"):
+            active.ZA_MOVE_LStick(20, 0, 40, 0, 4, "RELOAD")
+        left_inputs = [
+            held for held in active.holdButton
+            if isinstance(held, Direction) and held.stick == Stick.LEFT
+        ]
+        self.assertEqual(left_inputs[-1].angle_for_show, 0)
+        self.assertEqual(active._za_mega_field_attack_only_until, 0.0)
+        self.assertFalse(active.ZA_mega_field_attack_only_active())
+        self.assertFalse(
+            active.ZA_mega_field_attack_only_suppress_y_dodge())
+
     def test_za_tower_field_w_battles_send_up_through_battle_mode(self):
         source_path = os.path.join(
             SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
@@ -12303,6 +16433,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 self.selection_visible = not selection_after_lockon
                 self.buttons = []
                 self.lockon_actions = []
+                self.events = []
 
             def image_check(self, name):
                 return (
@@ -12319,6 +16450,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
             def ZA_ZL_ACTION(self, action):
                 self.lockon_actions.append(action)
+                self.events.append(("zl", action))
                 if self.selection_after_lockon and action == "":
                     self.selection_visible = True
 
@@ -12328,6 +16460,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
             def pressRep(self, button, **_kwargs):
                 self.buttons.append(button)
+                self.events.append(("button", button))
 
         for picture in (
                 "POKEMON_ZA_1_SELECT",
@@ -12338,14 +16471,267 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             namespace["ZA_battle_coCp_noloop"](
                 visible_selection, Xaction=1, Aaction=1, Baction=1)
             self.assertEqual(visible_selection.buttons, [Button.A])
-            self.assertEqual(visible_selection.lockon_actions, [])
+            self.assertEqual(visible_selection.lockon_actions, ["END"])
+            self.assertEqual(
+                visible_selection.events,
+                [("zl", "END"), ("button", Button.A)])
 
         selection_after_lockon = SelectionCommand(
             selection_after_lockon=True)
         namespace["ZA_battle_coCp_noloop"](
             selection_after_lockon, Xaction=1, Aaction=1, Baction=1)
         self.assertEqual(selection_after_lockon.buttons, [Button.A])
-        self.assertEqual(selection_after_lockon.lockon_actions, [""])
+        self.assertEqual(
+            selection_after_lockon.lockon_actions, ["", "END"])
+        self.assertEqual(selection_after_lockon.events, [
+            ("zl", ""), ("zl", "END"), ("button", Button.A)])
+
+        keep_lockon_selection = SelectionCommand()
+        namespace["ZA_battle_coCp_noloop"](
+            keep_lockon_selection, Xaction=1, Aaction=1, Baction=1,
+            lockon_endskip=1)
+        self.assertEqual(keep_lockon_selection.buttons, [Button.A])
+        self.assertEqual(keep_lockon_selection.lockon_actions, ["END"])
+        self.assertEqual(
+            keep_lockon_selection.events,
+            [("zl", "END"), ("button", Button.A)])
+
+        battle_move_node = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_battle_move_test")
+        lose_exit_branches = [
+            node for node in ast.walk(battle_move_node)
+            if isinstance(node, ast.If)
+            and "POKEMON_ZA_LOSE" in ast.unparse(node.test)
+            and any(isinstance(child, ast.Return)
+                    for statement in node.body
+                    for child in ast.walk(statement))
+        ]
+        self.assertGreaterEqual(len(lose_exit_branches), 2)
+        for branch in lose_exit_branches:
+            release_calls = [
+                call for call in ast.walk(branch)
+                if isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "ZA_ZL_ACTION"
+                and call.args
+                and isinstance(call.args[0], ast.Constant)
+                and call.args[0].value == "END"
+            ]
+            self.assertTrue(release_calls, ast.unparse(branch.test))
+
+        lockon_test_node = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_battle_lockon_test")
+        lockon_module = ast.Module(body=[lockon_test_node], type_ignores=[])
+        ast.fix_missing_locations(lockon_module)
+        lockon_namespace = {"Button": Button, "time": time}
+        exec(compile(lockon_module, source_path, "exec"), lockon_namespace)
+
+        class LockonExitCommand:
+            def __init__(self, terminal_picture):
+                self.terminal_picture = terminal_picture
+                self.quasar_battle_lockon = 0
+                self.battlemarker_skipcount_threshold = 3
+                self.battlemarker_skipcount = 0
+                self.notargetcount = 0
+                self.no_Cplus = 0
+                self.battle_step = 1
+                self.battle_current_state = "BATTLE_MOVE"
+                self.events = []
+
+            def image_check(self, picture):
+                return picture == self.terminal_picture
+
+            @staticmethod
+            def ZA_infi_attack_ready():
+                return False
+
+            def ZA_MOVE_SEE(self, action):
+                self.events.append(("view", action))
+
+            def ZA_ZL_ACTION(self, action):
+                self.events.append(("zl", action))
+
+            @staticmethod
+            def press(*_args, **_kwargs):
+                return None
+
+        for terminal_picture in (
+                "POKEMON_ZA_REWARD_RESULT",
+                "POKEMON_ZA_LOSE",
+                "POKEMON_ZA_REWORD_END",
+                "POKEMON_ZA_SELECT"):
+            with self.subTest(terminal_picture=terminal_picture):
+                terminal = LockonExitCommand(terminal_picture)
+                lockon_namespace["ZA_battle_lockon_test"](terminal)
+                self.assertIn(("zl", "END"), terminal.events)
+
+    def test_za_view_rotation_release_paths_do_not_leave_right_stick_held(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+
+        view_module = ast.Module(
+            body=[functions["ZA_MOVE_SEE"]], type_ignores=[])
+        ast.fix_missing_locations(view_module)
+        view_namespace = {"Direction": Direction, "Stick": Stick}
+        exec(compile(view_module, source_path, "exec"), view_namespace)
+        view_end = view_namespace["ZA_MOVE_SEE"]
+
+        class ViewCommand:
+            def __init__(self, lockon, attack_ready, no_cplus=0):
+                self.no_Cplus = no_cplus
+                self.notargetcount = 4
+                self.quasar_current_state = "QUASAR_BATTLE_LOOP"
+                self.quasar_battle_lockon = lockon
+                self.Rstick_state = 1
+                self.attack_ready = attack_ready
+                self.events = []
+
+            @staticmethod
+            def ZA_mega_mode5_testmode1_controls_cover():
+                return False
+
+            @staticmethod
+            def image_check(_target):
+                return False
+
+            def ZA_infi_attack_ready(self):
+                return self.attack_ready
+
+            def holdEnd(self, direction):
+                self.events.append(("hold_end", direction))
+
+            def ZA_mega_mode5_marker_search_view_stop(self, relock=False):
+                self.events.append(("marker_stop", relock))
+
+            def wait(self, duration):
+                self.events.append(("wait", duration))
+
+        for label, lockon, attack_ready, no_cplus in (
+                ("lockon_disabled", 0, False, 0),
+                ("attack_ready", 1, True, 0),
+                ("no_cplus", 1, False, 1)):
+            with self.subTest(label=label):
+                command = ViewCommand(lockon, attack_ready, no_cplus)
+                view_end(command, "END")
+                self.assertEqual(command.Rstick_state, 0)
+                self.assertEqual(
+                    [event[0] for event in command.events],
+                    ["hold_end", "marker_stop"])
+                released_direction = command.events[0][1]
+                self.assertEqual(released_direction.stick, Stick.RIGHT)
+                self.assertEqual(released_direction.angle_for_show, 180)
+                self.assertEqual(command.events[1], ("marker_stop", False))
+
+        battle_move = functions["ZA_battle_move_test"]
+        ticket_branch = next(
+            node for node in ast.walk(battle_move)
+            if isinstance(node, ast.If)
+            and "POKEMON_ZA_CHICKET_MAX_RIGHT" in ast.unparse(node.test))
+        direct_calls = []
+        for statement in ticket_branch.body:
+            if (not isinstance(statement, ast.Expr)
+                    or not isinstance(statement.value, ast.Call)
+                    or not isinstance(statement.value.func, ast.Attribute)):
+                continue
+            call = statement.value
+            first_argument = None
+            if (call.args and isinstance(call.args[0], ast.Constant)):
+                first_argument = call.args[0].value
+            direct_calls.append((call.func.attr, first_argument))
+        self.assertEqual(direct_calls[:3], [
+            ("ZA_MOVE_SEE", "END"),
+            ("ZA_ZL_ACTION", "END"),
+            ("pressRep", None),
+        ])
+        battle_return_index = next(
+            index for index, statement in enumerate(ticket_branch.body)
+            if isinstance(statement, ast.Return)
+            and isinstance(statement.value, ast.Constant)
+            and statement.value.value == "BATTLE_START")
+        cleanup_call_indices = [
+            index for index, statement in enumerate(ticket_branch.body)
+            if (isinstance(statement, ast.Expr)
+                and isinstance(statement.value, ast.Call)
+                and isinstance(statement.value.func, ast.Attribute)
+                and statement.value.func.attr in {
+                    "ZA_MOVE_SEE", "ZA_ZL_ACTION", "pressRep"})
+        ]
+        self.assertEqual(len(cleanup_call_indices), 3)
+        self.assertTrue(all(
+            index < battle_return_index for index in cleanup_call_indices))
+
+        class FakeTime:
+            values = iter((0.0, 1.0, 2.0, 3.0, 4.0, 21.0))
+
+            @classmethod
+            def perf_counter(cls):
+                return next(cls.values)
+
+            @staticmethod
+            def sleep(_duration):
+                return None
+
+        lockon_module = ast.Module(
+            body=[functions["ZA_battle_lockon_test"]], type_ignores=[])
+        ast.fix_missing_locations(lockon_module)
+        lockon_namespace = {
+            "Button": Button,
+            "Direction": Direction,
+            "Stick": Stick,
+            "time": FakeTime,
+        }
+        exec(compile(lockon_module, source_path, "exec"), lockon_namespace)
+
+        class TimeoutCommand:
+            def __init__(self):
+                self.quasar_battle_lockon = 0
+                self.battlemarker_skipcount_threshold = 3
+                self.battlemarker_skipcount = 0
+                self.notargetcount = 0
+                self.no_Cplus = 0
+                self.battle_step = 1
+                self.battle_current_state = "QUASAR_BATTLE_LOOP"
+                self.quasar_current_state = "QUASAR_BATTLE_LOOP"
+                self.Rstick_state = 0
+                self.events = []
+
+            @staticmethod
+            def image_check(target):
+                return target == "POKEMON_ZA_ESCAPE"
+
+            @staticmethod
+            def ZA_infi_attack_ready():
+                return False
+
+            def ZA_infi_relock_toward_marker(self):
+                self.events.append(("relock",))
+
+            def ZA_MOVE_SEE(self, action):
+                self.events.append(("view", action))
+
+            def ZA_ZL_ACTION(self, action):
+                self.events.append(("zl", action))
+
+            def press(self, *args, **kwargs):
+                self.events.append(("press", args, kwargs))
+
+        timeout = TimeoutCommand()
+        lockon_namespace["ZA_battle_lockon_test"](timeout)
+        view_events = [
+            event for event in timeout.events if event[0] == "view"]
+        self.assertEqual(view_events, [("view", ""), ("view", "END")])
+        self.assertFalse(any(event[0] == "zl" for event in timeout.events))
 
     def test_za_mega_common_battle_handles_field_w_up(self):
         source_path = os.path.join(
@@ -12539,15 +16925,24 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         with open(fragment_path, "r", encoding="utf-8") as stream:
             fragment_tree = ast.parse(stream.read())
         helper_name = "ZA_mega_mode5_field_w_up_retry"
-        source_helper = next(
-            node for node in ast.walk(source_tree)
-            if isinstance(node, ast.FunctionDef) and node.name == helper_name)
-        fragment_helper = next(
-            node for node in ast.walk(fragment_tree)
-            if isinstance(node, ast.FunctionDef) and node.name == helper_name)
-        self.assertEqual(
-            normalized_function_ast_dump(source_helper),
-            normalized_function_ast_dump(fragment_helper))
+        helper_names = (
+            "ZA_mega_mode5_x_menu_b_recovery",
+            helper_name,
+        )
+        source_helpers = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in helper_names
+        }
+        fragment_helpers = {
+            node.name: node for node in ast.walk(fragment_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name in helper_names
+        }
+        for name in helper_names:
+            self.assertEqual(
+                normalized_function_ast_dump(source_helpers[name]),
+                normalized_function_ast_dump(fragment_helpers[name]))
 
         class FakeTime:
             now = 0.0
@@ -12558,7 +16953,8 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
         namespace = {"time": FakeTime, "Button": Button}
         exec(compile(ast.Module(
-            body=[source_helper], type_ignores=[]),
+            body=[source_helpers[name] for name in helper_names],
+            type_ignores=[]),
             source_path, "exec"), namespace)
         retry = namespace[helper_name]
 
@@ -12620,6 +17016,13 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             def ZA_mega_mode5_set_start_flag(
                     self, value, detection, reason):
                 self.start_flags.append((value, detection, reason))
+
+            def ZA_mega_mode5_x_menu_b_recovery(self, *args, **kwargs):
+                return namespace["ZA_mega_mode5_x_menu_b_recovery"](
+                    self, *args, **kwargs)
+
+            def ZA_mega_mode5_trace(self, *args, **kwargs):
+                return None
 
             def checkIfAlive(self):
                 return None
@@ -12699,20 +17102,21 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             if isinstance(node, ast.If)
             and "field_w_action == 'menu_recovery'" in ast.unparse(node.test)
         ]
-        self.assertEqual(len(recovery_guards), 2)
+        self.assertEqual(len(recovery_guards), 3)
         self.assertTrue(all(
             len(node.body) == 1 and isinstance(node.body[0], ast.Continue)
             for node in recovery_guards))
 
-        # 開始時と戦闘中の両方で、FIELD_W中は上入力再送を優先し、
-        # 同じ周回のロックオン・移動・攻撃へ進めない。
+        # 再戦待ち・開始フラグ3・戦闘中フラグ4のすべてで、固有4技がない
+        # FIELD_W中はHARD FIELD／Escapeが同時一致しても上入力を優先し、
+        # 同じ周回の移動・通常攻撃へ進めない。
         field_w_priority_guards = [
             node for node in ast.walk(mega_battle)
             if isinstance(node, ast.If)
-            and ast.unparse(node.test) == "field_w_detected"
-            and "ZA_mega_mode5_field_w_up_retry" in ast.unparse(node)
+            and "field_w_detected" in ast.unparse(node.test)
+            and "ZA_mega_mode5_field_w_up_retry(True, False" in ast.unparse(node)
         ]
-        self.assertEqual(len(field_w_priority_guards), 2)
+        self.assertEqual(len(field_w_priority_guards), 3)
         self.assertTrue(all(
             any(isinstance(statement, ast.Continue)
                 for statement in node.body)
@@ -12723,11 +17127,261 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertIn(
             "ZA_mega_mode5_field_w_up_retry(True, False",
             ast.unparse(battle_field_guard))
+        self.assertTrue(all(
+            "field_hard" not in ast.unparse(node.test)
+            for node in field_w_priority_guards))
+        self.assertTrue(all(
+            "mode5_screen['escape']" not in ast.unparse(node.test)
+            for node in field_w_priority_guards))
+        # 再戦待ちはnofiled=1とstale nofiled=0の両方で、
+        # 状態遷移なしのFIELD_W上入力だけを先に行う。
+        retry_wait_guard = next(
+            node for node in ast.walk(mega_battle)
+            if isinstance(node, ast.If)
+            and "mode5_retry_field_input_wait" in ast.unparse(node.test)
+            and "retry wait; Lbutton_up only" in ast.unparse(node))
+        retry_wait_source = ast.unparse(retry_wait_guard)
+        self.assertIn("mode5_retry_field_input_wait", retry_wait_source)
+        self.assertIn("not choice_input_guard", retry_wait_source)
+        self.assertIn("not event_attack_picture", retry_wait_source)
+        self.assertNotIn("mode5_screen['field_hard']", retry_wait_source)
+        self.assertNotIn("mode5_screen['escape']", retry_wait_source)
+        self.assertIn(
+            "ZA_mega_mode5_field_w_up_retry(False, True)",
+            retry_wait_source)
+        self.assertNotIn("ZA_mega_mode5_begin_resume", retry_wait_source)
+        self.assertTrue(any(
+            isinstance(node, ast.Continue)
+            for node in ast.walk(retry_wait_guard)))
+        retry_wait_assignment = next(
+            node for node in ast.walk(mega_battle)
+            if isinstance(node, ast.Assign)
+            and any(isinstance(target, ast.Name)
+                    and target.id == "mode5_retry_field_input_wait"
+                    for target in node.targets))
+        retry_wait_assignment_source = ast.unparse(retry_wait_assignment.value)
+        self.assertIn("nofiled == 1", retry_wait_assignment_source)
+        self.assertIn("_za_mega_mode5_start_flag", retry_wait_assignment_source)
+        self.assertIn("'RETRY_SELECTION'", retry_wait_assignment_source)
 
         # mode 5以外には再送処理を適用しない。
         non_mode5 = Command(mode5=False)
         self.assertFalse(retry(non_mode5, True, False))
         self.assertEqual(non_mode5.commands, [])
+
+    def test_za_mega_mode5_field_w_wait_runs_real_up_without_resume(self):
+        from Commands.Keys import Button, Direction, Hat, Stick
+
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        source_functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)}
+        namespace = {
+            "time": time,
+            "Button": Button,
+            "Direction": Direction,
+            "Hat": Hat,
+            "Stick": Stick,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[
+                source_functions["ZA_mega_mode5_field_w_up_retry"],
+                source_functions["ZA_mega_evolution_battle"],
+            ],
+            type_ignores=[])), source_path, "exec"), namespace)
+        battle = namespace["ZA_mega_evolution_battle"]
+
+        class StopLoop(Exception):
+            pass
+
+        base_screen = {
+            "field_w": False,
+            "field_back_w": False,
+            "field_hard": False,
+            "field_screen": False,
+            "escape": False,
+            "green_resume": False,
+            "battle_screen": False,
+            "event_attack_picture": "",
+            "resume_screen": False,
+            "retry_resume": False,
+            "choice_guard": False,
+            "defeat_background_prompt": False,
+            "normal_black_comment": False,
+            "resume_reason": "none",
+        }
+
+        class Keys:
+            def __init__(self, owner):
+                self.owner = owner
+
+            def input(self, value):
+                self.owner.calls.append(("keys", value))
+
+        class Command:
+            def __init__(self, **screen):
+                self.screen = dict(base_screen, **screen)
+                self.calls = []
+                self.keys = Keys(self)
+                self.loop_count = 0
+                self.ZL_state = 0
+
+            def __getattr__(self, name):
+                if name.startswith("ZA_"):
+                    return lambda *args, **kwargs: False
+                raise AttributeError(name)
+
+            def ZA_mega_mode5_set_start_flag(
+                    self, value, _detection, _reason):
+                self._za_mega_mode5_start_flag = value
+                self.calls.append(("flag", value))
+
+            def ZA_mega_mode5_attack_watchdog_reset(self):
+                return None
+
+            def ZA_mega_mode5_rpush_field_wait_update(self, *_args):
+                self.loop_count += 1
+                if self.loop_count > 1:
+                    raise StopLoop
+                return "inactive"
+
+            def ZA_mega_mode5_rpush_prompt_confirmed(self):
+                return False
+
+            def ZA_mega_mode5_detect_screen_state(self, _nofiled):
+                return self.screen
+
+            def ZA_mega_mode5_trace(self, *args, **_kwargs):
+                self.calls.append(("trace", args))
+
+            def ZA_mega_mode5_field_w_up_retry(self, *args, **kwargs):
+                self.calls.append(("field_retry", args))
+                return namespace["ZA_mega_mode5_field_w_up_retry"](
+                    self, *args, **kwargs)
+
+            def ZA_mega_mode5_stale_retry_field(self, *_args):
+                return False
+
+            def ZA_mega_mode5_no_attack_watchdog(self, *_args):
+                return False
+
+            def ZA_mega_mode5_event_lockon_bootstrap(
+                    self, *_args, **_kwargs):
+                return ""
+
+            def ZA_mega_mode5_event_attack_axby(self, picture, *_args):
+                self.calls.append(("fixed4", picture))
+                raise StopLoop
+
+            def ZA_mega_mode5_begin_resume(self, *args):
+                self.calls.append(("resume", args))
+                raise StopLoop
+
+            def etc_sendCommand(self, *args, **kwargs):
+                self.calls.append(("serial", args, kwargs))
+
+            def wait(self, value):
+                self.calls.append(("wait", value))
+
+            def image_check(self, _name):
+                return False
+
+        def run_one_cycle(**screen):
+            command = Command(**screen)
+            with self.assertRaises(StopLoop):
+                battle(command, last_battle_mode=1, testmode1=1)
+            return command
+
+        field_w = run_one_cycle(
+            field_w=True,
+            field_screen=True,
+            resume_screen=True,
+            resume_reason="field_w")
+        self.assertIn(
+            ("serial", ("Lbutton_up",), {"wait": 0.10}),
+            field_w.calls)
+        self.assertIn(("keys", []), field_w.calls)
+        self.assertTrue(any(
+            call[0] == "field_retry" for call in field_w.calls))
+        self.assertFalse(any(
+            call[0] == "resume" for call in field_w.calls))
+
+        fixed4 = run_one_cycle(
+            field_w=True,
+            field_hard=True,
+            field_screen=True,
+            escape=True,
+            retry_resume=True,
+            resume_screen=True,
+            event_attack_picture="POKEMON_ZA_LAST_BATTLE_MOVE_UI",
+            resume_reason="event_attack")
+        self.assertIn(
+            ("fixed4", "POKEMON_ZA_LAST_BATTLE_MOVE_UI"),
+            fixed4.calls)
+        self.assertFalse(any(
+            call[0] in {"field_retry", "resume"}
+            for call in fixed4.calls))
+
+        # HARD FIELDは正常なFIELD_Wと同時一致するため、FIELD_Wの上入力を
+        # 先に送る。FIELD_Wが消えた次周回のHARD FIELDで再戦初期化する。
+        hard_with_field_w = run_one_cycle(
+            field_w=True,
+            field_hard=True,
+            field_screen=True,
+            resume_screen=True,
+            retry_resume=True,
+            resume_reason="hard-field")
+        self.assertIn(
+            ("serial", ("Lbutton_up",), {"wait": 0.10}),
+            hard_with_field_w.calls)
+        self.assertTrue(any(
+            call[0] == "field_retry" for call in hard_with_field_w.calls))
+        self.assertFalse(any(
+            call[0] == "resume" for call in hard_with_field_w.calls))
+
+        hard_without_field_w = run_one_cycle(
+            field_hard=True,
+            field_screen=True,
+            resume_screen=True,
+            retry_resume=True,
+            resume_reason="hard-field")
+        self.assertTrue(any(
+            call[0] == "resume" for call in hard_without_field_w.calls))
+        self.assertFalse(any(
+            call[0] == "field_retry" for call in hard_without_field_w.calls))
+
+        # Escapeアイコンは正常な戦闘画面でもFIELD_Wと共存するため、
+        # FIELD_Wがある場合は既存の上入力を先に送る。
+        escape_with_field_w = run_one_cycle(
+            field_w=True,
+            field_hard=True,
+            field_screen=True,
+            escape=True,
+            resume_screen=True,
+            retry_resume=True,
+            resume_reason="escape")
+        self.assertIn(
+            ("serial", ("Lbutton_up",), {"wait": 0.10}),
+            escape_with_field_w.calls)
+        self.assertTrue(any(
+            call[0] == "field_retry" for call in escape_with_field_w.calls))
+        self.assertFalse(any(
+            call[0] == "resume" for call in escape_with_field_w.calls))
+
+        # FIELD_WがないEscape単独画面は従来どおり再戦初期化へ進む。
+        escape_without_field_w = run_one_cycle(
+            escape=True,
+            resume_screen=True,
+            retry_resume=True,
+            resume_reason="escape")
+        self.assertTrue(any(
+            call[0] == "resume" for call in escape_without_field_w.calls))
+        self.assertFalse(any(
+            call[0] == "field_retry" for call in escape_without_field_w.calls))
 
     def test_za_field_reach_checks_use_no_battle_hard_guard(self):
         source_path = os.path.join(
@@ -12753,6 +17407,10 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             node for node in ast.walk(tree)
             if isinstance(node, ast.FunctionDef)
             and node.name == "ZA_mega_mode5_detect_screen_state")
+        mega_indefinite_wait = next(
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_mega_mode5_indefinite_field_wait_update")
         source_lines = source.splitlines(keepends=True)
         audited_source = "".join(
             source_lines[:protected.lineno - 1]
@@ -12787,6 +17445,12 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                     <= mega_detect_screen.end_lineno):
                 # mode 5専用画面判定へ共通関数内の優先検知を移しただけで、
                 # FIELD到達判定として流用する箇所ではない。
+                continue
+            if (node.args[0].value == "POKEMON_ZA_FIELD_BACK_W"
+                    and mega_indefinite_wait.lineno <= node.lineno
+                    <= mega_indefinite_wait.end_lineno):
+                # mode 5の無期限FIELD待機を解除する割込み検知であり、
+                # FIELD到達判定の代用ではない。
                 continue
             self.assertIn(
                 "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
@@ -12846,6 +17510,11 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 node for node in ast.walk(fragment_tree)
                 if isinstance(node, ast.FunctionDef)
                 and node.name == "ZA_mega_mode5_detect_screen_state"), None)
+            fragment_mega_indefinite_wait = next((
+                node for node in ast.walk(fragment_tree)
+                if isinstance(node, ast.FunctionDef)
+                and node.name == "ZA_mega_mode5_indefinite_field_wait_update"),
+                None)
             fragment_protected = next((
                 node for node in ast.walk(fragment_tree)
                 if isinstance(node, ast.FunctionDef)
@@ -12875,6 +17544,11 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                         and fragment_mega_detect_screen is not None
                         and fragment_mega_detect_screen.lineno <= node.lineno
                         <= fragment_mega_detect_screen.end_lineno):
+                    continue
+                if (node.args[0].value == "POKEMON_ZA_FIELD_BACK_W"
+                        and fragment_mega_indefinite_wait is not None
+                        and fragment_mega_indefinite_wait.lineno <= node.lineno
+                        <= fragment_mega_indefinite_wait.end_lineno):
                     continue
                 self.assertIn(
                     "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
@@ -13075,9 +17749,9 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
         variants = library["targets"]["POKEMON_ZA_ESCAPE"]["variants"]
         expected_paths = {
-            "Template/ZA_Story/Common/escape_full_normal.png",
-            "Template/ZA_Story/Common/escape_full_thin_red.png",
-            "Template/ZA_Story/Common/escape_full_red.png",
+            "Template/ZA_Story_PIC/Common/escape_full_normal.png",
+            "Template/ZA_Story_PIC/Common/escape_full_thin_red.png",
+            "Template/ZA_Story_PIC/Common/escape_full_red.png",
         }
         full_icon_variants = [
             variant for variant in variants
@@ -13143,8 +17817,9 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             def image_check(self, name):
                 return name in self.matched
 
-            def ZA_story_Template_Comment_Out(self):
+            def ZA_story_Template_Comment_Out(self, **kwargs):
                 self.comment_calls += 1
+                self.comment_options = kwargs
                 return self.comment_out
 
             def press(self, direction, **kwargs):
@@ -13178,6 +17853,8 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             namespace["_2_story_absol_move2"](white_comment),
             "2_STORY_ABSOL_BATTLE")
         self.assertEqual(white_comment.comment_calls, 1)
+        self.assertEqual(
+            white_comment.comment_options, {"timeout_seconds": 600.0})
 
     def test_za_absol_mega_battle_requires_name_before_white_end(self):
         source_path = os.path.join(
@@ -13238,6 +17915,12 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
             def ZA_mega_choice_input_guard(self):
                 return False
+
+            def ZA_mega_normal_choice_black_background_reset(self):
+                self._za_mega_normal_choice_black_background_since = 0.0
+                self._za_mega_normal_choice_black_background_state = "none"
+                self._za_mega_normal_choice_black_background_retry_at = 0.0
+                self._za_mega_normal_choice_black_background_logged = False
 
             def ZA_ZL_ACTION(self, action):
                 self.actions.append(("zl", action))
@@ -14020,7 +18703,8 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 return name in self.matched
 
             def ZA_markerdir(
-                    self, marker_type, search_mode=0, nofiled=False):
+                    self, marker_type, search_mode=0, nofiled=False,
+                    **_kwargs):
                 self.marker_calls.append(
                     (marker_type, search_mode, nofiled))
                 return self.marker_centered
@@ -14036,6 +18720,9 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             def wait(self, duration):
                 self.waits.append(duration)
 
+            def ZA_battle_Cp_loop(self, **_kwargs):
+                self.actions.append("battle_loop")
+
             @staticmethod
             def checkIfAlive():
                 return None
@@ -14045,13 +18732,20 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         battle = namespace[
             "ZA_story_Template_battle_function_active_level"]
 
-        for matched in (set(), {"POKEMON_ZA_X_MENU_OPEN"}):
-            default_b = Command(matched)
-            self.assertEqual(before(
-                default_b,
-                noprg_ret="BEFORE", prg_ret="BATTLE",
-                battle_flow_key="DEFAULT_B"), "BEFORE")
-            self.assertEqual(default_b.buttons, [Button.B])
+        no_picture = Command()
+        self.assertEqual(before(
+            no_picture,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="NO_PICTURE"), "BEFORE")
+        self.assertEqual(no_picture.buttons, [])
+        self.assertEqual(no_picture.waits, [])
+
+        x_menu = Command({"POKEMON_ZA_X_MENU_OPEN"})
+        self.assertEqual(before(
+            x_menu,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="X_MENU"), "BEFORE")
+        self.assertEqual(x_menu.buttons, [Button.B])
 
         class LateSelectionCommand(Command):
             def __init__(self):
@@ -14066,6 +18760,12 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 return super().image_check(name)
 
         late_selection = LateSelectionCommand()
+        self.assertEqual(before(
+            late_selection,
+            noprg_ret="BEFORE", prg_ret="BATTLE",
+            battle_flow_key="LATE_SELECTION"), "BEFORE")
+        self.assertEqual(late_selection.buttons, [])
+        # 全不一致周期では即時無入力とし、次のStep周期でSELECTを拾う。
         self.assertEqual(before(
             late_selection,
             noprg_ret="BEFORE", prg_ret="BATTLE",
@@ -14127,17 +18827,19 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             noprg_ret="BATTLE"), "BEFORE")
         self.assertEqual(battle_field_selection.buttons, [])
 
-        battle_active_field_selection = Command({
+        battle_active_field_false_select = Command({
             "POKEMON_ZA_BATTLE_ACTIVE_LEVEL",
             "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
             "POKEMON_ZA_2_SELECT",
         })
         self.assertEqual(battle(
-            battle_active_field_selection,
+            battle_active_field_false_select,
             bkprg_ret="BEFORE", prg_ret="AFTER",
             noprg_ret="BATTLE"), "BATTLE")
         self.assertEqual(
-            battle_active_field_selection.buttons, [Button.A])
+            battle_active_field_false_select.buttons, [])
+        self.assertIn(
+            "battle_loop", battle_active_field_false_select.actions)
 
         completion = Command({"POKEMON_ZA_MISSION_COMPLETE"})
         self.assertEqual(before(
@@ -14691,6 +19393,23 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertFalse(active_state["result_seen"])
         self.assertEqual(active_level.buttons, [])
 
+        # Switch No2のGURI_116実録画では、戦闘中のFIELD誤一致と同時に
+        # ESCAPEが明確に成立した。戦闘表示をFIELDより優先して115へ戻す。
+        for battle_picture in (
+                "POKEMON_ZA_BATTLE_BALL_CHECK", "POKEMON_ZA_ESCAPE"):
+            battle_over_field = Command({
+                battle_picture,
+                "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+            })
+            self.assertEqual(battle_after(
+                battle_over_field,
+                bkprg_ret="7_STORY_GURI_115",
+                prg_ret="7_STORY_GURI_117",
+                battle_flow_key="GURI_116_{}".format(battle_picture),
+                guri_select_defeat_state="7_STORY_GURI_116"),
+                "7_STORY_GURI_115")
+            self.assertEqual(battle_over_field.buttons, [])
+
         black_defeat = Command(
             {"POKEMON_ZA_TEXT_BLACK_COMMENT"}, [field])
         self.assertEqual(battle_after(
@@ -14743,6 +19462,710 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             bkprg_ret="BATTLE", prg_ret="NEXT"), "NEXT")
         self.assertEqual(black_dialogue.buttons, [Button.B])
 
+    def test_za_guri_116_battle_picture_beats_field_collision(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        selected = [functions[name] for name in (
+            "_ZA_story_battle_flow_state",
+            "_ZA_story_battle_flow_mark",
+            "_ZA_story_battle_flow_reset",
+            "_ZA_story_battle_after_safe_renda",
+            "ZA_story_Template_battle_after_renda_route",
+        )]
+        namespace = {"Button": Button}
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=selected, type_ignores=[])), source_path, "exec"), namespace)
+
+        class Command:
+            _ZA_story_battle_flow_state = namespace[
+                "_ZA_story_battle_flow_state"]
+            _ZA_story_battle_flow_mark = namespace[
+                "_ZA_story_battle_flow_mark"]
+            _ZA_story_battle_flow_reset = namespace[
+                "_ZA_story_battle_flow_reset"]
+            _ZA_story_battle_after_safe_renda = namespace[
+                "_ZA_story_battle_after_safe_renda"]
+
+            def __init__(self, battle_picture):
+                self.matched = {
+                    battle_picture,
+                    "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+                }
+                self.buttons = []
+
+            def image_check(self, name):
+                return name in self.matched
+
+            def checkIfAlive(self):
+                return None
+
+            def pressRep(self, button, **_kwargs):
+                self.buttons.append(button)
+
+            def wait(self, _duration):
+                return None
+
+            def etc_sendCommand(self, _command):
+                return None
+
+        battle_after = namespace[
+            "ZA_story_Template_battle_after_renda_route"]
+        for battle_picture in (
+                "POKEMON_ZA_BATTLE_BALL_CHECK", "POKEMON_ZA_ESCAPE"):
+            command = Command(battle_picture)
+            self.assertEqual(battle_after(
+                command,
+                bkprg_ret="7_STORY_GURI_115",
+                prg_ret="7_STORY_GURI_117",
+                battle_flow_key="7_STORY_GURI_115",
+                guri_select_defeat_state="7_STORY_GURI_116"),
+                "7_STORY_GURI_115")
+            self.assertEqual(command.buttons, [])
+
+    def test_guri_114_116_select_defeat_recovery_counts_three_total(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+        selected = [functions[name] for name in (
+            "_ZA_story_battle_flow_state",
+            "_ZA_story_battle_flow_mark",
+            "_ZA_story_battle_flow_reset",
+            "_ZA_story_guri_select_defeat_reset",
+            "_ZA_story_guri_defeat_recovery_reserve",
+            "_ZA_story_guri_select_defeat_observe",
+            "ZA_story_furadari_section_recovery_step",
+            "ZA_story_furadari_black_comment_recovery_step",
+            "_ZA_story_battle_before_safe_renda_once",
+            "ZA_story_Template_battle_before_renda_route",
+            "_ZA_story_battle_after_safe_renda",
+            "ZA_story_Template_battle_after_renda_route",
+        )]
+        module = ast.fix_missing_locations(ast.Module(
+            body=selected, type_ignores=[]))
+        namespace = {"Button": Button, "time": time}
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            ZA_STORY_GURI_SELECT_DEFEAT_PICTURES = frozenset({
+                "POKEMON_ZA_2_SELECT",
+                "POKEMON_ZA_3_SELECT",
+                "POKEMON_ZA_4_SELECT",
+            })
+            ZA_STORY_GURI_SELECT_DEFEAT_LIMIT = 3
+            ZA_STORY_GURI_SELECT_DEFEAT_TARGET = "7_STORY_GURI_108"
+            _ZA_story_battle_flow_state = namespace[
+                "_ZA_story_battle_flow_state"]
+            _ZA_story_battle_flow_mark = namespace[
+                "_ZA_story_battle_flow_mark"]
+            _ZA_story_battle_flow_reset = namespace[
+                "_ZA_story_battle_flow_reset"]
+            _ZA_story_guri_select_defeat_reset = namespace[
+                "_ZA_story_guri_select_defeat_reset"]
+            _ZA_story_guri_defeat_recovery_reserve = namespace[
+                "_ZA_story_guri_defeat_recovery_reserve"]
+            _ZA_story_guri_select_defeat_observe = namespace[
+                "_ZA_story_guri_select_defeat_observe"]
+            ZA_story_furadari_section_recovery_step = namespace[
+                "ZA_story_furadari_section_recovery_step"]
+            ZA_story_furadari_black_comment_recovery_step = namespace[
+                "ZA_story_furadari_black_comment_recovery_step"]
+            _ZA_story_battle_before_safe_renda_once = namespace[
+                "_ZA_story_battle_before_safe_renda_once"]
+            _ZA_story_battle_after_safe_renda = namespace[
+                "_ZA_story_battle_after_safe_renda"]
+
+            def __init__(self):
+                self.matched = set()
+                self.buttons = []
+                self.Common_current_state = "COMMON_GOTO_SELECT2"
+                self.map_cursor_reset = 9
+
+            def image_check(self, name):
+                return name in self.matched
+
+            def checkIfAlive(self):
+                return None
+
+            def pressRep(self, button, **_kwargs):
+                self.buttons.append(button)
+
+            def wait(self, _duration):
+                return None
+
+            def etc_sendCommand(self, _command):
+                return None
+
+            def ZA_Common_goto(self, *_args, **_kwargs):
+                return "START"
+
+        battle_before = namespace[
+            "ZA_story_Template_battle_before_renda_route"]
+        battle_after = namespace[
+            "ZA_story_Template_battle_after_renda_route"]
+        command = Command()
+
+        # 114で1回目を数え、非対象の1_SELECTを挟んでも累計を保持する。
+        command.matched = {"POKEMON_ZA_2_SELECT"}
+        self.assertEqual(battle_before(
+            command,
+            noprg_ret="7_STORY_GURI_114",
+            prg_ret="7_STORY_GURI_115",
+            green_check=1,
+            rebattle=0,
+            guri_select_defeat_state="7_STORY_GURI_114"),
+            "7_STORY_GURI_114")
+        self.assertEqual(command._za_story_guri_select_defeat_count, 1)
+        self.assertIsNone(command._ZA_story_guri_select_defeat_observe(
+            "7_STORY_GURI_114", "POKEMON_ZA_1_SELECT"))
+        self.assertEqual(command._za_story_guri_select_defeat_count, 1)
+
+        # 116の内部連打も各SELECTで外側Stepへ戻り、114との共有合計を
+        # 2回、3回へ進める。3回目だけ既存FURADARI敗戦復旧を予約する。
+        command.matched = {"POKEMON_ZA_3_SELECT"}
+        self.assertEqual(battle_after(
+            command,
+            bkprg_ret="7_STORY_GURI_115",
+            prg_ret="7_STORY_GURI_117",
+            guri_select_defeat_state="7_STORY_GURI_116"),
+            "7_STORY_GURI_116")
+        self.assertEqual(command._za_story_guri_select_defeat_count, 2)
+        self.assertFalse(hasattr(command, "_za_furadari_black_recovery"))
+
+        command.matched = {"POKEMON_ZA_4_SELECT"}
+        self.assertEqual(battle_after(
+            command,
+            bkprg_ret="7_STORY_GURI_115",
+            prg_ret="7_STORY_GURI_117",
+            guri_select_defeat_state="7_STORY_GURI_116"),
+            "7_STORY_GURI_116")
+        self.assertEqual(command._za_story_guri_select_defeat_count, 0)
+        recovery = command._za_furadari_black_recovery
+        self.assertEqual(recovery["recovery_target"], "7_STORY_GURI_108")
+        self.assertEqual(recovery["holding_state"], "7_STORY_GURI_116")
+        self.assertEqual(recovery["phase"], "WAIT_GURI_OUTCOME")
+        self.assertEqual(recovery["origin_state"], "7_STORY_GURI_116")
+        self.assertFalse(recovery["black_comment_confirmed"])
+        self.assertIs(recovery["close_button"], Button.B)
+        self.assertEqual(command.Common_current_state, "COMMON_START")
+        self.assertEqual(command.map_cursor_reset, 0)
+        self.assertNotIn(
+            "7_STORY_GURI_115",
+            getattr(command, "_za_story_battle_flows", {}))
+        self.assertEqual(command.buttons, [Button.A, Button.A, Button.A])
+        self.assertEqual(
+            command.ZA_story_furadari_section_recovery_step(
+                "7_STORY_GURI_116", "7_STORY_GURI_116"),
+            "7_STORY_GURI_116")
+        self.assertIsNone(command._za_furadari_section_recovery_state)
+
+        # SELECT累計後に黒Comment未確認のFIELDが見えた場合は誤復旧と
+        # 判断し、FURADARI_MAPへ移動せず復旧元116へ戻す。
+        command.matched = {"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_0"}
+        state_functions = {"7_STORY_GURI_108": lambda: None}
+        self.assertEqual(
+            command.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_116", state_functions),
+            "7_STORY_GURI_116")
+        self.assertIsNone(command._za_furadari_black_recovery)
+        self.assertIsNone(
+            command._za_furadari_eyes_dark_recovery_lock_state)
+        self.assertEqual(command.buttons, [Button.A, Button.A, Button.A])
+
+        # 黒Comment画面でSELECTが重なっても累計へ加算しない。
+        black_select = Command()
+        black_select.matched = {
+            "POKEMON_ZA_TEXT_BLACK_COMMENT",
+            "POKEMON_ZA_2_SELECT",
+        }
+        self.assertEqual(battle_before(
+            black_select,
+            noprg_ret="7_STORY_GURI_114",
+            prg_ret="7_STORY_GURI_115",
+            green_check=1,
+            rebattle=0,
+            guri_select_defeat_state="7_STORY_GURI_114"),
+            "7_STORY_GURI_114")
+        self.assertEqual(black_select.buttons, [Button.B])
+        self.assertEqual(
+            getattr(black_select, "_za_story_guri_select_defeat_count", 0),
+            0)
+
+        # 累計直前の二重ガードでもFIELD／Lv／黒Commentを拒否する。
+        for blocker in (
+                "POKEMON_ZA_FIELD_W",
+                "POKEMON_ZA_FIELD_BACK_W",
+                "POKEMON_ZA_BATTLE_ACTIVE_LEVEL",
+                "POKEMON_ZA_TEXT_BLACK_COMMENT"):
+            blocked_select = Command()
+            blocked_select.matched = {blocker}
+            self.assertEqual(
+                blocked_select._ZA_story_guri_select_defeat_observe(
+                    "7_STORY_GURI_114", "POKEMON_ZA_2_SELECT"),
+                "7_STORY_GURI_114")
+            self.assertEqual(
+                getattr(
+                    blocked_select,
+                    "_za_story_guri_select_defeat_count", 0),
+                0)
+
+        # 正常にFIELDへ戻って117へ進む場合は、次回の戦闘へ累計を残さない。
+        completed = Command()
+        completed._za_story_guri_select_defeat_count = 2
+        completed.matched = {"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"}
+        self.assertEqual(battle_after(
+            completed,
+            bkprg_ret="7_STORY_GURI_115",
+            prg_ret="7_STORY_GURI_117",
+            guri_select_defeat_state="7_STORY_GURI_116"),
+            "7_STORY_GURI_117")
+        self.assertEqual(completed._za_story_guri_select_defeat_count, 0)
+
+        # 116の通常黒Commentは、既存のB×10→Aを実行してから外側へ
+        # 戻る。これにより入力を止めずに連続90秒監視を更新できる。
+        persistent_black = Command()
+        persistent_black.matched = {"POKEMON_ZA_TEXT_BLACK_COMMENT"}
+        self.assertEqual(battle_after(
+            persistent_black,
+            bkprg_ret="7_STORY_GURI_115",
+            prg_ret="7_STORY_GURI_117",
+            guri_select_defeat_state="7_STORY_GURI_116"),
+            "7_STORY_GURI_116")
+        self.assertEqual(
+            persistent_black.buttons,
+            [Button.B] * 10 + [Button.A])
+
+        class ClearBlackCommand(Command):
+            def pressRep(self, button, **kwargs):
+                super().pressRep(button, **kwargs)
+                if button is Button.B:
+                    self.matched.clear()
+
+        cleared_black = ClearBlackCommand()
+        cleared_black.matched = {"POKEMON_ZA_TEXT_BLACK_COMMENT"}
+        self.assertEqual(battle_after(
+            cleared_black,
+            bkprg_ret="7_STORY_GURI_115",
+            prg_ret="7_STORY_GURI_117",
+            guri_select_defeat_state="7_STORY_GURI_116"),
+            "7_STORY_GURI_116")
+        self.assertEqual(cleared_black.buttons, [Button.B])
+
+    def test_guri_114_116_black_comment_uses_shared_recovery_after_90_seconds(
+            self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        functions = {
+            node.name: node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+        }
+
+        class FakeTime:
+            value = 0.0
+
+            @classmethod
+            def monotonic(cls):
+                return cls.value
+
+        selected = [functions[name] for name in (
+            "_ZA_story_battle_flow_reset",
+            "_ZA_story_guri_select_defeat_reset",
+            "_ZA_story_guri_defeat_recovery_reserve",
+            "ZA_story_furadari_section_recovery_step",
+            "ZA_story_furadari_black_comment_recovery_step",
+        )]
+        module = ast.fix_missing_locations(ast.Module(
+            body=selected, type_ignores=[]))
+        namespace = {"Button": Button, "time": FakeTime}
+        exec(compile(module, source_path, "exec"), namespace)
+
+        class Command:
+            ZA_STORY_FURADARI_BLACK_RECOVERY_STATES = frozenset({
+                "7_STORY_GURI_114", "7_STORY_GURI_116"})
+            ZA_STORY_FURADARI_BLACK_RECOVERY_FALLBACK = (
+                "7_STORY_GURI_87")
+            ZA_STORY_FURADARI_BLACK_RECOVERY_SECONDS = 30.0
+            ZA_STORY_FURADARI_BLACK_RECOVERY_MAX_INPUTS = 30
+            ZA_STORY_FURADARI_EYES_DARK_RECOVERY_MAX_INPUTS = 70
+            ZA_STORY_FURADARI_EYES_DARK_B_INTERVAL_SECONDS = 1.0
+            ZA_STORY_FURADARI_EYES_DARK_FIELD_RETURN_STATES = frozenset({
+                "7_STORY_GURI_114", "7_STORY_GURI_115",
+                "7_STORY_GURI_116", "7_STORY_GURI_117",
+                "7_STORY_GURI_118"})
+            ZA_STORY_FURADARI_EYES_DARK_FIELD_RETURN_TARGET = (
+                "7_STORY_GURI_114")
+            ZA_STORY_GURI_BLACK_DEFEAT_STATES = frozenset({
+                "7_STORY_GURI_114", "7_STORY_GURI_116"})
+            ZA_STORY_GURI_BLACK_DEFEAT_SECONDS = 90.0
+            ZA_STORY_GURI_BLACK_RECOVERY_A_MAX_INPUTS = 30
+            ZA_STORY_GURI_RECOVERY_OUTCOME_WAIT_SECONDS = 30.0
+            ZA_STORY_GURI_SELECT_DEFEAT_TARGET = "7_STORY_GURI_108"
+            ZA_STORY_FURADARI_SECTION_RECOVERY_TARGETS = {
+                "7_STORY_GURI_114": "7_STORY_GURI_105",
+                "7_STORY_GURI_116": "7_STORY_GURI_105",
+            }
+            _ZA_story_battle_flow_reset = namespace[
+                "_ZA_story_battle_flow_reset"]
+            _ZA_story_guri_select_defeat_reset = namespace[
+                "_ZA_story_guri_select_defeat_reset"]
+            _ZA_story_guri_defeat_recovery_reserve = namespace[
+                "_ZA_story_guri_defeat_recovery_reserve"]
+            ZA_story_furadari_section_recovery_step = namespace[
+                "ZA_story_furadari_section_recovery_step"]
+            ZA_story_furadari_black_comment_recovery_step = namespace[
+                "ZA_story_furadari_black_comment_recovery_step"]
+
+            def __init__(self, eyes_dark=False, field_after_b=False,
+                         field_after_a=False, battle_after_b=False):
+                self.matched = {"POKEMON_ZA_TEXT_BLACK_COMMENT"}
+                self.eyes_dark = eyes_dark
+                self.field_after_b = field_after_b
+                self.field_after_a = field_after_a
+                self.battle_after_b = battle_after_b
+                self.buttons = []
+                self.Common_current_state = "COMMON_GOTO_SELECT2"
+                self.map_cursor_reset = 5
+                self._za_story_guri_select_defeat_count = 2
+                self._za_story_battle_flows = {
+                    "7_STORY_GURI_115": {"phase": "RESULT_SEEN"}}
+
+            def image_check(self, name):
+                return name in self.matched
+
+            def _ZA_furadari_eyes_dark_comment_visible(self):
+                return self.eyes_dark
+
+            def checkIfAlive(self):
+                return None
+
+            def pressRep(self, button, **_kwargs):
+                self.buttons.append(button)
+                if self.field_after_b and button is Button.B:
+                    self.matched = {
+                        "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_0"}
+                if self.battle_after_b and button is Button.B:
+                    battle_picture = (
+                        self.battle_after_b
+                        if isinstance(self.battle_after_b, str)
+                        else "POKEMON_ZA_BATTLE_ACTIVE_LEVEL")
+                    self.matched = {battle_picture}
+                if self.field_after_a and button is Button.A:
+                    self.matched = {
+                        "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_0"}
+
+            def wait(self, _duration):
+                return None
+
+            def ZA_Common_goto(self, *_args, **_kwargs):
+                return "START"
+
+            def _ZA_furadari_screen_is_dark(self, **_kwargs):
+                raise AssertionError(
+                    "90-second GURI black candidate must suppress "
+                    "the 5-second section-dark recovery")
+
+        state_functions = {"7_STORY_GURI_108": lambda: None}
+        for current_state in (
+                "7_STORY_GURI_114", "7_STORY_GURI_116"):
+            command = Command(field_after_b=True)
+            FakeTime.value = 100.0
+            self.assertIsNone(
+                command.ZA_story_furadari_black_comment_recovery_step(
+                    current_state, state_functions))
+            self.assertEqual(command.buttons, [])
+            self.assertFalse(hasattr(
+                command, "_za_furadari_black_recovery"))
+
+            # 通常Stepの実行後に呼ばれる5秒暗転復旧だけは抑止する。
+            command._za_furadari_section_dark_candidate_state = (
+                current_state)
+            command._za_furadari_section_dark_candidate_started = 95.0
+            command._za_furadari_section_recovery_state = current_state
+            command._za_furadari_section_recovery_b_count = 4
+            self.assertEqual(
+                command.ZA_story_furadari_section_recovery_step(
+                    current_state, current_state),
+                current_state)
+            self.assertIsNone(
+                command._za_furadari_section_recovery_state)
+
+            FakeTime.value = 189.999
+            self.assertIsNone(
+                command.ZA_story_furadari_black_comment_recovery_step(
+                    current_state, state_functions))
+            self.assertEqual(command.buttons, [])
+
+            FakeTime.value = 190.0
+            self.assertEqual(
+                command.ZA_story_furadari_black_comment_recovery_step(
+                    current_state, state_functions),
+                current_state)
+            recovery = command._za_furadari_black_recovery
+            self.assertEqual(
+                recovery["recovery_target"], "7_STORY_GURI_108")
+            self.assertEqual(recovery["phase"], "RETRY_FURADARI")
+            self.assertEqual(command.buttons, [Button.B])
+            self.assertEqual(command._za_story_guri_select_defeat_count, 0)
+            self.assertNotIn(
+                "7_STORY_GURI_115", command._za_story_battle_flows)
+
+            self.assertEqual(
+                command.ZA_story_furadari_black_comment_recovery_step(
+                    current_state, state_functions),
+                "7_STORY_GURI_108")
+            self.assertIsNone(command._za_furadari_black_recovery)
+
+        # SELECT敗戦候補のロード中は入力せず、後からポケセン黒Commentが
+        # 出た場合だけ共有敗戦復旧へ進み、別枠Aで閉じる。
+        post_load = Command(field_after_a=True)
+        post_load.matched = set()
+        post_load._ZA_story_guri_defeat_recovery_reserve(
+            "7_STORY_GURI_114", "select_total_3")
+        self.assertEqual(
+            post_load.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_114", state_functions),
+            "7_STORY_GURI_114")
+        self.assertEqual(post_load.buttons, [])
+        self.assertEqual(
+            post_load._za_furadari_black_recovery["phase"],
+            "WAIT_GURI_OUTCOME")
+        self.assertEqual(
+            post_load._za_furadari_black_recovery["close_count"], 0)
+        self.assertEqual(
+            post_load._za_furadari_black_recovery[
+                "black_comment_a_count"], 0)
+
+        # 黒Commentが現れるまでは追加入力せず、表示された周期だけAを
+        # 送り、FIELD成立後は同じ周期に追加のB/Aを送らない。
+        self.assertEqual(
+            post_load.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_114", state_functions),
+            "7_STORY_GURI_114")
+        self.assertEqual(post_load.buttons, [])
+        post_load.matched = {"POKEMON_ZA_TEXT_BLACK_COMMENT"}
+        self.assertEqual(
+            post_load.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_114", state_functions),
+            "7_STORY_GURI_114")
+        self.assertEqual(post_load.buttons, [Button.B] * 30 + [Button.A])
+        self.assertEqual(
+            post_load._za_furadari_black_recovery["phase"],
+            "RETRY_FURADARI")
+        self.assertEqual(
+            post_load._za_furadari_black_recovery[
+                "black_comment_a_count"], 1)
+        self.assertEqual(
+            post_load.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_114", state_functions),
+            "7_STORY_GURI_108")
+        self.assertEqual(post_load.buttons, [Button.B] * 30 + [Button.A])
+        self.assertIsNone(post_load._za_furadari_black_recovery)
+
+        # SELECT累計だけで予約されても、黒Comment未確認のFIELDまたは
+        # 実戦闘表示ならマップ復旧せず、予約元の114／116へ戻す。
+        for origin_state, visible_picture in (
+                ("7_STORY_GURI_114",
+                 "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_0"),
+                ("7_STORY_GURI_116",
+                 "POKEMON_ZA_BATTLE_ACTIVE_LEVEL"),
+                ("7_STORY_GURI_114", "POKEMON_ZA_FIELD_W"),
+                ("7_STORY_GURI_116", "POKEMON_ZA_FIELD_BACK_W"),
+                ("7_STORY_GURI_116",
+                 "POKEMON_ZA_BATTLE_BALL_CHECK"),
+                ("7_STORY_GURI_114", "POKEMON_ZA_ESCAPE")):
+            false_recovery = Command()
+            false_recovery.matched = {visible_picture}
+            false_recovery._ZA_story_guri_defeat_recovery_reserve(
+                origin_state, "select_total_3")
+            self.assertEqual(
+                false_recovery.ZA_story_furadari_black_comment_recovery_step(
+                    origin_state, state_functions),
+                origin_state)
+            self.assertEqual(false_recovery.buttons, [])
+            self.assertIsNone(false_recovery._za_furadari_black_recovery)
+
+        # ロード中に黒／FIELD／戦闘表示が30秒間何も出ない場合も、
+        # 108へ推測ジャンプせず復旧元へ戻す。
+        no_outcome = Command()
+        no_outcome.matched = set()
+        FakeTime.value = 500.0
+        no_outcome._ZA_story_guri_defeat_recovery_reserve(
+            "7_STORY_GURI_116", "select_total_3")
+        FakeTime.value = 529.999
+        self.assertEqual(
+            no_outcome.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_116", state_functions),
+            "7_STORY_GURI_116")
+        self.assertIsNotNone(no_outcome._za_furadari_black_recovery)
+        FakeTime.value = 530.0
+        self.assertEqual(
+            no_outcome.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_116", state_functions),
+            "7_STORY_GURI_116")
+        self.assertIsNone(no_outcome._za_furadari_black_recovery)
+        self.assertEqual(no_outcome.buttons, [])
+
+        # SELECT復旧後の黒Commentが通常の戦闘Commentだった場合、B直後に
+        # 戦闘Lv.へ戻った時点で残りのBを止め、復旧元116へ戻す。
+        battle_resumed = Command(battle_after_b=True)
+        battle_resumed.matched = {"POKEMON_ZA_TEXT_BLACK_COMMENT"}
+        battle_resumed._ZA_story_guri_defeat_recovery_reserve(
+            "7_STORY_GURI_116", "select_total_3")
+        self.assertEqual(
+            battle_resumed.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_116", state_functions),
+            "7_STORY_GURI_116")
+        self.assertEqual(battle_resumed.buttons, [Button.B])
+        self.assertIsNone(battle_resumed._za_furadari_black_recovery)
+
+        # B直後に戦闘FIELDだけが戻った場合も、非戦闘HARD FIELDでは
+        # ないため敗北復旧を止め、B1回だけで元の114／116へ戻す。
+        for origin_state, field_picture in (
+                ("7_STORY_GURI_114", "POKEMON_ZA_FIELD_W"),
+                ("7_STORY_GURI_116", "POKEMON_ZA_FIELD_BACK_W")):
+            field_resumed = Command(battle_after_b=field_picture)
+            field_resumed.matched = {"POKEMON_ZA_TEXT_BLACK_COMMENT"}
+            field_resumed._ZA_story_guri_defeat_recovery_reserve(
+                origin_state, "select_total_3")
+            self.assertEqual(
+                field_resumed.ZA_story_furadari_black_comment_recovery_step(
+                    origin_state, state_functions),
+                origin_state)
+            self.assertEqual(field_resumed.buttons, [Button.B])
+            self.assertIsNone(field_resumed._za_furadari_black_recovery)
+
+        # 黒Commentと戦闘FIELD／戦闘表示が同時なら、敗北Commentと
+        # 決めつけずBを送る前に元の114／116へ戻す。
+        for origin_state, battle_picture in (
+                ("7_STORY_GURI_114", "POKEMON_ZA_FIELD_W"),
+                ("7_STORY_GURI_116", "POKEMON_ZA_FIELD_BACK_W"),
+                ("7_STORY_GURI_114", "POKEMON_ZA_ESCAPE")):
+            battle_already_visible = Command()
+            battle_already_visible.matched = {
+                "POKEMON_ZA_TEXT_BLACK_COMMENT",
+                battle_picture,
+            }
+            battle_already_visible._ZA_story_guri_defeat_recovery_reserve(
+                origin_state, "select_total_3")
+            self.assertEqual(
+                battle_already_visible.
+                ZA_story_furadari_black_comment_recovery_step(
+                    origin_state, state_functions),
+                origin_state)
+            self.assertEqual(battle_already_visible.buttons, [])
+            self.assertIsNone(
+                battle_already_visible._za_furadari_black_recovery)
+
+        # FIELDが戻らない場合でもAは別枠上限30回で止まり、31周期目には
+        # 入力を追加しない。その後FIELDだけ遅れて成立しても追加入力しない。
+        a_limited = Command()
+        a_limited.matched = set()
+        a_limited._ZA_story_guri_defeat_recovery_reserve(
+            "7_STORY_GURI_114", "select_total_3")
+        self.assertEqual(
+            a_limited.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_114", state_functions),
+            "7_STORY_GURI_114")
+        a_limited.matched = {"POKEMON_ZA_TEXT_BLACK_COMMENT"}
+        for _ in range(30):
+            self.assertEqual(
+                a_limited.ZA_story_furadari_black_comment_recovery_step(
+                    "7_STORY_GURI_114", state_functions),
+                "7_STORY_GURI_114")
+        self.assertEqual(
+            a_limited.buttons, [Button.B] * 30 + [Button.A] * 30)
+        self.assertEqual(
+            a_limited._za_furadari_black_recovery[
+                "black_comment_a_count"], 30)
+        self.assertEqual(
+            a_limited.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_114", state_functions),
+            "7_STORY_GURI_114")
+        self.assertEqual(
+            a_limited.buttons, [Button.B] * 30 + [Button.A] * 30)
+        a_limited.matched = {
+            "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_0"}
+        self.assertEqual(
+            a_limited.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_114", state_functions),
+            "7_STORY_GURI_114")
+        self.assertEqual(
+            a_limited.buttons, [Button.B] * 30 + [Button.A] * 30)
+        self.assertEqual(
+            a_limited._za_furadari_black_recovery["phase"],
+            "RETRY_FURADARI")
+        self.assertEqual(
+            a_limited.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_114", state_functions),
+            "7_STORY_GURI_108")
+        self.assertIsNone(a_limited._za_furadari_black_recovery)
+
+        # 一度でも黒Commentが消えれば90秒計測を破棄し、再表示時は0秒から。
+        cleared = Command()
+        FakeTime.value = 200.0
+        self.assertIsNone(
+            cleared.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_114", state_functions))
+        cleared.matched = set()
+        FakeTime.value = 289.0
+        self.assertIsNone(
+            cleared.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_114", state_functions))
+        self.assertIsNone(cleared._za_furadari_black_candidate_started)
+        cleared.matched = {"POKEMON_ZA_TEXT_BLACK_COMMENT"}
+        FakeTime.value = 300.0
+        self.assertIsNone(
+            cleared.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_114", state_functions))
+        FakeTime.value = 389.999
+        self.assertIsNone(
+            cleared.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_114", state_functions))
+        self.assertFalse(hasattr(
+            cleared, "_za_furadari_black_recovery"))
+
+        # 専用「目の前がまっくら」は従来どおり30秒で114復帰を開始する。
+        eyes_dark = Command(eyes_dark=True)
+        FakeTime.value = 400.0
+        self.assertEqual(
+            eyes_dark.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_114", state_functions),
+            "7_STORY_GURI_114")
+        FakeTime.value = 429.999
+        self.assertEqual(
+            eyes_dark.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_114", state_functions),
+            "7_STORY_GURI_114")
+        FakeTime.value = 430.0
+        self.assertEqual(
+            eyes_dark.ZA_story_furadari_black_comment_recovery_step(
+                "7_STORY_GURI_114", state_functions),
+            "7_STORY_GURI_114")
+        self.assertEqual(
+            eyes_dark._za_furadari_black_recovery["recovery_target"],
+            "7_STORY_GURI_114")
+        self.assertTrue(
+            eyes_dark._za_furadari_black_recovery["dark_comment"])
+        self.assertEqual(
+            eyes_dark._za_furadari_black_recovery["phase"],
+            "WAIT_INITIAL_BLACK_CLEAR")
+        self.assertEqual(eyes_dark.buttons, [Button.B])
+
     def test_za_mission_complete_requires_three_of_four_letter_regions(self):
         profile_path = os.path.join(
             SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
@@ -14754,10 +20177,10 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(len(variants), 4)
         self.assertEqual(
             [variant["template_path"] for variant in variants],
-            ["Template/ZA_Story/Common/POKEMON_ZA_MISSION_COMPLETE_C.png",
-             "Template/ZA_Story/Common/POKEMON_ZA_MISSION_COMPLETE_M.png",
-             "Template/ZA_Story/Common/POKEMON_ZA_MISSION_COMPLETE_P.png",
-             "Template/ZA_Story/Common/POKEMON_ZA_MISSION_COMPLETE_T.png"])
+            ["Template/ZA_Story_PIC/Common/POKEMON_ZA_MISSION_COMPLETE_C.png",
+             "Template/ZA_Story_PIC/Common/POKEMON_ZA_MISSION_COMPLETE_M.png",
+             "Template/ZA_Story_PIC/Common/POKEMON_ZA_MISSION_COMPLETE_P.png",
+             "Template/ZA_Story_PIC/Common/POKEMON_ZA_MISSION_COMPLETE_T.png"])
         self.assertTrue(all(
             "template_crop" not in variant for variant in variants))
         self.assertTrue(all(os.path.isfile(os.path.join(
@@ -14899,7 +20322,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(evolution_confirm["threshold"], 0.8)
         self.assertEqual(
             evolution_confirm["template_path"],
-            "Template/ZA_Story/Common/evolution_2_select.png")
+            "Template/ZA_Story_PIC/Common/evolution_2_select.png")
 
         module = ast.fix_missing_locations(ast.Module(
             body=list(source_functions.values()), type_ignores=[]))
@@ -14932,7 +20355,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             ({"POKEMON_ZA_SKILL_PAGE_WINDOW", "POKEMON_ZA_3_SELECT"},
              Button.B),
             ({"POKEMON_ZA_X_MENU_OPEN", "POKEMON_ZA_3_SELECT"},
-             Button.B),
+             None),
             ({"POKEMON_ZA_X_MENU_EVO_MENU", "POKEMON_ZA_3_SELECT"},
              Button.A),
             ({"POKEMON_ZA_3_SELECT"}, Button.A),
@@ -14942,7 +20365,9 @@ class ImageDetectionMonitorTests(unittest.TestCase):
                 command = Command(matched)
                 self.assertEqual(
                     execute(command), "COMMON_EVOLUTION_EXEC")
-                self.assertEqual(command.buttons, [expected_button])
+                self.assertEqual(
+                    command.buttons,
+                    [] if expected_button is None else [expected_button])
                 if ("POKEMON_ZA_3_SELECT" in matched
                         and matched != {"POKEMON_ZA_3_SELECT"}):
                     self.assertNotIn(
@@ -14966,9 +20391,49 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
         delayed = DelayedConfirmation()
         self.assertEqual(execute(delayed), "COMMON_EVOLUTION_EXEC")
+        self.assertEqual(delayed.buttons, [])
+        self.assertEqual(delayed.select_checks, 1)
+        self.assertEqual(delayed.waits, [])
+        self.assertEqual(execute(delayed), "COMMON_EVOLUTION_EXEC")
         self.assertEqual(delayed.buttons, [Button.A])
         self.assertEqual(delayed.select_checks, 2)
-        self.assertEqual(delayed.waits, [0.1, 0.5])
+        self.assertEqual(delayed.waits, [0.5])
+
+        class IdleCommand(Command):
+            def __init__(self):
+                super().__init__(set())
+                self.waits = []
+
+            def wait(self, duration):
+                self.waits.append(duration)
+
+        no_match = IdleCommand()
+        self.assertEqual(execute(no_match), "COMMON_EVOLUTION_EXEC")
+        self.assertEqual(no_match.buttons, [])
+        self.assertEqual(no_match.waits, [])
+
+        class StableMenu(Command):
+            def __init__(self):
+                super().__init__({"POKEMON_ZA_X_MENU_OPEN"})
+                self.waits = []
+
+            def wait(self, duration):
+                self.waits.append(duration)
+
+        stable_menu = StableMenu()
+        self.assertEqual(execute(stable_menu), "COMMON_EVOLUTION_EXEC")
+        self.assertEqual(stable_menu.buttons, [])
+        self.assertEqual(stable_menu.waits, [])
+
+        # 「進化する」へのA送信後は背景Xメニューが残っていても、
+        # EXEC内のBで進化開始会話を取り消さない。
+        started = Command({"POKEMON_ZA_X_MENU_EVO_MENU"})
+        self.assertEqual(execute(started), "COMMON_EVOLUTION_EXEC")
+        self.assertEqual(started.buttons, [Button.A])
+        self.assertTrue(started._za_common_evolution_exec_started)
+        started.matched = {"POKEMON_ZA_X_MENU_OPEN"}
+        self.assertEqual(execute(started), "COMMON_EVOLUTION_EXEC")
+        self.assertEqual(started.buttons, [Button.A])
 
         completed = Command({"POKEMON_ZA_TEXT_BLACK_COMMENT"})
         self.assertEqual(
@@ -14985,6 +20450,296 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(status_with_field.buttons, [Button.B])
         field = Command({"POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_1"})
         self.assertEqual(loop(field), "COMMON_EVOLUTION_END")
+
+        loop_comment = Command({"POKEMON_ZA_TEXT_BLACK_COMMENT"})
+        self.assertEqual(loop(loop_comment), "COMMON_EVOLUTION_LOOP")
+        self.assertEqual(loop_comment.buttons, [Button.B])
+
+        loop_no_match = Command(set())
+        self.assertEqual(loop(loop_no_match), "COMMON_EVOLUTION_LOOP")
+        self.assertEqual(loop_no_match.buttons, [])
+
+    def test_za_common_evolution_and_item_wait_before_detected_actions(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_CommonPokemonManagement",
+            "ZA_CommonPokemonManagement.pyfrag")
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_records = {
+                item["name"]: item["text"]
+                for item in source_function_records(stream.read())
+            }
+
+        synchronized_functions = {
+            "ZA_common_skill_change_pokemon_select",
+            "ZA_common_item_give_function",
+            "ZA_common_item_give_window_open",
+            "ZA_common_item_give_target_side",
+            "ZA_common_item_give_target_high",
+            "ZA_common_evolution_function",
+            "ZA_common_evolution_exec",
+            "ZA_common_evolution_loop",
+            "ZA_common_item_use_function",
+            "ZA_common_item_use_window_open",
+        }
+        for name in synchronized_functions:
+            self.assertEqual(
+                ast.dump(
+                    ast.parse(records[name]).body[0],
+                    include_attributes=False),
+                ast.dump(
+                    ast.parse(fragment_records[name]).body[0],
+                    include_attributes=False),
+                name)
+
+        function_names = {
+            "ZA_common_skill_change_start_check",
+            "ZA_common_skill_change_pokemon_select",
+            "ZA_common_item_give_function",
+            "ZA_common_item_give_window_open",
+            "ZA_common_item_give_target_side",
+            "ZA_common_item_give_target_high",
+            "ZA_common_evolution_function",
+            "ZA_common_evolution_exec",
+            "ZA_common_evolution_loop",
+            "ZA_common_item_use_function",
+            "ZA_common_item_use_window_open",
+            "ZA_common_item_use_window_close",
+            "ZA_renda_button",
+        }
+        namespace = {"Button": Button, "time": time}
+        for name in function_names:
+            exec(compile(records[name], source_path, "exec"), namespace)
+
+        class Keys:
+            def __init__(self, events):
+                self.events = events
+
+            def input(self, button):
+                self.events.append(("key", button))
+
+            def inputEnd(self, button):
+                self.events.append(("key_end", button))
+
+        class Command:
+            def __init__(self, matched):
+                self.matched = set(matched)
+                self.events = []
+                self.check_picture = 0
+                self.keys = Keys(self.events)
+
+            def image_check(self, name):
+                return name in self.matched
+
+            def wait(self, duration):
+                self.events.append(("wait", duration))
+
+            def pressRep(self, button, **_kwargs):
+                self.events.append(("press", button))
+
+            def etc_sendCommand(self, command):
+                self.events.append(("command", command))
+
+            def ZA_ZL_ACTION(self, action):
+                self.events.append(("zl", action))
+
+        def assert_wait_immediately_before(command, event):
+            index = command.events.index(event)
+            self.assertGreater(index, 0, command.events)
+            self.assertEqual(command.events[index - 1], ("wait", 0.5))
+
+        start = Command({"POKEMON_ZA_FILED_HARD_CHECK_1"})
+        namespace["ZA_common_skill_change_start_check"](
+            start, detected_action_wait=0.5)
+        self.assertEqual(start.events[0], ("zl", "END"))
+        assert_wait_immediately_before(start, ("press", Button.X))
+
+        select = Command({
+            "POKEMON_ZA_X_MENU_OPEN",
+            "POKEMON_ZA_POKEMON_MENU_X_MENU_W",
+        })
+        namespace["ZA_common_skill_change_pokemon_select"](
+            select, 1, detected_action_wait=0.5)
+        assert_wait_immediately_before(select, ("command", "Lbutton_left"))
+
+        give_open = Command({
+            "POKEMON_ZA_X_MENU_OPEN",
+            "POKEMON_ZA_POKEMON_MENU_X_MENU_W",
+        })
+        namespace["ZA_common_item_give_window_open"](give_open)
+        assert_wait_immediately_before(
+            give_open, ("command", "Lbutton_up"))
+
+        give_side = Command({"POKEMON_ZA_ITEM_WINDOW"})
+        namespace["ZA_common_item_give_target_side"](give_side, 1)
+        assert_wait_immediately_before(give_side, ("key", Button.R))
+
+        give_high = Command({"POKEMON_ZA_ITEM_WINDOW"})
+        namespace["ZA_common_item_give_target_high"](give_high, 1)
+        assert_wait_immediately_before(
+            give_high, ("command", "Lbutton_down"))
+
+        give_use = Command({"POKEMON_ZA_ITEM_WINDOW"})
+        namespace["ZA_common_item_give_target_high"](give_use, 0)
+        assert_wait_immediately_before(give_use, ("press", Button.A))
+
+        item_open = Command({
+            "POKEMON_ZA_X_MENU_OPEN",
+            "POKEMON_ZA_POKEMON_MENU_X_MENU_W",
+        })
+        namespace["ZA_common_item_use_window_open"](item_open)
+        assert_wait_immediately_before(
+            item_open, ("command", "Lbutton_left"))
+
+        evolution = Command({"POKEMON_ZA_EVOLUTION_CONFIRM"})
+        namespace["ZA_common_evolution_exec"](evolution)
+        # EXECは検知後0.5秒待機を挟まず、直ちに入力する。
+        self.assertEqual(evolution.events[0], ("press", Button.A))
+
+        evolution_loop = Command({"POKEMON_ZA_X_MENU_OPEN"})
+        namespace["ZA_common_evolution_loop"](evolution_loop)
+        assert_wait_immediately_before(
+            evolution_loop, ("press", Button.B))
+
+        for wrapper in (
+                "ZA_common_item_give_function",
+                "ZA_common_evolution_function",
+                "ZA_common_item_use_function"):
+            self.assertIn("detected_action_wait=0.5", records[wrapper])
+        self.assertIn(
+            "detected_action_wait=0.5",
+            records["ZA_common_item_use_window_close"])
+
+        class RendaCommand(Command):
+            def __init__(self):
+                super().__init__(set())
+                self.ended = False
+
+            def checkIfAlive(self):
+                return None
+
+            def image_check(self, name):
+                if name == "END":
+                    return self.ended
+                if name == "SUB":
+                    return not self.ended
+                return False
+
+            def pressRep(self, button, **_kwargs):
+                self.events.append(("press", button))
+                if button == Button.A:
+                    self.ended = True
+
+        renda = RendaCommand()
+        self.assertTrue(namespace["ZA_renda_button"](
+            renda,
+            endpicture="END",
+            not_endpicture="NO",
+            sub_button="A",
+            sub_picture="SUB",
+            sleeptime=0.0,
+            detected_action_wait=0.5,
+            timeout_seconds=1.0,
+        ))
+        assert_wait_immediately_before(renda, ("press", Button.A))
+
+    def test_za_renda_duplicate_endpicture_requires_image_match(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        with open(fragment_path, "r", encoding="utf-8") as stream:
+            fragment_tree = ast.parse(stream.read())
+        source_function = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_renda_button")
+        fragment_function = next(
+            node for node in fragment_tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "ZA_renda_button")
+        self.assertEqual(
+            ast.dump(source_function, include_attributes=False),
+            ast.dump(fragment_function, include_attributes=False))
+
+        class FakeTime:
+            def __init__(self):
+                self.now = 0.0
+
+            def monotonic(self):
+                self.now += 0.1
+                return self.now
+
+        namespace = {"Button": Button, "time": FakeTime()}
+        module = ast.fix_missing_locations(ast.Module(
+            body=[source_function], type_ignores=[]))
+        exec(compile(module, source_path, "exec"), namespace)
+        execute = namespace["ZA_renda_button"]
+
+        class Command:
+            def __init__(self, responses):
+                self.responses = list(responses)
+                self.inputs = []
+
+            def image_check(self, name):
+                if name == "SAME" and self.responses:
+                    return self.responses.pop(0)
+                return False
+
+            @staticmethod
+            def checkIfAlive():
+                return None
+
+            @staticmethod
+            def wait(_duration):
+                return None
+
+            def pressRep(self, button, **_kwargs):
+                self.inputs.append(button)
+
+            def press(self, button, *_args, **_kwargs):
+                self.inputs.append(button)
+
+            def ZA_EventSkip_plus(self):
+                self.inputs.append("event")
+
+        for index in range(1, 10):
+            picture_key = (
+                "sub_picture" if index == 1
+                else "sub{}_picture".format(index))
+            button_key = (
+                "sub_button" if index == 1
+                else "sub{}_button".format(index))
+            options = {
+                "rendabutton": "NULL",
+                "endpicture": "SAME",
+                picture_key: "SAME",
+                button_key: "A",
+                "sleeptime": 0.0,
+                "timeout_seconds": 0.25,
+            }
+
+            namespace["time"] = FakeTime()
+            missing = Command([False, False])
+            self.assertFalse(execute(missing, **options), index)
+            self.assertEqual(missing.inputs, [], index)
+
+            namespace["time"] = FakeTime()
+            detected = Command([False, True])
+            self.assertTrue(execute(detected, **options), index)
+            self.assertEqual(detected.inputs, [], index)
 
     def test_za_no_battle_hard_guard_supports_mode_zero_and_one_exceptions(self):
         source_path = os.path.join(
@@ -15365,6 +21120,83 @@ self.image_check("LOST")
         with self.assertRaises(SyntaxError):
             audit_image_check_references('self.image_check("BROKEN"')
 
+    def test_source_used_targets_ignore_generated_block_and_include_helper_arguments(self):
+        source = '''
+class Command:
+    # POKECON_IMAGE_CHECK_BEGIN
+    IMAGE_DETECTION_TARGETS = {"GENERATED_ONLY": [{}]}
+    def _image_check_target(self, targetimage):
+        return targetimage in self.IMAGE_DETECTION_TARGETS
+    # POKECON_IMAGE_CHECK_USER_BEGIN
+    def image_check_confirmation(self, targetimage):
+        return self.image_check("USER_ONLY") and bool(targetimage)
+    # POKECON_IMAGE_CHECK_USER_END
+    # POKECON_IMAGE_CHECK_END
+
+    def run(self):
+        self.image_check("DIRECT")
+        marker = "POKEMON_ZA_EVENT_MARKER"
+        center = marker + "_CENTER"
+        self.image_check(center)
+        suffix = "CONCAT"
+        self.image_check("DIRECT_" + suffix)
+        self.image_check("{}_FORMAT".format("DIRECT"))
+        self.image_check(f"DIRECT_{'FSTRING'}")
+        self.wait_for(endpicture="HELPER", alternatives=("COLLECTION", "DIRECT"))
+        self.image_check("NOT_REGISTERED")
+'''
+        library = {"targets": {
+            "DIRECT": {"variants": [{"template_path": "direct.png"}]},
+            "HELPER": {"variants": [{"template_path": "helper.png"}]},
+            "COLLECTION": {"variants": [{"template_path": "collection.png"}]},
+            "USER_ONLY": {"variants": [{"template_path": "user.png"}]},
+            "POKEMON_ZA_EVENT_MARKER_CENTER": {
+                "variants": [{"template_path": "marker.png"}]},
+            "DIRECT_CONCAT": {
+                "variants": [{"template_path": "concat.png"}]},
+            "DIRECT_FORMAT": {
+                "variants": [{"template_path": "format.png"}]},
+            "DIRECT_FSTRING": {
+                "variants": [{"template_path": "fstring.png"}]},
+            "POKEMON_ZA_ZONE1": {
+                "variants": [{"template_path": "zone.png"}]},
+            "GENERATED_ONLY": {"variants": [{"template_path": "old.png"}]},
+            "UNUSED": {"variants": [{"template_path": "unused.png"}]},
+        }}
+        self.assertEqual(
+            source_used_library_targets(
+                source, library,
+                ['{"1": ["POKEMON_ZA_ZONE1", "zone"]}']),
+            ["USER_ONLY", "DIRECT", "POKEMON_ZA_EVENT_MARKER_CENTER",
+             "DIRECT_CONCAT", "DIRECT_FORMAT", "DIRECT_FSTRING",
+             "HELPER", "COLLECTION", "POKEMON_ZA_ZONE1"])
+
+    def test_za_story_source_used_targets_include_runtime_dependencies(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        library_path = os.path.join(
+            SERIAL_CONTROLLER, "Template", "image_detection_profiles.json")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source = stream.read()
+        with open(library_path, "r", encoding="utf-8") as stream:
+            library = json.load(stream)
+        zones_path = os.path.join(
+            os.path.dirname(source_path), "zones.jsonc")
+        with open(zones_path, "r", encoding="utf-8") as stream:
+            zones = stream.read()
+        names = source_used_library_targets(source, library, [zones])
+        self.assertGreaterEqual(len(names), 280)
+        for name in (
+                "POKEMON_ZA_FIELD_W", "POKEMON_ZA_FIELD_BACK_W",
+                "POKEMON_ZA_ODAIRU_ICON", "POKEMON_ZA_FURADARI_MAP",
+                "POKEMON_ZA_MAP2", "POKEMON_ZA_TEXT_BLACK_COMMENT",
+                "POKEMON_ZA_FURADARI_EYES_DARK_COMMENT",
+                "POKEMON_ZA_EVENT_MARKER_CENTER_WIDE_DOWNER_LEFT",
+                "POKEMON_ZA_SIDE_MARKER_CENTER_WIDE_UPPER_RIGHT",
+                "POKEMON_ZA_ZONE1", "POKEMON_ZA_ZONE11"):
+            self.assertIn(name, names)
+
     def test_registered_library_target_can_be_merged_without_replacing_existing_targets(self):
         source = '''
 class Command:
@@ -15378,11 +21210,17 @@ class Command:
     def run(self):
         return self.image_check("MISSING")
 '''
-        library = {"targets": {"MISSING": {
-            "operator": "AND", "description": "added from DevStudio",
-            "variants": [{"template_path": "missing.png", "threshold": 0.8,
-                          "health_ignored_warnings": ["low_contrast"]}],
-        }}}
+        library = {"targets": {
+            "MISSING": {
+                "operator": "AND", "description": "added from DevStudio",
+                "variants": [{"template_path": "missing.png", "threshold": 0.8,
+                              "health_ignored_warnings": ["low_contrast"]}],
+            },
+            "UNSELECTED": {
+                "operator": "OR", "description": "must not be added",
+                "variants": [{"template_path": "unselected.png"}],
+            },
+        }}
         updated, added = merge_library_targets_into_source(source, library, ["MISSING"])
         self.assertEqual(added, ["MISSING"])
         self.assertIn('IMAGE_DETECTION_TARGETS = {"READY"', updated)
@@ -15391,6 +21229,156 @@ class Command:
         result = audit_image_check_references(updated)
         self.assertEqual(result["missing"], [])
         self.assertIn("MISSING", result["target_names"])
+        self.assertNotIn("UNSELECTED", result["target_names"])
+
+    def test_devstudio_selected_add_path_preserves_existing_registrations(self):
+        source = '''
+class Command:
+    # POKECON_IMAGE_CHECK_BEGIN
+    IMAGE_DETECTION_TARGETS = {"OLD": [{"template_path": "old.png"}]}
+    IMAGE_DETECTION_OPERATORS = {"OLD": "OR"}
+    IMAGE_DETECTION_DESCRIPTIONS = {"targets": {"OLD": "old"}}
+    def _image_check_target(self, targetimage):
+        return targetimage in self.IMAGE_DETECTION_TARGETS
+    # POKECON_IMAGE_CHECK_END
+'''
+        library = {"schema_version": 1, "targets": {
+            "NEW": {"operator": "OR", "description": "new",
+                    "variants": [{"template_path": "new.png"}]},
+            "UNSELECTED": {
+                "operator": "OR", "description": "unselected",
+                "variants": [{"template_path": "unselected.png"}]},
+        }, "lists": {}}
+
+        class Editor:
+            def __init__(self, text):
+                self.text = text
+
+            def get(self, _start, _end):
+                return self.text
+
+        class Studio:
+            def _read_image_library(self):
+                return library
+
+            @staticmethod
+            def _replace_image_library_editor_source(editor, text):
+                editor.text = text
+
+        editor = Editor(source)
+        added = DevStudio._add_registered_image_targets_to_editor(
+            Studio(), ["NEW"], editor=editor)
+        self.assertEqual(added, ["NEW"])
+        result = audit_image_check_references(editor.text)
+        self.assertIn("OLD", result["target_names"])
+        self.assertIn("NEW", result["target_names"])
+        self.assertNotIn("UNSELECTED", result["target_names"])
+
+    def test_devstudio_selected_add_does_not_collapse_large_registration_block(self):
+        old_targets = {
+            "OLD_{:03d}".format(index): [{"template_path": "old.png"}]
+            for index in range(333)
+        }
+        source = (
+            "class Command:\n"
+            "    # POKECON_IMAGE_CHECK_BEGIN\n"
+            "    IMAGE_DETECTION_TARGETS = {!r}\n"
+            "    def _image_check_target(self, targetimage):\n"
+            "        return targetimage in self.IMAGE_DETECTION_TARGETS\n"
+            "    # POKECON_IMAGE_CHECK_END\n"
+        ).format(old_targets)
+        library = {"schema_version": 1, "targets": {
+            "NEW": {"operator": "OR", "description": "new",
+                    "variants": [{"template_path": "new.png"}]},
+            "UNSELECTED": {"operator": "OR", "description": "unused",
+                           "variants": [{"template_path": "unused.png"}]},
+        }, "lists": {}}
+
+        class Editor:
+            def __init__(self, text):
+                self.text = text
+
+            def get(self, _start, _end):
+                return self.text
+
+        class Studio:
+            def _read_image_library(self):
+                return library
+
+            @staticmethod
+            def _replace_image_library_editor_source(editor, text):
+                editor.text = text
+
+        editor = Editor(source)
+        DevStudio._add_registered_image_targets_to_editor(
+            Studio(), ["NEW"], editor=editor)
+        result = audit_image_check_references(editor.text)
+        self.assertEqual(len(result["target_names"]), 334)
+        effective = parse_image_detection_source_settings(editor.text)
+        self.assertEqual(len(effective), 334)
+        self.assertIn("OLD_000", result["target_names"])
+        self.assertIn("OLD_332", result["target_names"])
+        self.assertIn("NEW", result["target_names"])
+        self.assertNotIn("UNSELECTED", result["target_names"])
+
+    def test_image_detection_sync_reads_managed_updates_and_overrides(self):
+        source = '''
+IMAGE_DETECTION_TARGETS = {
+    "OLD": [{"template_path": "old.png", "threshold": 0.70}],
+}
+IMAGE_DETECTION_OPERATORS = {"OLD": "OR"}
+IMAGE_DETECTION_DESCRIPTIONS = {"targets": {"OLD": "old base"}}
+# POKECON_IMAGE_CHECK_LIBRARY_IMPORTS_BEGIN
+IMAGE_DETECTION_TARGETS.update({
+    "OLD": [{"template_path": "old-new.png", "threshold": 0.90}],
+    "NEW": [{"template_path": "new.png", "threshold": 0.80}],
+})
+if 'IMAGE_DETECTION_OPERATORS' in locals():
+    IMAGE_DETECTION_OPERATORS.update({"OLD": "AND", "NEW": "OR"})
+if 'IMAGE_DETECTION_DESCRIPTIONS' in locals():
+    IMAGE_DETECTION_DESCRIPTIONS.setdefault('targets', {}).update({
+        "OLD": "old override", "NEW": "new",
+    })
+# POKECON_IMAGE_CHECK_LIBRARY_IMPORTS_END
+'''
+        settings = parse_image_detection_source_settings(source)
+        self.assertEqual(set(settings), {"OLD", "NEW"})
+        self.assertEqual(settings["OLD"]["operator"], "AND")
+        self.assertEqual(settings["OLD"]["description"], "old override")
+        self.assertEqual(
+            settings["OLD"]["variants"][0]["template_path"],
+            "old-new.png")
+        self.assertEqual(settings["NEW"]["description"], "new")
+
+    def test_partial_devstudio_apply_paths_use_additive_helper(self):
+        for function in (
+                DevStudio.apply_sample_apply_images,
+                DevStudio.apply_selected_sample_list,
+                DevStudio.open_registered_image_target_dialog):
+            self.assertIn(
+                "_add_registered_image_targets_to_editor",
+                inspect.getsource(function))
+
+    def test_devstudio_source_dependency_files_include_adjacent_jsonc(self):
+        with tempfile.TemporaryDirectory() as root:
+            source_path = os.path.join(root, "command.py")
+            zones_path = os.path.join(root, "zones.jsonc")
+            with open(source_path, "w", encoding="utf-8") as stream:
+                stream.write("# command")
+            with open(zones_path, "w", encoding="utf-8") as stream:
+                stream.write('{"1": ["POKEMON_ZONE1"]}')
+
+            class Studio:
+                def __init__(self):
+                    self.editor = object()
+                    self.current_path = source_path
+
+            studio = Studio()
+            result = DevStudio._image_detection_dependency_texts(
+                studio,
+                'config_path = os.path.join(command_dir, "zones.jsonc")',
+                studio.editor)
+            self.assertEqual(result, ['{"1": ["POKEMON_ZONE1"]}'])
 
     def test_multiple_merges_accumulate_and_generated_code_preserves_managed_block(self):
         source = '''
@@ -15604,7 +21592,7 @@ class ManualControllerResponsivenessTests(unittest.TestCase):
         self.assertEqual(int(neutral[0], 16) >> 2, 0)
         self.assertEqual(neutral[1], str(int(Hat.CENTER)))
 
-    def test_held_stick_direction_can_change_without_core_extension(self):
+    def test_releasing_button_preserves_separately_held_hat(self):
         class CaptureSender:
             def __init__(self):
                 self.rows = []
@@ -15614,28 +21602,123 @@ class ManualControllerResponsivenessTests(unittest.TestCase):
 
         sender = CaptureSender()
         keys = KeyPress(sender)
-        keys.input(Button.ZL)
-        keys.hold(Direction(Stick.LEFT, 40, 1.0))
+        keys.hold([Button.B, Hat.LEFT])
+        keys.holdEnd(Button.B)
+        released_button = sender.rows[-1].split()
+        self.assertEqual(int(released_button[0], 16) >> 2, 0)
+        self.assertEqual(released_button[1], str(int(Hat.LEFT)))
+
+        keys.input(Button.A)
+        keys.inputEnd(Button.A)
+        released_press = sender.rows[-1].split()
+        self.assertEqual(int(released_press[0], 16) >> 2, 0)
+        self.assertEqual(released_press[1], str(int(Hat.LEFT)))
+
+    def test_multi_button_press_does_not_release_held_stick(self):
+        class CaptureSender:
+            def __init__(self):
+                self.rows = []
+
+            def writeRow(self, row, is_show=False, priority=False):
+                self.rows.append(row)
+
+        sender = CaptureSender()
+        keys = KeyPress(sender)
+        held = Direction(Stick.LEFT, 179.55, 1.0)
+        keys.hold(held)
+        pulse = [Button.B, Button.A]
+
+        keys.input(pulse)
+        keys.inputEnd(pulse)
+
+        self.assertEqual(pulse, [Button.B, Button.A])
+        self.assertEqual(keys.format.format["lx"], held.x)
+        self.assertEqual(keys.format.format["ly"], 255 - held.y)
+        released = sender.rows[-1].split()
+        self.assertEqual(int(released[0], 16) >> 2, 0)
+
+    def test_held_stick_direction_is_replaced_atomically(self):
+        class CaptureSender:
+            def __init__(self):
+                self.rows = []
+
+            def writeRow(self, row, is_show=False, priority=False):
+                self.rows.append(row)
+
+        sender = CaptureSender()
+        keys = KeyPress(sender)
+        original_right = Direction(Stick.RIGHT, 210, 0.7)
+        keys.hold([
+            Button.ZL, Hat.LEFT, original_right,
+            Direction(Stick.LEFT, 212.11, 0.8739),
+        ])
         sender.rows.clear()
 
-        replacement = Direction(Stick.LEFT, 300, 1.0)
-        keys.holdButton = [
-            held for held in keys.holdButton
-            if not (isinstance(held, Direction)
-                    and held.stick == Stick.LEFT)
-        ]
-        keys.holdButton.append(replacement)
-        keys.input([])
+        # Direction.__eq__ ignores magnitude, but a strength-only change is a
+        # real replacement and occurs in the SSR3 recording.
+        replacement = Direction(Stick.LEFT, 212.11, 0.9482)
+        keys.hold(replacement)
 
         self.assertEqual(len(sender.rows), 1)
         self.assertTrue(keys.format.format["btn"] & Button.ZL)
         self.assertEqual(keys.format.format["lx"], replacement.x)
         self.assertEqual(keys.format.format["ly"], 255 - replacement.y)
+        self.assertEqual(keys.format.format["rx"], original_right.x)
+        self.assertEqual(keys.format.format["ry"], 255 - original_right.y)
+        self.assertEqual(keys.format.format["hat"], Hat.LEFT)
         held_left = [
             held for held in keys.holdButton
             if isinstance(held, Direction) and held.stick == Stick.LEFT
         ]
         self.assertEqual(held_left, [replacement])
+
+    def test_hold_batch_with_existing_button_is_transactional(self):
+        class CaptureSender:
+            def __init__(self):
+                self.rows = []
+
+            def writeRow(self, row, is_show=False, priority=False):
+                self.rows.append(row)
+
+        sender = CaptureSender()
+        keys = KeyPress(sender)
+        original = Direction(Stick.LEFT, 30, 0.5)
+        replacement = Direction(Stick.LEFT, 250, 0.9)
+        keys.hold([Button.A, original])
+        sender.rows.clear()
+
+        with mock.patch("builtins.print"):
+            keys.hold([replacement, Button.A])
+
+        self.assertEqual(len(sender.rows), 1)
+        self.assertIn(Button.A, keys.holdButton)
+        self.assertIn(replacement, keys.holdButton)
+        self.assertNotIn(original, keys.holdButton)
+        self.assertEqual(keys.format.format["lx"], replacement.x)
+        self.assertEqual(keys.format.format["ly"], 255 - replacement.y)
+
+    def test_held_hat_direction_is_replaced_atomically(self):
+        class CaptureSender:
+            def __init__(self):
+                self.rows = []
+
+            def writeRow(self, row, is_show=False, priority=False):
+                self.rows.append(row)
+
+        sender = CaptureSender()
+        keys = KeyPress(sender)
+        keys.hold([Button.B, Hat.LEFT])
+        sender.rows.clear()
+
+        keys.hold(Hat.RIGHT)
+
+        self.assertEqual(len(sender.rows), 1)
+        self.assertEqual(
+            [held for held in keys.holdButton if isinstance(held, Hat)],
+            [Hat.RIGHT])
+        packet = sender.rows[-1].split()
+        self.assertEqual(int(packet[0], 16) >> 2, int(Button.B))
+        self.assertEqual(packet[1], str(int(Hat.RIGHT)))
 
     def test_tuple_stick_position_does_not_flood_standard_output(self):
         logger = Direction(Stick.LEFT, (128, 127))._logger
@@ -15875,6 +21958,8 @@ class CommandRecoveryScriptTests(unittest.TestCase):
         releases = []
         app = types.SimpleNamespace(
             cur_command=command,
+            command_recovery_auto_pause_disabled=types.SimpleNamespace(
+                get=lambda: False),
             _command_recovery_detector_command=None,
             _command_recovery_timeline=CommandStateTimeline(loop_cycles=3),
             _command_recovery_input_tracker=CommandInputActivityTracker(60.0),
@@ -15977,6 +22062,8 @@ class CommandRecoveryScriptTests(unittest.TestCase):
         alerts = []
         app = types.SimpleNamespace(
             cur_command=command,
+            command_recovery_auto_pause_disabled=types.SimpleNamespace(
+                get=lambda: False),
             _command_recovery_detector_command=None,
             _command_recovery_timeline=CommandStateTimeline(loop_cycles=3),
             _command_recovery_input_tracker=CommandInputActivityTracker(60.0),
@@ -15999,6 +22086,24 @@ class CommandRecoveryScriptTests(unittest.TestCase):
         self.assertIn("一時停止しますか？", alerts[0][0])
         self.assertTrue(alerts[0][1]["automatic"])
         self.assertFalse(alerts[0][1]["pause_command"])
+
+    def test_checked_no_auto_pause_option_skips_loop_alert_and_pause(self):
+        from Window import PokeControllerApp
+
+        app, command, alerts, releases = self._loop_recovery_app()
+        app.command_recovery_auto_pause_disabled = types.SimpleNamespace(
+            get=lambda: True)
+        for index, value in enumerate(
+                ("A", "B", "A", "B", "A", "B"), start=1):
+            command._1_story_current_state = value
+            self.assertFalse(PokeControllerApp._poll_command_recovery_alerts(
+                app, now=float(index), running=True))
+
+        self.assertEqual(alerts, [])
+        self.assertEqual(command.pause_count, 0)
+        self.assertEqual(releases, [])
+        self.assertIsNone(app._command_recovery_loop_pause_command)
+        self.assertIsNone(app._command_recovery_loop_pause_cycle)
 
     def test_three_cycle_notice_can_pause_at_next_complete_loop(self):
         from Window import PokeControllerApp
@@ -16238,6 +22343,14 @@ class CommandRecoveryScriptTests(unittest.TestCase):
             source = stream.read()
         self.assertIn('text="復旧Pythonを開く"', source)
         self.assertIn('command=self.open_command_recovery_window', source)
+        self.assertIn(
+            'self.command_recovery_auto_pause_disabled = tk.BooleanVar(value=True)',
+            source)
+        self.assertIn(
+            'text="自動一時停止・復旧Pythonの自動表示を無効にする（既定ON）"',
+            source)
+        self.assertIn(
+            'variable=self.command_recovery_auto_pause_disabled', source)
 
     def test_recovery_window_source_does_not_force_focus_or_topmost(self):
         path = os.path.join(SERIAL_CONTROLLER, "CommandRecoveryWindow.py")
@@ -16639,6 +22752,50 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         self.assertIn("_stop_command_monitor_capture_on_request", calls)
         self.assertIn("_confirm_requested_command_monitor_stop", calls)
 
+    def test_all_command_monitor_ui_stop_paths_close_recording_in_background(self):
+        source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        method_names = {
+            "stopPlayPost",
+            "discard_command_monitor_temporary",
+            "_stop_command_monitor_capture_on_request",
+            "toggle_recording",
+        }
+        methods = {
+            item.name: item for node in module.body if isinstance(node, ast.ClassDef)
+            for item in node.body if isinstance(item, ast.FunctionDef)
+            and item.name in method_names
+        }
+        self.assertEqual(set(methods), method_names)
+        for method_name, method in methods.items():
+            finish_calls = [
+                node for node in ast.walk(method)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_finish_command_monitor_chunk"
+            ]
+            self.assertTrue(finish_calls, method_name)
+            for call in finish_calls:
+                keywords = {keyword.arg: keyword.value
+                            for keyword in call.keywords}
+                self.assertIn("background", keywords, method_name)
+                self.assertIsInstance(
+                    keywords["background"], ast.Constant, method_name)
+                self.assertIs(keywords["background"].value, True, method_name)
+
+        explicit_stop_call = next(
+            node for node in ast.walk(
+                methods["_stop_command_monitor_capture_on_request"])
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_finish_command_monitor_chunk")
+        explicit_keywords = {
+            keyword.arg: keyword.value for keyword in explicit_stop_call.keywords}
+        self.assertIs(
+            explicit_keywords["prune_after_finish"].value, False)
+
     def test_manual_stop_confirmation_is_requested_even_without_a_recording(self):
         source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
         with tokenize.open(source_path) as stream:
@@ -16712,6 +22869,31 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         self.assertEqual(dummy._command_monitor_previous_record_mode, "Template")
         self.assertEqual(calls, ["select", command])
         self.assertEqual(popup_values, [False])
+
+    def test_manually_armed_monitor_starts_new_session_when_auto_arm_is_off(self):
+        from Window import PokeControllerApp
+
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        command = object()
+        app = types.SimpleNamespace(
+            record_monitor_auto_arm=Value(False),
+            record_armed=True,
+            record_mode=Value("CommandMonitor"),
+            recorder=types.SimpleNamespace(active=False),
+            cur_command=command,
+            _record_storage_destination_key=lambda: "pc",
+            _command_monitor_begin_session=mock.Mock(),
+        )
+
+        PokeControllerApp._auto_arm_command_monitor_recording(app)
+
+        app._command_monitor_begin_session.assert_called_once_with(command)
 
     def test_commands_exposes_stop_before_automatic_monitor_setup(self):
         source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
@@ -17050,6 +23232,15 @@ class CommandMonitorRecordingTests(unittest.TestCase):
                 self.calls.append(("before", options))
                 return "before-result"
 
+            def checkIfAlive(self):
+                return None
+
+            def image_check(self, _name):
+                return False
+
+            def _ZA_story_battle_flow_state(self, _key):
+                return {}
+
             def ZA_story_Template_battle_function_renda_route(self, **options):
                 self.calls.append(("function", options))
                 return "function-result"
@@ -17077,6 +23268,8 @@ class CommandMonitorRecordingTests(unittest.TestCase):
                 "lockon_endskip": 0,
                 "get_chanceicon4": 0,
                 "noCp": 1,
+                "battle_debug_defeat": True,
+                "result_picture": "POKEMON_ZA_COIN_ICON",
             }),
             ("after", {
                 "bkprg_ret": "1_STORY_FARST_BATTLE",
@@ -17914,7 +24107,10 @@ class CommandMonitorRecordingTests(unittest.TestCase):
                 returncode = 0
                 stderr = ""
 
+            commands = []
+
             def fake_ffmpeg(command, **_kwargs):
+                commands.append(list(command))
                 with open(command[-1], "wb") as stream:
                     stream.write(b"merged mp4")
                 return Completed()
@@ -17948,6 +24144,35 @@ class CommandMonitorRecordingTests(unittest.TestCase):
                     return_value=measured):
                 with self.assertRaisesRegex(RuntimeError, "実映像は1.0秒"):
                     _validated_chunk_media([chunk], [session], strict=True)
+                with self.assertRaisesRegex(RuntimeError, "実映像は1.0秒"):
+                    _validated_chunk_media(
+                        [chunk], [session], strict=True,
+                        allow_low_presentations=True)
+
+    def test_command_merge_marks_unreadable_video_as_retryable(self):
+        with tempfile.TemporaryDirectory() as root:
+            session = os.path.join(root, "chunk")
+            os.makedirs(session)
+            with open(os.path.join(session, "recording.avi"), "wb") as stream:
+                stream.write(b"avi")
+            chunk = {
+                "id": "unreadable", "session_dir": session,
+                "started": 0.0, "ended": 30.0,
+            }
+
+            with mock.patch(
+                    "CommandRecordingMerge._video_duration_info",
+                    return_value=None):
+                with self.assertRaises(
+                        CommandRecordingSourceValidationError) as raised:
+                    _validated_chunk_media(
+                        [chunk], [session], strict=True,
+                        allow_low_presentations=True)
+
+            self.assertEqual(raised.exception.code, "video_unreadable")
+            self.assertEqual(
+                raised.exception.source_chunk_id, "unreadable")
+            self.assertTrue(raised.exception.retryable)
 
     def test_command_merge_rejects_cfr_fill_without_live_presentations(self):
         with tempfile.TemporaryDirectory() as root:
@@ -17973,6 +24198,176 @@ class CommandMonitorRecordingTests(unittest.TestCase):
                         [{"session_dir": session,
                           "started": 100.0, "ended": 160.0}],
                         [session], strict=True)
+
+    def test_youtube_command_merge_allows_timed_cfr_fill_with_warning(self):
+        with tempfile.TemporaryDirectory() as root:
+            session = os.path.join(root, "chunk")
+            os.makedirs(session)
+            with open(os.path.join(session, "recording.avi"), "wb") as stream:
+                stream.write(b"avi")
+            with open(os.path.join(session, "recording_timing.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump({"video": {
+                    "elapsed_seconds": 60.0,
+                    "presentation_frames": 1,
+                    "presentation_mode": "preview_presented",
+                }}, stream)
+            chunk = {
+                "id": "sparse", "session_dir": session,
+                "started": 100.0, "ended": 160.0,
+                "started_wall": "2026-10-13T11:07:00",
+                "command_session_id": "run-sparse",
+                "youtube_archive": {"enabled": True},
+            }
+            measured = {
+                "fps": 60.0, "frames": 3600, "duration": 60.0,
+            }
+
+            class Completed:
+                returncode = 0
+                stderr = ""
+
+            commands = []
+
+            def fake_ffmpeg(command, **_kwargs):
+                commands.append(list(command))
+                with open(command[-1], "wb") as stream:
+                    stream.write(b"merged mp4")
+                return Completed()
+
+            with mock.patch(
+                    "CommandRecordingMerge._video_duration_info",
+                    return_value=measured):
+                merged = merge_command_recording_chunks(
+                    [chunk], root, "run-sparse", ffmpeg_path="ffmpeg",
+                    run_command=fake_ffmpeg,
+                    now=datetime.datetime(2026, 10, 13, 12, 0, 0),
+                    allow_low_presentations=True)
+
+            warning = merged["source_media"][0]["quality_warnings"][0]
+            self.assertEqual(warning["code"], "low_presentation_rate")
+            self.assertEqual(warning["presentation_frames"], 1)
+            self.assertEqual(warning["elapsed_seconds"], 60.0)
+            self.assertEqual(
+                merged["source_quality_warnings"][0]["source_chunk_id"],
+                "sparse")
+            self.assertIn("-an", commands[0])
+            with open(os.path.join(
+                    merged["session_dir"], "command_monitor.json"),
+                    "r", encoding="utf-8") as stream:
+                metadata = json.load(stream)
+            self.assertEqual(
+                metadata["source_quality_warnings"][0]["code"],
+                "low_presentation_rate")
+            self.assertEqual(metadata["duration"], 60.0)
+
+    def test_youtube_low_presentation_mode_still_rejects_time_drift(self):
+        with tempfile.TemporaryDirectory() as root:
+            session = os.path.join(root, "chunk")
+            os.makedirs(session)
+            with open(os.path.join(session, "recording.avi"), "wb") as stream:
+                stream.write(b"avi")
+            with open(os.path.join(session, "recording_timing.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump({"video": {
+                    "elapsed_seconds": 65.0,
+                    "presentation_frames": 1,
+                }}, stream)
+            measured = {
+                "fps": 60.0, "frames": 3600, "duration": 60.0,
+            }
+            chunk = {
+                "id": "drift", "session_dir": session,
+                "started": 100.0, "ended": 160.0,
+            }
+            with mock.patch(
+                    "CommandRecordingMerge._video_duration_info",
+                    return_value=measured):
+                with self.assertRaisesRegex(
+                        CommandRecordingSourceValidationError, "時間ずれ"):
+                    _validated_chunk_media(
+                        [chunk], [session], strict=True,
+                        allow_low_presentations=True)
+
+    def test_youtube_low_presentation_mode_requires_timing_evidence(self):
+        with tempfile.TemporaryDirectory() as root:
+            session = os.path.join(root, "chunk")
+            os.makedirs(session)
+            with open(os.path.join(session, "recording.avi"), "wb") as stream:
+                stream.write(b"avi")
+            measured = {
+                "fps": 60.0, "frames": 3600, "duration": 60.0,
+            }
+            chunk = {
+                "id": "no-timing", "session_dir": session,
+                "started": 100.0, "ended": 160.0,
+            }
+            with mock.patch(
+                    "CommandRecordingMerge._video_duration_info",
+                    return_value=measured):
+                with self.assertRaisesRegex(
+                        CommandRecordingSourceValidationError,
+                        "時間ずれを判定できない"):
+                    _validated_chunk_media(
+                        [chunk], [session], strict=True,
+                        allow_low_presentations=True)
+
+    def test_youtube_low_presentation_mode_rejects_zero_timing(self):
+        with tempfile.TemporaryDirectory() as root:
+            session = os.path.join(root, "chunk")
+            os.makedirs(session)
+            with open(os.path.join(session, "recording.avi"), "wb") as stream:
+                stream.write(b"avi")
+            with open(os.path.join(session, "recording_timing.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump({"video": {
+                    "elapsed_seconds": 0.0,
+                    "presentation_frames": 0,
+                }}, stream)
+            measured = {
+                "fps": 60.0, "frames": 3600, "duration": 60.0,
+            }
+            chunk = {
+                "id": "zero-timing", "session_dir": session,
+                "started": 100.0, "ended": 160.0,
+            }
+            with mock.patch(
+                    "CommandRecordingMerge._video_duration_info",
+                    return_value=measured):
+                with self.assertRaisesRegex(
+                        CommandRecordingSourceValidationError,
+                        "録画時間を確認できません"):
+                    _validated_chunk_media(
+                        [chunk], [session], strict=True,
+                        allow_low_presentations=True)
+
+    def test_youtube_low_presentation_mode_compares_short_positive_timing(self):
+        with tempfile.TemporaryDirectory() as root:
+            session = os.path.join(root, "chunk")
+            os.makedirs(session)
+            with open(os.path.join(session, "recording.avi"), "wb") as stream:
+                stream.write(b"avi")
+            with open(os.path.join(session, "recording_timing.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump({"video": {
+                    "elapsed_seconds": 0.1,
+                    "presentation_frames": 1,
+                }}, stream)
+            measured = {
+                "fps": 60.0, "frames": 3600, "duration": 60.0,
+            }
+            chunk = {
+                "id": "near-zero-timing", "session_dir": session,
+                "started": 100.0, "ended": 160.0,
+            }
+            with mock.patch(
+                    "CommandRecordingMerge._video_duration_info",
+                    return_value=measured):
+                with self.assertRaisesRegex(
+                        CommandRecordingSourceValidationError, "時間ずれ"):
+                    _validated_chunk_media(
+                        [chunk], [session], strict=True,
+                        allow_low_presentations=True)
 
     def test_command_merge_inserts_one_second_loop_skip_slate(self):
         with tempfile.TemporaryDirectory() as root:
@@ -18211,6 +24606,486 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             "STATE_COMMON_FUNCTION": "COMMON_START",
         })
 
+    def test_runtime_snapshot_does_not_iterate_live_command_dictionary(self):
+        started = threading.Event()
+        changed = threading.Event()
+
+        class BlockingKey:
+            def __str__(self):
+                started.set()
+                self_test.assertTrue(changed.wait(timeout=2.0))
+                return "concurrent_key"
+
+        self_test = self
+        command = type("Story", (), {})()
+        # Insert the blocking key first so the worker mutates the original
+        # __dict__ while runtime_state_snapshot is iterating its snapshot.
+        command.__dict__[BlockingKey()] = object()
+        command.STATE_MAIN_FUNCTION = {"RUN": object()}
+        command.main_current_state = "RUN"
+
+        def mutate_command():
+            self.assertTrue(started.wait(timeout=2.0))
+            command.concurrent_attribute = True
+            changed.set()
+
+        worker = threading.Thread(target=mutate_command)
+        worker.start()
+        try:
+            self.assertEqual(runtime_state_snapshot(command), {
+                "STATE_MAIN_FUNCTION": "RUN",
+            })
+        finally:
+            changed.set()
+            worker.join(timeout=2.0)
+        self.assertFalse(worker.is_alive())
+
+    def test_monitor_frame_error_closes_the_active_chunk_in_background(self):
+        from Window import PokeControllerApp
+
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        active_chunk = {"id": "open"}
+        app = types.SimpleNamespace(
+            recorder=types.SimpleNamespace(active=True),
+            record_armed=True,
+            record_mode=Value("CommandMonitor"),
+            _command_monitor_current_chunk=active_chunk,
+            _command_monitor_stop_in_progress=False,
+            _update_commands_dark_safety=mock.Mock(),
+            _sync_audio_device_usage=mock.Mock(),
+            _process_operation_capture_frame=mock.Mock(),
+            _recording_disk_space_ok=mock.Mock(return_value=True),
+            _process_command_monitor_frame=mock.Mock(
+                side_effect=RuntimeError("snapshot race")),
+            _stop_command_record_window_capture=mock.Mock(),
+            _finish_command_monitor_chunk=mock.Mock(return_value=True),
+            _logger=mock.Mock(),
+            record_monitor_status=mock.Mock(),
+            show_output=mock.Mock(),
+        )
+
+        with mock.patch.object(
+                PokeControllerApp, "_camera_feature_limited_active",
+                return_value=False):
+            PokeControllerApp.process_recording_frame(app, object())
+
+        self.assertFalse(app.record_armed)
+        app._finish_command_monitor_chunk.assert_called_once_with(
+            "monitor_error", background=True)
+        app._stop_command_record_window_capture.assert_called_once_with()
+
+    def test_command_monitor_retention_mode_normalizes_legacy_values(self):
+        from Window import (COMMAND_MONITOR_RETENTION_KEEP_ALL,
+                            COMMAND_MONITOR_RETENTION_SMART,
+                            normalize_command_monitor_retention_mode)
+
+        self.assertEqual(
+            normalize_command_monitor_retention_mode("keep_all"),
+            COMMAND_MONITOR_RETENTION_KEEP_ALL)
+        self.assertEqual(
+            normalize_command_monitor_retention_mode("keep-all"),
+            COMMAND_MONITOR_RETENTION_KEEP_ALL)
+        for value in (None, "", "unknown", "smart"):
+            self.assertEqual(
+                normalize_command_monitor_retention_mode(value),
+                COMMAND_MONITOR_RETENTION_SMART)
+
+    def test_retention_mode_change_applies_from_next_commands_run(self):
+        from Window import PokeControllerApp
+
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        status = Value("")
+        app = types.SimpleNamespace(
+            record_monitor_retention_mode=Value("keep_all"),
+            _command_monitor_retention_mode_key=lambda: "keep_all",
+            _command_monitor_session_retention_mode="smart",
+            _command_monitor_command=object(),
+            record_monitor_status=status,
+        )
+
+        PokeControllerApp._on_command_monitor_retention_mode_changed(app)
+
+        self.assertIn("次回のCommands実行", status.value)
+        self.assertFalse(PokeControllerApp._command_monitor_keep_all_enabled(app))
+        app._command_monitor_session_retention_mode = "keep_all"
+        app.record_monitor_retention_mode.set("smart")
+        self.assertTrue(PokeControllerApp._command_monitor_keep_all_enabled(app))
+
+    def test_recording_set_change_disarms_inflight_chunk_rotation(self):
+        from Window import PokeControllerApp
+
+        class AppliedEnough(Exception):
+            pass
+
+        class StopAtFirstSetting:
+            def set(self, _value):
+                raise AppliedEnough()
+
+        app = types.SimpleNamespace(
+            _command_monitor_current_chunk={"id": "rotating"},
+            _command_monitor_stop_in_progress=True,
+            record_armed=True,
+            recorder=types.SimpleNamespace(active=False),
+            _youtube_recording_rotation_in_progress=False,
+            record_mode=StopAtFirstSetting(),
+        )
+
+        with self.assertRaises(AppliedEnough):
+            PokeControllerApp._apply_recording_preset_data(app, {})
+
+        self.assertFalse(app.record_armed)
+
+    def test_recording_set_reloads_output_after_new_retention_values(self):
+        from Window import PokeControllerApp
+
+        class Value:
+            def __init__(self, value=None, changed=None):
+                self.value = value
+                self.changed = changed
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+                if self.changed is not None:
+                    self.changed()
+
+        app = types.SimpleNamespace(
+            _command_monitor_current_chunk=None,
+            _command_monitor_stop_in_progress=False,
+            _youtube_recording_rotation_in_progress=False,
+            record_armed=False,
+            recorder=types.SimpleNamespace(
+                active=False, configure_template=mock.Mock()),
+            _command_monitor_chunks=[],
+            _apply_record_output_dir=mock.Mock(),
+            record_mode=Value("Manual"),
+            record_template_path=Value(""),
+            record_threshold=Value(0.9),
+            record_interval=Value(0.5),
+            record_release=Value(1.0),
+            record_roi=Value("0,0,0,0"),
+            record_debug=Value(False),
+            record_minimum_duration=Value(0),
+            record_min_free_gb=Value(5.0),
+            record_max_disk_usage_percent=Value(95.0),
+            record_variable_command=Value(""),
+            record_variable_name=Value(""),
+            record_variable_start=Value(""),
+            record_variable_stop=Value(""),
+            record_output_mode=Value("Video only"),
+            record_output_logs=Value("Output#1"),
+            record_output_guide=Value(False),
+            record_output_value=Value(False),
+            record_output_detection=Value(True),
+            record_monitor_chunk_seconds=Value(30.0),
+            record_monitor_keep_steps=Value(1),
+            record_monitor_loop_cycles=Value(2),
+            record_monitor_long_seconds=Value(30.0),
+            record_monitor_failure_tail_seconds=Value(60.0),
+            record_monitor_retention_mode=Value("smart"),
+            record_monitor_auto_arm=Value(True),
+            record_focus_repair_enabled=Value(False),
+            record_focus_repair_functions=Value(""),
+            record_common_battle_renda_enabled=Value(False),
+            record_youtube_channel_profile=Value(""),
+            record_youtube_delete_local=Value(True),
+            record_youtube_segment_minutes=Value(120),
+            record_youtube_commands_video_mode=Value(""),
+            record_youtube_commands_allow_low_presentations=Value(True),
+            record_monitor_confirm_delete_on_stop=Value(True),
+            _normalize_record_storage_destination=lambda *_args, **_kwargs: "pc",
+            _set_record_storage_destination=mock.Mock(),
+            _select_recording_mode_page=mock.Mock(),
+            _refresh_youtube_channel_choices=mock.Mock(),
+            configure_recording_rules=mock.Mock(),
+            toggle_record_debug=mock.Mock(),
+        )
+        app._record_output_dir_changed = types.MethodType(
+            PokeControllerApp._record_output_dir_changed, app)
+        app.record_output_dir = Value(
+            "old", changed=app._record_output_dir_changed)
+        observed = []
+
+        def load_chunks():
+            observed.append((
+                app.record_monitor_keep_steps.get(),
+                app.record_monitor_loop_cycles.get(),
+                app.record_monitor_long_seconds.get(),
+                app.record_monitor_retention_mode.get(),
+            ))
+
+        app._load_command_monitor_chunks = load_chunks
+
+        PokeControllerApp._apply_recording_preset_data(app, {
+            "output_dir": "new-root",
+            "monitor_keep_steps": 91,
+            "monitor_loop_cycles": 7,
+            "monitor_long_seconds": 999.0,
+            "monitor_retention_mode": "keep_all",
+            "youtube_commands_allow_low_presentations": False,
+        })
+
+        self.assertEqual(observed, [(91, 7, 999.0, "keep_all")])
+        self.assertEqual(app.record_output_dir.get(), "new-root")
+        self.assertFalse(
+            app.record_youtube_commands_allow_low_presentations.get())
+
+    def test_keep_all_prune_preserves_current_and_tagged_historical_chunks(self):
+        from Window import PokeControllerApp
+
+        current = {
+            "id": "current", "command_session_id": "run-1",
+            "started": 10.0, "ended": 20.0, "historical": False,
+            "delete_pending": True, "loop_anchor": True,
+            "loop_gap_before": True, "loop_gap_seconds": 99.0,
+        }
+        historical = {
+            "id": "historical", "command_session_id": "old-run",
+            "started": 1.0, "ended": 2.0, "historical": True,
+            "monitor_retention_mode": "keep_all",
+            "delete_pending": True,
+        }
+        ordinary = {
+            "id": "ordinary", "command_session_id": "old-run",
+            "started": 3.0, "ended": 4.0, "historical": True,
+            "monitor_retention_mode": "smart",
+            "delete_pending": True,
+        }
+        writes = []
+        app = types.SimpleNamespace(
+            _command_monitor_session_id="run-1",
+            _command_monitor_chunks=[historical, ordinary, current],
+            _command_monitor_keep_all_enabled=lambda: True,
+            _write_command_monitor_metadata=lambda chunk: (
+                writes.append(chunk["id"]) or True),
+            _refresh_command_monitor_tree=mock.Mock(),
+        )
+        app._update_command_monitor_loop_segments = (
+            lambda retention, now=None:
+            PokeControllerApp._update_command_monitor_loop_segments(
+                app, retention, now))
+
+        retention = PokeControllerApp._mark_command_monitor_prune_candidates(
+            app, now=30.0, explicit_stop=True)
+
+        self.assertEqual(retention["mode"], "keep_all")
+        self.assertFalse(current["delete_pending"])
+        self.assertEqual(current["monitor_retention_mode"], "keep_all")
+        self.assertFalse(current["loop_anchor"])
+        self.assertFalse(current["loop_gap_before"])
+        self.assertEqual(current["loop_gap_seconds"], 0.0)
+        self.assertFalse(historical["delete_pending"])
+        self.assertTrue(ordinary["delete_pending"])
+        self.assertIn("current", writes)
+        self.assertIn("historical", writes)
+
+    def test_keep_all_manifest_survives_historical_startup_cleanup(self):
+        from Window import PokeControllerApp
+
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        class Status:
+            def __init__(self):
+                self.value = ""
+
+            def set(self, value):
+                self.value = value
+
+        with tempfile.TemporaryDirectory() as root:
+            for index in range(10):
+                folder = os.path.join(root, "chunk-{:02d}".format(index))
+                os.makedirs(folder)
+                metadata = {
+                    "id": "chunk-{:02d}".format(index),
+                    "started_wall": "2026-10-12T00:{:02d}:00".format(index),
+                    "duration": 10.0,
+                    "states": ["STEP_{}".format(index % 2)],
+                    "pinned": False,
+                    "command_session_id": "old-run",
+                    "monitor_retention_mode": (
+                        "keep_all" if index in (0, 2) else "smart"),
+                    "delete_pending": index == 2,
+                }
+                if index == 0:
+                    metadata.update({
+                        "recording_close_pending": True,
+                        "recording_close_failed": True,
+                        "recording_close_error": "writer timeout",
+                    })
+                if index == 4:
+                    # A process crash during rolling preflight can leave this
+                    # transient gate durable. Startup must reclaim it while
+                    # preserving the durable rolling retry intent.
+                    metadata.update({
+                        "merge_pending": True,
+                        "youtube_roll_pending": True,
+                        "youtube_archive": {"enabled": True},
+                        "youtube_merge_retry_probe": {
+                            "version": 1,
+                            "code": "video_unreadable",
+                            "source_fingerprint": {
+                                "device": 1, "inode": 2,
+                                "size": 3, "mtime_ns": 4,
+                            },
+                            "attempts": 3,
+                            "first_epoch": 100.0,
+                            "last_epoch": 120.0,
+                        },
+                    })
+                if index == 5:
+                    metadata.update({
+                        "pinned": True,
+                        "youtube_archive": {"enabled": True},
+                        "youtube_merge_attention_required": True,
+                        "youtube_merge_attention_code": "video_too_short",
+                        "youtube_merge_attention_error": "recorded time differs",
+                        "youtube_merge_attention_at": "2026-10-13T12:00:00",
+                        "source_media": [{
+                            "duration": 30.0,
+                            "quality_warnings": [{
+                                "code": "low_presentation_rate"}],
+                        }],
+                        "source_quality_warnings": [{
+                            "code": "low_presentation_rate",
+                            "source_chunk_id": "chunk-05",
+                        }],
+                    })
+                with open(os.path.join(folder, "command_monitor.json"),
+                          "w", encoding="utf-8") as stream:
+                    json.dump(metadata, stream)
+                if index == 3:
+                    with open(os.path.join(
+                            folder, "mp4_finalize_job.json"), "w",
+                            encoding="utf-8") as stream:
+                        json.dump({
+                            "version": 1, "status": "closing",
+                            "worker_pid": 99999999,
+                        }, stream)
+
+            app = types.SimpleNamespace(
+                _effective_record_output_dir=lambda: root,
+                record_monitor_keep_steps=Value(1),
+                record_monitor_long_seconds=Value(30.0),
+                record_monitor_loop_cycles=Value(3),
+                _command_monitor_chunks=[],
+                _command_monitor_current_chunk=None,
+                _flush_command_monitor_deletes=mock.Mock(return_value=False),
+                _refresh_command_monitor_tree=mock.Mock(),
+                record_monitor_status=Status(),
+            )
+
+            scanned = PokeControllerApp._scan_command_monitor_chunks(root)
+            PokeControllerApp._apply_scanned_command_monitor_chunks(
+                app, scanned)
+
+            loaded = {chunk["id"]: chunk
+                      for chunk in app._command_monitor_chunks}
+            self.assertFalse(loaded["chunk-00"]["delete_pending"])
+            self.assertEqual(
+                loaded["chunk-00"]["monitor_retention_mode"], "keep_all")
+            self.assertTrue(loaded["chunk-00"]["recording_close_pending"])
+            self.assertTrue(loaded["chunk-00"]["recording_close_failed"])
+            self.assertEqual(
+                loaded["chunk-00"]["recording_close_error"],
+                "writer timeout")
+            self.assertTrue(loaded["chunk-01"]["delete_pending"])
+            self.assertTrue(loaded["chunk-02"]["delete_pending"])
+            self.assertTrue(loaded["chunk-03"]["recording_close_failed"])
+            self.assertFalse(loaded["chunk-03"]["delete_pending"])
+            self.assertFalse(loaded["chunk-04"].get("merge_pending", False))
+            self.assertTrue(loaded["chunk-04"]["youtube_roll_pending"])
+            self.assertEqual(
+                loaded["chunk-04"]["youtube_merge_retry_probe"]["attempts"],
+                3)
+            self.assertFalse(loaded["chunk-04"]["delete_pending"])
+            self.assertTrue(
+                loaded["chunk-05"]["youtube_merge_attention_required"])
+            self.assertEqual(
+                loaded["chunk-05"]["youtube_merge_attention_code"],
+                "video_too_short")
+            self.assertEqual(
+                loaded["chunk-05"]["youtube_merge_attention_at"],
+                "2026-10-13T12:00:00")
+            self.assertEqual(
+                loaded["chunk-05"]["source_media"][0]["quality_warnings"][0][
+                    "code"], "low_presentation_rate")
+            self.assertEqual(
+                loaded["chunk-05"]["source_quality_warnings"][0][
+                    "source_chunk_id"], "chunk-05")
+            self.assertFalse(loaded["chunk-05"]["delete_pending"])
+
+    def test_keep_all_frame_path_skips_recording_failure_cutoffs(self):
+        from Window import PokeControllerApp
+
+        class Value:
+            def get(self):
+                return 30.0
+
+        command = types.SimpleNamespace(alive=True)
+        frame = object()
+        visual_detector = types.SimpleNamespace(reset=mock.Mock())
+        input_tracker = types.SimpleNamespace(reset=mock.Mock())
+        app = types.SimpleNamespace(
+            record_armed=True,
+            _command_monitor_stop_in_progress=False,
+            cur_command=command,
+            _command_monitor_command=command,
+            _command_monitor_current_chunk={"started": 99.0},
+            recorder=types.SimpleNamespace(
+                active=True, audio_start_in_progress=False),
+            _command_trace_targets=[],
+            _command_focus_trace_started=False,
+            _command_monitor_keep_all_enabled=lambda: True,
+            _command_monitor_visual_detector=visual_detector,
+            _command_monitor_input_tracker=input_tracker,
+            _update_command_monitor_state=mock.Mock(return_value={
+                "changed": False, "loop_started": False,
+                "loop_ended": False}),
+            _update_command_monitor_visual_state=mock.Mock(),
+            _update_command_monitor_input_state=mock.Mock(),
+            _command_monitor_failure_capture_until=None,
+            _command_monitor_failure_capture_mode="",
+            record_monitor_chunk_seconds=Value(),
+            _finish_command_monitor_chunk=mock.Mock(),
+            _mark_command_monitor_prune_candidates=mock.Mock(),
+            _queue_recording_frame=mock.Mock(),
+        )
+
+        with mock.patch.object(
+                PokeControllerApp, "_camera_feature_limited_active",
+                return_value=False), \
+                mock.patch("Window.time.monotonic", return_value=100.0):
+            PokeControllerApp._process_command_monitor_frame(app, frame)
+
+        visual_detector.reset.assert_not_called()
+        input_tracker.reset.assert_not_called()
+        app._update_command_monitor_visual_state.assert_not_called()
+        app._update_command_monitor_input_state.assert_not_called()
+        app._finish_command_monitor_chunk.assert_not_called()
+        app._queue_recording_frame.assert_called_once_with(frame)
+
     def test_two_step_loop_counts_as_two_unique_steps_and_detects_three_cycles(self):
         timeline = CommandStateTimeline(loop_cycles=3)
         for now, value in enumerate(("A", "B", "A", "B", "A", "B")):
@@ -18226,6 +25101,32 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         timeline.add({"STATE": "A"}, 6.0)
         self.assertEqual(timeline.loop_progress()["completed_cycles"], 3)
         self.assertEqual(timeline.loop_progress()["phase"], 1)
+
+    def test_keep_all_timeline_records_steps_without_classifying_a_loop(self):
+        timeline = CommandStateTimeline(loop_cycles=3)
+        results = [
+            timeline.add({"STATE": value}, now, detect_loops=False)
+            for now, value in enumerate(("A", "B", "A", "B", "A", "B"))
+        ]
+
+        self.assertEqual(len(timeline.events), 6)
+        self.assertTrue(all(result["changed"] for result in results))
+        self.assertFalse(any(result["loop_started"] for result in results))
+        self.assertFalse(any(result["loop_ended"] for result in results))
+        self.assertIsNone(timeline.active_loop)
+        self.assertIsNone(timeline.completed_loop)
+
+        # Switching modes must also clear a loop already classified by the
+        # automatic mode while retaining the subsequent Step event.
+        automatic = CommandStateTimeline(loop_cycles=3)
+        for now, value in enumerate(("A", "B", "A", "B", "A", "B")):
+            automatic.add({"STATE": value}, now)
+        self.assertIsNotNone(automatic.active_loop)
+        switched = automatic.add(
+            {"STATE": "C"}, 6.0, detect_loops=False)
+        self.assertTrue(switched["changed"])
+        self.assertIsNone(automatic.active_loop)
+        self.assertIsNone(automatic.completed_loop)
 
     def test_short_unescaped_loop_keeps_preceding_steps_without_a_gap(self):
         timeline = CommandStateTimeline(loop_cycles=3)
@@ -18416,7 +25317,8 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             show_output=lambda name, text: outputs.append((name, text)),
             _release_command_input_for_dark_pause=(
                 lambda target: releases.append(target)),
-            command_recovery_auto_open=types.SimpleNamespace(get=lambda: True),
+            command_recovery_auto_pause_disabled=types.SimpleNamespace(
+                get=lambda: False),
             _show_command_recovery_window=(
                 lambda reason, **options:
                 recovery_windows.append((reason, options))),
@@ -18442,6 +25344,64 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         self.assertFalse(command.pause_requested)
         self.assertEqual(command.resume_count, 1)
         self.assertEqual(len(outputs), 2)
+
+    def test_checked_no_auto_pause_option_skips_dark_pause_and_popup(self):
+        from Window import PokeControllerApp
+
+        command = types.SimpleNamespace(
+            alive=True, pause_requested=False,
+            request_pause=mock.Mock(), resume=mock.Mock())
+        detector = DarkStillFrameDetector(
+            hold_seconds=0.5, sample_interval=0.1)
+        app = types.SimpleNamespace(
+            cur_command=command,
+            start_button={"text": "Stop"},
+            command_recovery_auto_pause_disabled=types.SimpleNamespace(
+                get=lambda: True),
+            _commands_dark_safety_detector=detector,
+            _commands_dark_safety_command=None,
+            _commands_dark_safety_paused_command=None,
+            _software_controller_override_active=False,
+            _show_command_recovery_window=mock.Mock(),
+            _release_command_input_for_dark_pause=mock.Mock(),
+        )
+
+        results = [
+            PokeControllerApp._update_commands_dark_safety(
+                app, self._SolidFrame(0), now=index * 0.1)
+            for index in range(12)
+        ]
+
+        self.assertFalse(any(result["command_paused"] for result in results))
+        command.request_pause.assert_not_called()
+        app._show_command_recovery_window.assert_not_called()
+        app._release_command_input_for_dark_pause.assert_not_called()
+        self.assertIsNone(detector.active)
+
+    def test_enabling_no_auto_pause_resumes_dark_safety_owned_pause(self):
+        from Window import PokeControllerApp
+
+        command = types.SimpleNamespace(
+            alive=True, pause_requested=True, resume=mock.Mock())
+        detector = mock.Mock()
+        app = types.SimpleNamespace(
+            cur_command=command,
+            start_button={"text": "Stop"},
+            command_recovery_auto_pause_disabled=types.SimpleNamespace(
+                get=lambda: True),
+            _commands_dark_safety_detector=detector,
+            _commands_dark_safety_command=command,
+            _commands_dark_safety_paused_command=command,
+            _software_controller_override_active=False,
+        )
+
+        result = PokeControllerApp._update_commands_dark_safety(
+            app, self._SolidFrame(0), now=1.0)
+
+        self.assertTrue(result["command_resumed"])
+        command.resume.assert_called_once_with()
+        detector.add.assert_not_called()
+        self.assertIsNone(app._commands_dark_safety_paused_command)
 
     def test_dark_still_pause_can_be_manually_resumed_before_video_changes(self):
         from Window import PokeControllerApp
@@ -18481,7 +25441,8 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             _commands_dark_safety_paused_command=None,
             _software_controller_override_active=False,
             _logger=mock.Mock(),
-            command_recovery_auto_open=types.SimpleNamespace(get=lambda: True),
+            command_recovery_auto_pause_disabled=types.SimpleNamespace(
+                get=lambda: False),
             show_output=mock.Mock(),
             _release_command_input_for_dark_pause=mock.Mock(),
             _show_command_recovery_window=(
@@ -18607,7 +25568,7 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             cur_command=command,
             _write_command_monitor_event=lambda *args, **kwargs: None,
             _write_command_monitor_output_log=lambda *args, **kwargs: None,
-            _write_command_monitor_metadata=lambda *args, **kwargs: None,
+            _write_command_monitor_metadata=lambda *args, **kwargs: True,
             _sync_audio_device_usage=lambda: None,
             _refresh_command_monitor_tree=lambda: None,
             _mark_command_monitor_prune_candidates=mock.Mock(),
@@ -18637,6 +25598,836 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         self.assertFalse(app._command_monitor_stop_in_progress)
         self.assertIsNone(app._command_monitor_current_chunk)
         app._mark_command_monitor_prune_candidates.assert_called_once()
+
+    def _async_command_monitor_start_fixture(self, folder, start_error=None):
+        from Window import PokeControllerApp
+
+        entered = threading.Event()
+        release = threading.Event()
+        created = []
+        main_thread = threading.get_ident()
+
+        class Value:
+            def __init__(self, value):
+                self.value = value
+                self.call_threads = []
+
+            def get(self):
+                self.call_threads.append(threading.get_ident())
+                return self.value
+
+        class Status:
+            def __init__(self):
+                self.value = ""
+
+            def set(self, value):
+                self.value = value
+
+        class FakeRecorder:
+            def __init__(self, output_dir=None):
+                self.output_dir = output_dir
+                self.active = False
+                self.is_finalizing = False
+                self.writer_thread = None
+                self._video_late_close_thread = None
+                self.stop_calls = []
+                self.activated_frame = None
+                self.activated_at = 0.0
+                created.append(self)
+
+            def start(self, frame, *_args, **_kwargs):
+                entered.set()
+                release.wait(2.0)
+                if start_error is not None:
+                    raise start_error
+                self.session_dir = os.path.join(
+                    self.output_dir, "async-session")
+                os.makedirs(self.session_dir, exist_ok=True)
+                self.started_at = time.monotonic() - 100.0
+                self.active = True
+
+            def activate_timeline(self, frame, started_at=None):
+                self.activated_frame = frame
+                self.activated_at = float(started_at)
+                self.started_at = float(started_at)
+                return True
+
+            def stop(self, discard=False):
+                self.stop_calls.append(bool(discard))
+                self.active = False
+                return ""
+
+            def retire_finalize_worker(self):
+                return None
+
+        old_recorder = FakeRecorder(folder)
+        created.clear()
+        command = types.SimpleNamespace(alive=True, NAME="Async command")
+        fps = Value(60.0)
+        gain = Value(100)
+        output_mode = Value("Video only")
+        app = types.SimpleNamespace(
+            _command_monitor_lock=threading.Lock(),
+            _command_monitor_start_generation=0,
+            _command_monitor_start_request=None,
+            _command_monitor_start_thread=None,
+            _command_monitor_current_chunk=None,
+            _command_monitor_stop_in_progress=False,
+            _command_monitor_command=command,
+            _command_monitor_session_id="session-1",
+            _command_monitor_source={},
+            _command_monitor_chunks=[],
+            _command_focus_targets=[],
+            _command_common_targets=[],
+            _command_common_function_groups=[],
+            _command_focus_trace_dropped=0,
+            _command_monitor_last_snapshot={},
+            _command_monitor_last_location_key=(),
+            _command_monitor_timeline=mock.Mock(),
+            recorder=old_recorder,
+            operation_recorder=types.SimpleNamespace(
+                is_finalizing=False, writer_thread=None,
+                _video_late_close_thread=None),
+            _operation_finalize_thread=None,
+            cur_command=command,
+            record_armed=True,
+            fps=fps,
+            audio_gain=gain,
+            record_output_mode=output_mode,
+            audio_monitor=None,
+            _active_recording_youtube_config={},
+            _record_compose_condition=threading.Condition(),
+            _record_compose_queue_max_depth=0,
+            _recording_latest_snapshot=None,
+            _recording_last_presentation_at=0.0,
+            _youtube_retiring_recorders=[],
+            _gui_action_queue=queue.Queue(),
+            _preview_shutdown_mode=False,
+            _command_monitor_exit_after_stop=False,
+            _logger=mock.Mock(),
+            record_monitor_status=Status(),
+            show_output=mock.Mock(),
+            _confirm_selected_audio_for_use=lambda: True,
+            _selected_audio_device_name=lambda: "",
+            _audio_level_options=lambda: {},
+            _effective_record_output_dir=lambda: folder,
+            _youtube_recording_config_snapshot=lambda: {
+                "enabled": False, "record_mode": "CommandMonitor"},
+            _command_monitor_keep_all_enabled=lambda: False,
+            _write_command_monitor_metadata=mock.Mock(return_value=True),
+            _queue_command_monitor_source_snapshot=mock.Mock(return_value=True),
+            _sync_audio_device_usage=mock.Mock(),
+            _refresh_command_monitor_tree=mock.Mock(),
+            _queue_command_monitor_step_frame=mock.Mock(return_value=""),
+            _write_command_monitor_event=mock.Mock(),
+            _retire_youtube_recorder=mock.Mock(),
+            _stop_command_record_window_capture=mock.Mock(),
+            _wait_for_recording_finalization=mock.Mock(),
+            _recording_frame_recorders=lambda: [],
+        )
+        app._request_command_monitor_chunk_restart = types.MethodType(
+            PokeControllerApp._request_command_monitor_chunk_restart, app)
+        app._cancel_command_monitor_chunk_start = types.MethodType(
+            PokeControllerApp._cancel_command_monitor_chunk_start, app)
+        app._stop_capture_recorder_instance = (
+            lambda recorder, youtube_config=None, discard=False:
+            recorder.stop(discard=discard))
+        return {
+            "app": app, "command": command, "recorder_class": FakeRecorder,
+            "created": created, "entered": entered, "release": release,
+            "main_thread": main_thread, "values": (fps, gain, output_mode),
+        }
+
+    def test_async_command_start_is_nonblocking_deduped_and_uses_latest_frame(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self._async_command_monitor_start_fixture(folder)
+            app = fixture["app"]
+            first = numpy.zeros((2, 2, 3), dtype=numpy.uint8)
+            latest = numpy.ones((2, 2, 3), dtype=numpy.uint8)
+            with mock.patch("Window.CaptureRecorder",
+                            fixture["recorder_class"]):
+                started = time.monotonic()
+                self.assertTrue(app._request_command_monitor_chunk_restart(
+                    first, fixture["command"], "recording_started"))
+                self.assertLess(time.monotonic() - started, 0.2)
+                self.assertTrue(fixture["entered"].wait(1.0))
+                self.assertTrue(
+                    PokeControllerApp._recording_background_work_active(app))
+                self.assertFalse(app._request_command_monitor_chunk_restart(
+                    first, fixture["command"], "recording_started"))
+                PokeControllerApp.process_presented_recording_frame(
+                    app, latest, 2, time.monotonic())
+                released_at = time.monotonic()
+                fixture["release"].set()
+                callback = app._gui_action_queue.get(timeout=2.0)
+                callback()
+
+            successor = fixture["created"][0]
+            self.assertIs(app.recorder, successor)
+            self.assertTrue(numpy.array_equal(
+                successor.activated_frame, latest))
+            self.assertGreaterEqual(successor.activated_at, released_at)
+            self.assertEqual(len(app._command_monitor_chunks), 1)
+            self.assertIs(app._command_monitor_current_chunk,
+                          app._command_monitor_chunks[0])
+            self.assertIsNone(app._command_monitor_start_request)
+            for value in fixture["values"]:
+                self.assertTrue(value.call_threads)
+                self.assertEqual(set(value.call_threads), {
+                    fixture["main_thread"]})
+
+    def test_command_stop_during_async_start_waits_for_worker_cleanup(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self._async_command_monitor_start_fixture(folder)
+            app = fixture["app"]
+            app.record_mode = types.SimpleNamespace(get=lambda: "CommandMonitor")
+            app._command_focus_trace_started = False
+            app._complete_command_monitor_capture_on_request = mock.Mock()
+            with mock.patch("Window.CaptureRecorder",
+                            fixture["recorder_class"]):
+                self.assertTrue(app._request_command_monitor_chunk_restart(
+                    numpy.zeros((2, 2, 3), dtype=numpy.uint8),
+                    fixture["command"], "recording_started"))
+                self.assertTrue(fixture["entered"].wait(1.0))
+                self.assertTrue(
+                    PokeControllerApp._stop_command_monitor_capture_on_request(
+                        app, fixture["command"], "stop_requested"))
+                app._complete_command_monitor_capture_on_request.assert_not_called()
+                fixture["release"].set()
+                app._gui_action_queue.get(timeout=2.0)()
+                cleanup = app._command_monitor_start_request["cleanup_thread"]
+                cleanup.join(2.0)
+                app._gui_action_queue.get(timeout=2.0)()
+
+            successor = fixture["created"][0]
+            self.assertEqual(successor.stop_calls, [True])
+            self.assertEqual(app._command_monitor_chunks, [])
+            self.assertIsNone(app._command_monitor_current_chunk)
+            self.assertIsNone(app._command_monitor_start_request)
+            app._complete_command_monitor_capture_on_request.assert_called_once_with(
+                fixture["command"], error=None, confirm=True)
+
+    def test_async_command_start_failure_disarms_without_retry_storm(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self._async_command_monitor_start_fixture(
+                folder, start_error=RuntimeError("open failed"))
+            app = fixture["app"]
+            with mock.patch("Window.CaptureRecorder",
+                            fixture["recorder_class"]):
+                self.assertTrue(app._request_command_monitor_chunk_restart(
+                    numpy.zeros((2, 2, 3), dtype=numpy.uint8),
+                    fixture["command"], "recording_started"))
+                self.assertTrue(fixture["entered"].wait(1.0))
+                fixture["release"].set()
+                app._gui_action_queue.get(timeout=2.0)()
+                self.assertFalse(app.record_armed)
+                self.assertFalse(app._request_command_monitor_chunk_restart(
+                    numpy.zeros((2, 2, 3), dtype=numpy.uint8),
+                    fixture["command"], "recording_started"))
+
+            self.assertEqual(len(fixture["created"]), 1)
+            self.assertIsNone(app._command_monitor_start_request)
+            self.assertIn("開始できなかった", app.record_monitor_status.value)
+
+    def test_adjustment_journal_rejects_inflight_chunk_publication(self):
+        with tempfile.TemporaryDirectory() as folder:
+            fixture = self._async_command_monitor_start_fixture(folder)
+            app = fixture["app"]
+            old_recorder = app.recorder
+            with mock.patch("Window.CaptureRecorder",
+                            fixture["recorder_class"]):
+                self.assertTrue(app._request_command_monitor_chunk_restart(
+                    numpy.zeros((2, 2, 3), dtype=numpy.uint8),
+                    fixture["command"], "recording_started"))
+                self.assertTrue(fixture["entered"].wait(1.0))
+                app._command_monitor_adjustment_protect_request = {
+                    "token": object()}
+                fixture["release"].set()
+                app._gui_action_queue.get(timeout=2.0)()
+                cleanup = app._command_monitor_start_request["cleanup_thread"]
+                cleanup.join(2.0)
+                app._gui_action_queue.get(timeout=2.0)()
+
+            successor = fixture["created"][0]
+            self.assertEqual(successor.stop_calls, [True])
+            self.assertIs(app.recorder, old_recorder)
+            self.assertEqual(app._command_monitor_chunks, [])
+            self.assertIsNone(app._command_monitor_current_chunk)
+            self.assertIsNone(app._command_monitor_start_request)
+
+    def test_command_delete_is_blocked_by_every_async_journal_gate(self):
+        from Window import PokeControllerApp
+
+        for pending_key in (
+                "_start_journal_pending", "_source_snapshot_pending",
+                "_retention_journal_pending",
+                "_protection_journal_pending"):
+            chunk = {
+                "id": pending_key, "delete_pending": True,
+                "pinned": False, pending_key: True,
+            }
+            app = types.SimpleNamespace(
+                recorder=types.SimpleNamespace(is_finalizing=False),
+                _command_monitor_chunks=[chunk],
+                _command_monitor_current_chunk=None,
+                _command_monitor_delete_probe_results={},
+            )
+
+            self.assertFalse(
+                PokeControllerApp._flush_command_monitor_deletes(app))
+            self.assertEqual(app._command_monitor_chunks, [chunk])
+
+    @staticmethod
+    def _command_protection_app(chunks, write_metadata):
+        from Window import PokeControllerApp
+
+        class Status:
+            def __init__(self):
+                self.value = ""
+
+            def set(self, value):
+                self.value = value
+
+        selected = [str(chunk.get("id", "")) for chunk in chunks]
+        app = types.SimpleNamespace(
+            _command_monitor_chunks=chunks,
+            _command_monitor_current_chunk=None,
+            _command_monitor_stop_in_progress=False,
+            _command_monitor_start_request=None,
+            _command_monitor_merge_lock=None,
+            _command_monitor_metadata_journal_lock=threading.Lock(),
+            _command_monitor_metadata_journal_threads=set(),
+            _command_monitor_adjustment_protect_request=None,
+            _record_output_scan_active=False,
+            _record_output_scan_generation=0,
+            _record_output_scan_requested=None,
+            _schedule_command_monitor_output_reload=mock.Mock(),
+            _gui_action_queue=queue.Queue(),
+            _write_command_monitor_metadata=write_metadata,
+            _flush_command_monitor_deletes=mock.Mock(return_value=False),
+            _refresh_command_monitor_tree=mock.Mock(),
+            record_monitor_status=Status(),
+            record_monitor_tree=types.SimpleNamespace(
+                selection=lambda: tuple(selected)),
+            root=object(),
+            _preview_shutdown_mode=False,
+            _process_exit_ready=False,
+            _logger=mock.Mock(),
+            cur_command=types.SimpleNamespace(alive=True),
+            stopPlay=mock.Mock(),
+            recorder=types.SimpleNamespace(is_finalizing=False),
+            operation_recorder=types.SimpleNamespace(is_finalizing=False),
+            _operation_finalize_thread=None,
+        )
+        app._queue_command_monitor_metadata_journal = types.MethodType(
+            PokeControllerApp._queue_command_monitor_metadata_journal, app)
+        return app, selected
+
+    def test_protect_all_journals_off_tk_and_coalesces_double_click(self):
+        from Window import PokeControllerApp
+
+        entered = threading.Event()
+        release = threading.Event()
+        writer_threads = []
+
+        def write_metadata(_chunk):
+            writer_threads.append(threading.get_ident())
+            entered.set()
+            release.wait(2.0)
+            return True
+
+        chunk = {"id": "one", "pinned": False, "delete_pending": True}
+        app, _selected = self._command_protection_app(
+            [chunk], write_metadata)
+        app._record_output_scan_active = True
+        app._record_output_scan_generation = 7
+        app._record_output_scan_requested = {
+            "generation": 7, "root": "old-root"}
+        caller_thread = threading.get_ident()
+
+        started = time.perf_counter()
+        self.assertTrue(
+            PokeControllerApp.protect_command_monitor_recordings(app))
+        self.assertLess(time.perf_counter() - started, 0.5)
+        self.assertTrue(entered.wait(1.0))
+        self.assertTrue(chunk["pinned"])
+        self.assertFalse(chunk["delete_pending"])
+        self.assertNotIn(caller_thread, writer_threads)
+        self.assertFalse(
+            PokeControllerApp.protect_command_monitor_recordings(app))
+        self.assertEqual(app._record_output_scan_generation, 8)
+        self.assertIsNone(app._record_output_scan_requested)
+        app._schedule_command_monitor_output_reload.assert_called_once_with()
+        self.assertTrue(
+            PokeControllerApp._command_monitor_output_reload_busy(app))
+
+        release.set()
+        app._gui_action_queue.get(timeout=2.0)()
+
+        self.assertEqual(len(writer_threads), 1)
+        self.assertIn("自動削除されません", app.record_monitor_status.value)
+
+    def test_adjustment_stop_waits_for_protection_and_exit_tracks_journal(self):
+        from Window import PokeControllerApp
+
+        entered = threading.Event()
+        release = threading.Event()
+
+        def write_metadata(_chunk):
+            entered.set()
+            release.wait(2.0)
+            return True
+
+        chunk = {"id": "one", "pinned": False, "delete_pending": True}
+        app, _selected = self._command_protection_app(
+            [chunk], write_metadata)
+
+        self.assertTrue(
+            PokeControllerApp.stop_command_for_adjustment_with_recordings(app))
+        self.assertTrue(entered.wait(1.0))
+        app.stopPlay.assert_not_called()
+        self.assertFalse(
+            PokeControllerApp.stop_command_for_adjustment_with_recordings(app))
+        self.assertTrue(PokeControllerApp._recording_background_work_active(app))
+
+        release.set()
+        app._gui_action_queue.get(timeout=2.0)()
+
+        app.stopPlay.assert_called_once_with()
+        self.assertIsNone(app._command_monitor_adjustment_protect_request)
+
+    def test_adjustment_journal_callback_does_not_stop_during_exit(self):
+        from Window import PokeControllerApp
+
+        chunk = {"id": "one", "pinned": False, "delete_pending": True}
+        app, _selected = self._command_protection_app(
+            [chunk], mock.Mock(return_value=True))
+
+        self.assertTrue(
+            PokeControllerApp.stop_command_for_adjustment_with_recordings(app))
+        callback = app._gui_action_queue.get(timeout=2.0)
+        app._preview_shutdown_mode = True
+        callback()
+
+        app.stopPlay.assert_not_called()
+        self.assertIsNone(app._command_monitor_adjustment_protect_request)
+
+    def test_natural_command_end_during_adjustment_journal_does_not_double_stop(self):
+        from Window import PokeControllerApp
+
+        chunk = {"id": "one", "pinned": False, "delete_pending": True}
+        app, _selected = self._command_protection_app(
+            [chunk], mock.Mock(return_value=True))
+        command = app.cur_command
+        app._camera_feature_limited_runtime = False
+        app._command_monitor_visual_detector = mock.Mock()
+        app._command_monitor_lock = threading.Lock()
+        app._command_monitor_start_request = None
+        app.record_armed = True
+        app._command_monitor_stop_in_progress = False
+        app._command_monitor_current_chunk = chunk
+        app._command_monitor_command = command
+        app._finish_command_monitor_chunk = mock.Mock()
+
+        self.assertTrue(
+            PokeControllerApp.stop_command_for_adjustment_with_recordings(app))
+        callback = app._gui_action_queue.get(timeout=2.0)
+        command.alive = False
+        with mock.patch.object(
+                PokeControllerApp, "_drain_command_focus_trace") as drain:
+            PokeControllerApp._process_command_monitor_frame(app, object())
+        callback()
+
+        drain.assert_called_once_with(app, command, chunk=chunk)
+        app._finish_command_monitor_chunk.assert_called_once_with(
+            "command_stopped", background=True)
+        app.stopPlay.assert_not_called()
+
+    def test_adjustment_journal_wait_keeps_current_chunk_without_rotation(self):
+        from Window import PokeControllerApp
+
+        class Value:
+            def get(self):
+                return 10.0
+
+        frame = object()
+        command = types.SimpleNamespace(alive=True)
+        state_result = {
+            "changed": False, "loop_started": False, "loop_ended": False}
+        app = types.SimpleNamespace(
+            _camera_feature_limited_runtime=False,
+            _command_monitor_visual_detector=mock.Mock(),
+            cur_command=command,
+            _command_monitor_command=command,
+            _command_monitor_lock=threading.Lock(),
+            _command_monitor_start_request=None,
+            record_armed=True,
+            _command_monitor_adjustment_protect_request={"token": object()},
+            recorder=types.SimpleNamespace(
+                active=True, audio_start_in_progress=False),
+            _command_monitor_stop_in_progress=False,
+            _command_monitor_current_chunk={"started": 0.0},
+            _command_monitor_failure_active=lambda: False,
+            _update_command_monitor_state=mock.Mock(return_value=state_result),
+            _command_monitor_keep_all_enabled=lambda: True,
+            _command_monitor_failure_capture_until=None,
+            _command_monitor_failure_capture_mode="",
+            record_monitor_chunk_seconds=Value(),
+            _queue_recording_frame=mock.Mock(),
+            _finish_command_monitor_chunk=mock.Mock(),
+            _request_command_monitor_chunk_restart=mock.Mock(),
+        )
+
+        with mock.patch.object(
+                PokeControllerApp, "_ensure_command_focus_trace") as ensure, \
+                mock.patch.object(
+                    PokeControllerApp,
+                    "_drain_command_focus_trace") as drain:
+            PokeControllerApp._process_command_monitor_frame(app, frame)
+
+        app._queue_recording_frame.assert_called_once_with(frame)
+        ensure.assert_called_once_with(app, command)
+        drain.assert_called_once_with(
+            app, command, chunk=app._command_monitor_current_chunk)
+        app._update_command_monitor_state.assert_called_once()
+        app._finish_command_monitor_chunk.assert_not_called()
+        app._request_command_monitor_chunk_restart.assert_not_called()
+
+    def test_adjustment_stop_journal_failure_is_fail_closed(self):
+        from Window import PokeControllerApp
+
+        chunk = {"id": "one", "pinned": False, "delete_pending": True}
+        app, _selected = self._command_protection_app(
+            [chunk], mock.Mock(return_value=False))
+
+        with mock.patch("Window.tkmsg.showwarning") as warning:
+            self.assertTrue(
+                PokeControllerApp.stop_command_for_adjustment_with_recordings(
+                    app))
+            app._gui_action_queue.get(timeout=2.0)()
+
+        self.assertTrue(chunk["pinned"])
+        self.assertFalse(chunk["delete_pending"])
+        app.stopPlay.assert_not_called()
+        warning.assert_called_once()
+        self.assertIn("停止していません", app.record_monitor_status.value)
+
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        app.record_monitor_keep_steps = Value(1)
+        app.record_monitor_long_seconds = Value(30.0)
+        app.record_monitor_loop_cycles = Value(2)
+        stale = {
+            "id": "one", "session_dir": "", "pinned": False,
+            "delete_pending": True, "duration_saved": 1.0,
+            "monitor_retention_mode": "smart", "youtube_archive": {},
+        }
+        PokeControllerApp._apply_scanned_command_monitor_chunks(app, [stale])
+        self.assertTrue(stale["pinned"])
+        self.assertFalse(stale["delete_pending"])
+        self.assertIn("not durable", stale["retention_journal_error"])
+
+    def test_protection_thread_start_failure_clears_gate_and_latches_intent(self):
+        from Window import PokeControllerApp
+
+        chunk = {"id": "one", "pinned": False, "delete_pending": True}
+        app, _selected = self._command_protection_app(
+            [chunk], mock.Mock(return_value=True))
+        app._record_output_scan_active = True
+
+        with mock.patch.object(
+                threading.Thread, "start",
+                side_effect=RuntimeError("thread unavailable")), \
+                mock.patch("Window.tkmsg.showwarning") as warning:
+            self.assertFalse(
+                PokeControllerApp.protect_command_monitor_recordings(app))
+
+        self.assertTrue(chunk["pinned"])
+        self.assertFalse(chunk["delete_pending"])
+        self.assertNotIn("_protection_journal_pending", chunk)
+        identity = PokeControllerApp._command_monitor_chunk_storage_identity(
+            chunk)
+        self.assertIn(identity, app._command_monitor_protection_failures)
+        warning.assert_called_once()
+
+    def test_toggle_completion_cannot_overwrite_newer_generation(self):
+        from Window import PokeControllerApp
+
+        chunk = {"id": "one", "pinned": False, "delete_pending": False}
+        app, _selected = self._command_protection_app(
+            [chunk], mock.Mock(return_value=True))
+
+        self.assertTrue(
+            PokeControllerApp.toggle_selected_command_monitor_chunks(app))
+        stale_callback = app._gui_action_queue.get(timeout=2.0)
+        self.assertTrue(chunk["pinned"])
+        self.assertTrue(
+            PokeControllerApp.toggle_selected_command_monitor_chunks(app))
+        current_callback = app._gui_action_queue.get(timeout=2.0)
+        self.assertFalse(chunk["pinned"])
+        status_before_stale = app.record_monitor_status.value
+
+        stale_callback()
+        self.assertEqual(app.record_monitor_status.value, status_before_stale)
+        current_callback()
+
+        self.assertEqual(
+            app.record_monitor_status.value, "選択した録画の保護を更新しました。")
+        self.assertFalse(chunk["pinned"])
+
+    def test_superseded_protect_still_reports_other_chunk_failure(self):
+        from Window import PokeControllerApp
+
+        chunks = [
+            {"id": "one", "pinned": False, "delete_pending": False},
+            {"id": "two", "pinned": False, "delete_pending": False},
+        ]
+
+        def write_metadata(chunk):
+            return chunk["id"] != "two"
+
+        app, selected = self._command_protection_app(chunks, write_metadata)
+        self.assertTrue(
+            PokeControllerApp.protect_command_monitor_recordings(app))
+        protect_callback = app._gui_action_queue.get(timeout=2.0)
+        selected[:] = ["one"]
+        self.assertTrue(
+            PokeControllerApp.toggle_selected_command_monitor_chunks(app))
+        toggle_callback = app._gui_action_queue.get(timeout=2.0)
+
+        with mock.patch("Window.tkmsg.showwarning") as warning:
+            protect_callback()
+
+        warning.assert_called_once()
+        self.assertTrue(chunks[1]["pinned"])
+        toggle_callback()
+
+    def test_command_event_hot_path_only_queues_source_snapshot_work(self):
+        from Window import PokeControllerApp
+
+        trace_queue = queue.Queue()
+        chunk = {
+            "states": [], "session_dir": "recording-folder",
+            "started": 10.0, "focus_repair": {},
+        }
+        app = types.SimpleNamespace(
+            _command_monitor_lock=threading.Lock(),
+            _command_monitor_step_text=lambda _snapshot: "STATE=A",
+            _command_monitor_command=object(),
+            _command_monitor_session_started=10.0,
+            _command_focus_targets=[],
+            _command_trace_queue=trace_queue,
+            _ensure_command_monitor_source_snapshot=mock.Mock(),
+        )
+        location = {"file": "story.py", "function": "step"}
+
+        PokeControllerApp._write_command_monitor_event(
+            app, chunk, {"STATE": "A"}, location=location, now=11.0)
+
+        app._ensure_command_monitor_source_snapshot.assert_not_called()
+        path, payload, queued_chunk = trace_queue.get_nowait()
+        self.assertEqual(path, os.path.join(
+            "recording-folder", "steps.jsonl"))
+        self.assertEqual(payload["location"], location)
+        self.assertIs(queued_chunk, chunk)
+
+    def test_source_snapshot_identity_stat_runs_off_gui_thread(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            chunk = {"session_dir": folder, "source_snapshots": {}}
+            app = types.SimpleNamespace(
+                _ensure_command_monitor_source_snapshot=mock.Mock(
+                    return_value={}),
+                _write_command_monitor_metadata=mock.Mock(return_value=True),
+                _gui_action_queue=queue.Queue(),
+                _logger=mock.Mock(),
+            )
+            call_threads = []
+            real_lstat = os.lstat
+
+            def observed_lstat(path):
+                call_threads.append(threading.get_ident())
+                return real_lstat(path)
+
+            with mock.patch("Window.os.lstat", side_effect=observed_lstat):
+                self.assertTrue(
+                    PokeControllerApp._queue_command_monitor_source_snapshot(
+                        app, chunk, {}, assign_source=True))
+                self.assertTrue(chunk["_source_snapshot_ready"].wait(2.0))
+
+            self.assertTrue(call_threads)
+            self.assertNotIn(threading.get_ident(), call_threads)
+            app._ensure_command_monitor_source_snapshot.assert_called_once()
+
+    def test_command_monitor_stop_does_not_wait_for_source_snapshot(self):
+        from Window import PokeControllerApp
+
+        source_ready = threading.Event()
+        finish_io_started = threading.Event()
+        chunk = {
+            "id": "open", "started": 1.0, "ended": None,
+            "_source_snapshot_pending": True,
+            "_source_snapshot_ready": source_ready,
+        }
+        command = type("Command", (), {"alive": False})()
+        app = types.SimpleNamespace(
+            _command_monitor_lock=threading.Lock(),
+            _command_monitor_current_chunk=chunk,
+            _command_monitor_stop_in_progress=False,
+            _command_monitor_command=command,
+            _command_monitor_last_snapshot={},
+            _command_monitor_session_started=1.0,
+            _gui_action_queue=queue.Queue(),
+            _logger=mock.Mock(),
+            _record_log_lines=mock.Mock(return_value=[]),
+            _write_command_monitor_event=(
+                lambda *_args, **_kwargs: finish_io_started.set()),
+            _write_command_monitor_output_log=mock.Mock(),
+            _write_command_monitor_metadata=mock.Mock(return_value=True),
+            _stop_capture_recorder=mock.Mock(),
+            _complete_command_monitor_chunk_finish=mock.Mock(),
+        )
+
+        with mock.patch.object(
+                PokeControllerApp, "_drain_command_focus_trace"):
+            self.assertTrue(PokeControllerApp._finish_command_monitor_chunk(
+                app, "stop_requested", background=True))
+            self.assertTrue(finish_io_started.wait(1.0))
+            callback = app._gui_action_queue.get(timeout=2.0)
+            callback()
+
+        self.assertFalse(source_ready.is_set())
+        app._stop_capture_recorder.assert_called_once_with()
+        app._complete_command_monitor_chunk_finish.assert_called_once()
+
+    def test_explicit_stop_retention_and_prompt_wait_for_background_close(self):
+        from Window import PokeControllerApp
+
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        command = object()
+        chunk = {"id": "open"}
+        events = []
+        finish_arguments = {}
+
+        def request_finish(reason, **kwargs):
+            finish_arguments.update({"reason": reason, **kwargs})
+            return True
+
+        app = types.SimpleNamespace(
+            record_mode=Value("CommandMonitor"),
+            record_armed=True,
+            _command_monitor_command=command,
+            _command_monitor_current_chunk=chunk,
+            _command_monitor_stop_in_progress=False,
+            _finish_command_monitor_chunk=request_finish,
+            _stop_command_record_window_capture=(
+                lambda: events.append("window_stop")),
+            _mark_command_monitor_prune_candidates=(
+                lambda *_args, **_kwargs:
+                events.append("retention") or {"mode": "manual_stop"}),
+            record_monitor_keep_steps=Value(15),
+            _command_monitor_failure_tail_seconds=lambda: 60.0,
+            record_monitor_status=types.SimpleNamespace(
+                set=lambda _text: events.append("status")),
+            _refresh_command_monitor_tree=lambda: events.append("refresh"),
+            _confirm_requested_command_monitor_stop=(
+                lambda value: events.append(("confirm", value)) or True),
+        )
+        app._complete_command_monitor_capture_on_request = types.MethodType(
+            PokeControllerApp._complete_command_monitor_capture_on_request, app)
+
+        with mock.patch.object(
+                PokeControllerApp, "_drain_command_focus_trace"), \
+                mock.patch.object(
+                    PokeControllerApp, "_stop_command_focus_trace"):
+            deferred = PokeControllerApp._stop_command_monitor_capture_on_request(
+                app, command, "stop_requested")
+
+        self.assertTrue(deferred)
+        self.assertFalse(app.record_armed)
+        self.assertEqual(finish_arguments["reason"], "stop_requested")
+        self.assertTrue(finish_arguments["background"])
+        self.assertFalse(finish_arguments["prune_after_finish"])
+        self.assertEqual(events, ["status"])
+
+        events.clear()
+        finish_arguments["after_finish"](None)
+        self.assertEqual(events, [
+            "window_stop", "retention", "status", "refresh",
+            ("confirm", command),
+        ])
+
+    def test_explicit_stop_callback_precedes_other_finish_callbacks(self):
+        from Window import PokeControllerApp
+
+        stop_started = threading.Event()
+        allow_stop = threading.Event()
+        chunk = {"id": "open", "started": 1.0, "ended": None}
+        command = type("Command", (), {"alive": False})()
+        events = []
+        prune = mock.Mock()
+        app = types.SimpleNamespace(
+            _command_monitor_lock=threading.Lock(),
+            _command_monitor_current_chunk=chunk,
+            _command_monitor_stop_in_progress=False,
+            _command_monitor_command=command,
+            _gui_action_queue=queue.Queue(),
+            _logger=mock.Mock(),
+            record_armed=False,
+            cur_command=command,
+            _write_command_monitor_event=lambda *args, **kwargs: None,
+            _write_command_monitor_output_log=lambda *args, **kwargs: None,
+            _write_command_monitor_metadata=lambda *args, **kwargs: True,
+            _sync_audio_device_usage=lambda: None,
+            _refresh_command_monitor_tree=lambda: None,
+            _mark_command_monitor_prune_candidates=prune,
+            _command_monitor_exit_after_stop=False,
+        )
+
+        def stop_recorder():
+            stop_started.set()
+            allow_stop.wait(2.0)
+
+        app._stop_capture_recorder = stop_recorder
+        app._complete_command_monitor_chunk_finish = types.MethodType(
+            PokeControllerApp._complete_command_monitor_chunk_finish, app)
+        app._finish_command_monitor_chunk = types.MethodType(
+            PokeControllerApp._finish_command_monitor_chunk, app)
+
+        self.assertTrue(app._finish_command_monitor_chunk(
+            "stop_requested", background=True, prune_after_finish=False,
+            after_finish=lambda _error: events.append("explicit")))
+        self.assertTrue(stop_started.wait(1.0))
+        self.assertTrue(app._finish_command_monitor_chunk(
+            "command_finished", background=True,
+            after_finish=lambda _error: events.append("natural")))
+        # A second explicit request is priority too, but the callback that
+        # initiated the close must retain ownership of the first confirmation.
+        self.assertTrue(app._finish_command_monitor_chunk(
+            "force_stop_requested", background=True, prune_after_finish=False,
+            after_finish=lambda _error: events.append("later_explicit")))
+        allow_stop.set()
+        callback = app._gui_action_queue.get(timeout=2.0)
+        callback()
+
+        self.assertEqual(events, ["explicit", "later_explicit", "natural"])
+        prune.assert_not_called()
 
     def test_template_segment_stop_returns_before_avi_drain_finishes(self):
         from Window import PokeControllerApp
@@ -18672,6 +26463,87 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         callback()
         self.assertEqual(completed, [None])
 
+    def test_normal_recording_stop_coalesces_callbacks_and_preserves_discard(self):
+        from Window import PokeControllerApp
+
+        stop_started = threading.Event()
+        allow_stop = threading.Event()
+        stop_calls = []
+        completed = []
+        recorder = types.SimpleNamespace(active=True, defer_finalization=True)
+
+        def stop_recorder(discard=False):
+            stop_calls.append(bool(discard))
+            stop_started.set()
+            allow_stop.wait(2.0)
+
+        app = types.SimpleNamespace(
+            recorder=recorder,
+            _active_recording_youtube_config={},
+            _template_finalize_after_stop=False,
+            _template_exit_after_stop=False,
+            _template_recording_stop_in_progress=False,
+            _recording_stop_callbacks=[],
+            _recording_stop_discard_requested=False,
+            _stop_capture_recorder=stop_recorder,
+            _gui_action_queue=queue.Queue(),
+            record_armed=True,
+            record_button=mock.Mock(),
+            _launch_deferred_template_finalizer=mock.Mock(return_value=True),
+            _logger=mock.Mock(),
+        )
+        app._complete_template_recording_stop = types.MethodType(
+            PokeControllerApp._complete_template_recording_stop, app)
+
+        started_at = time.monotonic()
+        self.assertTrue(PokeControllerApp._request_template_recording_stop(
+            app, discard=True, defer_finalization=False,
+            after_stop=lambda error: completed.append(("first", error))))
+        self.assertLess(time.monotonic() - started_at, 0.2)
+        self.assertTrue(stop_started.wait(1.0))
+        self.assertTrue(PokeControllerApp._request_template_recording_stop(
+            app, after_stop=lambda error: completed.append(("second", error))))
+        self.assertEqual(stop_calls, [True])
+        self.assertFalse(recorder.defer_finalization)
+        self.assertEqual(completed, [])
+
+        allow_stop.set()
+        callback = app._gui_action_queue.get(timeout=2.0)
+        callback()
+
+        self.assertEqual(stop_calls, [True])
+        self.assertEqual(completed, [("first", None), ("second", None)])
+        self.assertFalse(app._template_recording_stop_in_progress)
+        app._launch_deferred_template_finalizer.assert_not_called()
+
+    def test_manual_and_variable_ui_paths_never_drain_recorder_on_tk(self):
+        source_path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(source_path) as stream:
+            source = stream.read()
+        module = ast.parse(source)
+        methods = {
+            item.name: item for node in module.body if isinstance(node, ast.ClassDef)
+            for item in node.body if isinstance(item, ast.FunctionDef)
+            and item.name in {"toggle_recording", "process_recording_frame"}
+        }
+        self.assertEqual(
+            set(methods), {"toggle_recording", "process_recording_frame"})
+        for method_name, method in methods.items():
+            direct_stops = [
+                node for node in ast.walk(method)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_stop_capture_recorder"
+            ]
+            self.assertEqual(direct_stops, [], method_name)
+            async_requests = [
+                node for node in ast.walk(method)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_request_template_recording_stop"
+            ]
+            self.assertTrue(async_requests, method_name)
+
     def test_exit_after_recording_stop_launches_worker_before_destroy(self):
         from Window import PokeControllerApp
 
@@ -18686,6 +26558,7 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             _launch_deferred_template_finalizer=(
                 lambda wait_for_exit=False:
                 events.append(("launch", wait_for_exit)) or True),
+            _recording_background_work_active=lambda: False,
             _exit_now=(
                 lambda confirm=True: events.append(("exit", confirm))),
             _preview_shutdown_mode=True,
@@ -18698,6 +26571,57 @@ class CommandMonitorRecordingTests(unittest.TestCase):
 
         self.assertEqual(events, [("launch", True), ("exit", False)])
         self.assertFalse(app._template_recording_stop_in_progress)
+
+    def test_exit_routes_active_recorder_through_async_stop_after_mode_change(self):
+        from Window import PokeControllerApp
+
+        request_stop = mock.Mock(return_value=True)
+        app = types.SimpleNamespace(
+            _exit_waiting=False,
+            _template_exit_after_stop=False,
+            _preview_shutdown_mode=False,
+            _refresh_preview_priority_status=mock.Mock(),
+            _youtube_recording_rotation_continue=True,
+            record_mode=types.SimpleNamespace(get=lambda: "CommandMonitor"),
+            _template_finalize_candidates=lambda: [],
+            _command_monitor_current_chunk=None,
+            _command_monitor_stop_in_progress=False,
+            recorder=types.SimpleNamespace(active=True),
+            _template_recording_stop_in_progress=False,
+            record_armed=False,
+            record_button=mock.Mock(),
+            root=object(),
+            _request_template_recording_stop=request_stop,
+        )
+
+        with mock.patch("Window.tkmsg.askyesno", return_value=True):
+            PokeControllerApp.exit(app)
+
+        request_stop.assert_called_once_with(exit_after=True)
+
+    def test_exit_waits_for_inprocess_youtube_finalizer_before_destroy(self):
+        from Window import PokeControllerApp
+
+        app = types.SimpleNamespace(
+            _template_finalize_after_stop=False,
+            _template_exit_after_stop=True,
+            _template_recording_stop_in_progress=True,
+            record_armed=False,
+            _launch_deferred_template_finalizer=mock.Mock(return_value=True),
+            _recording_background_work_active=mock.Mock(return_value=True),
+            _wait_for_recording_finalization=mock.Mock(),
+            _exit_now=mock.Mock(),
+            _preview_shutdown_mode=True,
+            _refresh_preview_priority_status=mock.Mock(),
+            _logger=mock.Mock(),
+            show_output=mock.Mock(),
+        )
+
+        self.assertTrue(PokeControllerApp._complete_template_recording_stop(app))
+
+        self.assertTrue(app._exit_waiting)
+        app._wait_for_recording_finalization.assert_called_once_with()
+        app._exit_now.assert_not_called()
 
     def test_loop_anchor_is_released_after_different_step(self):
         timeline = CommandStateTimeline(loop_cycles=3)
@@ -18811,6 +26735,422 @@ class CommandMonitorRecordingTests(unittest.TestCase):
             temporary_chunk_ids_for_session(chunks, "run-2"), {"current"})
         self.assertEqual(temporary_chunk_ids_for_session(chunks, ""), set())
 
+    def test_stop_cleanup_excludes_incomplete_youtube_material(self):
+        chunks = [
+            {"id": "plain", "command_session_id": "run", "pinned": False},
+            {"id": "rolling", "command_session_id": "run", "pinned": False,
+             "youtube_roll_pending": True},
+            {"id": "merging", "command_session_id": "run", "pinned": False,
+             "merge_pending": True},
+            {"id": "queued", "command_session_id": "run", "pinned": False,
+             "youtube_upload": {"status": "queued"}},
+            {"id": "uploaded", "command_session_id": "run", "pinned": False,
+             "youtube_upload": {"status": "completed"}},
+        ]
+
+        self.assertEqual(
+            temporary_chunk_ids_for_session(chunks, "run"),
+            {"plain", "uploaded"})
+
+    def test_manual_discard_skips_incomplete_youtube_material(self):
+        from Window import PokeControllerApp
+
+        chunks = [
+            {"id": "plain", "pinned": False},
+            {"id": "rolling", "pinned": False,
+             "youtube_roll_pending": True},
+            {"id": "merging", "pinned": False, "merge_pending": True},
+            {"id": "queued", "pinned": False,
+             "youtube_upload": {"status": "authentication_required"}},
+            {"id": "uploaded", "pinned": False,
+             "youtube_upload": {"status": "completed"}},
+        ]
+        app = types.SimpleNamespace(
+            _command_monitor_chunks=chunks,
+            _command_monitor_current_chunk=None,
+            _command_monitor_discard_probe_active=False,
+            _gui_action_queue=queue.Queue(),
+            _effective_record_output_dir=lambda: os.getcwd(),
+            _write_command_monitor_metadata=mock.Mock(return_value=True),
+            _flush_command_monitor_deletes=mock.Mock(),
+            record_monitor_status=mock.Mock(),
+            _refresh_command_monitor_tree=mock.Mock(),
+            _logger=mock.Mock(),
+        )
+        with mock.patch("Window.tkmsg.askyesno", return_value=True) as confirm:
+            PokeControllerApp.discard_command_monitor_temporary(app)
+            app._gui_action_queue.get(timeout=2.0)()
+            app._gui_action_queue.get(timeout=2.0)()
+
+        self.assertIn("1本", confirm.call_args.args[1])
+        self.assertTrue(chunks[0]["delete_pending"])
+        self.assertTrue(chunks[0]["explicit_delete_pending"])
+        self.assertNotIn("delete_pending", chunks[1])
+        self.assertNotIn("delete_pending", chunks[2])
+        self.assertNotIn("delete_pending", chunks[3])
+        self.assertNotIn("delete_pending", chunks[4])
+        self.assertNotIn("explicit_delete_pending", chunks[4])
+        self.assertEqual(
+            app._write_command_monitor_metadata.call_count, 1)
+        app._flush_command_monitor_deletes.assert_called_once_with()
+
+    def test_metadata_writer_cannot_overwrite_newer_delete_tombstone(self):
+        from Window import PokeControllerApp
+        import Window
+
+        with tempfile.TemporaryDirectory() as folder:
+            chunk = {
+                "id": "chunk", "session_dir": folder,
+                "started": 1.0, "ended": 2.0,
+                "delete_pending": False,
+                "explicit_delete_pending": False,
+            }
+            app = types.SimpleNamespace(
+                _command_trace_targets=[], _logger=mock.Mock())
+            original_dump = Window.json.dump
+            first_inside = threading.Event()
+            release_first = threading.Event()
+            calls = [0]
+            calls_lock = threading.Lock()
+
+            def controlled_dump(*args, **kwargs):
+                with calls_lock:
+                    calls[0] += 1
+                    number = calls[0]
+                if number == 1:
+                    first_inside.set()
+                    self.assertTrue(release_first.wait(5.0))
+                return original_dump(*args, **kwargs)
+
+            with mock.patch("Window.json.dump", side_effect=controlled_dump):
+                older = threading.Thread(
+                    target=PokeControllerApp._write_command_monitor_metadata,
+                    args=(app, chunk))
+                older.start()
+                self.assertTrue(first_inside.wait(5.0))
+                chunk["delete_pending"] = True
+                chunk["explicit_delete_pending"] = True
+                newer = threading.Thread(
+                    target=PokeControllerApp._write_command_monitor_metadata,
+                    args=(app, chunk))
+                newer.start()
+                release_first.set()
+                older.join(5.0)
+                newer.join(5.0)
+
+            self.assertFalse(older.is_alive())
+            self.assertFalse(newer.is_alive())
+            with open(os.path.join(folder, "command_monitor.json"),
+                      "r", encoding="utf-8") as stream:
+                saved = json.load(stream)
+            self.assertTrue(saved["delete_pending"])
+            self.assertTrue(saved["explicit_delete_pending"])
+            self.assertNotIn("_metadata_lock", saved)
+
+    def test_flush_keeps_youtube_media_until_queue_job_completes(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            def session(name):
+                return os.path.join(folder, name)
+
+            def identity(target):
+                target = os.path.abspath(target)
+                return {
+                    "root": os.path.abspath(folder),
+                    "root_realpath": os.path.normcase(os.path.realpath(folder)),
+                    "target": target,
+                    "target_realpath": os.path.normcase(os.path.realpath(target)),
+                    "device": 1,
+                    "inode": hash(target),
+                }
+
+            chunks = [
+                {"id": "rolling", "session_dir": session("rolling"),
+                 "delete_pending": True, "youtube_roll_pending": True},
+                {"id": "merging", "session_dir": session("merging"),
+                 "delete_pending": True, "merge_pending": True},
+                {"id": "processing", "session_dir": session("processing"),
+                 "delete_pending": True,
+                  "youtube_upload": {"status": "queued",
+                                     "job_path": session("pending.json")}},
+                {"id": "unknown-youtube", "session_dir": session("unknown"),
+                 "delete_pending": True, "merged": True,
+                  "youtube_archive": {"enabled": True}},
+                {"id": "raw-cleanup", "session_dir": session("raw-cleanup"),
+                 "delete_pending": True,
+                  "youtube_source_cleanup_pending": True,
+                  "youtube_source_cleanup_identity": identity(
+                      session("raw-cleanup")),
+                  "youtube_archive": {"enabled": True},
+                  "youtube_upload": {"status": "queued",
+                                     "job_path": session("cleanup.json")}},
+                {"id": "uploaded", "session_dir": session("uploaded"),
+                 "delete_pending": True,
+                  "youtube_upload": {"status": "queued",
+                                     "job_path": session("complete.json")}},
+                {"id": "plain", "session_dir": session("plain"),
+                  "delete_pending": True},
+            ]
+            app = types.SimpleNamespace(
+                recorder=types.SimpleNamespace(is_finalizing=False),
+                _command_monitor_chunks=chunks,
+                _command_monitor_current_chunk=None,
+                _command_monitor_delete_queue=queue.Queue(),
+                _command_monitor_delete_probe_active=False,
+                _command_monitor_delete_probe_after=0.0,
+                _command_monitor_delete_probe_results={},
+                _gui_action_queue=queue.Queue(),
+                _effective_record_output_dir=lambda: folder,
+                _refresh_command_monitor_tree=mock.Mock(),
+                _logger=mock.Mock(),
+            )
+
+            protected_ids = {
+                "rolling", "merging", "processing", "unknown-youtube"}
+            with mock.patch.object(
+                    PokeControllerApp,
+                    "_command_monitor_youtube_delete_protected",
+                    side_effect=lambda item: item["id"] in protected_ids), \
+                    mock.patch.object(
+                        PokeControllerApp,
+                        "_command_monitor_delete_target_snapshot",
+                        side_effect=lambda _root, target: identity(target)):
+                changed = PokeControllerApp._flush_command_monitor_deletes(app)
+                self.assertFalse(changed)
+                app._gui_action_queue.get(timeout=2.0)()
+
+        self.assertEqual(
+            [chunk["id"] for chunk in app._command_monitor_chunks],
+            ["rolling", "merging", "processing", "unknown-youtube"])
+        queued = []
+        while not app._command_monitor_delete_queue.empty():
+            queued.append(app._command_monitor_delete_queue.get_nowait())
+        self.assertEqual(
+            {os.path.basename(item["target"]) for item in queued},
+            {"raw-cleanup", "uploaded", "plain"})
+        cleanup = next(
+            item for item in queued
+            if os.path.basename(item["target"]) == "raw-cleanup")
+        self.assertEqual(cleanup["youtube_cleanup_probe"]["id"], "raw-cleanup")
+
+    def test_command_monitor_delete_retries_temporary_oserror_with_backoff(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            target = os.path.join(folder, "recording")
+            os.makedirs(target)
+            app = types.SimpleNamespace(
+                _command_monitor_delete_queue=queue.Queue(),
+                _command_step_frame_queue=queue.Queue(),
+                _command_monitor_index_events={},
+                _command_monitor_index_events_lock=threading.Lock(),
+                _effective_record_output_dir=lambda: folder,
+                _logger=mock.Mock(),
+            )
+            with mock.patch(
+                    "Window.shutil.rmtree",
+                    side_effect=[OSError("temporarily locked"), None]) as remove, \
+                    mock.patch("Window.time.sleep") as pause:
+                threading.Thread(
+                    target=PokeControllerApp._command_monitor_delete_loop,
+                    args=(app,), daemon=True).start()
+                self.assertTrue(
+                    PokeControllerApp._queue_command_monitor_folder_delete(
+                        app, target))
+                app._command_monitor_delete_queue.join()
+
+            self.assertEqual(remove.call_count, 2)
+            first_target = remove.call_args_list[0].args[0]
+            second_target = remove.call_args_list[1].args[0]
+            self.assertEqual(first_target, second_target)
+            self.assertNotEqual(os.path.normcase(first_target),
+                                os.path.normcase(target))
+            self.assertIn(".commands-delete-", os.path.basename(first_target))
+            pause.assert_called_once_with(0.25)
+
+    def test_command_monitor_delete_rejects_reparse_target_at_enqueue(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            target = os.path.join(folder, "recording")
+            os.makedirs(target)
+            app = types.SimpleNamespace(
+                _command_monitor_delete_queue=queue.Queue(),
+                _effective_record_output_dir=lambda: folder,
+                _logger=mock.Mock(),
+            )
+            reparse_details = types.SimpleNamespace(
+                st_mode=stat.S_IFDIR | 0o755,
+                st_file_attributes=0x400,
+                st_dev=1,
+                st_ino=2,
+            )
+            with mock.patch("Window.os.lstat", return_value=reparse_details):
+                self.assertFalse(
+                    PokeControllerApp._queue_command_monitor_folder_delete(
+                        app, target))
+
+            self.assertTrue(app._command_monitor_delete_queue.empty())
+            self.assertTrue(os.path.isdir(target))
+            app._logger.warning.assert_called_once()
+
+    def test_command_monitor_delete_retains_replaced_target_without_retry(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            target = os.path.join(folder, "recording")
+            original = os.path.join(folder, "recording-original")
+            os.makedirs(target)
+            with open(os.path.join(target, "original.bin"), "wb") as stream:
+                stream.write(b"original")
+            app = types.SimpleNamespace(
+                _command_monitor_delete_queue=queue.Queue(),
+                _command_step_frame_queue=queue.Queue(),
+                _command_monitor_index_events={},
+                _command_monitor_index_events_lock=threading.Lock(),
+                _effective_record_output_dir=lambda: folder,
+                _logger=mock.Mock(),
+            )
+            self.assertTrue(
+                PokeControllerApp._queue_command_monitor_folder_delete(
+                    app, target))
+
+            os.replace(target, original)
+            os.makedirs(target)
+            with open(os.path.join(target, "replacement.bin"), "wb") as stream:
+                stream.write(b"replacement")
+
+            with mock.patch("Window.shutil.rmtree") as remove, \
+                    mock.patch("Window.time.sleep") as pause:
+                threading.Thread(
+                    target=PokeControllerApp._command_monitor_delete_loop,
+                    args=(app,), daemon=True).start()
+                app._command_monitor_delete_queue.join()
+
+            remove.assert_not_called()
+            pause.assert_not_called()
+            self.assertTrue(os.path.isfile(os.path.join(
+                original, "original.bin")))
+            self.assertTrue(os.path.isfile(os.path.join(
+                target, "replacement.bin")))
+            self.assertTrue(app._command_monitor_delete_queue.empty())
+
+    def test_raw_cleanup_retains_source_when_merged_media_is_replaced(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            source_dir = os.path.join(folder, "source")
+            merged_dir = os.path.join(folder, "merged")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(source_dir)
+            os.makedirs(merged_dir)
+            with open(os.path.join(source_dir, "recording.avi"), "wb") as stream:
+                stream.write(b"raw")
+            media = os.path.join(merged_dir, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"original" * 1024)
+            job_path = enqueue_upload_job(queue_dir, media, merged_dir)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            identity = (
+                PokeControllerApp._command_monitor_delete_target_snapshot(
+                    folder, source_dir))
+            chunk = {
+                "id": "source", "session_dir": source_dir,
+                "delete_pending": True,
+                "youtube_archive": {"enabled": True},
+                "youtube_source_cleanup_pending": True,
+                "youtube_source_cleanup_identity": identity,
+                "youtube_source_cleanup_job": {
+                    "id": job["id"], "job_path": job_path,
+                    "media_path": media, "session_dir": merged_dir,
+                },
+                "youtube_upload": {
+                    "status": job["status"], "job_path": job_path},
+            }
+            self.assertFalse(
+                PokeControllerApp._command_monitor_youtube_delete_protected(
+                    chunk))
+
+            original_media = os.path.join(merged_dir, "original.mp4")
+            os.replace(media, original_media)
+            with open(media, "wb") as stream:
+                stream.write(b"replacement" * 1024)
+            self.assertTrue(
+                PokeControllerApp._command_monitor_youtube_delete_protected(
+                    chunk))
+
+            app = types.SimpleNamespace(
+                _command_monitor_delete_queue=queue.Queue(),
+                _command_step_frame_queue=queue.Queue(),
+                _command_monitor_index_events={},
+                _command_monitor_index_events_lock=threading.Lock(),
+                _logger=mock.Mock(),
+            )
+            prepared = PokeControllerApp._command_monitor_prepared_delete_item(
+                identity, chunk)
+            app._command_monitor_delete_queue.put_nowait(prepared)
+            with mock.patch("Window.shutil.rmtree") as remove, \
+                    mock.patch("Window.time.sleep") as pause:
+                threading.Thread(
+                    target=PokeControllerApp._command_monitor_delete_loop,
+                    args=(app,), daemon=True).start()
+                app._command_monitor_delete_queue.join()
+
+            remove.assert_not_called()
+            pause.assert_not_called()
+            self.assertTrue(os.path.isdir(source_dir))
+            self.assertTrue(app._command_monitor_delete_queue.empty())
+
+    def test_completed_youtube_job_requires_every_remote_video_id(self):
+        import YouTubeArchive
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"video" * 1024)
+            job_path = enqueue_upload_job(queue_dir, media, session)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            chunk = {
+                "id": "merged", "session_dir": session,
+                "delete_pending": True,
+                "youtube_archive": {"enabled": True},
+                "youtube_upload": {
+                    "status": "completed", "job_path": job_path},
+            }
+
+            job["status"] = "completed"
+            job["segments"] = []
+            YouTubeArchive._atomic_json(job_path, job)
+            self.assertTrue(
+                PokeControllerApp._command_monitor_youtube_delete_protected(
+                    chunk))
+
+            job["segments"] = [{
+                "part": 1, "start_seconds": 0.0, "duration_seconds": 1.0,
+                "uploaded_bytes": 2048, "video_id": "",
+            }]
+            YouTubeArchive._atomic_json(job_path, job)
+            self.assertTrue(
+                PokeControllerApp._command_monitor_youtube_delete_protected(
+                    chunk))
+
+            job["segments"].append({
+                "part": 2, "start_seconds": 1.0, "duration_seconds": 1.0,
+                "uploaded_bytes": 2048, "video_id": "video-2",
+            })
+            job["segments"][0]["video_id"] = "video-1"
+            YouTubeArchive._atomic_json(job_path, job)
+            self.assertFalse(
+                PokeControllerApp._command_monitor_youtube_delete_protected(
+                    chunk))
+
     def test_youtube_commands_chunks_roll_at_segment_boundary(self):
         chunks = []
         for index, duration in enumerate((30.0, 30.0, 30.0), start=1):
@@ -18819,6 +27159,7 @@ class CommandMonitorRecordingTests(unittest.TestCase):
                 "command_session_id": "run-youtube",
                 "started": (index - 1) * 30.0,
                 "ended": index * 30.0,
+                "monitor_retention_mode": "keep_all",
                 "youtube_archive": {
                     "enabled": True, "segment_seconds": 60},
             })
@@ -18832,6 +27173,75 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         self.assertEqual(
             youtube_rolling_chunk_ids(chunks, "run-youtube", force=True),
             ["chunk3"])
+
+    def test_youtube_commands_attention_is_a_hard_segment_boundary(self):
+        archive = {"enabled": True, "segment_seconds": 60}
+        chunks = [
+            {"id": "before", "command_session_id": "run",
+             "started": 0.0, "ended": 30.0,
+             "youtube_archive": archive},
+            {"id": "bad", "command_session_id": "run",
+             "started": 30.0, "ended": 60.0, "historical": True,
+             "pinned": True, "youtube_merge_attention_required": True,
+             "youtube_archive": archive},
+            {"id": "after1", "command_session_id": "run",
+             "started": 60.0, "ended": 90.0,
+             "youtube_archive": archive},
+            {"id": "after2", "command_session_id": "run",
+             "started": 90.0, "ended": 120.0,
+             "youtube_archive": archive},
+        ]
+
+        # The short good prefix is finalized rather than joined across "bad".
+        self.assertEqual(
+            youtube_rolling_chunk_ids(chunks, "run"), ["before"])
+        chunks[0]["youtube_rolling_committed"] = True
+        self.assertEqual(
+            youtube_rolling_chunk_ids(chunks, "run"), ["after1", "after2"])
+
+    def test_youtube_commands_attention_boundary_survives_delete_intent(self):
+        archive = {"enabled": True, "segment_seconds": 60}
+        chunks = [
+            {"id": "before", "command_session_id": "run",
+             "started": 0.0, "ended": 30.0,
+             "youtube_archive": archive},
+            {"id": "bad", "command_session_id": "run",
+             "started": 30.0, "ended": 60.0,
+             "delete_pending": True,
+             "youtube_merge_attention_required": True,
+             "youtube_archive": archive},
+            {"id": "after", "command_session_id": "run",
+             "started": 60.0, "ended": 90.0,
+             "youtube_archive": archive},
+        ]
+
+        self.assertEqual(
+            youtube_rolling_chunk_ids(chunks, "run"), ["before"])
+
+    def test_youtube_commands_policy_change_is_a_hard_segment_boundary(self):
+        chunks = [
+            {"id": "legacy-on", "command_session_id": "run",
+             "started": 0.0, "ended": 30.0,
+             # A recording from before the option existed defaults to ON.
+             "youtube_archive": {"enabled": True, "segment_seconds": 60}},
+            {"id": "strict-1", "command_session_id": "run",
+             "started": 30.0, "ended": 60.0,
+             "youtube_archive": {
+                 "enabled": True, "segment_seconds": 60,
+                 "allow_low_presentations": False}},
+            {"id": "strict-2", "command_session_id": "run",
+             "started": 60.0, "ended": 90.0,
+             "youtube_archive": {
+                 "enabled": True, "segment_seconds": 60,
+                 "allow_low_presentations": False}},
+        ]
+
+        self.assertEqual(
+            youtube_rolling_chunk_ids(chunks, "run"), ["legacy-on"])
+        chunks[0]["youtube_rolling_committed"] = True
+        self.assertEqual(
+            youtube_rolling_chunk_ids(chunks, "run"),
+            ["strict-1", "strict-2"])
 
     def test_youtube_commands_roll_ignores_pc_and_committed_segments(self):
         chunks = [
@@ -18847,6 +27257,148 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         self.assertEqual(youtube_rolling_chunk_ids(chunks, "run"), [])
         self.assertEqual(
             youtube_rolling_chunk_ids(chunks, "run", force=True), ["tail"])
+
+    def test_youtube_commands_roll_recovers_pending_historical_chunks(self):
+        chunks = [{
+            "id": "interrupted", "command_session_id": "run",
+            "started": 0.0, "ended": 20.0, "historical": True,
+            "youtube_roll_pending": True,
+            "youtube_archive": {"enabled": True, "segment_seconds": 600},
+        }]
+
+        self.assertEqual(
+            youtube_rolling_chunk_ids(chunks, "run", force=True),
+            ["interrupted"])
+
+    def test_close_failed_chunks_are_not_selected_or_deleted(self):
+        from Window import PokeControllerApp
+
+        base = {
+            "command_session_id": "run", "started": 0.0, "ended": 30.0,
+            "youtube_archive": {"enabled": True, "segment_seconds": 30},
+        }
+        pending = dict(base, id="pending", recording_close_pending=True)
+        failed = dict(base, id="failed", recording_close_failed=True)
+        ready = dict(base, id="ready", started=60.0, ended=90.0)
+        chunks = [pending, failed, ready]
+
+        self.assertEqual(
+            temporary_chunk_ids_for_session(chunks, "run"), {"ready"})
+        self.assertEqual(
+            youtube_rolling_chunk_ids(chunks, "run", force=True), [])
+        pending["recording_close_pending"] = False
+        self.assertEqual(
+            youtube_rolling_chunk_ids(chunks, "run", force=True), ["pending"])
+        pending["youtube_rolling_committed"] = True
+        self.assertEqual(
+            youtube_rolling_chunk_ids(chunks, "run", force=True), ["ready"])
+        self.assertTrue(
+            PokeControllerApp._command_monitor_youtube_delete_protected(
+                pending))
+        self.assertTrue(
+            PokeControllerApp._command_monitor_youtube_delete_protected(
+                failed))
+
+    def test_failed_chunk_close_is_pinned_and_journaled(self):
+        from Window import PokeControllerApp
+
+        chunk = {"id": "failed", "delete_pending": True,
+                 "merge_pending": True}
+        app = types.SimpleNamespace(
+            _command_monitor_stop_in_progress=True,
+            _sync_audio_device_usage=mock.Mock(),
+            _command_monitor_lock=threading.Lock(),
+            _command_monitor_current_chunk=chunk,
+            _refresh_command_monitor_tree=mock.Mock(),
+            _write_command_monitor_metadata=mock.Mock(return_value=True),
+            record_armed=True,
+            _stop_command_record_window_capture=mock.Mock(),
+            record_monitor_status=mock.Mock(),
+            show_output=mock.Mock(),
+            _logger=mock.Mock(),
+            _command_monitor_exit_after_stop=False,
+        )
+
+        result = PokeControllerApp._complete_command_monitor_chunk_finish(
+            app, chunk, error=RuntimeError("writer timeout"))
+
+        self.assertFalse(result)
+        self.assertIsNone(app._command_monitor_current_chunk)
+        self.assertTrue(chunk["recording_close_pending"])
+        self.assertTrue(chunk["recording_close_failed"])
+        self.assertTrue(chunk["pinned"])
+        self.assertFalse(chunk["delete_pending"])
+        self.assertFalse(chunk["merge_pending"])
+        app._write_command_monitor_metadata.assert_called_once_with(chunk)
+
+    def test_reconcile_does_not_force_short_tail_while_commands_is_running(self):
+        from Window import PokeControllerApp
+
+        chunk = {
+            "id": "tail", "command_session_id": "run",
+            "started": 0.0, "ended": 20.0,
+            "youtube_roll_pending": True,
+            "youtube_archive": {"enabled": True, "segment_seconds": 600},
+        }
+        command = types.SimpleNamespace(alive=True)
+        app = types.SimpleNamespace(
+            _command_monitor_merge_active=0,
+            _command_monitor_stop_in_progress=False,
+            _command_monitor_chunks=[chunk],
+            _command_monitor_session_id="run",
+            _command_monitor_command=command,
+            record_armed=True,
+            _merge_stopped_command_monitor_recordings=mock.Mock(),
+        )
+
+        self.assertFalse(
+            PokeControllerApp._reconcile_command_monitor_youtube_recordings(app))
+        app._merge_stopped_command_monitor_recordings.assert_not_called()
+
+        app.record_armed = False
+        self.assertTrue(
+            PokeControllerApp._reconcile_command_monitor_youtube_recordings(app))
+        app._merge_stopped_command_monitor_recordings.assert_called_once_with(
+            "run", ["tail"], youtube_rolling=True, final_segment=True)
+
+    def test_stop_tail_waits_for_active_youtube_merge(self):
+        from Window import PokeControllerApp
+
+        chunk = {
+            "id": "tail", "command_session_id": "run",
+            "youtube_archive": {"enabled": True},
+        }
+        persisted = threading.Event()
+
+        def write_metadata(_chunk):
+            persisted.set()
+            return True
+
+        app = types.SimpleNamespace(
+            _command_monitor_chunks=[chunk],
+            _command_monitor_merge_lock=threading.Lock(),
+            _command_monitor_merge_active=1,
+            _write_command_monitor_metadata=mock.Mock(
+                side_effect=write_metadata),
+            record_monitor_status=mock.Mock(),
+            _reconcile_command_monitor_youtube_recordings=mock.Mock(),
+            root=types.SimpleNamespace(after=mock.Mock()),
+        )
+
+        result = PokeControllerApp._merge_stopped_command_monitor_recordings(
+            app, "run", ["tail"], youtube_rolling=True,
+            final_segment=True)
+
+        self.assertFalse(result)
+        self.assertTrue(chunk["youtube_roll_pending"])
+        self.assertFalse(chunk["delete_pending"])
+        self.assertTrue(persisted.wait(2.0))
+        persisted_chunk = app._write_command_monitor_metadata.call_args.args[0]
+        self.assertEqual(persisted_chunk["id"], "tail")
+        self.assertTrue(persisted_chunk["youtube_roll_pending"])
+        self.assertFalse(persisted_chunk["delete_pending"])
+        app.root.after.assert_called_once_with(
+            1000, app._reconcile_command_monitor_youtube_recordings)
 
     def test_window_queues_ready_youtube_segment_without_stopping_commands(self):
         from Window import PokeControllerApp
@@ -18868,6 +27420,1041 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         self.assertTrue(queued)
         app._merge_stopped_command_monitor_recordings.assert_called_once_with(
             "run", ["one"], youtube_rolling=True, final_segment=False)
+
+    def test_youtube_commands_chunks_defer_individual_mp4_finalization(self):
+        from Window import PokeControllerApp
+
+        recorder = types.SimpleNamespace(
+            defer_finalization=False,
+            durable_finalization=False,
+            start=mock.Mock(return_value="started"),
+        )
+        app = types.SimpleNamespace(
+            _record_compose_condition=threading.Condition(),
+            recorder=recorder,
+            _youtube_recording_config_snapshot=lambda: {
+                "enabled": True,
+                "record_mode": "CommandMonitor",
+                "commands_video_mode": COMMANDS_VIDEO_MODE_COMPOSITE,
+            },
+        )
+
+        result = PokeControllerApp._start_capture_recorder(
+            app, object(), 60.0)
+
+        self.assertEqual(result, "started")
+        self.assertTrue(recorder.defer_finalization)
+        self.assertTrue(recorder.durable_finalization)
+        recorder.start.assert_called_once()
+
+    def test_exit_finishes_open_commands_chunk_after_mode_changed(self):
+        from Window import PokeControllerApp
+
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        chunk = {"id": "old-command-chunk"}
+        app = types.SimpleNamespace(
+            _exit_waiting=False,
+            _template_exit_after_stop=False,
+            _preview_shutdown_mode=False,
+            _refresh_preview_priority_status=mock.Mock(),
+            _youtube_recording_rotation_continue=True,
+            # The new InputSet has already changed the selected mode, while
+            # this chunk still belongs to the old Commands runtime.
+            record_mode=Value("Manual"),
+            recorder=types.SimpleNamespace(active=False),
+            _template_recording_stop_in_progress=False,
+            _command_monitor_current_chunk=chunk,
+            _command_monitor_stop_in_progress=False,
+            _command_monitor_exit_after_stop=False,
+            _template_finalize_candidates=lambda: [],
+            _finish_command_monitor_chunk=mock.Mock(),
+            record_armed=False,
+            root=object(),
+        )
+
+        with mock.patch("Window.tkmsg.askyesno", return_value=True):
+            PokeControllerApp.exit(app)
+
+        self.assertTrue(app._command_monitor_exit_after_stop)
+        app._finish_command_monitor_chunk.assert_called_once_with(
+            "application_exit", background=True)
+
+    def test_youtube_commands_merge_ignores_stale_manifest_and_global_queue(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "chunk")
+            os.makedirs(session)
+            with open(os.path.join(session, "recording.avi"), "wb") as stream:
+                stream.write(b"raw")
+            manifest = os.path.join(session, "mp4_finalize_job.json")
+            with open(manifest, "w", encoding="utf-8") as stream:
+                json.dump({"version": 1, "status": "recording",
+                           "worker_pid": 99999999,
+                           "video_path": os.path.join(
+                               session, "recording.avi")}, stream)
+            chunk = {
+                "id": "one", "session_dir": session,
+                "command_session_id": "run",
+                "youtube_archive": {"enabled": True},
+            }
+            gui_actions = queue.Queue()
+            root = types.SimpleNamespace(after=mock.Mock())
+            app = types.SimpleNamespace(
+                root=root,
+                # Later/non-target work must not block this closed AVI.
+                recorder=types.SimpleNamespace(is_finalizing=True),
+                _command_monitor_chunks=[chunk],
+                _command_monitor_merge_lock=threading.Lock(),
+                _command_monitor_merge_active=0,
+                _command_trace_queue=queue.Queue(),
+                _command_step_frame_queue=queue.Queue(),
+                _gui_action_queue=gui_actions,
+                _effective_record_output_dir=lambda: folder,
+                _write_command_monitor_metadata=mock.Mock(return_value=True),
+                _refresh_command_monitor_tree=mock.Mock(),
+                record_monitor_status=mock.Mock(),
+                # The current UI belongs to a later InputSet. A legacy chunk
+                # without the field must still retain its default-ON policy.
+                record_youtube_commands_allow_low_presentations=
+                types.SimpleNamespace(get=lambda: False),
+                _logger=mock.Mock(),
+                _reconcile_command_monitor_youtube_recordings=mock.Mock(),
+            )
+
+            with mock.patch(
+                    "Window.validate_command_recording_sources",
+                    return_value=[{"duration": 30.0}]) as validate, mock.patch(
+                    "Window.merge_command_recording_chunks",
+                    side_effect=RuntimeError("merge probe reached")):
+                PokeControllerApp._merge_stopped_command_monitor_recordings(
+                    app, "run", ["one"], youtube_rolling=True,
+                    final_segment=True)
+                apply_result = gui_actions.get(timeout=2.0)
+                apply_result()
+
+            self.assertFalse(chunk["merge_pending"])
+            self.assertFalse(os.path.exists(manifest))
+            self.assertTrue(
+                validate.call_args.kwargs["allow_low_presentations"])
+            root.after.assert_called_once()
+            delay_ms, retry = root.after.call_args.args
+            self.assertEqual(delay_ms, 500)
+            retry()
+            app._reconcile_command_monitor_youtube_recordings.assert_called_once_with()
+
+    def test_youtube_merge_fails_closed_for_stale_mixed_policy_target(self):
+        from Window import PokeControllerApp
+
+        enabled = {
+            "enabled": True, "allow_low_presentations": True,
+        }
+        strict = {
+            "enabled": True, "allow_low_presentations": False,
+        }
+        chunks = [
+            {"id": "enabled", "youtube_archive": enabled,
+             "delete_pending": True},
+            {"id": "strict", "youtube_archive": strict,
+             "delete_pending": True},
+        ]
+        reconcile = mock.Mock()
+        root = types.SimpleNamespace(after=mock.Mock())
+        app = types.SimpleNamespace(
+            root=root,
+            _command_monitor_chunks=chunks,
+            record_monitor_status=mock.Mock(),
+            _refresh_command_monitor_tree=mock.Mock(),
+            _reconcile_command_monitor_youtube_recordings=reconcile,
+        )
+
+        result = PokeControllerApp._merge_stopped_command_monitor_recordings(
+            app, "run", ["enabled", "strict"], youtube_rolling=True)
+
+        self.assertFalse(result)
+        self.assertTrue(all(chunk["youtube_roll_pending"] for chunk in chunks))
+        self.assertTrue(all(not chunk["delete_pending"] for chunk in chunks))
+        root.after.assert_called_once_with(500, reconcile)
+
+    def test_segment_merge_atomically_retires_per_clip_finalize_manifest(self):
+        with tempfile.TemporaryDirectory() as folder:
+            manifest = os.path.join(folder, "mp4_finalize_job.json")
+            video = os.path.join(folder, "recording.avi")
+            with open(video, "wb") as stream:
+                stream.write(b"raw")
+            alias = prepare_segment_merge_source_alias(video)
+            write_finalize_manifest(
+                video, os.path.join(folder, "recording.wav"),
+                os.path.join(folder, "recording.mp4"), 60.0, 30.0)
+            lock = manifest + ".lock"
+            with open(lock, "w", encoding="utf-8") as stream:
+                json.dump({"worker_pid": os.getpid(), "token": "live"},
+                          stream)
+
+            with self.assertRaises(FinalizeJobAlreadyRunning):
+                retire_finalize_manifest_for_segment_merge(manifest, video)
+            self.assertTrue(os.path.isfile(manifest))
+            self.assertTrue(os.path.isfile(video))
+
+            # Capture and pre-lock workers advertised ownership through the
+            # manifest PID only.  Acquiring a new-style lock must not override
+            # that still-live legacy/recording owner.
+            os.remove(lock)
+            with open(manifest, "r", encoding="utf-8") as stream:
+                legacy = json.load(stream)
+            legacy["status"] = "recording"
+            legacy["worker_pid"] = os.getpid()
+            with open(manifest, "w", encoding="utf-8") as stream:
+                json.dump(legacy, stream)
+            with self.assertRaises(FinalizeJobAlreadyRunning):
+                retire_finalize_manifest_for_segment_merge(manifest, video)
+            self.assertTrue(os.path.isfile(manifest))
+            self.assertFalse(os.path.exists(lock))
+
+            legacy["status"] = "processing"
+            legacy["worker_pid"] = os.getpid()
+            with open(manifest, "w", encoding="utf-8") as stream:
+                json.dump(legacy, stream)
+            with self.assertRaises(FinalizeJobAlreadyRunning):
+                retire_finalize_manifest_for_segment_merge(manifest, video)
+            self.assertTrue(os.path.isfile(manifest))
+            self.assertFalse(os.path.exists(lock))
+
+            legacy["worker_pid"] = 99999999
+            with open(manifest, "w", encoding="utf-8") as stream:
+                json.dump(legacy, stream)
+            with open(lock, "w", encoding="utf-8") as stream:
+                json.dump({"worker_pid": 99999999, "token": "stale"},
+                          stream)
+            self.assertTrue(
+                retire_finalize_manifest_for_segment_merge(manifest, video))
+            self.assertFalse(os.path.exists(manifest))
+            self.assertFalse(os.path.exists(lock))
+            # Retiring the per-clip job never deletes the raw merge source.
+            self.assertTrue(os.path.isfile(video))
+            self.assertTrue(os.path.samefile(video, alias))
+
+            # Simulate the narrow pre-lock race: an old worker loaded the
+            # pending job before retirement and unlinks the original later.
+            os.remove(video)
+            self.assertFalse(os.path.exists(video))
+            with open(alias, "rb") as stream:
+                self.assertEqual(stream.read(), b"raw")
+            measured = {"fps": 60.0, "frames": 1800, "duration": 30.0}
+            with mock.patch(
+                    "CommandRecordingMerge._video_duration_info",
+                    return_value=measured) as probe:
+                _validated_chunk_media(
+                    [{"session_dir": folder,
+                      "started": 0.0, "ended": 30.0}],
+                    [folder], strict=True)
+            probe.assert_called_once_with(alias)
+
+    def test_youtube_merge_keeps_manifest_when_recovery_journal_write_fails(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "chunk")
+            os.makedirs(session)
+            video = os.path.join(session, "recording.avi")
+            with open(video, "wb") as stream:
+                stream.write(b"raw")
+            manifest = write_finalize_manifest(
+                video, os.path.join(session, "recording.wav"),
+                os.path.join(session, "recording.mp4"), 60.0, 30.0)
+            chunk = {
+                "id": "one", "session_dir": session,
+                "command_session_id": "run", "ended": 30.0,
+                "youtube_archive": {"enabled": True},
+            }
+            root = types.SimpleNamespace(after=mock.Mock())
+            gui_actions = queue.Queue()
+            app = types.SimpleNamespace(
+                root=root,
+                recorder=types.SimpleNamespace(is_finalizing=False),
+                _command_monitor_chunks=[chunk],
+                _command_monitor_merge_lock=threading.Lock(),
+                _command_monitor_merge_active=0,
+                _command_trace_queue=queue.Queue(),
+                _command_step_frame_queue=queue.Queue(),
+                _gui_action_queue=gui_actions,
+                _effective_record_output_dir=lambda: folder,
+                _write_command_monitor_metadata=mock.Mock(
+                    return_value=False),
+                _refresh_command_monitor_tree=mock.Mock(),
+                record_monitor_status=mock.Mock(),
+                _logger=mock.Mock(),
+                _reconcile_command_monitor_youtube_recordings=mock.Mock(),
+            )
+
+            with mock.patch(
+                    "Window.validate_command_recording_sources",
+                    return_value=[{"duration": 30.0}]), mock.patch(
+                    "Window.merge_command_recording_chunks") as merge:
+                PokeControllerApp._merge_stopped_command_monitor_recordings(
+                    app, "run", ["one"], youtube_rolling=True,
+                    final_segment=True)
+                apply_result = gui_actions.get(timeout=2.0)
+                apply_result()
+
+            self.assertTrue(os.path.isfile(manifest))
+            self.assertTrue(os.path.isfile(video))
+            self.assertTrue(chunk["youtube_roll_pending"])
+            merge.assert_not_called()
+            root.after.assert_called_once()
+
+    def test_youtube_merge_metadata_io_never_runs_on_gui_thread(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            source_dir = os.path.join(folder, "source")
+            merged_dir = os.path.join(folder, "merged")
+            os.makedirs(source_dir)
+            os.makedirs(merged_dir)
+            source = {
+                "id": "source", "session_dir": source_dir,
+                "command_session_id": "run", "started": 0.0,
+                "ended": 30.0,
+                "youtube_archive": {"enabled": True,
+                                    "segment_seconds": 30},
+            }
+            merged = {
+                "id": "merged", "session_dir": merged_dir,
+                "command_session_id": "run", "started": 0.0,
+                "ended": 30.0, "duration_saved": 30.0, "merged": True,
+                "youtube_archive": {"enabled": True,
+                                    "segment_seconds": 30},
+            }
+            entered = threading.Event()
+            release = threading.Event()
+            returned = threading.Event()
+            gui_actions = queue.Queue()
+            metadata_threads = []
+            gui_thread_id = []
+
+            def slow_write(_chunk):
+                metadata_threads.append(threading.get_ident())
+                entered.set()
+                release.wait(5.0)
+                return True
+
+            app = types.SimpleNamespace(
+                root=types.SimpleNamespace(after=mock.Mock()),
+                recorder=types.SimpleNamespace(is_finalizing=False),
+                _command_monitor_chunks=[source],
+                _command_monitor_merge_lock=threading.Lock(),
+                _command_monitor_merge_active=0,
+                _command_trace_queue=queue.Queue(),
+                _command_step_frame_queue=queue.Queue(),
+                _gui_action_queue=gui_actions,
+                _effective_record_output_dir=lambda: folder,
+                _write_command_monitor_metadata=slow_write,
+                _queue_command_monitor_youtube_upload=mock.Mock(
+                    return_value=os.path.join(folder, "queue.json")),
+                _launch_youtube_upload_worker=mock.Mock(),
+                _queue_command_monitor_folder_delete=mock.Mock(),
+                _refresh_command_monitor_tree=mock.Mock(),
+                record_monitor_status=mock.Mock(),
+                _logger=mock.Mock(),
+                _reconcile_command_monitor_youtube_recordings=mock.Mock(),
+            )
+
+            def gui_call():
+                gui_thread_id.append(threading.get_ident())
+                PokeControllerApp._merge_stopped_command_monitor_recordings(
+                    app, "run", ["source"], youtube_rolling=True,
+                    final_segment=True)
+                returned.set()
+                gui_actions.get(timeout=5.0)()
+
+            with mock.patch(
+                    "Window.prepare_segment_merge_source_alias"), \
+                    mock.patch(
+                        "Window.retire_finalize_manifest_for_segment_merge"), \
+                    mock.patch(
+                        "Window.validate_command_recording_sources",
+                        return_value=[{"duration": 30.0}]), \
+                    mock.patch(
+                        "Window.merge_command_recording_chunks",
+                        return_value=merged):
+                thread = threading.Thread(target=gui_call)
+                thread.start()
+                self.assertTrue(entered.wait(2.0))
+                returned_before_release = returned.wait(0.5)
+                release.set()
+                thread.join(5.0)
+
+            self.assertTrue(returned_before_release)
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(metadata_threads)
+            self.assertNotIn(gui_thread_id[0], metadata_threads)
+
+    def test_youtube_merge_launches_only_after_source_journal_commit(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            source_dir = os.path.join(folder, "source")
+            merged_dir = os.path.join(folder, "merged")
+            os.makedirs(source_dir)
+            os.makedirs(merged_dir)
+            source = {
+                "id": "source", "session_dir": source_dir,
+                "command_session_id": "run", "started": 0.0,
+                "ended": 30.0,
+                "youtube_archive": {"enabled": True,
+                                    "segment_seconds": 30},
+            }
+            merged = {
+                "id": "merged", "session_dir": merged_dir,
+                "command_session_id": "run", "started": 0.0,
+                "ended": 30.0, "duration_saved": 30.0, "merged": True,
+                "youtube_archive": {"enabled": True,
+                                    "segment_seconds": 30},
+            }
+            events = []
+            gui_actions = queue.Queue()
+
+            def write_metadata(chunk):
+                events.append((
+                    "metadata", chunk.get("id"),
+                    bool(chunk.get("youtube_rolling_committed")),
+                    bool(chunk.get("delete_pending"))))
+                return True
+
+            def enqueue(_chunk, **kwargs):
+                events.append(("enqueue", kwargs))
+                return os.path.join(folder, "queue.json.local-commit")
+
+            def release(job_path):
+                events.append(("release", job_path))
+                return os.path.join(folder, "queue.json")
+
+            def launch(_config, **_kwargs):
+                events.append(("launch",))
+
+            def flush(_app):
+                events.append(("flush",))
+                return False
+
+            app = types.SimpleNamespace(
+                root=types.SimpleNamespace(after=mock.Mock()),
+                recorder=types.SimpleNamespace(is_finalizing=False),
+                _command_monitor_chunks=[source],
+                _command_monitor_merge_lock=threading.Lock(),
+                _command_monitor_merge_active=0,
+                _command_trace_queue=queue.Queue(),
+                _command_step_frame_queue=queue.Queue(),
+                _gui_action_queue=gui_actions,
+                _effective_record_output_dir=lambda: folder,
+                _write_command_monitor_metadata=write_metadata,
+                _queue_command_monitor_youtube_upload=enqueue,
+                _launch_youtube_upload_worker=launch,
+                _command_monitor_delete_queue=queue.Queue(),
+                _refresh_command_monitor_tree=mock.Mock(),
+                record_monitor_status=mock.Mock(),
+                _logger=mock.Mock(),
+                _reconcile_command_monitor_youtube_recordings=mock.Mock(),
+            )
+
+            with mock.patch(
+                    "Window.prepare_segment_merge_source_alias"), \
+                    mock.patch(
+                        "Window.retire_finalize_manifest_for_segment_merge"), \
+                    mock.patch(
+                        "Window.validate_command_recording_sources",
+                        return_value=[{"duration": 30.0}]), \
+                    mock.patch(
+                        "Window.merge_command_recording_chunks",
+                        return_value=merged), \
+                    mock.patch(
+                        "Window.release_upload_job_local_commit",
+                        side_effect=release), \
+                    mock.patch.object(
+                        PokeControllerApp,
+                        "_flush_command_monitor_deletes",
+                        side_effect=flush):
+                PokeControllerApp._merge_stopped_command_monitor_recordings(
+                    app, "run", ["source"], youtube_rolling=True,
+                    final_segment=True)
+                gui_actions.get(timeout=2.0)()
+
+            enqueue_event = next(item for item in events if item[0] == "enqueue")
+            self.assertEqual(
+                enqueue_event[1],
+                {"background": False, "launch_worker": False,
+                 "hold_for_local_commit": True,
+                 "persist_metadata": False})
+            relationship_index = next(
+                index for index, item in enumerate(events)
+                if item[:4] == ("metadata", "source", True, False))
+            release_index = next(
+                index for index, item in enumerate(events)
+                if item[0] == "release")
+            cleanup_index = next(
+                index for index, item in enumerate(events)
+                if item[:4] == ("metadata", "source", True, True))
+            launch_index = events.index(("launch",))
+            flush_index = next(
+                index for index, item in enumerate(events)
+                if item == ("flush",))
+            self.assertLess(relationship_index, release_index)
+            self.assertLess(release_index, launch_index)
+            self.assertLess(launch_index, cleanup_index)
+            self.assertLess(cleanup_index, flush_index)
+
+    def test_youtube_queue_failure_keeps_completed_merge_for_retry(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            source_dir = os.path.join(folder, "source")
+            merged_dir = os.path.join(folder, "merged")
+            os.makedirs(source_dir)
+            os.makedirs(merged_dir)
+            source = {
+                "id": "source", "session_dir": source_dir,
+                "command_session_id": "run", "started": 0.0,
+                "ended": 30.0,
+                "youtube_archive": {"enabled": True,
+                                    "allow_low_presentations": False,
+                                    "segment_seconds": 30},
+            }
+            merged = {
+                "id": "merged", "session_dir": merged_dir,
+                "command_session_id": "run", "started": 0.0,
+                "ended": 30.0, "duration_saved": 30.0, "merged": True,
+                "source_chunk_ids": ["source"],
+                "youtube_archive": {"enabled": True,
+                                    "segment_seconds": 30},
+            }
+            gui_actions = queue.Queue()
+            root = types.SimpleNamespace(after=mock.Mock())
+            app = types.SimpleNamespace(
+                root=root,
+                recorder=types.SimpleNamespace(is_finalizing=False),
+                _command_monitor_chunks=[source],
+                _command_monitor_merge_lock=threading.Lock(),
+                _command_monitor_merge_active=0,
+                _command_trace_queue=queue.Queue(),
+                _command_step_frame_queue=queue.Queue(),
+                _gui_action_queue=gui_actions,
+                _effective_record_output_dir=lambda: folder,
+                _write_command_monitor_metadata=mock.Mock(return_value=True),
+                _queue_command_monitor_youtube_upload=mock.Mock(
+                    return_value=""),
+                _queue_command_monitor_folder_delete=mock.Mock(),
+                _refresh_command_monitor_tree=mock.Mock(),
+                record_monitor_status=mock.Mock(),
+                _logger=mock.Mock(),
+                _reconcile_command_monitor_youtube_recordings=mock.Mock(),
+            )
+
+            with mock.patch(
+                    "Window.prepare_segment_merge_source_alias"), \
+                    mock.patch(
+                        "Window.retire_finalize_manifest_for_segment_merge"), \
+                    mock.patch(
+                        "Window.validate_command_recording_sources",
+                        return_value=[{"duration": 30.0}]) as validate, \
+                    mock.patch(
+                        "Window.merge_command_recording_chunks",
+                        return_value=merged) as merge:
+                PokeControllerApp._merge_stopped_command_monitor_recordings(
+                    app, "run", ["source"], youtube_rolling=True,
+                    final_segment=True)
+                gui_actions.get(timeout=2.0)()
+
+            self.assertEqual(merge.call_count, 1)
+            self.assertFalse(
+                validate.call_args.kwargs["allow_low_presentations"])
+            self.assertFalse(
+                merge.call_args.kwargs["allow_low_presentations"])
+            self.assertEqual(
+                merge.call_args.kwargs["prevalidated_source_media"],
+                [{"duration": 30.0}])
+            self.assertIn(source, app._command_monitor_chunks)
+            self.assertIn(merged, app._command_monitor_chunks)
+            self.assertTrue(merged["pinned"])
+            self.assertFalse(merged["youtube_rolling_committed"])
+            app._queue_command_monitor_folder_delete.assert_not_called()
+            root.after.assert_called_once()
+
+    def test_youtube_recovery_source_commit_runs_off_gui_thread(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            queue_dir = os.path.join(folder, "queue")
+            source_dir = os.path.join(folder, "source")
+            merged_dir = os.path.join(folder, "merged")
+            os.makedirs(queue_dir)
+            os.makedirs(source_dir)
+            os.makedirs(merged_dir)
+            with open(os.path.join(merged_dir, "recording.mp4"), "wb") as stream:
+                stream.write(b"x" * 2048)
+            source = {
+                "id": "source", "session_dir": source_dir,
+                "command_session_id": "run",
+                "youtube_archive": {"enabled": True},
+                "youtube_source_cleanup_identity": (
+                    PokeControllerApp._command_monitor_delete_target_snapshot(
+                        folder, source_dir)),
+            }
+            merged = {
+                "id": "merged", "session_dir": merged_dir,
+                "command_session_id": "run", "merged": True,
+                "source_chunk_ids": ["source"],
+                "youtube_archive": {"enabled": True},
+            }
+            gui_actions = queue.Queue()
+            metadata_write_threads = []
+            queue_threads = []
+            launch_threads = []
+            gui_thread = threading.get_ident()
+
+            def write_metadata(chunk):
+                metadata_write_threads.append(threading.get_ident())
+                return True
+
+            def queue_upload(_chunk, **_kwargs):
+                queue_threads.append(threading.get_ident())
+                return os.path.join(queue_dir, "job.json")
+
+            def launch(_config, **_kwargs):
+                launch_threads.append(threading.get_ident())
+                return True
+
+            app = types.SimpleNamespace(
+                root=types.SimpleNamespace(after=mock.Mock()),
+                _command_monitor_merge_active=0,
+                _command_monitor_stop_in_progress=False,
+                _command_monitor_chunks=[source, merged],
+                _command_monitor_merge_lock=threading.Lock(),
+                _gui_action_queue=gui_actions,
+                _youtube_upload_queue_dir=lambda: queue_dir,
+                _queue_command_monitor_youtube_upload=mock.Mock(
+                    side_effect=queue_upload),
+                _launch_youtube_upload_worker=mock.Mock(side_effect=launch),
+                _write_command_monitor_metadata=write_metadata,
+                _effective_record_output_dir=lambda: folder,
+                _queue_command_monitor_folder_delete=mock.Mock(),
+                _refresh_command_monitor_tree=mock.Mock(),
+                record_monitor_status=mock.Mock(),
+                _reconcile_command_monitor_youtube_recordings=lambda: None,
+            )
+
+            with mock.patch.object(
+                    PokeControllerApp,
+                    "_flush_command_monitor_deletes",
+                    return_value=False) as flush:
+                self.assertTrue(
+                    PokeControllerApp._reconcile_command_monitor_youtube_recordings(
+                        app))
+                gui_actions.get(timeout=2.0)()
+
+            self.assertTrue(metadata_write_threads)
+            self.assertTrue(queue_threads)
+            self.assertTrue(launch_threads)
+            self.assertNotIn(gui_thread, metadata_write_threads)
+            self.assertNotIn(gui_thread, queue_threads)
+            self.assertNotIn(gui_thread, launch_threads)
+            app._queue_command_monitor_youtube_upload.assert_called_once_with(
+                mock.ANY, background=False, launch_worker=False,
+                hold_for_local_commit=True, persist_metadata=False)
+            self.assertEqual(app._command_monitor_chunks, [source, merged])
+            self.assertTrue(source["delete_pending"])
+            self.assertTrue(source["youtube_source_cleanup_identity"])
+            self.assertEqual(
+                source["youtube_source_cleanup_job"]["job_path"],
+                os.path.join(queue_dir, "job.json"))
+            self.assertTrue(merged["_youtube_recovery_checked"])
+            self.assertFalse(
+                PokeControllerApp._reconcile_command_monitor_youtube_recordings(
+                    app))
+            flush.assert_called_once_with(app)
+            app._queue_command_monitor_folder_delete.assert_not_called()
+
+    def test_commands_rolling_manifests_are_not_sent_to_per_clip_worker(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            rolling_dir = os.path.join(folder, "rolling")
+            normal_dir = os.path.join(folder, "normal")
+            os.makedirs(rolling_dir)
+            os.makedirs(normal_dir)
+            rolling = os.path.join(rolling_dir, "mp4_finalize_job.json")
+            normal = os.path.join(normal_dir, "mp4_finalize_job.json")
+            for path in (rolling, normal):
+                with open(path, "w", encoding="utf-8") as stream:
+                    json.dump({"version": 1, "status": "pending"}, stream)
+            with open(os.path.join(rolling_dir, "command_monitor.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump({
+                    "mode": "Commands monitoring recording",
+                    "merged": False,
+                    "youtube_archive": {"enabled": True},
+                    "youtube_roll_pending": True,
+                }, stream)
+            recorder = types.SimpleNamespace(
+                deferred_finalize_manifests=lambda: [rolling, normal])
+            app = types.SimpleNamespace(
+                recorder=recorder,
+                _youtube_handoff_recorder=None,
+                _youtube_retiring_recorders=[],
+                _template_finalize_launched_paths=set(),
+            )
+
+            self.assertEqual(
+                PokeControllerApp._template_finalize_candidates(app), [normal])
+
+    def test_youtube_commands_merge_retry_has_bounded_exponential_backoff(self):
+        from Window import PokeControllerApp
+
+        callbacks = []
+
+        def after(delay, callback):
+            callbacks.append((delay, callback))
+
+        app = types.SimpleNamespace(
+            root=types.SimpleNamespace(after=after),
+            _logger=mock.Mock(),
+            _reconcile_command_monitor_youtube_recordings=mock.Mock(),
+        )
+        delays = []
+        for _index in range(8):
+            self.assertTrue(
+                PokeControllerApp._schedule_command_monitor_youtube_merge_retry(
+                    app, "run", reason="still pending"))
+            delay, callback = callbacks.pop(0)
+            delays.append(delay)
+            callback()
+
+        self.assertEqual(delays[:5], [500, 1000, 2000, 4000, 8000])
+        self.assertEqual(delays[-1], 60000)
+        app._command_monitor_youtube_merge_retry_attempts["run"] = 719
+        self.assertTrue(
+            PokeControllerApp._schedule_command_monitor_youtube_merge_retry(
+                app, "run", reason="long finalizer"))
+        delay, callback = callbacks.pop(0)
+        self.assertEqual(delay, 60000)
+        callback()
+        self.assertFalse(
+            PokeControllerApp._schedule_command_monitor_youtube_merge_retry(
+                app, "run", reason="corrupt forever"))
+        self.assertEqual(callbacks, [])
+        self.assertEqual(
+            app._reconcile_command_monitor_youtube_recordings.call_count, 9)
+
+    def test_youtube_commands_final_tail_merge_error_schedules_retry(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "chunk")
+            os.makedirs(session)
+            with open(os.path.join(session, "recording.avi"), "wb") as stream:
+                stream.write(b"closed raw video")
+            chunk = {
+                "id": "one", "session_dir": session,
+                "command_session_id": "run",
+                "youtube_archive": {"enabled": True},
+            }
+            gui_actions = queue.Queue()
+            root = types.SimpleNamespace(after=mock.Mock())
+            app = types.SimpleNamespace(
+                root=root,
+                recorder=types.SimpleNamespace(is_finalizing=False),
+                _command_monitor_chunks=[chunk],
+                _command_monitor_merge_lock=threading.Lock(),
+                _command_monitor_merge_active=0,
+                _command_trace_queue=queue.Queue(),
+                _command_step_frame_queue=queue.Queue(),
+                _gui_action_queue=gui_actions,
+                _effective_record_output_dir=lambda: folder,
+                _write_command_monitor_metadata=mock.Mock(return_value=True),
+                _refresh_command_monitor_tree=mock.Mock(),
+                record_monitor_status=mock.Mock(),
+                _logger=mock.Mock(),
+                _reconcile_command_monitor_youtube_recordings=mock.Mock(),
+            )
+
+            with mock.patch(
+                    "Window.validate_command_recording_sources",
+                    return_value=[{"duration": 30.0}]), mock.patch(
+                    "Window.merge_command_recording_chunks",
+                    side_effect=RuntimeError("final AVI not ready")):
+                PokeControllerApp._merge_stopped_command_monitor_recordings(
+                    app, "run", ["one"], youtube_rolling=True,
+                    final_segment=True)
+                apply_result = gui_actions.get(timeout=3.0)
+                apply_result()
+
+            self.assertFalse(chunk["merge_pending"])
+            root.after.assert_called_once()
+            self.assertEqual(root.after.call_args.args[0], 500)
+            self.assertIn(
+                "final AVI not ready", app._logger.warning.call_args.args[-1])
+
+    def test_terminal_youtube_source_error_quarantines_only_bad_chunk(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            good_dir = os.path.join(folder, "good")
+            bad_dir = os.path.join(folder, "bad")
+            os.makedirs(good_dir)
+            os.makedirs(bad_dir)
+            archive = {"enabled": True, "segment_seconds": 60}
+            good = {
+                "id": "good", "session_dir": good_dir,
+                "command_session_id": "run", "started": 0.0,
+                "ended": 30.0, "youtube_archive": archive,
+            }
+            bad = {
+                "id": "bad", "session_dir": bad_dir,
+                "command_session_id": "run", "started": 30.0,
+                "ended": 60.0, "youtube_archive": archive,
+            }
+            gui_actions = queue.Queue()
+            root = types.SimpleNamespace(after=mock.Mock())
+            writes = []
+            app = types.SimpleNamespace(
+                root=root,
+                recorder=types.SimpleNamespace(is_finalizing=False),
+                _command_monitor_chunks=[good, bad],
+                _command_monitor_merge_lock=threading.Lock(),
+                _command_monitor_merge_active=0,
+                _command_trace_queue=queue.Queue(),
+                _command_step_frame_queue=queue.Queue(),
+                _gui_action_queue=gui_actions,
+                _effective_record_output_dir=lambda: folder,
+                _write_command_monitor_metadata=lambda value: (
+                    writes.append(value.copy()) or True),
+                _refresh_command_monitor_tree=mock.Mock(),
+                record_monitor_status=mock.Mock(),
+                _logger=mock.Mock(),
+                _reconcile_command_monitor_youtube_recordings=mock.Mock(),
+            )
+            error = CommandRecordingSourceValidationError(
+                "recorded time is short", code="video_too_short",
+                source_index=2, source_chunk_id="bad")
+
+            with mock.patch(
+                    "Window.prepare_segment_merge_source_alias"), mock.patch(
+                    "Window.validate_command_recording_sources",
+                    side_effect=error), mock.patch(
+                    "Window.merge_command_recording_chunks") as merge:
+                PokeControllerApp._merge_stopped_command_monitor_recordings(
+                    app, "run", ["good", "bad"], youtube_rolling=True,
+                    final_segment=False)
+                gui_actions.get(timeout=2.0)()
+
+            merge.assert_not_called()
+            self.assertTrue(bad["youtube_merge_attention_required"])
+            self.assertTrue(bad["pinned"])
+            self.assertFalse(bad["youtube_roll_pending"])
+            self.assertTrue(bad["youtube_merge_attention_at"])
+            self.assertFalse(good.get("youtube_merge_attention_required", False))
+            self.assertTrue(good["youtube_roll_pending"])
+            self.assertFalse(good["merge_pending"])
+            self.assertNotIn(
+                "_command_monitor_youtube_merge_retry_attempts", app.__dict__)
+            persisted = {item["id"]: item for item in writes}
+            self.assertTrue(
+                persisted["bad"]["youtube_merge_attention_required"])
+            self.assertFalse(persisted["bad"]["youtube_roll_pending"])
+            self.assertEqual(
+                persisted["bad"]["youtube_merge_attention_at"],
+                bad["youtube_merge_attention_at"])
+            self.assertTrue(persisted["good"]["youtube_roll_pending"])
+            self.assertEqual(root.after.call_count, 1)
+            delay, callback = root.after.call_args.args
+            self.assertEqual(delay, 500)
+            callback()
+            app._reconcile_command_monitor_youtube_recordings.assert_called_once()
+
+    def test_retryable_source_probe_does_not_rewrite_every_chunk(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "chunk")
+            os.makedirs(session)
+            chunk = {
+                "id": "one", "session_dir": session,
+                "command_session_id": "run", "started": 0.0,
+                "ended": 30.0,
+                "youtube_archive": {"enabled": True},
+            }
+            gui_actions = queue.Queue()
+            root = types.SimpleNamespace(after=mock.Mock())
+            app = types.SimpleNamespace(
+                root=root,
+                recorder=types.SimpleNamespace(is_finalizing=False),
+                _command_monitor_chunks=[chunk],
+                _command_monitor_merge_lock=threading.Lock(),
+                _command_monitor_merge_active=0,
+                _command_trace_queue=queue.Queue(),
+                _command_step_frame_queue=queue.Queue(),
+                _gui_action_queue=gui_actions,
+                _effective_record_output_dir=lambda: folder,
+                _write_command_monitor_metadata=mock.Mock(return_value=True),
+                _refresh_command_monitor_tree=mock.Mock(),
+                record_monitor_status=mock.Mock(),
+                _logger=mock.Mock(),
+                _reconcile_command_monitor_youtube_recordings=mock.Mock(),
+            )
+            error = CommandRecordingSourceValidationError(
+                "temporarily unreadable", code="video_unreadable",
+                source_index=1, source_chunk_id="one", retryable=True)
+
+            with mock.patch(
+                    "Window.prepare_segment_merge_source_alias"), mock.patch(
+                    "Window.validate_command_recording_sources",
+                    side_effect=error):
+                PokeControllerApp._merge_stopped_command_monitor_recordings(
+                    app, "run", ["one"], youtube_rolling=True,
+                    final_segment=True)
+                gui_actions.get(timeout=2.0)()
+
+            app._write_command_monitor_metadata.assert_not_called()
+            self.assertFalse(
+                chunk.get("youtube_merge_attention_required", False))
+            self.assertTrue(chunk["youtube_roll_pending"])
+            self.assertFalse(chunk["merge_pending"])
+            root.after.assert_called_once()
+
+    def test_unreadable_probe_journals_only_the_failing_source(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            chunks = []
+            for index, name in enumerate(("bad", "good")):
+                session = os.path.join(folder, name)
+                os.makedirs(session)
+                with open(os.path.join(session, "recording.avi"),
+                          "wb") as stream:
+                    stream.write(name.encode("ascii"))
+                chunks.append({
+                    "id": name, "session_dir": session,
+                    "command_session_id": "run", "started": index * 30.0,
+                    "ended": (index + 1) * 30.0,
+                    "youtube_archive": {"enabled": True},
+                })
+            chunks[0]["youtube_merge_retry_probe"] = {
+                "version": "malformed", "code": "video_unreadable",
+                "source_fingerprint": {
+                    "device": -1, "inode": -1,
+                    "size": -1, "mtime_ns": -1,
+                },
+                "attempts": "not-an-int",
+                "first_epoch": time.time() - 600.0,
+            }
+            writes = []
+            gui_actions = queue.Queue()
+            root = types.SimpleNamespace(after=mock.Mock())
+            app = types.SimpleNamespace(
+                root=root,
+                recorder=types.SimpleNamespace(is_finalizing=False),
+                _command_monitor_chunks=chunks,
+                _command_monitor_merge_lock=threading.Lock(),
+                _command_monitor_merge_active=0,
+                _command_trace_queue=queue.Queue(),
+                _command_step_frame_queue=queue.Queue(),
+                _gui_action_queue=gui_actions,
+                _effective_record_output_dir=lambda: folder,
+                _write_command_monitor_metadata=lambda value: (
+                    writes.append(value.copy()) or True),
+                _refresh_command_monitor_tree=mock.Mock(),
+                record_monitor_status=mock.Mock(),
+                _logger=mock.Mock(),
+                _reconcile_command_monitor_youtube_recordings=mock.Mock(),
+            )
+            error = CommandRecordingSourceValidationError(
+                "temporarily unreadable", code="video_unreadable",
+                source_index=1, source_chunk_id="bad", retryable=True)
+
+            with mock.patch(
+                    "Window.prepare_segment_merge_source_alias"), mock.patch(
+                    "Window.validate_command_recording_sources",
+                    side_effect=error):
+                PokeControllerApp._merge_stopped_command_monitor_recordings(
+                    app, "run", ["bad", "good"], youtube_rolling=True)
+                gui_actions.get(timeout=2.0)()
+
+            self.assertEqual([value["id"] for value in writes], ["bad"])
+            self.assertEqual(
+                chunks[0]["youtube_merge_retry_probe"]["attempts"], 1)
+            self.assertNotIn("youtube_merge_retry_probe", chunks[1])
+            self.assertFalse(
+                chunks[0].get("youtube_merge_attention_required", False))
+            root.after.assert_called_once()
+
+    def test_persistently_unreadable_source_is_quarantined(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "chunk")
+            os.makedirs(session)
+            with open(os.path.join(session, "recording.avi"), "wb") as stream:
+                stream.write(b"permanently unreadable source")
+            chunk = {
+                "id": "one", "session_dir": session,
+                "command_session_id": "run", "started": 0.0,
+                "ended": 30.0,
+                "youtube_archive": {"enabled": True},
+            }
+            gui_actions = queue.Queue()
+            root = types.SimpleNamespace(after=mock.Mock())
+            writes = []
+            app = types.SimpleNamespace(
+                root=root,
+                recorder=types.SimpleNamespace(is_finalizing=False),
+                _command_monitor_chunks=[chunk],
+                _command_monitor_merge_lock=threading.Lock(),
+                _command_monitor_merge_active=0,
+                _command_trace_queue=queue.Queue(),
+                _command_step_frame_queue=queue.Queue(),
+                _gui_action_queue=gui_actions,
+                _effective_record_output_dir=lambda: folder,
+                _write_command_monitor_metadata=lambda value: (
+                    writes.append(value.copy()) or True),
+                _refresh_command_monitor_tree=mock.Mock(),
+                record_monitor_status=mock.Mock(),
+                _logger=mock.Mock(),
+                _reconcile_command_monitor_youtube_recordings=mock.Mock(),
+            )
+            error = CommandRecordingSourceValidationError(
+                "persistently unreadable", code="video_unreadable",
+                source_index=1, source_chunk_id="one", retryable=True)
+
+            with mock.patch(
+                    "Window.COMMAND_YOUTUBE_UNREADABLE_ATTENTION_ATTEMPTS", 1), \
+                    mock.patch(
+                        "Window.COMMAND_YOUTUBE_UNREADABLE_ATTENTION_SECONDS",
+                        0.0), \
+                    mock.patch(
+                        "Window.prepare_segment_merge_source_alias"), \
+                    mock.patch(
+                        "Window.validate_command_recording_sources",
+                        side_effect=error), \
+                    mock.patch(
+                        "Window.merge_command_recording_chunks") as merge:
+                PokeControllerApp._merge_stopped_command_monitor_recordings(
+                    app, "run", ["one"], youtube_rolling=True,
+                    final_segment=True)
+                gui_actions.get(timeout=2.0)()
+
+            merge.assert_not_called()
+            self.assertTrue(chunk["youtube_merge_attention_required"])
+            self.assertEqual(
+                chunk["youtube_merge_attention_code"],
+                "video_unreadable_persistent")
+            self.assertTrue(chunk["pinned"])
+            self.assertFalse(chunk["youtube_roll_pending"])
+            self.assertTrue(writes[-1]["youtube_merge_attention_required"])
+            root.after.assert_called_once()
 
     def test_commands_youtube_queue_can_be_persisted_before_source_cleanup(self):
         from Window import PokeControllerApp
@@ -18920,6 +28507,19 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         self.assertEqual(
             temporary_chunk_ids_for_session(chunks, "run-2"), {"latest"})
 
+    def test_explicit_delete_tombstone_is_never_restored_for_stop_dialog(self):
+        chunks = [
+            {"id": "deleted", "command_session_id": "run-2",
+             "started": 20.0, "ended": 30.0, "historical": False,
+             "delete_pending": True, "explicit_delete_pending": True},
+        ]
+
+        restored = ensure_stopped_session_recording_candidate(
+            chunks, "run-2")
+
+        self.assertEqual(restored, "")
+        self.assertTrue(chunks[0]["delete_pending"])
+
     def test_stop_save_choice_protects_only_the_current_run(self):
         chunks = [
             {"id": "current", "command_session_id": "run-2",
@@ -18935,6 +28535,25 @@ class CommandMonitorRecordingTests(unittest.TestCase):
         self.assertTrue(chunks[0]["pinned"])
         self.assertFalse(chunks[0]["delete_pending"])
         self.assertFalse(chunks[2]["pinned"])
+
+    def test_keep_all_mode_still_requires_explicit_stop_save_choice(self):
+        chunks = [
+            {"id": "first", "command_session_id": "run-keep-all",
+             "pinned": False, "delete_pending": False,
+             "monitor_retention_mode": "keep_all"},
+            {"id": "second", "command_session_id": "run-keep-all",
+             "pinned": False, "delete_pending": False,
+             "monitor_retention_mode": "keep_all"},
+        ]
+
+        self.assertEqual(
+            temporary_chunk_ids_for_session(chunks, "run-keep-all"),
+            {"first", "second"})
+        selected = apply_stopped_session_recording_choice(
+            chunks, "run-keep-all", save=True)
+
+        self.assertEqual(selected, {"first", "second"})
+        self.assertTrue(all(chunk["pinned"] for chunk in chunks))
 
     def test_stop_do_not_save_choice_deletes_only_the_current_run(self):
         chunks = [
@@ -19508,6 +29127,49 @@ class ProcessShutdownTests(unittest.TestCase):
                 event_kinds.append(worker.events.get_nowait()[0])
             self.assertEqual(event_kinds.count("added"), 2)
             self.assertEqual(event_kinds.count("completed"), 2)
+
+    def test_mp4_worker_retries_a_manifest_claimed_by_live_finalizer(self):
+        from Recording import FinalizeJobAlreadyRunning
+        from RecordingFinalizeWorker import FinalizeProgressWindow
+
+        with tempfile.TemporaryDirectory() as folder:
+            recording = os.path.join(folder, "recording")
+            os.makedirs(recording)
+            manifest = os.path.abspath(os.path.join(
+                recording, "mp4_finalize_job.json"))
+            with open(manifest, "w", encoding="utf-8") as stream:
+                json.dump({"version": 1, "status": "pending"}, stream)
+            with open(os.path.join(folder, "request_001.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump({"jobs": [manifest], "wait_pid": 0}, stream)
+
+            worker = object.__new__(FinalizeProgressWindow)
+            worker.queue_dir = folder
+            worker.events = queue.Queue()
+            worker.stop_event = threading.Event()
+            worker.load_guard = types.SimpleNamespace(
+                decision=lambda: {"ready": True})
+            thread = threading.Thread(target=worker._run_jobs)
+
+            with mock.patch(
+                    "RecordingFinalizeWorker.finalize_recording_manifest",
+                    side_effect=[FinalizeJobAlreadyRunning("owned"),
+                                 "recording.mp4"]) as finalize:
+                thread.start()
+                deadline = time.monotonic() + 3.0
+                while finalize.call_count < 2 and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                worker.stop_event.set()
+                thread.join(timeout=2.0)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(finalize.call_count, 2)
+            event_kinds = []
+            while not worker.events.empty():
+                event_kinds.append(worker.events.get_nowait()[0])
+            self.assertIn("claim_wait", event_kinds)
+            self.assertEqual(event_kinds.count("completed"), 1)
+            self.assertNotIn("failed", event_kinds)
 
     def test_mp4_wait_override_processes_exactly_one_file(self):
         from RecordingFinalizeWorker import FinalizeProgressWindow
@@ -20939,6 +30601,256 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
         self.assertTrue(writer.audio_was_frozen)
         self.assertEqual(monitor.removed, [9])
 
+    def test_stop_timeout_uses_remaining_cfr_frame_debt(self):
+        class FakeWriterThread:
+            timeout = None
+
+            def join(self, timeout=None):
+                self.timeout = timeout
+
+            @staticmethod
+            def is_alive():
+                return False
+
+        recorder = CaptureRecorder(start_finalize_worker=False)
+        writer = FakeWriterThread()
+        recorder.active = True
+        recorder.started_at = 10.0
+        recorder.requested_fps = 60.0
+        recorder.frames_written = 0
+        recorder.writer_thread = writer
+        recorder.writer_stop = threading.Event()
+        recorder.video = mock.Mock()
+        recorder.wav_path = os.path.join(
+            tempfile.gettempdir(), "missing-recording.wav")
+
+        with mock.patch("Recording.time.monotonic", return_value=100.0):
+            recorder.stop()
+
+        self.assertEqual(recorder.video_stop_target_frames, 5400)
+        self.assertEqual(recorder.video_stop_pending_frames, 5400)
+        self.assertEqual(writer.timeout, 190.0)
+
+    def test_audio_shutdown_does_not_consume_video_join_allowance(self):
+        class FakeWriterThread:
+            timeout = None
+
+            def join(self, timeout=None):
+                self.timeout = timeout
+
+            @staticmethod
+            def is_alive():
+                return False
+
+        recorder = CaptureRecorder(start_finalize_worker=False)
+        writer = FakeWriterThread()
+        clock = [100.0]
+        recorder.active = True
+        recorder.started_at = 99.0
+        recorder.requested_fps = 60.0
+        recorder.frames_written = 0
+        recorder.writer_thread = writer
+        recorder.writer_stop = threading.Event()
+        recorder.video = mock.Mock()
+        recorder.wav_path = os.path.join(
+            tempfile.gettempdir(), "missing-recording.wav")
+        recorder._join_audio_start = lambda: clock.__setitem__(0, 140.0)
+
+        with mock.patch(
+                "Recording.time.monotonic", side_effect=lambda: clock[0]):
+            recorder.stop()
+
+        self.assertEqual(writer.timeout, 30.0)
+        self.assertEqual(recorder.video_stop_drain_seconds, 0.0)
+
+    def test_audio_shutdown_error_is_reported_after_video_close(self):
+        events = []
+
+        class FakeWriterThread:
+            def join(self, timeout=None):
+                events.append(("video_join", timeout))
+
+            @staticmethod
+            def is_alive():
+                return False
+
+        class FailingAudioStream:
+            @staticmethod
+            def stop():
+                events.append(("audio_stop", None))
+                raise RuntimeError("device unplugged")
+
+            @staticmethod
+            def close():
+                events.append(("audio_close", None))
+
+        recorder = CaptureRecorder(start_finalize_worker=False)
+        writer = FakeWriterThread()
+        video = mock.Mock()
+        video.release.side_effect = lambda: events.append(
+            ("video_release", None))
+        recorder.active = True
+        recorder.started_at = 99.0
+        recorder.requested_fps = 60.0
+        recorder.frames_written = 0
+        recorder.writer_thread = writer
+        recorder.writer_stop = threading.Event()
+        recorder.video = video
+        recorder.audio_stream = FailingAudioStream()
+        recorder.wav_path = os.path.join(
+            tempfile.gettempdir(), "missing-recording.wav")
+
+        with mock.patch("Recording.time.monotonic", return_value=100.0):
+            with self.assertRaisesRegex(
+                    RuntimeError, "映像は安全に閉じました"):
+                recorder.stop()
+
+        self.assertEqual(events, [
+            ("audio_stop", None),
+            ("audio_close", None),
+            ("video_join", 30.0),
+            ("video_release", None),
+        ])
+        self.assertIsNone(recorder.audio_stream)
+        self.assertIsNone(recorder.writer_thread)
+        self.assertIsNone(recorder.video)
+        self.assertFalse(recorder.video_close_pending)
+        self.assertIsNone(recorder.stop())
+
+    def test_start_rejects_live_writer_from_previous_timed_out_close(self):
+        recorder = CaptureRecorder(start_finalize_worker=False)
+        recorder.video_close_pending = True
+        recorder.writer_thread = types.SimpleNamespace(is_alive=lambda: True)
+        frame = numpy.zeros((8, 12, 3), dtype=numpy.uint8)
+
+        with mock.patch.object(recorder, "_open_video_writer") as open_writer:
+            with self.assertRaisesRegex(RuntimeError, "前回の録画映像"):
+                recorder.start(frame, 60.0)
+
+        open_writer.assert_not_called()
+        self.assertFalse(recorder.active)
+
+    def test_stop_timeout_never_releases_live_writer(self):
+        release_writer = threading.Event()
+
+        class FakeWriterThread:
+            def join(self, timeout=None):
+                if timeout is None:
+                    release_writer.wait(2.0)
+
+            def is_alive(self):
+                return not release_writer.is_set()
+
+        recorder = CaptureRecorder(start_finalize_worker=False)
+        video = mock.Mock()
+        recorder.active = True
+        recorder.started_at = 99.0
+        recorder.requested_fps = 60.0
+        recorder.frames_written = 0
+        recorder.writer_thread = FakeWriterThread()
+        recorder.writer_stop = threading.Event()
+        recorder.video = video
+        recorder.wav_path = os.path.join(
+            tempfile.gettempdir(), "missing-recording.wav")
+
+        with mock.patch("Recording.time.monotonic", return_value=100.0):
+            with self.assertRaisesRegex(RuntimeError, "30秒以内"):
+                recorder.stop()
+
+        video.release.assert_not_called()
+        self.assertTrue(recorder.video_close_pending)
+        with self.assertRaisesRegex(RuntimeError, "安全に閉じています"):
+            recorder.stop()
+        release_writer.set()
+        recorder._video_late_close_thread.join(2.0)
+        self.assertFalse(recorder.video_close_pending)
+        self.assertIsNone(recorder.video)
+
+    def test_writer_error_clears_dead_writer_ownership_before_reporting(self):
+        class DeadWriterThread:
+            @staticmethod
+            def join(timeout=None):
+                return None
+
+            @staticmethod
+            def is_alive():
+                return False
+
+        recorder = CaptureRecorder(start_finalize_worker=False)
+        video = mock.Mock()
+        recorder.active = True
+        recorder.started_at = 99.0
+        recorder.requested_fps = 60.0
+        recorder.frames_written = 0
+        recorder.writer_thread = DeadWriterThread()
+        recorder.writer_stop = threading.Event()
+        recorder.video = video
+        recorder.video_writer_released = True
+        recorder.video_writer_error = OSError("encoder failed")
+        recorder.wav_path = os.path.join(
+            tempfile.gettempdir(), "missing-recording.wav")
+
+        with mock.patch("Recording.time.monotonic", return_value=100.0):
+            with self.assertRaisesRegex(RuntimeError, "encoder failed"):
+                recorder.stop()
+
+        self.assertIsNone(recorder.writer_thread)
+        self.assertIsNone(recorder.video)
+        self.assertFalse(recorder.video_close_pending)
+        video.release.assert_not_called()
+
+    def test_writer_thread_counts_as_recording_background_work(self):
+        from Window import PokeControllerApp
+
+        live_thread = types.SimpleNamespace(is_alive=lambda: True)
+        app = types.SimpleNamespace(
+            recorder=types.SimpleNamespace(
+                active=False, is_finalizing=False,
+                audio_start_in_progress=False, writer_thread=live_thread),
+            operation_recorder=types.SimpleNamespace(is_finalizing=False),
+            _command_monitor_merge_lock=None,
+            _youtube_handoff_recorder=None,
+            _youtube_retiring_recorders=[],
+        )
+
+        self.assertTrue(
+            PokeControllerApp._recording_background_work_active(app))
+
+    def test_operation_writer_thread_counts_as_recording_background_work(self):
+        from Window import PokeControllerApp
+
+        live_thread = types.SimpleNamespace(is_alive=lambda: True)
+        app = types.SimpleNamespace(
+            recorder=types.SimpleNamespace(
+                active=False, is_finalizing=False,
+                audio_start_in_progress=False, writer_thread=None),
+            operation_recorder=types.SimpleNamespace(
+                is_finalizing=False, _video_late_close_thread=live_thread),
+            _command_monitor_merge_lock=None,
+            _youtube_handoff_recorder=None,
+            _youtube_retiring_recorders=[],
+        )
+
+        self.assertTrue(
+            PokeControllerApp._recording_background_work_active(app))
+
+    def test_pending_normal_stop_counts_as_recording_background_work(self):
+        from Window import PokeControllerApp
+
+        app = types.SimpleNamespace(
+            recorder=types.SimpleNamespace(
+                active=False, is_finalizing=False,
+                audio_start_in_progress=False, writer_thread=None),
+            operation_recorder=types.SimpleNamespace(is_finalizing=False),
+            _command_monitor_merge_lock=None,
+            _youtube_handoff_recorder=None,
+            _youtube_retiring_recorders=[],
+            _template_recording_stop_in_progress=True,
+        )
+
+        self.assertTrue(
+            PokeControllerApp._recording_background_work_active(app))
+
     def test_template_stop_defers_mp4_to_a_durable_manifest(self):
         with tempfile.TemporaryDirectory() as folder:
             session = os.path.join(folder, "20260822_120000_000000")
@@ -20957,6 +30869,8 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
             recorder.started_at = 100.0
             recorder.requested_fps = 60.0
             recorder.video_codec = "mp4v"
+            recorder.youtube_upload_job_path = os.path.join(
+                folder, "youtube_upload_queue", "job.json")
 
             with mock.patch("Recording.time.monotonic", return_value=101.0):
                 result = recorder.stop()
@@ -20969,6 +30883,9 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
             self.assertEqual(payload["status"], "pending")
             self.assertEqual(payload["output_fps"], 60.0)
             self.assertEqual(payload["video_path"], recorder.video_path)
+            self.assertEqual(
+                payload["youtube_upload_job_path"],
+                os.path.abspath(recorder.youtube_upload_job_path))
 
     def test_finalize_manifest_omits_image_arrays_and_is_discoverable(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -20986,6 +30903,250 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
             payload = load_finalize_manifest(manifest)
             self.assertNotIn("image", payload["cleanup_rules"][0])
             self.assertEqual(discover_finalize_manifests(folder), [manifest])
+
+    def test_recovered_finalizer_receives_bound_youtube_upload_intent(self):
+        import Recording
+
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            os.makedirs(session)
+            video = os.path.join(session, "recording.avi")
+            wav = os.path.join(session, "recording.wav")
+            mp4 = os.path.join(session, "recording.mp4")
+            job_path = os.path.join(folder, "youtube_upload_queue", "job.json")
+            manifest = write_finalize_manifest(
+                video, wav, mp4, 60.0, 2.0, discard=True,
+                youtube_upload_job_path=job_path)
+
+            def finalize(_recorder, *args):
+                self.assertEqual(args[-1], os.path.abspath(job_path))
+                with open(mp4, "wb") as stream:
+                    stream.write(b"x" * 2048)
+                return mp4
+
+            with mock.patch.object(
+                    Recording.CaptureRecorder, "_finalize",
+                    autospec=True, side_effect=finalize) as called:
+                result = Recording.finalize_recording_manifest(manifest)
+
+            self.assertEqual(result, mp4)
+            called.assert_called_once()
+            self.assertFalse(os.path.exists(manifest))
+
+    def test_youtube_capture_journals_manifest_before_upload_intent(self):
+        class FakeVideo:
+            def write(self, _frame):
+                pass
+
+            def release(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as folder:
+            recorder = CaptureRecorder(folder, start_finalize_worker=False)
+            recorder.durable_finalization = True
+            observed = []
+            upload_job = os.path.join(folder, "youtube_upload_queue", "job.json")
+
+            def session_started(active):
+                manifest = os.path.join(
+                    active.session_dir, "mp4_finalize_job.json")
+                observed.append(load_finalize_manifest(manifest))
+                return upload_job
+
+            with mock.patch.object(
+                    recorder, "_open_video_writer",
+                    return_value=(FakeVideo(), "mp4v")):
+                recorder.start(
+                    numpy.zeros((2, 2, 3), dtype=numpy.uint8), 60.0,
+                    session_started_callback=session_started)
+
+            self.assertEqual(len(observed), 1)
+            self.assertEqual(observed[0]["status"], "recording")
+            self.assertEqual(observed[0]["worker_pid"], os.getpid())
+            self.assertEqual(
+                observed[0]["mp4_path"], recorder.mp4_path)
+            attached = load_finalize_manifest(os.path.join(
+                recorder.session_dir, "mp4_finalize_job.json"))
+            self.assertEqual(
+                attached["youtube_upload_job_path"],
+                os.path.abspath(upload_job))
+            self.assertEqual(
+                recorder.youtube_upload_job_path, os.path.abspath(upload_job))
+            # Keep this journal-order unit test from scheduling an encoder;
+            # the writer must see a zero-length logical timeline at Stop.
+            recorder.started_at = time.monotonic() + 1.0
+            recorder.stop(discard=True)
+
+    def test_zero_frame_youtube_stop_cancels_mp4_intent(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            os.makedirs(session)
+            recorder = CaptureRecorder(folder, start_finalize_worker=False)
+            recorder.session_dir = session
+            recorder.video_path = os.path.join(session, "recording.avi")
+            recorder.wav_path = os.path.join(session, "recording.wav")
+            recorder.mp4_path = os.path.join(session, "recording.mp4")
+            with open(recorder.video_path, "wb") as stream:
+                stream.write(b"avi")
+            with open(recorder.wav_path, "wb") as stream:
+                stream.write(b"wav")
+            queue_dir = os.path.join(folder, "youtube_upload_queue")
+            os.makedirs(queue_dir)
+            recorder.youtube_upload_job_path = os.path.join(
+                queue_dir, "job.json")
+            with open(recorder.youtube_upload_job_path, "w",
+                      encoding="utf-8") as stream:
+                json.dump({"status": "waiting_media"}, stream)
+            recorder._active_finalize_manifest = write_finalize_manifest(
+                recorder.video_path, recorder.wav_path, recorder.mp4_path,
+                60.0, 0.001,
+                status="recording", worker_pid=os.getpid(),
+                youtube_upload_job_path=recorder.youtube_upload_job_path)
+            manifest_path = recorder._active_finalize_manifest
+            recorder.active = True
+            recorder.durable_finalization = True
+            recorder.video = mock.Mock()
+            recorder.frames_written = 0
+            recorder.started_at = time.monotonic()
+            recorder.requested_fps = 60.0
+
+            with mock.patch(
+                    "YouTubeArchive.cancel_upload_job",
+                    return_value=True) as cancel:
+                result = recorder.stop()
+
+            self.assertIsNone(result)
+            cancel.assert_called_once_with(
+                recorder.youtube_upload_job_path,
+                "Recording stopped before receiving a video frame")
+            self.assertFalse(os.path.exists(manifest_path))
+            self.assertTrue(os.path.isfile(recorder.wav_path))
+
+    def test_discard_finalizer_cancels_bound_youtube_intent_before_delete(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            os.makedirs(session)
+            video = os.path.join(session, "recording.avi")
+            with open(video, "wb") as stream:
+                stream.write(b"avi")
+            recorder = CaptureRecorder(folder, start_finalize_worker=False)
+            job_path = os.path.join(folder, "youtube_upload_queue", "job.json")
+            os.makedirs(os.path.dirname(job_path))
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump({"status": "pending"}, stream)
+
+            with mock.patch(
+                    "YouTubeArchive.cancel_upload_job",
+                    return_value=True) as cancel, mock.patch.object(
+                        recorder, "_mux") as mux:
+                result = recorder._finalize(
+                    video, os.path.join(session, "recording.wav"),
+                    os.path.join(session, "recording.mp4"), 60.0, 1.0,
+                    discard=True, youtube_upload_job_path=job_path)
+
+            self.assertIsNone(result)
+            cancel.assert_called_once_with(
+                job_path, "Recording discarded: command-variable rule")
+            mux.assert_not_called()
+            self.assertFalse(os.path.exists(session))
+
+    def test_discard_finalizer_keeps_media_when_upload_cancel_is_unsafe(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            os.makedirs(session)
+            video = os.path.join(session, "recording.avi")
+            with open(video, "wb") as stream:
+                stream.write(b"avi")
+            recorder = CaptureRecorder(folder, start_finalize_worker=False)
+            mp4 = os.path.join(session, "recording.mp4")
+            job_path = os.path.join(folder, "youtube_upload_queue", "job.json")
+            os.makedirs(os.path.dirname(job_path))
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump({"status": "uploading"}, stream)
+
+            with mock.patch(
+                    "YouTubeArchive.cancel_upload_job",
+                    return_value=False), mock.patch.object(
+                        recorder, "_mux", return_value=mp4) as mux:
+                result = recorder._finalize(
+                    video, os.path.join(session, "recording.wav"), mp4,
+                    60.0, 1.0, minimum_duration=10.0,
+                    youtube_upload_job_path=job_path)
+
+            self.assertEqual(result, mp4)
+            mux.assert_called_once()
+            self.assertTrue(os.path.isdir(session))
+
+    def test_discard_never_treats_temporarily_missing_bound_job_as_cancelled(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            os.makedirs(session)
+            video = os.path.join(session, "recording.avi")
+            with open(video, "wb") as stream:
+                stream.write(b"avi")
+            recorder = CaptureRecorder(folder, start_finalize_worker=False)
+            mp4 = os.path.join(session, "recording.mp4")
+            missing_job = os.path.join(
+                folder, "youtube_upload_queue", "temporarily-missing.json")
+
+            with mock.patch(
+                    "YouTubeArchive.cancel_upload_job",
+                    return_value=False) as cancel, mock.patch.object(
+                        recorder, "_mux", return_value=mp4) as mux:
+                result = recorder._finalize(
+                    video, os.path.join(session, "recording.wav"), mp4,
+                    60.0, 1.0, discard=True,
+                    youtube_upload_job_path=missing_job)
+
+            self.assertEqual(result, mp4)
+            cancel.assert_called_once_with(
+                missing_job, "Recording discarded: command-variable rule")
+            mux.assert_called_once()
+            self.assertTrue(os.path.isdir(session))
+
+    def test_retired_segment_finalizer_thread_exits_after_queued_work(self):
+        recorder = CaptureRecorder()
+        thread = recorder.retire_finalize_worker()
+
+        thread.join(timeout=2.0)
+
+        self.assertFalse(thread.is_alive())
+
+    def test_stale_processing_finalize_manifest_is_recovered_but_live_one_is_not(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            os.makedirs(session)
+            manifest = write_finalize_manifest(
+                os.path.join(session, "recording.avi"),
+                os.path.join(session, "recording.wav"),
+                os.path.join(session, "recording.mp4"), 60.0, 2.0,
+                status="processing", worker_pid=424242)
+
+            with mock.patch("Recording.process_is_alive", return_value=True):
+                self.assertEqual(discover_finalize_manifests(folder), [])
+            with mock.patch("Recording.process_is_alive", return_value=False):
+                self.assertEqual(discover_finalize_manifests(folder), [manifest])
+
+    def test_live_finalize_claim_prevents_duplicate_encoder(self):
+        import Recording
+
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            os.makedirs(session)
+            manifest = write_finalize_manifest(
+                os.path.join(session, "recording.avi"),
+                os.path.join(session, "recording.wav"),
+                os.path.join(session, "recording.mp4"), 60.0, 2.0)
+            with open(manifest + ".lock", "w", encoding="utf-8") as stream:
+                json.dump({"worker_pid": 1234, "token": "owner"}, stream)
+
+            with mock.patch("Recording.process_is_alive", return_value=True), \
+                    mock.patch.object(
+                        Recording.CaptureRecorder, "_finalize") as finalize:
+                with self.assertRaises(Recording.FinalizeJobAlreadyRunning):
+                    Recording.finalize_recording_manifest(manifest)
+
+            finalize.assert_not_called()
 
     def test_template_detection_requests_stop_without_blocking_itself(self):
         recorder = CaptureRecorder(start_finalize_worker=False)
@@ -21445,6 +31606,7 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
         with mock.patch("Recording.shutil.which", return_value="ffmpeg.exe"), \
                 mock.patch("Recording.os.path.isfile", return_value=True), \
                 mock.patch("Recording.os.path.getsize", return_value=2048), \
+                mock.patch("Recording.os.replace"), \
                 mock.patch("Recording.subprocess.run",
                            return_value=completed) as run:
             result = recorder._mux(
@@ -21467,6 +31629,31 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
             self.assertTrue(flags & 0x08000000)  # no console window
         self.assertEqual(result, "recording.mp4")
 
+    def test_mp4_mux_creates_h264_mp4_when_audio_is_disabled(self):
+        recorder = CaptureRecorder()
+        completed = types.SimpleNamespace(returncode=0, stderr="")
+
+        def is_file(path):
+            return str(path).endswith(("recording.avi", ".building.mp4"))
+
+        with mock.patch("Recording.shutil.which", return_value="ffmpeg.exe"), \
+                mock.patch("Recording.os.path.isfile", side_effect=is_file), \
+                mock.patch("Recording.os.path.getsize", return_value=2048), \
+                mock.patch("Recording.os.replace") as publish, \
+                mock.patch("Recording.subprocess.run",
+                           return_value=completed) as run:
+            result = recorder._mux(
+                "recording.avi", "recording.wav", "recording.mp4", 60.0)
+
+        command = run.call_args.args[0]
+        self.assertEqual(command.count("-i"), 1)
+        self.assertIn("-an", command)
+        self.assertNotIn("-c:a", command)
+        self.assertTrue(command[-1].endswith(".building.mp4"))
+        publish.assert_called_once_with(
+            "recording.mp4.building.mp4", "recording.mp4")
+        self.assertEqual(result, "recording.mp4")
+
     def test_mp4_mux_uses_presentation_clock_audio_when_drift_accumulates(self):
         recorder = CaptureRecorder()
         completed = types.SimpleNamespace(returncode=0, stderr="")
@@ -21476,6 +31663,7 @@ class MultiInstanceResponsivenessTests(unittest.TestCase):
         with mock.patch("Recording.shutil.which", return_value="ffmpeg.exe"), \
                 mock.patch("Recording.os.path.isfile", return_value=True), \
                 mock.patch("Recording.os.path.getsize", return_value=2048), \
+                mock.patch("Recording.os.replace"), \
                 mock.patch(
                     "RecordingSyncRepair.write_presentation_aligned_audio",
                     return_value=alignment) as align, \
@@ -22049,6 +32237,7 @@ class PythonSourceSafetyTests(unittest.TestCase):
             "sub4_button": "A",
             "sub4_picture": "POKEMON_ZA_HELP_MARKER",
             "sleeptime": 0.5,
+            "timeout_seconds": 600.0,
         })
         self.assertEqual(
             found._5_story_karasuba_46_recovery_phase, "34")
@@ -22301,7 +32490,7 @@ class PythonSourceSafetyTests(unittest.TestCase):
                 item["name"]: item["text"]
                 for item in source_function_records(stream.read())
             }
-        namespace = {"Button": Button}
+        namespace = {"Button": Button, "time": time}
         for name in ("ZA_story_Template_Comment_Out", "_7_story_guri_54"):
             exec(compile(records[name], source_path, "exec"), namespace)
         comment_out = namespace["ZA_story_Template_Comment_Out"]
@@ -22360,7 +32549,9 @@ class PythonSourceSafetyTests(unittest.TestCase):
 
         completed = Guri54(True, False)
         self.assertEqual(step54(completed), "7_STORY_GURI_55")
-        self.assertEqual(completed.comment_options, {"mode": 1})
+        self.assertEqual(
+            completed.comment_options,
+            {"mode": 1, "timeout_seconds": 600.0})
         self.assertEqual(completed.buttons, [])
 
         retry = Guri54(False, True)
@@ -22632,8 +32823,6 @@ class PythonSourceSafetyTests(unittest.TestCase):
             "7_STORY_GURI_101": "7_STORY_GURI_94",
             "7_STORY_GURI_105": "7_STORY_GURI_97",
             "7_STORY_GURI_108": "7_STORY_GURI_101",
-            "7_STORY_GURI_118": "7_STORY_GURI_105",
-            "7_STORY_GURI_123": "7_STORY_GURI_108",
             "7_STORY_GURI_87": "7_STORY_GURI_86",
             "7_STORY_GURI_88": "7_STORY_GURI_86",
             "7_STORY_GURI_89": "7_STORY_GURI_86",
@@ -22659,15 +32848,10 @@ class PythonSourceSafetyTests(unittest.TestCase):
             "7_STORY_GURI_115": "7_STORY_GURI_105",
             "7_STORY_GURI_116": "7_STORY_GURI_105",
             "7_STORY_GURI_117": "7_STORY_GURI_105",
-            "7_STORY_GURI_119": "7_STORY_GURI_108",
-            "7_STORY_GURI_120": "7_STORY_GURI_108",
-            "7_STORY_GURI_121": "7_STORY_GURI_108",
-            "7_STORY_GURI_122": "7_STORY_GURI_108",
-            "7_STORY_GURI_124": "7_STORY_GURI_118",
-            "7_STORY_GURI_125": "7_STORY_GURI_118",
-            "7_STORY_GURI_126": "7_STORY_GURI_118",
-            "7_STORY_GURI_127": "7_STORY_GURI_118",
-            "7_STORY_GURI_128": "7_STORY_GURI_118",
+            "7_STORY_GURI_119": "7_STORY_GURI_118",
+            "7_STORY_GURI_120": "7_STORY_GURI_118",
+            "7_STORY_GURI_121": "7_STORY_GURI_118",
+            "7_STORY_GURI_122": "7_STORY_GURI_118",
         })
         comment_skip_assignment = next(
             node for node in base_class.body
@@ -22698,6 +32882,7 @@ class PythonSourceSafetyTests(unittest.TestCase):
             "time": time,
         }
         for name in (
+                "_ZA_story_furadari_release_held_recovery_controls",
                 "ZA_story_furadari_section_recovery_step",
                 "_7_story_guri_110"):
             exec(compile(records[name], source_path, "exec"), namespace)
@@ -22708,6 +32893,8 @@ class PythonSourceSafetyTests(unittest.TestCase):
         class Command:
             ZA_STORY_FURADARI_SECTION_RECOVERY_TARGETS = recovery_targets
             ZA_STORY_FURADARI_DARK_RECOVERY_SECONDS = 0.0
+            _ZA_story_furadari_release_held_recovery_controls = namespace[
+                "_ZA_story_furadari_release_held_recovery_controls"]
 
             def __init__(self, dark=True, field_after_b=None):
                 self.dark = dark
@@ -22715,8 +32902,13 @@ class PythonSourceSafetyTests(unittest.TestCase):
                 self.field_visible = False
                 self.buttons = []
                 self.waits = []
+                self.released = []
+                self.zl_actions = []
                 self.dark_checks = 0
                 self.alive_checks = 0
+                self.Rstick_state = 0
+                self.ZL_state = 0
+                self._za_furadari_map_view_active = False
                 self.Common_current_state = "COMMON_GOTO_SELECT2"
                 self.map_cursor_reset = 1
 
@@ -22746,6 +32938,13 @@ class PythonSourceSafetyTests(unittest.TestCase):
 
             def wait(self, seconds):
                 self.waits.append(seconds)
+
+            def holdEnd(self, direction):
+                self.released.append(direction)
+
+            def ZA_ZL_ACTION(self, action):
+                self.zl_actions.append(action)
+                self.ZL_state = 0
 
         # 110自体はFIELDがない間に自己ループするため、共通ラッパー側の
         # 暗転復帰が必要になる。
@@ -22796,6 +32995,28 @@ class PythonSourceSafetyTests(unittest.TestCase):
         self.assertEqual(goto91_dark.Common_current_state, "COMMON_START")
         self.assertEqual(goto91_dark.map_cursor_reset, 0)
 
+        # GURI_105のgoto戦闘復帰が視点・ZLを保持したまま暗転復帰へ
+        # 横取りされても、B入力より先に両方を必ず解除する。
+        guri105_held_view = Command(field_after_b=1)
+        guri105_held_view._za_furadari_map_view_active = True
+        guri105_held_view.Rstick_state = 1
+        guri105_held_view.ZL_state = 1
+        self.assertEqual(
+            recovery_step(
+                guri105_held_view,
+                "7_STORY_GURI_105", "7_STORY_GURI_105"),
+            "7_STORY_GURI_97")
+        self.assertEqual(len(guri105_held_view.released), 1)
+        self.assertEqual(guri105_held_view.released[0].stick, Stick.RIGHT)
+        self.assertEqual(
+            guri105_held_view.released[0].angle_for_show, 180)
+        self.assertEqual(guri105_held_view.Rstick_state, 0)
+        self.assertFalse(guri105_held_view._za_furadari_map_view_active)
+        self.assertEqual(guri105_held_view.zl_actions, ["END"])
+        self.assertEqual(
+            [button for button, _ in guri105_held_view.buttons],
+            [Button.B])
+
         # Bの途中でFIELDへ戻れば、110から数えて2つ前にある
         # FURADARI_MAP goto（105）へ戻る。
         field_after_four = Command(field_after_b=4)
@@ -22809,6 +33030,17 @@ class PythonSourceSafetyTests(unittest.TestCase):
             [Button.B] * 4)
         self.assertEqual(field_after_four.Common_current_state, "COMMON_START")
         self.assertEqual(field_after_four.map_cursor_reset, 0)
+
+        # 終了会話StepのGURI_122で周辺暗転復旧が発生しても、前半の
+        # GURI_108ではなく、直前区間のgotoであるGURI_118へ戻す。
+        guri122_dark = Command(field_after_b=1)
+        self.assertEqual(
+            recovery_step(
+                guri122_dark,
+                "7_STORY_GURI_122", "7_STORY_GURI_122"),
+            "7_STORY_GURI_118")
+        self.assertEqual(
+            [button for button, _ in guri122_dark.buttons], [Button.B])
 
         # 30回でFIELDが戻らない場合は追加入力せず待ち、遅れて復帰した
         # FIELDを確認した時点で同じgotoへ戻る。
@@ -22910,6 +33142,8 @@ class PythonSourceSafetyTests(unittest.TestCase):
 
             def pressRep(self, button, **kwargs):
                 self.buttons.append((button, kwargs))
+                if button is Button.B and self.picture_after_b:
+                    self.matched = {self.picture_after_b}
 
         change_time_set = namespace["ZA_Common_change_time_set"]
 
@@ -22973,6 +33207,9 @@ class PythonSourceSafetyTests(unittest.TestCase):
             records["_ZA_furadari_eyes_dark_comment_visible"],
             source_path, "exec"), namespace)
         exec(compile(
+            records["_ZA_story_furadari_release_held_recovery_controls"],
+            source_path, "exec"), namespace)
+        exec(compile(
             records["ZA_story_furadari_black_comment_recovery_step"],
             source_path, "exec"), namespace)
         exec(compile(
@@ -22992,18 +33229,31 @@ class PythonSourceSafetyTests(unittest.TestCase):
 
         class Command:
             _ZA_furadari_eyes_dark_comment_visible = eyes_dark_check
+            _ZA_story_furadari_release_held_recovery_controls = namespace[
+                "_ZA_story_furadari_release_held_recovery_controls"]
             ZA_STORY_FURADARI_BLACK_RECOVERY_STATES = frozenset({
-                "7_STORY_GURI_87", "7_STORY_GURI_105", "7_STORY_GURI_114"})
+                "7_STORY_GURI_87", "7_STORY_GURI_105",
+                "7_STORY_GURI_114", "7_STORY_GURI_115",
+                "7_STORY_GURI_116", "7_STORY_GURI_117",
+                "7_STORY_GURI_118", "7_STORY_GURI_122"})
             ZA_STORY_FURADARI_BLACK_RECOVERY_FALLBACK = (
                 "7_STORY_GURI_87")
             ZA_STORY_FURADARI_SECTION_RECOVERY_TARGETS = {
-                "7_STORY_GURI_105": "7_STORY_GURI_97"}
+                "7_STORY_GURI_105": "7_STORY_GURI_97",
+                "7_STORY_GURI_122": "7_STORY_GURI_118",
+            }
             ZA_STORY_FURADARI_BLACK_RECOVERY_SECONDS = 30.0
+            ZA_STORY_FURADARI_BLACK_RECOVERY_SECONDS_BY_STATE = {
+                "7_STORY_GURI_122": 90.0,
+            }
+            ZA_STORY_FURADARI_DARK_RECOVERY_SECONDS = 0.0
             ZA_STORY_FURADARI_BLACK_RECOVERY_MAX_INPUTS = 30
             ZA_STORY_FURADARI_EYES_DARK_RECOVERY_MAX_INPUTS = 70
             ZA_STORY_FURADARI_EYES_DARK_B_INTERVAL_SECONDS = 1.0
             ZA_STORY_FURADARI_EYES_DARK_FIELD_RETURN_STATES = frozenset({
-                "7_STORY_GURI_114", "7_STORY_GURI_115", "7_STORY_GURI_116"})
+                "7_STORY_GURI_114", "7_STORY_GURI_115",
+                "7_STORY_GURI_116", "7_STORY_GURI_117",
+                "7_STORY_GURI_118"})
             ZA_STORY_FURADARI_EYES_DARK_FIELD_RETURN_TARGET = (
                 "7_STORY_GURI_114")
 
@@ -23019,7 +33269,12 @@ class PythonSourceSafetyTests(unittest.TestCase):
                 self.goto_calls = []
                 self.map_calls = []
                 self.waits = []
+                self.released = []
+                self.zl_actions = []
                 self.alive_checks = 0
+                self.Rstick_state = 0
+                self.ZL_state = 0
+                self._za_furadari_map_view_active = False
                 self.Common_current_state = "COMMON_CHANGE_TIME"
                 self.map_cursor_reset = 1
 
@@ -23034,6 +33289,9 @@ class PythonSourceSafetyTests(unittest.TestCase):
                         and len(self.buttons) >= self.field_after_input)
                 return False
 
+            def _ZA_furadari_screen_is_dark(self, *_args, **_kwargs):
+                return True
+
             def pressRep(self, button, **kwargs):
                 self.buttons.append((button, kwargs))
 
@@ -23045,6 +33303,20 @@ class PythonSourceSafetyTests(unittest.TestCase):
 
             def wait(self, seconds):
                 self.waits.append(seconds)
+
+            def holdEnd(self, direction):
+                self.released.append(direction)
+
+            def ZA_ZL_ACTION(self, action):
+                self.zl_actions.append(action)
+                self.ZL_state = 0
+
+            def holdEnd(self, direction):
+                self.released.append(direction)
+
+            def ZA_ZL_ACTION(self, action):
+                self.zl_actions.append(action)
+                self.ZL_state = 0
 
             def ZA_Common_map_open(self, **kwargs):
                 self.map_calls.append(("open", (), kwargs))
@@ -23067,7 +33339,33 @@ class PythonSourceSafetyTests(unittest.TestCase):
             "7_STORY_GURI_97": lambda: None,
             "7_STORY_GURI_105": lambda: None,
             "7_STORY_GURI_114": lambda: None,
+            "7_STORY_GURI_118": lambda: None,
+            "7_STORY_GURI_122": lambda: None,
         }
+
+        # GURI_122だけは汎用30秒を使用せず、黒Commentが90秒連続した
+        # 場合に限ってGURI_118向けの復旧を開始する。
+        guri122_black = Command(
+            dark_comment=False, field_after_input=1)
+        with mock.patch.object(
+                time, "monotonic", side_effect=[300.0, 389.9, 390.0]):
+            self.assertIsNone(recovery_step(
+                guri122_black, "7_STORY_GURI_122", state_functions))
+            self.assertIsNone(recovery_step(
+                guri122_black, "7_STORY_GURI_122", state_functions))
+            self.assertEqual(section_recovery_step(
+                guri122_black,
+                "7_STORY_GURI_122", "7_STORY_GURI_122"),
+                "7_STORY_GURI_122")
+            self.assertEqual(guri122_black.buttons, [])
+            self.assertEqual(recovery_step(
+                guri122_black, "7_STORY_GURI_122", state_functions),
+                "7_STORY_GURI_122")
+        self.assertEqual(
+            guri122_black._za_furadari_black_recovery["recovery_target"],
+            "7_STORY_GURI_118")
+        self.assertEqual(
+            [button for button, _ in guri122_black.buttons], [Button.B])
 
         # 専用画像が見えた候補は30秒確認中から通常Stepをロックするが、
         # この段階ではBを送らない。黒Commentが消えたらロックも候補も破棄。
@@ -23100,10 +33398,19 @@ class PythonSourceSafetyTests(unittest.TestCase):
         # ロード後に黒Commentが再検知されてからB70回の経路へ入る。
         dark = Command(
             dark_comment=True, field_after_input=3)
+        dark._za_furadari_map_view_active = True
+        dark.Rstick_state = 1
+        dark.ZL_state = 1
         with mock.patch.object(time, "monotonic", return_value=200.0):
             self.assertEqual(recovery_step(
                 dark, "7_STORY_GURI_105", state_functions),
                 "7_STORY_GURI_105")
+        self.assertEqual(len(dark.released), 1)
+        self.assertEqual(dark.released[0].stick, Stick.RIGHT)
+        self.assertEqual(dark.released[0].angle_for_show, 180)
+        self.assertEqual(dark.Rstick_state, 0)
+        self.assertFalse(dark._za_furadari_map_view_active)
+        self.assertEqual(dark.zl_actions, ["END"])
         self.assertTrue(dark._za_furadari_black_candidate_eyes_dark)
         self.assertEqual(
             dark._za_furadari_eyes_dark_recovery_lock_state,
@@ -23183,39 +33490,44 @@ class PythonSourceSafetyTests(unittest.TestCase):
         self.assertIsNone(
             dark._za_furadari_eyes_dark_recovery_lock_state)
 
-        # GURI_114～116でだけ、専用黒Comment復帰後にマップは開かない。
-        # FIELDから左90度・4秒を一度送ってGURI_114を再実行する。
-        direct_field_return = Command(
-            dark_comment=True, field_after_input=2)
-        direct_field_return.ZA_STORY_FURADARI_BLACK_RECOVERY_SECONDS = 0.0
-        self.assertEqual(recovery_step(
-            direct_field_return, "7_STORY_GURI_114", state_functions),
-            "7_STORY_GURI_114")
-        self.assertEqual(
-            [button for button, _ in direct_field_return.buttons],
-            [Button.B])
-        direct_field_return.black_comment = False
-        self.assertEqual(recovery_step(
-            direct_field_return, "7_STORY_GURI_114", state_functions),
-            "7_STORY_GURI_114")
-        direct_field_return.black_comment = True
-        self.assertEqual(recovery_step(
-            direct_field_return, "7_STORY_GURI_114", state_functions),
-            "7_STORY_GURI_114")
-        self.assertEqual(
-            direct_field_return._za_furadari_black_recovery["phase"],
-            "RETURN_GURI_114_FROM_FIELD")
-        self.assertEqual(recovery_step(
-            direct_field_return, "7_STORY_GURI_114", state_functions),
-            "7_STORY_GURI_114")
-        self.assertEqual(direct_field_return.map_calls, [])
-        self.assertEqual(direct_field_return.goto_calls, [])
-        self.assertEqual(len(direct_field_return.moves), 1)
-        self.assertEqual(direct_field_return.moves[0][1], {
-            "duration": 4.0, "wait": 1.0})
-        self.assertIsNone(direct_field_return._za_furadari_black_recovery)
-        self.assertIsNone(
-            direct_field_return._za_furadari_eyes_dark_recovery_lock_state)
+        # GURI_114～118は敗戦後もフラダリラボ内へ戻るため、専用黒Comment
+        # 復帰後にマップを開かない。FIELDから左90度・3秒を一度送って
+        # GURI_114を再実行する。今回の実録画で発生した118も含めて確認。
+        for current_state in (
+                "7_STORY_GURI_114", "7_STORY_GURI_115",
+                "7_STORY_GURI_116", "7_STORY_GURI_117",
+                "7_STORY_GURI_118"):
+            direct_field_return = Command(
+                dark_comment=True, field_after_input=2)
+            direct_field_return.ZA_STORY_FURADARI_BLACK_RECOVERY_SECONDS = 0.0
+            self.assertEqual(recovery_step(
+                direct_field_return, current_state, state_functions),
+                current_state)
+            self.assertEqual(
+                [button for button, _ in direct_field_return.buttons],
+                [Button.B])
+            direct_field_return.black_comment = False
+            self.assertEqual(recovery_step(
+                direct_field_return, current_state, state_functions),
+                current_state)
+            direct_field_return.black_comment = True
+            self.assertEqual(recovery_step(
+                direct_field_return, current_state, state_functions),
+                current_state)
+            self.assertEqual(
+                direct_field_return._za_furadari_black_recovery["phase"],
+                "RETURN_GURI_114_FROM_FIELD")
+            self.assertEqual(recovery_step(
+                direct_field_return, current_state, state_functions),
+                "7_STORY_GURI_114")
+            self.assertEqual(direct_field_return.map_calls, [])
+            self.assertEqual(direct_field_return.goto_calls, [])
+            self.assertEqual(len(direct_field_return.moves), 1)
+            self.assertEqual(direct_field_return.moves[0][1], {
+                "duration": 3.0, "wait": 1.0})
+            self.assertIsNone(direct_field_return._za_furadari_black_recovery)
+            self.assertIsNone(
+                direct_field_return._za_furadari_eyes_dark_recovery_lock_state)
 
         # 専用画像不一致の黒CommentはBでFIELDへ戻して直接gotoを再試行。
         ordinary = Command(
@@ -23311,7 +33623,7 @@ class PythonSourceSafetyTests(unittest.TestCase):
         self.assertIn(
             "POKEMON_ZA_FURADARI_EYES_DARK_COMMENT", source_text)
         template_path = os.path.join(
-            SERIAL_CONTROLLER, "Template", "ZA_Story", "Common",
+            SERIAL_CONTROLLER, "Template", "ZA_Story_PIC", "Common",
             "furadari_eyes_dark_comment.png")
         template = cv2.imread(template_path, cv2.IMREAD_COLOR)
         self.assertIsNotNone(template)
@@ -23900,8 +34212,12 @@ class PythonSourceSafetyTests(unittest.TestCase):
             "Direction": Direction,
             "Stick": Stick,
         }
+        recovery_node = next(
+            node for node in ast.walk(source_tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_1_story_out_hotel_z_43_46_green_comment_recovery")
         exec(compile(ast.fix_missing_locations(ast.Module(
-            body=[step_node], type_ignores=[])),
+            body=[step_node, recovery_node], type_ignores=[])),
             source_path, "exec"), namespace)
 
         class Command:
@@ -23911,6 +34227,12 @@ class PythonSourceSafetyTests(unittest.TestCase):
                     "POKEMON_ZA_IN_ICON",
                 }
                 self.moves = []
+
+            _1_story_out_hotel_z_43_46_green_comment_recovery = namespace[
+                "_1_story_out_hotel_z_43_46_green_comment_recovery"]
+
+            def checkIfAlive(self):
+                pass
 
             def image_check(self, picture):
                 return picture in self.visible
@@ -23998,6 +34320,10 @@ class PythonSourceSafetyTests(unittest.TestCase):
 
             @staticmethod
             def _1_story_out_hotel_z_17_22_black_comment_recovery(_state):
+                return None
+
+            @staticmethod
+            def _1_story_out_hotel_z_20_dead_recovery():
                 return None
 
             def image_check(self, target):
@@ -24695,10 +35021,16 @@ class PythonSourceSafetyTests(unittest.TestCase):
         self.assertEqual(
             ast.dump(source_renda_node, include_attributes=False),
             ast.dump(fragment_renda_node, include_attributes=False))
+        renda_default_arguments = {
+            argument.arg: default
+            for argument, default in zip(
+                source_renda_node.args.args[-len(
+                    source_renda_node.args.defaults):],
+                source_renda_node.args.defaults)
+        }
+        self.assertIn("timeout_seconds", renda_default_arguments)
         self.assertEqual(
-            source_renda_node.args.args[-1].arg, "timeout_seconds")
-        self.assertEqual(
-            source_renda_node.args.defaults[-1].value, 0.0)
+            renda_default_arguments["timeout_seconds"].value, 0.0)
 
     def test_za_karasuba70_moves_field_slot1_before_step71(self):
         source_path = os.path.join(
@@ -26381,6 +36713,275 @@ class RecordingDiskGuardTests(unittest.TestCase):
             [],
         )
 
+    def test_disk_probe_is_single_flight_and_ignores_stale_key(self):
+        from Window import PokeControllerApp
+
+        gui_actions = queue.Queue()
+        entered = threading.Event()
+        release = threading.Event()
+        calls = []
+        active = {"count": 0, "maximum": 0}
+        current = {"snapshot": None}
+        callbacks = []
+
+        def snapshot(name):
+            path = os.path.abspath(name)
+            paths = (("output", path),)
+            return {
+                "kind": "recording", "paths": paths,
+                "minimum": 5.0, "maximum": 95.0,
+                "generation": name, "session": "",
+                "key": ("recording", paths, 5.0, 95.0, name, ""),
+            }
+
+        first = snapshot("first-root")
+        second = snapshot("second-root")
+        current["snapshot"] = first
+        app = types.SimpleNamespace(
+            _gui_action_queue=gui_actions,
+            _recording_disk_probe_snapshot=lambda: current["snapshot"],
+            _record_disk_last_check=0.0,
+            _record_disk_last_ok=True,
+            _record_disk_violation_key=None,
+            _record_disk_interrupt_queued=False,
+            recorder=types.SimpleNamespace(active=False),
+            record_armed=False,
+        )
+
+        def probe(*_args, **_kwargs):
+            calls.append(threading.current_thread())
+            active["count"] += 1
+            active["maximum"] = max(active["maximum"], active["count"])
+            if len(calls) == 1:
+                entered.set()
+                self.assertTrue(release.wait(timeout=2.0))
+            active["count"] -= 1
+            return []
+
+        with mock.patch("Window.disk_space_violations", side_effect=probe):
+            self.assertIsNone(PokeControllerApp._request_disk_probe(
+                app, "recording", first, force=True,
+                continuation_key="start",
+                on_ready=lambda: callbacks.append("stale")))
+            self.assertTrue(entered.wait(timeout=2.0))
+            current["snapshot"] = second
+            self.assertIsNone(PokeControllerApp._request_disk_probe(
+                app, "recording", second, force=True,
+                continuation_key="start",
+                on_ready=lambda: callbacks.append("current")))
+            release.set()
+            gui_actions.get(timeout=2.0)()
+            gui_actions.get(timeout=2.0)()
+
+        self.assertEqual(callbacks, ["current"])
+        self.assertEqual(active["maximum"], 1)
+        self.assertEqual(len(calls), 2)
+        self.assertTrue(all(item is not threading.main_thread()
+                            for item in calls))
+
+    def test_recording_disk_violation_queues_one_interrupt(self):
+        from Window import PokeControllerApp
+
+        snapshot = {
+            "kind": "recording", "paths": (("output", "X:\\"),),
+            "minimum": 5.0, "maximum": 95.0,
+            "generation": 1, "session": "session",
+            "key": ("recording", "one"),
+        }
+        violation = [{
+            "label": "output", "path": "X:\\", "drive": "x:",
+            "free_gb": 1.0, "used_percent": 99.0,
+        }]
+        gui_actions = queue.Queue()
+        app = types.SimpleNamespace(
+            _gui_action_queue=gui_actions,
+            _recording_disk_probe_snapshot=lambda: snapshot,
+            _record_disk_last_check=0.0,
+            _record_disk_last_ok=True,
+            _record_disk_violation_key=None,
+            _record_disk_interrupt_queued=False,
+            recorder=types.SimpleNamespace(active=True),
+            record_armed=True,
+        )
+        PokeControllerApp._ensure_disk_probe_state(app)
+        app._disk_probe_active["recording"] = snapshot["key"]
+        PokeControllerApp._apply_disk_probe_result(
+            app, "recording", snapshot, violation)
+        app._disk_probe_active["recording"] = snapshot["key"]
+        PokeControllerApp._apply_disk_probe_result(
+            app, "recording", snapshot, violation)
+        self.assertEqual(gui_actions.qsize(), 1)
+
+        interruptions = []
+        with mock.patch.object(
+                PokeControllerApp, "_interrupt_recording_for_disk_space",
+                side_effect=lambda *_args, **_kwargs:
+                interruptions.append("interrupt")):
+            gui_actions.get_nowait()()
+        self.assertEqual(interruptions, ["interrupt"])
+
+    def test_disk_probe_result_after_exit_has_no_popup_or_start(self):
+        from Window import PokeControllerApp
+
+        snapshot = {
+            "kind": "recording", "paths": (("output", "X:\\"),),
+            "minimum": 5.0, "maximum": 95.0,
+            "generation": 1, "session": "",
+            "key": ("recording", "shutdown"),
+        }
+        started = []
+        app = types.SimpleNamespace(
+            _gui_action_queue=queue.Queue(),
+            _recording_disk_probe_snapshot=lambda: snapshot,
+            _record_disk_last_check=0.0,
+            _record_disk_last_ok=True,
+            _record_disk_violation_key=None,
+            _record_disk_interrupt_queued=False,
+            _preview_shutdown_mode=True,
+            _process_exit_ready=False,
+            recorder=types.SimpleNamespace(active=False),
+            record_armed=False,
+        )
+        PokeControllerApp._ensure_disk_probe_state(app)
+        app._disk_probe_active["recording"] = snapshot["key"]
+        app._disk_probe_pending["recording"] = {
+            "snapshot": snapshot, "show_popup": True}
+        app._disk_probe_continuations["recording"]["start"] = (
+            snapshot["key"], lambda: started.append(True))
+        with mock.patch.object(
+                PokeControllerApp, "_show_disk_probe_violation") as show:
+            PokeControllerApp._apply_disk_probe_result(
+                app, "recording", snapshot,
+                [{"label": "output", "path": "X:\\", "error": "full"}])
+        self.assertEqual(started, [])
+        self.assertTrue(app._gui_action_queue.empty())
+        show.assert_not_called()
+
+    def test_recording_disk_popup_waits_for_recorder_close(self):
+        from Window import PokeControllerApp
+
+        after_stop = []
+        shown = []
+        app = types.SimpleNamespace(
+            recorder=types.SimpleNamespace(active=True),
+            record_armed=True,
+            _record_disk_interrupt_queued=True,
+            _youtube_recording_rotation_in_progress=False,
+            _command_monitor_start_request=None,
+            _command_monitor_current_chunk=None,
+            _command_monitor_stop_in_progress=False,
+            _request_template_recording_stop=(
+                lambda **kwargs: after_stop.append(kwargs["after_stop"])),
+            _stop_command_record_window_capture=mock.Mock(),
+            _record_variable_active_rule_id="rule",
+            _record_variable_evaluator=types.SimpleNamespace(reset=mock.Mock()),
+            record_button=types.SimpleNamespace(configure=mock.Mock()),
+            record_mode=types.SimpleNamespace(get=lambda: "Manual"),
+            show_output=mock.Mock(),
+        )
+        with mock.patch.object(
+                PokeControllerApp, "_show_disk_probe_violation",
+                side_effect=lambda *_args, **_kwargs: shown.append("popup")):
+            PokeControllerApp._interrupt_recording_for_disk_space(
+                app, snapshot={"minimum": 5.0, "maximum": 95.0},
+                violations=[{"error": "full"}])
+            self.assertEqual(shown, [])
+            self.assertEqual(len(after_stop), 1)
+            after_stop[0](None)
+        self.assertEqual(shown, ["popup"])
+        self.assertFalse(app._record_disk_interrupt_queued)
+
+    def test_history_scan_stale_root_never_reconciles(self):
+        from Window import PokeControllerApp
+
+        first = os.path.abspath("first-history-root")
+        second = os.path.abspath("second-history-root")
+        selected = {"root": first}
+        gui_actions = queue.Queue()
+        entered = threading.Event()
+        release = threading.Event()
+        app = types.SimpleNamespace(
+            _effective_record_output_dir=lambda: selected["root"],
+            _gui_action_queue=gui_actions,
+            _command_monitor_current_chunk=None,
+            _command_monitor_stop_in_progress=False,
+            _command_monitor_start_request=None,
+            _command_monitor_merge_lock=threading.Lock(),
+            _command_monitor_merge_active=0,
+            record_armed=False,
+            recorder=types.SimpleNamespace(active=False),
+        )
+
+        def scan(root):
+            self.assertIsNot(threading.current_thread(), threading.main_thread())
+            self.assertEqual(os.path.normcase(root), os.path.normcase(first))
+            entered.set()
+            self.assertTrue(release.wait(timeout=2.0))
+            return [{"id": "stale"}]
+
+        with mock.patch.object(
+                PokeControllerApp, "_scan_command_monitor_chunks",
+                side_effect=scan), mock.patch.object(
+                    PokeControllerApp,
+                    "_schedule_command_monitor_output_reload") as schedule, \
+                mock.patch.object(
+                    PokeControllerApp,
+                    "_apply_scanned_command_monitor_chunks") as apply_scan:
+            self.assertTrue(PokeControllerApp._load_command_monitor_chunks(app))
+            self.assertTrue(entered.wait(timeout=2.0))
+            selected["root"] = second
+            release.set()
+            gui_actions.get(timeout=2.0)()
+        apply_scan.assert_not_called()
+        schedule.assert_called_once_with(app)
+
+    def test_startup_finalizer_discovery_filters_concurrent_stop(self):
+        from Window import PokeControllerApp
+
+        manifest = os.path.abspath("pending-finalizer.json")
+        gui_actions = queue.Queue()
+        entered = threading.Event()
+        release = threading.Event()
+        app = types.SimpleNamespace(
+            _startup_finalizer_discovery_active=False,
+            _startup_finalizer_discovery_generation=0,
+            _gui_action_queue=gui_actions,
+            _template_finalize_launched_paths=set(),
+            _template_recording_stop_in_progress=False,
+            _youtube_recording_rotation_in_progress=False,
+            recorder=types.SimpleNamespace(
+                active=False, lock=threading.Lock(),
+                _inprocess_finalize_manifests=set(),
+                _active_finalize_manifest=manifest,
+                video_close_pending=False, writer_thread=None),
+            _youtube_handoff_recorder=None,
+            _youtube_retiring_recorders=[],
+            _logger=mock.Mock(),
+        )
+
+        def discover(_app):
+            self.assertIsNot(threading.current_thread(), threading.main_thread())
+            entered.set()
+            self.assertTrue(release.wait(timeout=2.0))
+            return [manifest]
+
+        with mock.patch.object(
+                PokeControllerApp, "_template_finalize_candidates",
+                side_effect=discover), mock.patch.object(
+                    PokeControllerApp,
+                    "_launch_deferred_template_finalizer") as launch:
+            self.assertTrue(
+                PokeControllerApp._resume_pending_recording_finalizers(app))
+            self.assertTrue(entered.wait(timeout=2.0))
+            # Stop has begun after discovery but before its Tk apply. It owns
+            # the active manifest even before the in-process finalizer set is
+            # published, so startup recovery must not launch a duplicate.
+            app._template_recording_stop_in_progress = True
+            release.set()
+            gui_actions.get(timeout=2.0)()
+        launch.assert_not_called()
+        self.assertFalse(app._startup_finalizer_discovery_active)
+
 
 class OperationCaptureSessionTests(unittest.TestCase):
     def test_keyboard_input_is_rejected_from_operation_recording(self):
@@ -26825,16 +37426,21 @@ class OperationSessionModelTests(unittest.TestCase):
         inputs = [{
             "kind": "input", "line": 1, "time": 0.2,
             "message": "0x4003 8 80 80 80 80", "summary": "HOME",
+        }, {
+            "kind": "input", "line": 2, "time": 0.3,
+            "message": "0x0003 8 80 80 80 80", "summary": "NEUTRAL",
         }]
         mappings = [{
-            "start_line": 1, "end_line": 1, "kind": "step",
+            "start_line": 1, "end_line": 2, "kind": "step",
             "step_name": "OPEN_HOME", "next_step": "NEXT",
         }]
         generated = generate_intermediate(
             {"status": "paused", "session_id": "paused-home"},
             inputs, mappings)
         self.assertIn("def OPEN_HOME", generated)
-        self.assertIn("0x4003", generated)
+        self.assertIn("self.press(Button.HOME", generated)
+        self.assertNotIn("0x4003", generated)
+        self.assertNotIn("self.direct_serial", generated)
 
     def test_legacy_keyboard_rows_are_excluded_from_commands_generation(self):
         inputs = [
@@ -26953,15 +37559,127 @@ class OperationSessionModelTests(unittest.TestCase):
         mappings = [{"start_line": 1, "end_line": 1, "kind": "raw"}]
         exact = generate_intermediate(
             {"session_id": "exact"}, [row], mappings)
-        self.assertIn("0x0002 8 b5 6a", exact)
+        self.assertIn(
+            "Direction(Stick.LEFT, (181, 149), "
+            "showName='22.54deg/0.4518')", exact)
+        self.assertNotIn("0x0002 8 b5 6a", exact)
 
         quantized_message = quantize_serial_stick_message(row)
         self.assertEqual(quantized_message, "0x0002 8 c0 80")
         eight_way = generate_intermediate(
             {"session_id": "eight"}, [row], mappings,
             stick_mode=STICK_MODE_EIGHT_WAY)
-        self.assertIn("0x0002 8 c0 80", eight_way)
+        self.assertIn("Direction(Stick.LEFT, 45, 0.4518)", eight_way)
         self.assertNotIn("0x0002 8 b5 6a", eight_way)
+
+    def test_switch_readable_generation_preserves_stick_carry_and_held_button(self):
+        rows = [
+            {"line": 1, "time": 0.0, "message": "0x000a 8 ff 80"},
+            {"line": 2, "time": 0.2, "message": "0x0018 8"},
+            {"line": 3, "time": 0.3, "message": "0x0008 8"},
+            {"line": 4, "time": 0.5, "message": "0x000a 8 80 80"},
+            {"line": 5, "time": 0.7, "message": "0x0000 8"},
+        ]
+        decoded, _state, malformed = decode_switch_input_rows(rows)
+        self.assertEqual(malformed, [])
+        self.assertIn(("button", "B"), decoded[1]["controls"])
+        self.assertTrue(any(control[0] == "stick"
+                            for control in decoded[1]["controls"]))
+        source = "\n".join(readable_switch_input_lines(rows, indent=""))
+        self.assertIn("self.hold([Button.B, Direction(Stick.LEFT", source)
+        self.assertIn("self.press(Button.A, duration=0.1, wait=0.0)", source)
+        self.assertIn("self.holdEnd(Direction(Stick.LEFT", source)
+        self.assertNotIn("0x", source)
+        self.assertNotIn("direct_serial", source)
+
+    def test_switch_readable_generation_uses_named_dpad_command(self):
+        rows = [
+            {"line": 1, "time": 0.0, "message": "0x0000 6"},
+            {"line": 2, "time": 0.1, "message": "0x0000 8"},
+        ]
+        source = "\n".join(readable_switch_input_lines(rows, indent=""))
+        self.assertIn(
+            'self.etc_sendCommand("Lbutton_left", duration=0.1, wait=0.0)',
+            source)
+
+    def test_switch_readable_generation_replaces_stick_without_neutral(self):
+        rows = [
+            {"line": 1, "time": 0.0, "message": "0x0002 8 ff 80"},
+            {"line": 2, "time": 0.1, "message": "0x0002 8 80 ff"},
+            {"line": 3, "time": 0.2, "message": "0x0002 8 80 80"},
+        ]
+        source = "\n".join(readable_switch_input_lines(rows, indent=""))
+        self.assertEqual(source.count("self.hold(Direction(Stick.LEFT"), 2)
+        # Only the final return to neutral releases the stick.  The direction
+        # change itself is a single atomic hold() replacement.
+        self.assertEqual(source.count("self.holdEnd(Direction(Stick.LEFT"), 1)
+
+    def test_switch_exact_stick_jitter_uses_recorded_coordinate_distance(self):
+        rows = [
+            {"line": 1, "time": 0.0, "message": "0x0002 8 15 2f"},
+            {"line": 2, "time": 0.1, "message": "0x0002 8 02 16"},
+            {"line": 3, "time": 0.2, "message": "0x0002 8 80 80"},
+        ]
+        source = "\n".join(readable_switch_input_lines(rows, indent=""))
+        # Both saturated diagonal positions have similar polar values, but are
+        # physically far apart and must remain distinct exact tuple controls.
+        self.assertIn("Direction(Stick.LEFT, (21, 208)", source)
+        self.assertIn("Direction(Stick.LEFT, (2, 233)", source)
+        self.assertEqual(source.count("self.hold(Direction(Stick.LEFT"), 2)
+
+    def test_switch_readable_generation_replaces_hat_without_neutral(self):
+        rows = [
+            {"line": 1, "time": 0.0, "message": "0x0000 6"},
+            {"line": 2, "time": 0.1, "message": "0x0000 2"},
+            {"line": 3, "time": 0.2, "message": "0x0000 8"},
+        ]
+        source = "\n".join(readable_switch_input_lines(rows, indent=""))
+        self.assertIn("self.hold(Hat.LEFT, wait=0.0)", source)
+        self.assertIn("self.hold(Hat.RIGHT, wait=0.0)", source)
+        self.assertNotIn("self.holdEnd(Hat.LEFT)", source)
+        self.assertEqual(source.count("self.holdEnd(Hat.RIGHT)"), 1)
+
+    def test_switch_state_carries_across_nested_function_boundaries(self):
+        rows = [
+            {"kind": "input", "line": 1, "time": 0.0,
+             "message": "0x0002 8 ff 80"},
+            {"kind": "input", "line": 2, "time": 0.1,
+             "message": "0x0010 8"},
+            {"kind": "input", "line": 3, "time": 0.2,
+             "message": "0x0000 8"},
+            {"kind": "input", "line": 4, "time": 0.3,
+             "message": "0x0002 8 80 80"},
+        ]
+        mappings = [
+            {"start_line": 1, "end_line": 4, "kind": "step",
+             "step_name": "STEP_A", "next_step": ""},
+            {"start_line": 2, "end_line": 3, "kind": "function",
+             "function_name": "tap_a", "call_from_step": "STEP_A"},
+        ]
+        source = generate_intermediate(
+            {"session_id": "carry"}, rows, mappings)
+        step = source[source.index("def STEP_A"):source.index("def tap_a")]
+        function = source[source.index("def tap_a"):]
+        self.assertIn("self.hold(Direction(Stick.LEFT", step)
+        self.assertIn("self.tap_a()", step)
+        self.assertIn("self.holdEnd(Direction(Stick.LEFT", step)
+        self.assertIn("self.press(Button.A, duration=0.1, wait=0.0)", function)
+        self.assertNotIn("self.hold(Direction(Stick.LEFT", function)
+
+    def test_generated_class_merge_adds_readable_key_imports(self):
+        source = "class Story(object):\n    pass\n"
+        generated = (
+            "# POKECON_OPERATION_SESSION:keys:BEGIN\n"
+            "def STEP_A(self):\n"
+            "    self.press(Button.A, wait=0.0)\n"
+            "    self.hold(Direction(Stick.LEFT, 90, 1.0), wait=0.0)\n"
+            "    self.press(Hat.TOP, wait=0.0)\n"
+            "# POKECON_OPERATION_SESSION:keys:END\n")
+        updated = replace_generated_region(
+            source, generated, "keys", class_name="Story")
+        self.assertIn(
+            "from Commands.Keys import Button, Direction, Hat, Stick", updated)
+        ast.parse(updated)
 
     def test_semantic_stick_names_are_quantized_to_eight_directions(self):
         row = {"buttons": ["ZR"], "hat": "UP_LEFT",
@@ -27049,6 +37767,17 @@ class OperationSessionModelTests(unittest.TestCase):
 
             namespace = {}
             exec(compile(source, "vision_sample.py", "exec"), namespace)
+            variants = namespace["IMAGE_DETECTION_TARGETS"][
+                "AUTO_STEP_A_COMPLETE"]
+            self.assertIsInstance(variants, list)
+            self.assertEqual(len(variants), 1)
+            self.assertIn("platform_templates", variants[0])
+            self.assertEqual(
+                namespace["IMAGE_DETECTION_OPERATORS"][
+                    "AUTO_STEP_A_COMPLETE"], "OR")
+            self.assertIn(
+                "AUTO_STEP_A_COMPLETE",
+                namespace["IMAGE_DETECTION_DESCRIPTIONS"]["targets"])
             methods = {name: value for name, value in namespace.items()
                        if inspect.isfunction(value)}
             SampleCommand = type("SampleCommand", (), methods)
@@ -27056,7 +37785,7 @@ class OperationSessionModelTests(unittest.TestCase):
             results = iter((False, False, True))
             recorded = []
             command.STEP_A = lambda: recorded.append("STEP_A")
-            command._operation_sample_detect = lambda *_args, **_options: next(results)
+            command.image_check = lambda *_args, **_options: next(results)
             command.wait = lambda _seconds: None
             self.assertEqual(command.VISION_SAMPLE_STEP_A(), "STEP_B")
             self.assertEqual(recorded, ["STEP_A"])
@@ -27245,15 +37974,1234 @@ class YouTubeArchiveAndCommonFunctionIndexTests(unittest.TestCase):
                 youtube_url_for_time(session, 7323),
                 "https://www.youtube.com/watch?v=part2&t=123s")
 
-    def test_description_keeps_common_function_timestamp(self):
+    def test_local_commit_upload_job_is_invisible_until_atomic_release(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"video" * 1024)
+
+            staging_path = enqueue_upload_job(
+                queue_dir, media, session, input_set="Switch_No3",
+                recording_kind="commands_monitor",
+                hold_for_local_commit=True)
+            final_path = staging_path[:-len(
+                YouTubeArchive.LOCAL_COMMIT_SUFFIX)]
+
+            self.assertTrue(staging_path.endswith(".json.local-commit"))
+            self.assertTrue(os.path.isfile(staging_path))
+            self.assertFalse(os.path.exists(final_path))
+            self.assertFalse(any(
+                name.endswith(".json") for name in os.listdir(queue_dir)))
+            with open(staging_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["status"], "pending")
+
+            with mock.patch.object(
+                    YouTubeArchive, "process_upload_job") as process:
+                before = YouTubeArchive.run_upload_queue(
+                    queue_dir, os.path.join(folder, "channels.json"),
+                    max_wait_seconds=0)
+            self.assertEqual(before["completed"], 0)
+            process.assert_not_called()
+
+            released = YouTubeArchive.release_upload_job_local_commit(
+                staging_path)
+            self.assertEqual(released, final_path)
+            self.assertTrue(os.path.isfile(final_path))
+            self.assertFalse(os.path.exists(staging_path))
+
+            def complete_job(path, _store_path):
+                with open(path, "r", encoding="utf-8") as stream:
+                    job = json.load(stream)
+                job["status"] = "completed"
+                YouTubeArchive._atomic_json(path, job)
+                return "completed"
+
+            with mock.patch.object(
+                    YouTubeArchive, "process_upload_job",
+                    side_effect=complete_job) as process:
+                after = YouTubeArchive.run_upload_queue(
+                    queue_dir, os.path.join(folder, "channels.json"),
+                    max_wait_seconds=1)
+            self.assertEqual(after["completed"], 1)
+            process.assert_called_once_with(
+                final_path, os.path.join(folder, "channels.json"))
+
+    def test_local_commit_upload_job_enqueue_and_release_are_idempotent(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"video")
+
+            first = enqueue_upload_job(
+                queue_dir, media, session, hold_for_local_commit=True)
+            with open(first, "rb") as stream:
+                original = stream.read()
+            second = enqueue_upload_job(
+                queue_dir, media, session, hold_for_local_commit=True)
+            self.assertEqual(second, first)
+            with open(second, "rb") as stream:
+                self.assertEqual(stream.read(), original)
+            # A generic caller cannot accidentally publish a held job.
+            self.assertEqual(
+                enqueue_upload_job(queue_dir, media, session), "")
+
+            final_path = YouTubeArchive.release_upload_job_local_commit(first)
+            self.assertTrue(final_path.endswith(".json"))
+            self.assertEqual(
+                YouTubeArchive.release_upload_job_local_commit(first),
+                final_path)
+            # A held retry discovers the already-published final job.
+            self.assertEqual(
+                enqueue_upload_job(
+                    queue_dir, media, session,
+                    hold_for_local_commit=True),
+                final_path)
+            self.assertFalse(os.path.exists(first))
+
+    def test_local_commit_enqueue_does_not_revive_cancelled_final_job(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"video")
+
+            final_path = enqueue_upload_job(queue_dir, media, session)
+            self.assertTrue(YouTubeArchive.cancel_upload_job(
+                final_path, "recording discarded"))
+
+            self.assertEqual(
+                enqueue_upload_job(
+                    queue_dir, media, session,
+                    hold_for_local_commit=True),
+                "")
+            self.assertFalse(os.path.exists(
+                final_path + YouTubeArchive.LOCAL_COMMIT_SUFFIX))
+            with open(final_path, "r", encoding="utf-8") as stream:
+                cancelled = json.load(stream)
+            self.assertEqual(cancelled["status"], "cancelled")
+
+    def test_local_commit_release_does_not_accept_cancelled_final_race(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"video")
+
+            staging_path = enqueue_upload_job(
+                queue_dir, media, session, hold_for_local_commit=True)
+            final_path = staging_path[:-len(
+                YouTubeArchive.LOCAL_COMMIT_SUFFIX)]
+            with open(staging_path, "r", encoding="utf-8") as stream:
+                cancelled = json.load(stream)
+            cancelled["status"] = "cancelled"
+            cancelled["cancel_reason"] = "concurrent cancellation"
+            YouTubeArchive._atomic_json(final_path, cancelled)
+
+            self.assertEqual(
+                YouTubeArchive.release_upload_job_local_commit(staging_path),
+                "")
+            self.assertTrue(os.path.isfile(staging_path))
+            with open(final_path, "r", encoding="utf-8") as stream:
+                persisted = json.load(stream)
+            self.assertEqual(persisted["status"], "cancelled")
+            self.assertEqual(
+                persisted["cancel_reason"], "concurrent cancellation")
+
+    def test_enqueue_quarantines_schema_valid_final_for_other_recording(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            other_session = os.path.join(folder, "other-session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            os.makedirs(other_session)
+            media = os.path.join(session, "recording.mp4")
+            other_media = os.path.join(other_session, "recording.mp4")
+            for path in (media, other_media):
+                with open(path, "wb") as stream:
+                    stream.write(b"video")
+
+            final_path = enqueue_upload_job(queue_dir, media, session)
+            with open(final_path, "r", encoding="utf-8") as stream:
+                misplaced = json.load(stream)
+            misplaced["status"] = "completed"
+            misplaced["media_path"] = os.path.abspath(other_media)
+            misplaced["session_dir"] = os.path.abspath(other_session)
+            YouTubeArchive._atomic_json(final_path, misplaced)
+
+            self.assertEqual(
+                enqueue_upload_job(queue_dir, media, session), "")
+            with open(final_path, "r", encoding="utf-8") as stream:
+                stub = json.load(stream)
+            self.assertEqual(stub["status"], YouTubeArchive.INVALID_JOB)
+            with open(stub["quarantined_payload_path"],
+                      "r", encoding="utf-8") as stream:
+                preserved = json.load(stream)
+            self.assertEqual(
+                preserved["media_path"], os.path.abspath(other_media))
+            self.assertEqual(
+                preserved["session_dir"], os.path.abspath(other_session))
+
+    def test_local_commit_release_rejects_conflicting_valid_final_identity(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            other_session = os.path.join(folder, "other-session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            os.makedirs(other_session)
+            media = os.path.join(session, "recording.mp4")
+            other_media = os.path.join(other_session, "recording.mp4")
+            for path in (media, other_media):
+                with open(path, "wb") as stream:
+                    stream.write(b"video")
+
+            staging_path = enqueue_upload_job(
+                queue_dir, media, session, hold_for_local_commit=True)
+            final_path = staging_path[:-len(
+                YouTubeArchive.LOCAL_COMMIT_SUFFIX)]
+            with open(staging_path, "r", encoding="utf-8") as stream:
+                misplaced = json.load(stream)
+            misplaced["media_path"] = os.path.abspath(other_media)
+            misplaced["session_dir"] = os.path.abspath(other_session)
+            YouTubeArchive._atomic_json(final_path, misplaced)
+
+            self.assertEqual(
+                YouTubeArchive.release_upload_job_local_commit(staging_path),
+                "")
+            self.assertTrue(os.path.isfile(staging_path))
+            with open(final_path, "r", encoding="utf-8") as stream:
+                stub = json.load(stream)
+            self.assertEqual(stub["status"], YouTubeArchive.INVALID_JOB)
+            with open(staging_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["status"], "pending")
+
+    def test_local_commit_release_rejects_misplaced_valid_staging(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            other_session = os.path.join(folder, "other-session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            os.makedirs(other_session)
+            media = os.path.join(session, "recording.mp4")
+            other_media = os.path.join(other_session, "recording.mp4")
+            for path in (media, other_media):
+                with open(path, "wb") as stream:
+                    stream.write(b"video")
+
+            staging_path = enqueue_upload_job(
+                queue_dir, media, session, hold_for_local_commit=True)
+            final_path = staging_path[:-len(
+                YouTubeArchive.LOCAL_COMMIT_SUFFIX)]
+            with open(staging_path, "r", encoding="utf-8") as stream:
+                misplaced = json.load(stream)
+            misplaced["media_path"] = os.path.abspath(other_media)
+            misplaced["session_dir"] = os.path.abspath(other_session)
+            YouTubeArchive._atomic_json(staging_path, misplaced)
+
+            self.assertEqual(
+                YouTubeArchive.release_upload_job_local_commit(staging_path),
+                "")
+            self.assertFalse(os.path.exists(final_path))
+            with open(staging_path, "r", encoding="utf-8") as stream:
+                stub = json.load(stream)
+            self.assertEqual(stub["status"], YouTubeArchive.INVALID_JOB)
+            with open(stub["quarantined_payload_path"],
+                      "r", encoding="utf-8") as stream:
+                preserved = json.load(stream)
+            self.assertEqual(
+                preserved["media_path"], os.path.abspath(other_media))
+
+    def test_corrupt_local_commit_is_quarantined_once_and_self_healed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"video")
+
+            staging_path = enqueue_upload_job(
+                queue_dir, media, session, hold_for_local_commit=True)
+            with open(staging_path, "w", encoding="utf-8") as stream:
+                stream.write("{corrupt")
+
+            self.assertEqual(
+                enqueue_upload_job(
+                    queue_dir, media, session,
+                    hold_for_local_commit=True),
+                staging_path)
+            quarantine_prefix = os.path.basename(staging_path) + ".invalid."
+
+            def quarantines():
+                return sorted(
+                    name for name in os.listdir(queue_dir)
+                    if (name.startswith(quarantine_prefix)
+                        and name.endswith(".bad")))
+
+            first_quarantine = quarantines()
+            self.assertEqual(len(first_quarantine), 1)
+            with open(staging_path, "r", encoding="utf-8") as stream:
+                repaired = json.load(stream)
+            self.assertEqual(repaired["status"], "pending")
+            self.assertEqual(repaired["media_path"], os.path.abspath(media))
+            self.assertEqual(
+                repaired["session_dir"], os.path.abspath(session))
+
+            for _attempt in range(3):
+                self.assertEqual(
+                    enqueue_upload_job(
+                        queue_dir, media, session,
+                        hold_for_local_commit=True),
+                    staging_path)
+            self.assertEqual(quarantines(), first_quarantine)
+
+    def test_invalid_local_commit_stub_is_repaired_without_new_quarantine(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"video")
+
+            staging_path = enqueue_upload_job(
+                queue_dir, media, session, hold_for_local_commit=True)
+            YouTubeArchive._quarantine_invalid_upload_job(
+                staging_path, "simulated interrupted repair")
+            before = sorted(
+                name for name in os.listdir(queue_dir)
+                if name.endswith(".bad"))
+            self.assertEqual(len(before), 1)
+
+            self.assertEqual(
+                enqueue_upload_job(
+                    queue_dir, media, session,
+                    hold_for_local_commit=True),
+                staging_path)
+            self.assertEqual(sorted(
+                name for name in os.listdir(queue_dir)
+                if name.endswith(".bad")), before)
+            with open(staging_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["status"], "pending")
+
+    def test_release_does_not_requarantine_invalid_local_commit_stub(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"video")
+
+            staging_path = enqueue_upload_job(
+                queue_dir, media, session, hold_for_local_commit=True)
+            YouTubeArchive._quarantine_invalid_upload_job(
+                staging_path, "simulated interrupted repair")
+            before = sorted(
+                name for name in os.listdir(queue_dir)
+                if name.endswith(".bad"))
+            for _attempt in range(3):
+                self.assertEqual(
+                    YouTubeArchive.release_upload_job_local_commit(
+                        staging_path),
+                    "")
+            self.assertEqual(sorted(
+                name for name in os.listdir(queue_dir)
+                if name.endswith(".bad")), before)
+
+    def test_local_commit_upload_job_concurrent_publish_has_one_final(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"video")
+
+            enqueue_results = []
+            enqueue_lock = threading.Lock()
+
+            def enqueue_one():
+                result = enqueue_upload_job(
+                    queue_dir, media, session,
+                    hold_for_local_commit=True)
+                with enqueue_lock:
+                    enqueue_results.append(result)
+
+            threads = [threading.Thread(target=enqueue_one)
+                       for _index in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(5.0)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(len(set(enqueue_results)), 1)
+            staging_path = enqueue_results[0]
+
+            release_results = []
+            release_lock = threading.Lock()
+
+            def release_one():
+                result = YouTubeArchive.release_upload_job_local_commit(
+                    staging_path)
+                with release_lock:
+                    release_results.append(result)
+
+            threads = [threading.Thread(target=release_one)
+                       for _index in range(8)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(5.0)
+            self.assertTrue(all(not thread.is_alive() for thread in threads))
+            self.assertEqual(len(set(release_results)), 1)
+            final_path = release_results[0]
+            self.assertTrue(os.path.isfile(final_path))
+            self.assertFalse(os.path.exists(staging_path))
+            with open(final_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            self.assertEqual(job["status"], "pending")
+            self.assertEqual(job["media_path"], os.path.abspath(media))
+
+    def test_youtube_job_identity_normalizes_windows_path_case(self):
+        if os.path.normcase("A") != os.path.normcase("a"):
+            self.skipTest("Windows case-insensitive path identity test")
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "Session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "Recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"video")
+
+            first = enqueue_upload_job(queue_dir, media, session)
+            second = enqueue_upload_job(
+                queue_dir, media.swapcase(), session.swapcase())
+            self.assertEqual(second, first)
+            self.assertEqual(len([
+                name for name in os.listdir(queue_dir)
+                if name.endswith(".json")]), 1)
+            with open(first, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            self.assertEqual(
+                job["identity_version"],
+                YouTubeArchive.UPLOAD_JOB_IDENTITY_VERSION)
+
+    def test_youtube_job_identity_adopts_legacy_case_preserving_job(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "Session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "Recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"video")
+
+            current_path = enqueue_upload_job(queue_dir, media, session)
+            with open(current_path, "r", encoding="utf-8") as stream:
+                legacy = json.load(stream)
+            os.remove(current_path)
+            legacy_id = YouTubeArchive._upload_job_identity(
+                media, session, identity_version=1)
+            legacy["id"] = legacy_id
+            legacy.pop("identity_version", None)
+            legacy_path = os.path.join(queue_dir, legacy_id + ".json")
+            YouTubeArchive._atomic_json(legacy_path, legacy)
+
+            self.assertEqual(
+                enqueue_upload_job(queue_dir, media, session), legacy_path)
+            self.assertEqual(len([
+                name for name in os.listdir(queue_dir)
+                if name.endswith(".json")]), 1)
+
+    def test_process_and_cancel_reject_job_copied_under_another_name(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"video" * 1024)
+            original = enqueue_upload_job(queue_dir, media, session)
+            with open(original, "r", encoding="utf-8") as stream:
+                copied = json.load(stream)
+            wrong_path = os.path.join(queue_dir, "0" * 24 + ".json")
+            YouTubeArchive._atomic_json(wrong_path, copied)
+
+            self.assertFalse(YouTubeArchive.cancel_upload_job(
+                wrong_path, "must not cancel another job"))
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile") as resolve_profile:
+                result = YouTubeArchive.process_upload_job(
+                    wrong_path, os.path.join(folder, "channels.json"))
+            self.assertEqual(result, YouTubeArchive.INVALID_JOB)
+            resolve_profile.assert_not_called()
+            with open(wrong_path, "r", encoding="utf-8") as stream:
+                stub = json.load(stream)
+            self.assertEqual(stub["status"], YouTubeArchive.INVALID_JOB)
+            self.assertTrue(os.path.isfile(stub["quarantined_payload_path"]))
+
+    def test_process_stops_on_equivalent_v1_v2_duplicate_jobs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"video" * 1024)
+            current_path = enqueue_upload_job(queue_dir, media, session)
+            with open(current_path, "r", encoding="utf-8") as stream:
+                legacy = json.load(stream)
+            legacy_id = YouTubeArchive._upload_job_identity(
+                media, session, identity_version=1)
+            if legacy_id == legacy["id"]:
+                self.skipTest("identity versions are equal on this platform")
+            legacy["id"] = legacy_id
+            legacy.pop("identity_version", None)
+            legacy_path = os.path.join(queue_dir, legacy_id + ".json")
+            YouTubeArchive._atomic_json(legacy_path, legacy)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile") as resolve_profile:
+                result = YouTubeArchive.process_upload_job(
+                    current_path, os.path.join(folder, "channels.json"))
+            self.assertEqual(result, YouTubeArchive.UPLOAD_ATTENTION_REQUIRED)
+            resolve_profile.assert_not_called()
+            self.assertTrue(os.path.isfile(legacy_path))
+            with open(current_path, "r", encoding="utf-8") as stream:
+                stopped = json.load(stream)
+            self.assertEqual(
+                stopped["status"], YouTubeArchive.UPLOAD_ATTENTION_REQUIRED)
+
+    def test_local_commit_release_preserves_equivalent_v1_v2_jobs(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"video")
+            staging_path = enqueue_upload_job(
+                queue_dir, media, session, hold_for_local_commit=True)
+            with open(staging_path, "r", encoding="utf-8") as stream:
+                legacy = json.load(stream)
+            legacy_id = YouTubeArchive._upload_job_identity(
+                media, session, identity_version=1)
+            if legacy_id == legacy["id"]:
+                self.skipTest("identity versions are equal on this platform")
+            legacy["id"] = legacy_id
+            legacy.pop("identity_version", None)
+            legacy_path = os.path.join(queue_dir, legacy_id + ".json")
+            YouTubeArchive._atomic_json(legacy_path, legacy)
+
+            self.assertEqual(
+                YouTubeArchive.release_upload_job_local_commit(staging_path),
+                "")
+            self.assertTrue(os.path.isfile(staging_path))
+            self.assertTrue(os.path.isfile(legacy_path))
+
+    def test_window_queue_keeps_durable_job_when_worker_launch_fails(self):
+        import Window as WindowModule
+
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            media = os.path.join(session, "recording.mp4")
+            os.makedirs(session)
+            with open(media, "wb") as stream:
+                stream.write(b"video")
+            app = types.SimpleNamespace(
+                _youtube_upload_queue_dir=mock.Mock(return_value=queue_dir),
+                _youtube_channel_store_path=mock.Mock(
+                    return_value=os.path.join(folder, "channels.json")),
+                _logger=mock.Mock(),
+            )
+            config = {
+                "enabled": True,
+                "channel_profile": "main",
+                "delete_local": True,
+                "segment_seconds": 600,
+            }
+            with mock.patch.object(
+                    WindowModule, "load_channel_store", return_value={
+                        "default_profile": "main",
+                        "profiles": {"main": {"channel_id": "channel-main"}},
+                    }), mock.patch.object(
+                        WindowModule, "launch_upload_worker",
+                        side_effect=OSError(
+                            "worker process could not start")) as launch:
+                job_path = WindowModule.PokeControllerApp._queue_youtube_path(
+                    app, media, session, "normal", config=config)
+
+            self.assertTrue(os.path.isfile(job_path))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["status"], "pending")
+            launch.assert_called_once()
+            self.assertTrue(any(
+                "queued job remains" in str(call)
+                for call in app._logger.warning.call_args_list))
+
+    def test_consumer_rejects_completed_job_without_remote_video_proof(self):
+        import YouTubeArchive
+
+        for segments in ([], [{
+                "part": 1, "start_seconds": 0.0, "duration_seconds": 1.0,
+                "uploaded_bytes": 2048, "video_id": "",
+        }]):
+            with self.subTest(segments=segments), tempfile.TemporaryDirectory() as folder:
+                session = os.path.join(folder, "session")
+                queue_dir = os.path.join(folder, "queue")
+                os.makedirs(session)
+                media = os.path.join(session, "recording.mp4")
+                with open(media, "wb") as stream:
+                    stream.write(b"video" * 1024)
+                job_path = enqueue_upload_job(queue_dir, media, session)
+                with open(job_path, "r", encoding="utf-8") as stream:
+                    job = json.load(stream)
+                job["status"] = "completed"
+                job["segments"] = segments
+                YouTubeArchive._atomic_json(job_path, job)
+
+                with mock.patch.object(
+                        YouTubeArchive,
+                        "_recover_cleanup_tombstone_intents") as recover:
+                    result = YouTubeArchive.process_upload_job(
+                        job_path, os.path.join(folder, "channels.json"))
+
+                self.assertEqual(
+                    result, YouTubeArchive.UPLOAD_ATTENTION_REQUIRED)
+                recover.assert_not_called()
+                with open(job_path, "r", encoding="utf-8") as stream:
+                    retained = json.load(stream)
+                self.assertEqual(
+                    retained["status"],
+                    YouTubeArchive.UPLOAD_ATTENTION_REQUIRED)
+
+    def test_consumer_accepts_completed_job_with_all_remote_video_ids(self):
+        import YouTubeArchive
+
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"video" * 1024)
+            job_path = enqueue_upload_job(queue_dir, media, session)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job["status"] = "completed"
+            job["segments"] = [{
+                "part": 1, "start_seconds": 0.0, "duration_seconds": 1.0,
+                "uploaded_bytes": 2048, "video_id": "video-1",
+            }, {
+                "part": 2, "start_seconds": 1.0, "duration_seconds": 1.0,
+                "uploaded_bytes": 2048, "video_id": "video-2",
+            }]
+            YouTubeArchive._atomic_json(job_path, job)
+
+            with mock.patch.object(
+                    YouTubeArchive,
+                    "_recover_cleanup_tombstone_intents") as recover, \
+                    mock.patch.object(
+                        YouTubeArchive,
+                        "_retry_cleanup_delete_tombstones") as retry:
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            recover.assert_called_once()
+            retry.assert_called_once()
+
+    def test_youtube_upload_watchdog_relaunches_only_actionable_jobs(self):
+        import Window as WindowModule
+
+        with tempfile.TemporaryDirectory() as folder:
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(queue_dir)
+            for name, status in (("done", "completed"),
+                                 ("auth", "authentication_required"),
+                                 ("cancel", "cancelled"),
+                                 ("verify", "remote_verification_required"),
+                                 ("remote_fail", "remote_processing_failed"),
+                                 ("cleanup_attention",
+                                  "cleanup_attention_required"),
+                                 ("upload_attention",
+                                  "upload_attention_required"),
+                                 ("source_verify",
+                                  "source_verification_required"),
+                                 ("invalid", "invalid_job")):
+                with open(os.path.join(queue_dir, name + ".json"), "w",
+                          encoding="utf-8") as stream:
+                    json.dump({"status": status}, stream)
+            scheduled = []
+            app = types.SimpleNamespace(
+                _youtube_upload_queue_dir=lambda: queue_dir,
+                _youtube_channel_store_path=lambda: os.path.join(
+                    folder, "channels.json"),
+                _logger=mock.Mock(),
+                _preview_shutdown_mode=False,
+                _youtube_upload_watchdog_id="old",
+                _gui_action_queue=queue.Queue(),
+                root=types.SimpleNamespace(
+                    after=lambda delay, callback: scheduled.append(
+                        (delay, callback)) or "next"),
+            )
+            app._resume_youtube_uploads = types.MethodType(
+                WindowModule.PokeControllerApp._resume_youtube_uploads, app)
+            app._youtube_upload_watchdog = types.MethodType(
+                WindowModule.PokeControllerApp._youtube_upload_watchdog, app)
+            with mock.patch.object(
+                    WindowModule, "load_channel_store", return_value={
+                        "profiles": {"main": {}}}), mock.patch.object(
+                        WindowModule, "launch_upload_worker") as launch:
+                WindowModule.PokeControllerApp._youtube_upload_watchdog(app)
+                app._gui_action_queue.get(timeout=2.0)()
+                launch.assert_not_called()
+                with open(os.path.join(queue_dir, "wait.json"), "w",
+                          encoding="utf-8") as stream:
+                    json.dump({"status": "waiting_media"}, stream)
+                WindowModule.PokeControllerApp._youtube_upload_watchdog(app)
+                app._gui_action_queue.get(timeout=2.0)()
+
+            launch.assert_called_once_with(
+                queue_dir, os.path.join(folder, "channels.json"))
+            self.assertEqual(scheduled[-1][0], 5 * 60 * 1000)
+            self.assertEqual(app._youtube_upload_watchdog_id, "next")
+
+    def test_youtube_queue_snapshot_rescans_for_midscan_resume(self):
+        import Window as WindowModule
+
+        first_scan_started = threading.Event()
+        release_first_scan = threading.Event()
+        snapshots = [
+            {"store": {"profiles": {"main": {}}}, "jobs": []},
+            {"store": {"profiles": {"main": {}}},
+             "jobs": [("new.json", {"status": "waiting_media"})]},
+        ]
+        reads = []
+
+        def read_snapshot(_queue_dir, _store_path):
+            position = len(reads)
+            reads.append(position)
+            if position == 0:
+                first_scan_started.set()
+                self.assertTrue(release_first_scan.wait(2.0))
+            return snapshots[min(position, len(snapshots) - 1)]
+
+        published = []
+        app = types.SimpleNamespace(
+            _youtube_upload_queue_dir=lambda: "queue-root",
+            _youtube_channel_store_path=lambda: "channel-store.json",
+            _logger=mock.Mock(),
+            _gui_action_queue=queue.Queue(),
+        )
+        with mock.patch.object(
+                WindowModule.PokeControllerApp,
+                "_read_youtube_queue_snapshot",
+                side_effect=read_snapshot), mock.patch.object(
+                    WindowModule, "launch_upload_worker") as launch:
+            self.assertTrue(
+                WindowModule.PokeControllerApp._request_youtube_queue_snapshot(
+                    app, callback=published.append, resume_uploads=True))
+            self.assertTrue(first_scan_started.wait(2.0))
+            self.assertFalse(
+                WindowModule.PokeControllerApp._request_youtube_queue_snapshot(
+                    app, resume_uploads=True))
+            release_first_scan.set()
+            app._gui_action_queue.get(timeout=2.0)()
+
+        self.assertEqual(len(reads), 2)
+        self.assertEqual(published, [snapshots[1]])
+        launch.assert_called_once_with("queue-root", "channel-store.json")
+
+    def test_youtube_channel_store_mutations_hold_one_process_lock(self):
+        with tempfile.TemporaryDirectory() as folder:
+            store_path = os.path.join(folder, "channels.json")
+            YouTubeArchive.save_channel_store(store_path, {
+                "version": 1,
+                "default_profile": "old",
+                "profiles": {"main": {}, "old": {}},
+            })
+            real_read = YouTubeArchive._read_json
+            first_read_started = threading.Event()
+            release_first_read = threading.Event()
+            second_started = threading.Event()
+            read_count = []
+            read_lock = threading.Lock()
+
+            def delayed_read(path, default=None):
+                value = real_read(path, default)
+                if os.path.abspath(path) == os.path.abspath(store_path):
+                    with read_lock:
+                        position = len(read_count)
+                        read_count.append(threading.get_ident())
+                    if position == 0:
+                        first_read_started.set()
+                        self.assertTrue(release_first_read.wait(2.0))
+                return value
+
+            errors = []
+
+            def set_default():
+                try:
+                    YouTubeArchive.set_default_channel_profile(
+                        store_path, "main")
+                except Exception as error:
+                    errors.append(error)
+
+            def remove_old():
+                second_started.set()
+                try:
+                    YouTubeArchive.remove_channel_profile(
+                        store_path, "old")
+                except Exception as error:
+                    errors.append(error)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_read_json",
+                    side_effect=delayed_read):
+                first = threading.Thread(target=set_default)
+                second = threading.Thread(target=remove_old)
+                first.start()
+                self.assertTrue(first_read_started.wait(2.0))
+                second.start()
+                self.assertTrue(second_started.wait(2.0))
+                time.sleep(0.05)
+                with read_lock:
+                    self.assertEqual(len(read_count), 1)
+                release_first_read.set()
+                first.join(2.0)
+                second.join(2.0)
+
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(errors, [])
+            store = YouTubeArchive.load_channel_store(store_path)
+            self.assertEqual(store["default_profile"], "main")
+            self.assertEqual(set(store["profiles"]), {"main"})
+
+    def test_youtube_channel_refresh_reads_store_off_tk(self):
+        import Window as WindowModule
+
+        entered = threading.Event()
+        release = threading.Event()
+        worker_threads = []
+
+        def load_store(_path):
+            worker_threads.append(threading.get_ident())
+            entered.set()
+            self.assertTrue(release.wait(2.0))
+            return {
+                "version": 1,
+                "default_profile": "main",
+                "profiles": {"main": {"channel_title": "Main"}},
+            }
+
+        combo = mock.Mock()
+        app = types.SimpleNamespace(
+            _youtube_channel_store_path=lambda: "channels.json",
+            _gui_action_queue=queue.Queue(),
+            _logger=mock.Mock(),
+            record_youtube_channel_cb=combo,
+            record_youtube_channel_profile=mock.Mock(
+                get=mock.Mock(return_value="")),
+            record_youtube_status=mock.Mock(),
+            _update_youtube_recording_status=mock.Mock(),
+        )
+        main_thread = threading.get_ident()
+        with mock.patch.object(
+                WindowModule, "load_channel_store",
+                side_effect=load_store):
+            started_at = time.monotonic()
+            self.assertTrue(
+                WindowModule.PokeControllerApp
+                ._refresh_youtube_channel_choices(app))
+            self.assertLess(time.monotonic() - started_at, 0.2)
+            self.assertTrue(entered.wait(2.0))
+            self.assertTrue(app._gui_action_queue.empty())
+            release.set()
+            app._gui_action_queue.get(timeout=2.0)()
+
+        self.assertEqual(len(worker_threads), 1)
+        self.assertNotEqual(worker_threads[0], main_thread)
+        combo.configure.assert_called_once_with(values=["", "main"])
+        app._update_youtube_recording_status.assert_called_once_with()
+
+    def test_youtube_queue_dialog_ignores_stale_and_closed_results(self):
+        import Window as WindowModule
+
+        class FakeWidget:
+            instances = []
+
+            def __init__(self, *_args, **kwargs):
+                self.options = dict(kwargs)
+                self.command = kwargs.get("command")
+                type(self).instances.append(self)
+
+            def pack(self, **_kwargs):
+                return self
+
+            def grid(self, **_kwargs):
+                return self
+
+            def configure(self, **kwargs):
+                self.options.update(kwargs)
+
+        class FakeDialog(FakeWidget):
+            instances = []
+
+            def __init__(self, *_args, **kwargs):
+                super().__init__(*_args, **kwargs)
+                self.protocols = {}
+                self.bindings = {}
+                self.destroyed = False
+
+            def title(self, _value):
+                return None
+
+            def geometry(self, _value):
+                return None
+
+            def protocol(self, name, callback):
+                self.protocols[name] = callback
+
+            def bind(self, name, callback, add=None):
+                self.bindings[name] = callback
+
+            def destroy(self):
+                self.destroyed = True
+                callback = self.bindings.get("<Destroy>")
+                if callback:
+                    callback(types.SimpleNamespace(widget=self))
+
+        class FakeText(FakeWidget):
+            instances = []
+
+            def __init__(self, *_args, **kwargs):
+                super().__init__(*_args, **kwargs)
+                self.content = ""
+
+            def delete(self, _start, _end):
+                self.content = ""
+
+            def insert(self, _index, value):
+                self.content += str(value)
+
+        class FakeFrame(FakeWidget):
+            instances = []
+
+        class FakeButton(FakeWidget):
+            instances = []
+
+        first_entered = threading.Event()
+        release_first = threading.Event()
+        close_entered = threading.Event()
+        release_close = threading.Event()
+        reads = []
+        main_thread = threading.get_ident()
+
+        def read_rows(_queue_dir):
+            position = len(reads)
+            reads.append(threading.get_ident())
+            if position == 0:
+                first_entered.set()
+                self.assertTrue(release_first.wait(2.0))
+                return {"rows": ["old-row"], "queue_exists": True}
+            if position == 1:
+                return {"rows": ["new-row"], "queue_exists": True}
+            close_entered.set()
+            self.assertTrue(release_close.wait(2.0))
+            return {"rows": ["closed-row"], "queue_exists": True}
+
+        app = types.SimpleNamespace(
+            root=object(),
+            _youtube_upload_queue_dir=lambda: "queue-root",
+            _gui_action_queue=queue.Queue(),
+            _logger=mock.Mock(),
+        )
+        patches = (
+            mock.patch.object(WindowModule.tk, "Toplevel", FakeDialog),
+            mock.patch.object(WindowModule.tk, "Text", FakeText),
+            mock.patch.object(WindowModule.ttk, "Frame", FakeFrame),
+            mock.patch.object(WindowModule.ttk, "Button", FakeButton),
+            mock.patch.object(
+                WindowModule.PokeControllerApp,
+                "_read_youtube_queue_dialog_rows", side_effect=read_rows),
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4]:
+            dialog = (WindowModule.PokeControllerApp
+                      ._show_youtube_upload_queue(app))
+            self.assertTrue(first_entered.wait(2.0))
+            viewer = FakeText.instances[-1]
+            self.assertIn("読み込み中", viewer.content)
+            refresh = next(
+                item for item in FakeButton.instances
+                if item.options.get("text") == "再読込")
+            close = next(
+                item for item in FakeButton.instances
+                if item.options.get("text") == "閉じる")
+            refresh.command()
+            app._gui_action_queue.get(timeout=2.0)()
+            self.assertEqual(viewer.content, "new-row")
+            release_first.set()
+            app._gui_action_queue.get(timeout=2.0)()
+            self.assertEqual(viewer.content, "new-row")
+
+            refresh.command()
+            self.assertTrue(close_entered.wait(2.0))
+            close.command()
+            self.assertTrue(dialog.destroyed)
+            release_close.set()
+            app._gui_action_queue.get(timeout=2.0)()
+            self.assertNotIn("closed-row", viewer.content)
+
+        self.assertEqual(len(reads), 3)
+        self.assertTrue(all(value != main_thread for value in reads))
+
+    def test_oauth_resume_failure_preserves_store_and_launches_once_off_tk(self):
+        import Window as WindowModule
+
+        main_thread = threading.get_ident()
+        calls = []
+        authorized_store = {
+            "version": 1,
+            "default_profile": "main",
+            "profiles": {"main": {"channel_id": "channel-main"}},
+        }
+
+        def note(name, value=None):
+            calls.append((name, threading.get_ident()))
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        result_queue = queue.Queue()
+        with mock.patch.object(
+                WindowModule, "authorize_installed_app",
+                side_effect=lambda *_args: note("authorize", {
+                    "profile": "main", "channel_id": "channel-main",
+                    "channel_title": "Main",
+                })), mock.patch.object(
+                    WindowModule, "resume_upload_jobs_for_profile",
+                    side_effect=lambda *_args: note(
+                        "resume", OSError("queue temporarily unavailable"))), \
+                mock.patch.object(
+                    WindowModule, "load_channel_store",
+                    side_effect=lambda *_args: note(
+                        "reload", authorized_store)), mock.patch.object(
+                    WindowModule, "launch_upload_worker",
+                    side_effect=lambda *_args: note("launch")) as launch:
+            worker = threading.Thread(
+                target=lambda: result_queue.put(
+                    WindowModule.PokeControllerApp
+                    ._complete_youtube_authorization(
+                        "client.json", "main", "channels.json", "queue")))
+            worker.start()
+            worker.join(2.0)
+
+        self.assertFalse(worker.is_alive())
+        result = result_queue.get_nowait()
+        self.assertIs(result["store"], authorized_store)
+        self.assertEqual(result["resumed"], [])
+        self.assertEqual(
+            [label for label, _error in result["post_errors"]],
+            ["キュー再開"])
+        self.assertEqual([name for name, _thread in calls],
+                         ["authorize", "resume", "reload", "launch"])
+        self.assertTrue(all(thread_id != main_thread
+                            for _name, thread_id in calls))
+        launch.assert_called_once_with("queue", "channels.json")
+
+    def test_discarded_normal_youtube_recording_cancels_queued_intent(self):
+        import Window as WindowModule
+
+        recorder = types.SimpleNamespace(
+            active=True,
+            durable_finalization=False,
+            session_dir=os.path.abspath("discarded-session"),
+            youtube_upload_job_path=os.path.abspath("upload-job.json"),
+            stop=mock.Mock(return_value=None),
+        )
+        app = types.SimpleNamespace(
+            _record_compose_condition=threading.Condition(),
+            _record_compose_closing_sessions=set(),
+            _record_compose_active_sessions=set(),
+            _record_compose_active_session=None,
+            _record_compose_queue=[],
+            _queue_youtube_path=mock.Mock(),
+            _logger=mock.Mock(),
+        )
+        config = {"enabled": True, "record_mode": "Variable"}
+
+        with mock.patch.object(
+                WindowModule, "cancel_upload_job",
+                return_value=True) as cancel:
+            result = WindowModule.PokeControllerApp._stop_capture_recorder_instance(
+                app, recorder, youtube_config=config, discard=True)
+
+        self.assertIsNone(result)
+        cancel.assert_called_once_with(
+            recorder.youtube_upload_job_path,
+            "Recording discarded before MP4 finalization")
+        recorder.stop.assert_called_once_with(discard=True)
+        app._queue_youtube_path.assert_not_called()
+        self.assertNotIn(
+            recorder.session_dir, app._record_compose_closing_sessions)
+
+    def test_youtube_intent_timeout_retains_recording_and_stop_continues(self):
+        import Window as WindowModule
+
+        recorder = types.SimpleNamespace(
+            active=True,
+            durable_finalization=False,
+            session_dir=os.path.abspath("slow-intent-session"),
+            mp4_path=os.path.abspath(
+                os.path.join("slow-intent-session", "recording.mp4")),
+            youtube_upload_job_path="",
+            _youtube_upload_intent_ready=threading.Event(),
+            stop=mock.Mock(return_value=None),
+        )
+        app = types.SimpleNamespace(
+            _record_compose_condition=threading.Condition(),
+            _record_compose_closing_sessions=set(),
+            _record_compose_active_sessions=set(),
+            _record_compose_active_session=None,
+            _record_compose_queue=[],
+            _queue_youtube_path=mock.Mock(),
+            _logger=mock.Mock(),
+        )
+
+        with mock.patch.object(
+                threading.Event, "wait", return_value=False) as wait, \
+                mock.patch.object(WindowModule, "cancel_upload_job") as cancel:
+            result = WindowModule.PokeControllerApp._stop_capture_recorder_instance(
+                app, recorder,
+                youtube_config={"enabled": True, "record_mode": "Manual"},
+                discard=True)
+
+        self.assertIsNone(result)
+        wait.assert_called_once_with(30.0)
+        cancel.assert_not_called()
+        recorder.stop.assert_called_once_with(discard=False)
+        app._queue_youtube_path.assert_not_called()
+        self.assertTrue(app._logger.warning.called)
+        self.assertNotIn(
+            recorder.session_dir, app._record_compose_closing_sessions)
+
+    def test_late_youtube_intent_does_not_bind_to_reused_recorder(self):
+        import Window as WindowModule
+
+        entered = threading.Event()
+        release = threading.Event()
+        first_session = os.path.abspath("first-session")
+        second_session = os.path.abspath("second-session")
+        job_path = os.path.abspath("old-job.json")
+        recorder = types.SimpleNamespace(
+            session_dir=first_session,
+            mp4_path=os.path.join(first_session, "recording.mp4"),
+            bind_youtube_upload_job=mock.Mock(),
+        )
+
+        def enqueue(*_args, **_kwargs):
+            entered.set()
+            self.assertTrue(release.wait(2.0))
+            return job_path
+
+        app = types.SimpleNamespace(
+            _queue_youtube_path=mock.Mock(side_effect=enqueue),
+        )
+        with mock.patch.object(
+                WindowModule.PokeControllerApp,
+                "_launch_youtube_upload_worker") as launch:
+            WindowModule.PokeControllerApp._queue_youtube_upload_intent_async(
+                app, recorder, {"enabled": True})
+            old_ready = recorder._youtube_upload_intent_ready
+            self.assertTrue(entered.wait(2.0))
+            recorder.session_dir = second_session
+            recorder.mp4_path = os.path.join(second_session, "recording.mp4")
+            recorder._youtube_upload_intent_ready = threading.Event()
+            release.set()
+            self.assertTrue(old_ready.wait(2.0))
+
+            deadline = time.monotonic() + 2.0
+            while (not launch.called and time.monotonic() < deadline):
+                time.sleep(0.01)
+
+        recorder.bind_youtube_upload_job.assert_not_called()
+        app._queue_youtube_path.assert_called_once_with(
+            os.path.join(first_session, "recording.mp4"), first_session,
+            "normal", config={"enabled": True}, launch_worker=False)
+        launch.assert_called_once_with(
+            app, {"enabled": True}, job_path=job_path)
+
+    def test_zero_frame_youtube_stop_never_queues_returned_wav(self):
+        import Window as WindowModule
+
+        session = os.path.abspath("zero-frame-session")
+        recorder = types.SimpleNamespace(
+            active=True,
+            durable_finalization=False,
+            session_dir=session,
+            mp4_path=os.path.join(session, "recording.mp4"),
+            youtube_upload_job_path="",
+            stop=mock.Mock(return_value=os.path.join(
+                session, "recording.wav")),
+        )
+        app = types.SimpleNamespace(
+            _record_compose_condition=threading.Condition(),
+            _record_compose_closing_sessions=set(),
+            _record_compose_active_sessions=set(),
+            _record_compose_active_session=None,
+            _record_compose_queue=[],
+            _queue_youtube_path=mock.Mock(),
+            _logger=mock.Mock(),
+        )
+
+        result = WindowModule.PokeControllerApp._stop_capture_recorder_instance(
+            app, recorder,
+            youtube_config={"enabled": True, "record_mode": "Manual"})
+
+        self.assertTrue(str(result).endswith("recording.wav"))
+        app._queue_youtube_path.assert_not_called()
+
+    def test_youtube_description_emits_step_transitions_not_functions(self):
         with tempfile.TemporaryDirectory() as folder:
             with open(os.path.join(folder, "common_function_index.json"), "w",
                       encoding="utf-8") as stream:
                 json.dump({"occurrences": [{
-                    "start_seconds": 125.0,
+                    "start_seconds": 126.0,
                     "step_owner": "_4_story_shiro_35",
                     "target_function": BATTLE_RENDA_GROUP["functions"][0],
                 }]}, stream)
+            with open(os.path.join(folder, "steps.jsonl"), "w",
+                      encoding="utf-8") as stream:
+                for event in ({
+                    "video_time": 125.0,
+                    "step_path": "MAIN > 4_STORY_SHIRO_35",
+                }, {
+                    # Sampling and function events within the same Step must
+                    # not create another YouTube timestamp.
+                    "video_time": 126.0,
+                    "step_path": "MAIN > 4_STORY_SHIRO_35",
+                    "location": {"function": BATTLE_RENDA_GROUP["functions"][0]},
+                }, {
+                    "video_time": 185.0,
+                    "step_path": "MAIN > 4_STORY_SHIRO_36",
+                }, {
+                    # A non-consecutive revisit is a real Step transition.
+                    "video_time": 245.0,
+                    "step_path": "MAIN > 4_STORY_SHIRO_35",
+                }):
+                    stream.write(json.dumps(event, ensure_ascii=False) + "\n")
             description = build_video_description({
                 "session_dir": folder,
                 "input_set": "Switch_No2",
@@ -27262,13 +39210,105 @@ class YouTubeArchiveAndCommonFunctionIndexTests(unittest.TestCase):
                 "commands_video_mode": COMMANDS_VIDEO_MODE_VIDEO_ONLY,
             }, 0.0, 600.0)
             self.assertIn("映像内容: ゲーム映像のみ", description)
-            self.assertIn("2:05 _4_story_shiro_35", description)
-            self.assertIn(BATTLE_RENDA_GROUP["functions"][0], description)
+            self.assertIn("2:05 Step: MAIN ＞ 4_STORY_SHIRO_35", description)
+            self.assertIn("3:05 Step: MAIN ＞ 4_STORY_SHIRO_36", description)
+            self.assertIn("4:05 Step: MAIN ＞ 4_STORY_SHIRO_35", description)
+            self.assertEqual(
+                description.count("Step: MAIN ＞ 4_STORY_SHIRO_35"), 2)
+            self.assertNotIn(BATTLE_RENDA_GROUP["functions"][0], description)
+            self.assertIn("タイムスタンプはStep遷移のみ", description)
             self.assertLessEqual(len(description.encode("utf-8")), 5000)
             self.assertEqual(format_timestamp(3723), "1:02:03")
             self.assertEqual(
                 youtube_watch_url("abc", 65),
                 "https://www.youtube.com/watch?v=abc&t=65s")
+
+    def test_youtube_description_sanitizes_forbidden_metadata_characters(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "steps.jsonl"), "w",
+                      encoding="utf-8") as stream:
+                stream.write(json.dumps({
+                    "video_time": 1.0,
+                    "step_path": "MAIN < CHILD > \u0001\u007f\u0085",
+                }, ensure_ascii=False) + "\n")
+
+            description = build_video_description({
+                "session_dir": folder,
+                "input_set": "Switch_No2",
+                "recording_kind": "commands_monitor",
+            }, 0.0, 60.0)
+
+            self.assertNotIn("<", description)
+            self.assertNotIn(">", description)
+            self.assertIn("MAIN ＜ CHILD ＞", description)
+            self.assertNotIn("\u0001", description)
+            self.assertNotIn("\u007f", description)
+            self.assertNotIn("\u0085", description)
+            self.assertLessEqual(len(description.encode("utf-8")), 5000)
+
+    def test_youtube_queue_range_infers_end_without_opening_video(self):
+        import Window as WindowModule
+
+        started, ended, duration = (
+            WindowModule._youtube_queue_recording_window({
+                "duration_seconds": 7213.5,
+            }, {
+                "started_wall": "2026/10/12 1:19:38",
+            }))
+
+        self.assertEqual(started, "2026/10/12 1:19:38")
+        self.assertEqual(ended, "2026/10/12 03:19:51")
+        self.assertEqual(duration, 7213.5)
+
+    def test_waiting_media_queue_row_separates_past_http_error(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            os.makedirs(session)
+            with open(os.path.join(folder, "waiting.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump({
+                    "status": "waiting_media",
+                    "session_dir": session,
+                    "media_path": os.path.join(session, "recording.mp4"),
+                    "error": "YouTube API HTTP 429 from an older attempt",
+                    "quota_waiting_at": "2026-10-13T08:06:39+09:00",
+                    "quota_retry_after": "2026-10-14T16:05:00+09:00",
+                }, stream)
+
+            snapshot = PokeControllerApp._read_youtube_queue_dialog_rows(
+                folder)
+
+        row = snapshot["rows"][0]
+        self.assertIn("[waiting_media]", row)
+        self.assertIn("現在理由: ローカル動画の確定・復旧待ち", row)
+        self.assertIn("過去エラー発生: 2026-10-13T08:06:39+09:00", row)
+        self.assertIn("HTTP 429", row)
+        self.assertIn("次回再試行: -", row)
+        self.assertNotIn("2026-10-14T16:05:00", row)
+
+    def test_quota_waiting_queue_row_shows_failure_and_retry_times(self):
+        from Window import PokeControllerApp
+
+        with tempfile.TemporaryDirectory() as folder:
+            with open(os.path.join(folder, "quota.json"), "w",
+                      encoding="utf-8") as stream:
+                json.dump({
+                    "status": "quota_waiting",
+                    "error": "YouTube API HTTP 429 Video Uploads per day",
+                    "quota_waiting_at": "2026-10-13T08:06:39+09:00",
+                    "quota_retry_after": "2026-10-14T08:11:39+09:00",
+                }, stream)
+
+            snapshot = PokeControllerApp._read_youtube_queue_dialog_rows(
+                folder)
+
+        row = snapshot["rows"][0]
+        self.assertIn("現在エラー発生: 2026-10-13T08:06:39+09:00", row)
+        self.assertIn("HTTP 429", row)
+        self.assertIn(
+            "次回再試行: 2026-10-14T08:11:39+09:00", row)
 
     def test_commands_video_mode_accepts_keys_and_ui_labels(self):
         self.assertEqual(
@@ -27283,6 +39323,37 @@ class YouTubeArchiveAndCommonFunctionIndexTests(unittest.TestCase):
         self.assertEqual(
             commands_video_mode_label(COMMANDS_VIDEO_MODE_POKECON_WINDOW),
             "PokeCon画面全体")
+
+    def test_youtube_recording_snapshot_keeps_low_quality_mode_in_input_set(self):
+        from Window import PokeControllerApp
+
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+        app = types.SimpleNamespace(
+            record_youtube_segment_minutes=Value(120),
+            record_youtube_channel_profile=Value("main"),
+            record_youtube_delete_local=Value(True),
+            record_youtube_commands_video_mode=Value(
+                COMMANDS_VIDEO_MODE_COMPOSITE),
+            record_youtube_commands_allow_low_presentations=Value(False),
+            record_mode=Value("CommandMonitor"),
+            _active_input_set_name="archive-set",
+            _youtube_channel_store_cache={
+                "default_profile": "main",
+                "profiles": {"main": {"channel_id": "channel-main"}},
+            },
+            _record_storage_destination_key=lambda: "youtube",
+        )
+
+        snapshot = PokeControllerApp._youtube_recording_config_snapshot(app)
+
+        self.assertFalse(snapshot["allow_low_presentations"])
+        self.assertEqual(snapshot["input_set"], "archive-set")
 
     def test_recording_destination_is_exclusive_and_migrates_legacy_youtube(self):
         from Window import PokeControllerApp
@@ -27305,6 +39376,10 @@ class YouTubeArchiveAndCommonFunctionIndexTests(unittest.TestCase):
             PokeControllerApp._normalize_record_storage_destination(
                 "pc", youtube_enabled=True),
             "pc")
+        self.assertEqual(
+            PokeControllerApp._normalize_record_storage_destination(
+                "none", youtube_enabled=True),
+            "none")
         app = PokeControllerApp.__new__(PokeControllerApp)
         app.record_storage_destination = Value("pc")
         app.record_youtube_upload_enabled = Value(False)
@@ -27321,6 +39396,326 @@ class YouTubeArchiveAndCommonFunctionIndexTests(unittest.TestCase):
             app, "pc"), "pc")
         self.assertFalse(app.record_youtube_upload_enabled.get())
         app._stop_command_record_window_capture.assert_called_once_with()
+        self.assertEqual(PokeControllerApp._set_record_storage_destination(
+            app, "none"), "none")
+        self.assertEqual(app.record_storage_destination.get(), "none")
+        self.assertFalse(app.record_youtube_upload_enabled.get())
+        self.assertFalse(app.record_armed)
+
+    def test_recording_none_skips_commands_auto_arm(self):
+        from Window import PokeControllerApp
+
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        app = types.SimpleNamespace(
+            record_monitor_auto_arm=Value(True),
+            record_monitor_status=Value(""),
+            record_mode=Value("Manual"),
+            recorder=types.SimpleNamespace(active=False),
+            record_armed=False,
+            _record_storage_destination_key=lambda: "none",
+            _arm_command_monitor_recording=mock.Mock(),
+            _command_monitor_begin_session=mock.Mock(),
+            _select_recording_mode_page=mock.Mock(),
+            show_output=mock.Mock(),
+            cur_command=object(),
+        )
+
+        PokeControllerApp._auto_arm_command_monitor_recording(app)
+
+        self.assertEqual(app.record_mode.get(), "Manual")
+        self.assertIn("録画なし", app.record_monitor_status.get())
+        app._arm_command_monitor_recording.assert_not_called()
+        app._command_monitor_begin_session.assert_not_called()
+
+    def test_normal_youtube_recording_handoffs_before_old_segment_stops(self):
+        from Window import PokeControllerApp
+
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        class FakeRecorder:
+            def __init__(self, output_dir="Recordings"):
+                self.output_dir = output_dir
+                self.active = False
+                self.started_at = 0.0
+                self.defer_finalization = False
+                self.durable_finalization = False
+                self.template = None
+                self.template_path = ""
+                self.trigger_rules = []
+                self.cleanup_rules = []
+                self.minimum_duration = 0.0
+                self.video_presentation_frames = 0
+
+            def start(self, *_args, **_kwargs):
+                self.active = True
+                self.started_at = 160.0
+                self.video_presentation_frames = 1
+
+        frame = numpy.zeros((2, 2, 3), dtype=numpy.uint8)
+        old = FakeRecorder()
+        old.active = True
+        old.started_at = 100.0
+        successor = FakeRecorder()
+        stop_calls = []
+        app = types.SimpleNamespace(
+            recorder=old,
+            _active_recording_youtube_config={
+                "enabled": True, "record_mode": "Manual",
+                "segment_seconds": 60},
+            _youtube_recording_rotation_in_progress=False,
+            _youtube_recording_rotation_continue=False,
+            _youtube_recording_rotation_thread=None,
+            _youtube_handoff_recorder=None,
+            _youtube_retiring_recorders=[],
+            record_mode=Value("Manual"),
+            recording_state_text=Value(""),
+            record_armed=False,
+            _record_variable_active_rule_id=None,
+            _record_compose_condition=threading.Condition(),
+            _stop_capture_recorder_instance=(
+                lambda recorder, youtube_config=None, discard=False:
+                stop_calls.append((recorder, youtube_config, discard))),
+            _sync_audio_device_usage=mock.Mock(),
+            _record_storage_destination_key=lambda: "youtube",
+            _effective_record_output_dir=lambda: "Recordings",
+            camera=types.SimpleNamespace(image_bgr=frame),
+            fps=Value(60),
+            audio_gain=Value(100),
+            _selected_audio_device_name=lambda: "",
+            _audio_level_options=lambda: {},
+            _gui_action_queue=queue.Queue(),
+            _logger=mock.Mock(),
+            show_output=mock.Mock(),
+            _request_template_recording_stop=mock.Mock(),
+            audio_monitor=object(),
+        )
+        app._youtube_recording_rotation_due = (
+            lambda now=None: PokeControllerApp._youtube_recording_rotation_due(
+                app, now=now))
+
+        with mock.patch("Window.CaptureRecorder", return_value=successor):
+            requested = PokeControllerApp._request_youtube_recording_rotation(
+                app, now=160.0)
+
+        self.assertTrue(requested)
+        decide = app._gui_action_queue.get(timeout=2.0)
+        self.assertTrue(old.active)
+        self.assertTrue(successor.active)
+        self.assertIs(app._youtube_handoff_recorder, successor)
+        decide()
+        finished = app._gui_action_queue.get(timeout=2.0)
+        finished()
+        self.assertIs(app.recorder, successor)
+        self.assertEqual(stop_calls[0][0], old)
+        self.assertFalse(stop_calls[0][2])
+        self.assertFalse(app._youtube_recording_rotation_in_progress)
+        self.assertIn("次区間を録画中", app.recording_state_text.get())
+
+    def test_retired_youtube_recorder_waits_for_all_file_owner_threads(self):
+        from Window import PokeControllerApp
+
+        releases = [threading.Event() for _ in range(3)]
+        finished = [threading.Event() for _ in range(3)]
+
+        def file_owner(index):
+            releases[index].wait(timeout=5.0)
+            finished[index].set()
+
+        owners = [
+            threading.Thread(
+                target=file_owner, args=(index,), daemon=True,
+                name="SyntheticRecordingOwner{}".format(index))
+            for index in range(3)
+        ]
+        for thread in owners:
+            thread.start()
+
+        recorder = types.SimpleNamespace(
+            writer_thread=owners[1],
+            _video_late_close_thread=owners[2],
+            is_finalizing=True,
+            retire_finalize_worker=lambda: owners[0],
+        )
+        condition = threading.Condition()
+        app = types.SimpleNamespace(
+            _record_compose_condition=condition,
+            _youtube_retiring_recorders=[recorder],
+        )
+
+        PokeControllerApp._retire_youtube_recorder(app, recorder)
+
+        releases[0].set()
+        self.assertTrue(finished[0].wait(timeout=2.0))
+        self.assertIn(recorder, app._youtube_retiring_recorders)
+        releases[1].set()
+        self.assertTrue(finished[1].wait(timeout=2.0))
+        self.assertIn(recorder, app._youtube_retiring_recorders)
+        releases[2].set()
+        self.assertTrue(finished[2].wait(timeout=2.0))
+        with condition:
+            removed = condition.wait_for(
+                lambda: recorder not in app._youtube_retiring_recorders,
+                timeout=2.0)
+        self.assertTrue(removed)
+
+    def test_rotation_failure_still_honors_concurrent_stop_request(self):
+        from Window import PokeControllerApp
+
+        class Value:
+            def __init__(self, value):
+                self.value = value
+
+            def get(self):
+                return self.value
+
+            def set(self, value):
+                self.value = value
+
+        started = threading.Event()
+        release = threading.Event()
+
+        class FailingRecorder:
+            def __init__(self, output_dir="Recordings"):
+                self.output_dir = output_dir
+                self.session_dir = os.path.join(output_dir, "successor")
+                self.mp4_path = os.path.join(
+                    self.session_dir, "recording.mp4")
+                self.active = False
+                self.started_at = 0.0
+                self.defer_finalization = False
+                self.durable_finalization = False
+                self.template = None
+                self.template_path = ""
+                self.trigger_rules = []
+                self.cleanup_rules = []
+                self.minimum_duration = 0.0
+
+            def start(self, *_args, **_kwargs):
+                self.active = True
+                callback = _kwargs.get("session_started_callback")
+                if callable(callback):
+                    callback(self)
+                started.set()
+                release.wait(timeout=2.0)
+                raise RuntimeError("audio device is exclusive")
+
+        frame = numpy.zeros((2, 2, 3), dtype=numpy.uint8)
+        old = FailingRecorder()
+        old.active = True
+        old.started_at = 100.0
+        successor = FailingRecorder()
+        stop_successor = mock.Mock(
+            side_effect=lambda recorder, youtube_config=None, discard=False:
+            setattr(recorder, "active", False))
+        request_stop = mock.Mock()
+        app = types.SimpleNamespace(
+            recorder=old,
+            _active_recording_youtube_config={
+                "enabled": True, "record_mode": "Manual",
+                "segment_seconds": 60},
+            _youtube_recording_rotation_in_progress=False,
+            _youtube_recording_rotation_continue=False,
+            _youtube_recording_rotation_thread=None,
+            _youtube_handoff_recorder=None,
+            _youtube_retiring_recorders=[],
+            record_mode=Value("Manual"),
+            recording_state_text=Value(""),
+            record_armed=False,
+            _record_variable_active_rule_id=None,
+            _record_compose_condition=threading.Condition(),
+            _stop_capture_recorder_instance=stop_successor,
+            _sync_audio_device_usage=mock.Mock(),
+            _record_storage_destination_key=lambda: "youtube",
+            _effective_record_output_dir=lambda: "Recordings",
+            camera=types.SimpleNamespace(image_bgr=frame),
+            fps=Value(60),
+            audio_gain=Value(100),
+            _selected_audio_device_name=lambda: "exclusive input",
+            _audio_level_options=lambda: {},
+            _gui_action_queue=queue.Queue(),
+            _logger=mock.Mock(),
+            show_output=mock.Mock(),
+            _queue_youtube_path=mock.Mock(return_value="queue/job.json"),
+            _request_template_recording_stop=request_stop,
+            audio_monitor=object(),
+        )
+        app._youtube_recording_rotation_due = (
+            lambda now=None: PokeControllerApp._youtube_recording_rotation_due(
+                app, now=now))
+
+        with mock.patch("Window.CaptureRecorder", return_value=successor), \
+                mock.patch(
+                    "Window.cancel_upload_job", return_value=True) as cancel:
+            self.assertTrue(
+                PokeControllerApp._request_youtube_recording_rotation(
+                    app, now=160.0))
+            self.assertTrue(started.wait(timeout=2.0))
+            app._youtube_recording_rotation_continue = False
+            release.set()
+            finished = app._gui_action_queue.get(timeout=2.0)
+            finished()
+
+        cancel.assert_called_once_with(
+            "queue/job.json",
+            "YouTube segment handoff failed before promotion")
+        request_stop.assert_called_once_with(launch_after=True)
+        self.assertTrue(old.active)
+        self.assertFalse(app._youtube_recording_rotation_in_progress)
+        self.assertTrue(stop_successor.call_args.kwargs["discard"])
+
+    def test_presented_frame_is_fanned_out_during_youtube_handoff(self):
+        from Window import PokeControllerApp
+
+        class Recorder:
+            def __init__(self, session):
+                self.active = True
+                self.session_dir = session
+                self.frames = []
+
+            def add_frame(self, frame, **kwargs):
+                self.frames.append((frame, kwargs))
+
+        old = Recorder("old")
+        successor = Recorder("successor")
+        app = types.SimpleNamespace(
+            recorder=old,
+            _youtube_handoff_recorder=successor,
+            _recording_latest_snapshot={"mode": "Video only"},
+            _recording_last_presentation_at=0.0,
+            _record_compose_lock=threading.Lock(),
+            _record_compose_condition=threading.Condition(),
+            _record_compose_closing_sessions=set(),
+        )
+        app._recording_frame_recorders = types.MethodType(
+            PokeControllerApp._recording_frame_recorders, app)
+        frame = numpy.zeros((2, 2, 3), dtype=numpy.uint8)
+
+        PokeControllerApp._queue_recording_frame(
+            app, frame, presented_at=10.0,
+            presentation_mode="preview_presented")
+
+        self.assertEqual(len(old.frames), 1)
+        self.assertEqual(len(successor.frames), 1)
+        self.assertEqual(
+            old.frames[0][1]["presented_at"],
+            successor.frames[0][1]["presented_at"])
 
     def test_pokecon_window_frame_is_letterboxed_to_recording_size(self):
         from Window import PokeControllerApp
@@ -27417,6 +39812,2723 @@ class YouTubeArchiveAndCommonFunctionIndexTests(unittest.TestCase):
         PokeControllerApp._stop_command_record_window_capture(app)
         self.assertTrue(created[0].destroyed)
 
+    def test_cancel_upload_job_only_cancels_pre_upload_intent(self):
+        with tempfile.TemporaryDirectory() as folder:
+            queue_dir = os.path.join(folder, "queue")
+
+            def queued_job(name):
+                session = os.path.join(folder, name)
+                os.makedirs(session)
+                media = os.path.join(session, "recording.mp4")
+                with open(media, "wb") as stream:
+                    stream.write(b"x" * 4096)
+                return enqueue_upload_job(queue_dir, media, session), media
+
+            waiting_path, waiting_media = queued_job("waiting")
+            with open(waiting_path, "r", encoding="utf-8") as stream:
+                waiting = json.load(stream)
+            waiting["status"] = "waiting_media"
+            with open(waiting_path, "w", encoding="utf-8") as stream:
+                json.dump(waiting, stream)
+            self.assertTrue(YouTubeArchive.cancel_upload_job(
+                waiting_path, "rotation successor failed"))
+            with open(waiting_path, "r", encoding="utf-8") as stream:
+                cancelled = json.load(stream)
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertEqual(
+                cancelled["cancel_reason"], "rotation successor failed")
+            self.assertTrue(os.path.isfile(waiting_media))
+            self.assertTrue(YouTubeArchive.cancel_upload_job(
+                waiting_path, "retry after crash before session removal"))
+            self.assertEqual(
+                enqueue_upload_job(
+                    queue_dir, waiting_media, os.path.dirname(waiting_media)),
+                "")
+            with open(waiting_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["status"], "cancelled")
+
+            remote_path, _remote_media = queued_job("remote")
+            with open(remote_path, "r", encoding="utf-8") as stream:
+                remote = json.load(stream)
+            remote["segments"] = [{
+                "part": 1, "status": "pending",
+                "upload_url": "https://upload.example/session"}]
+            with open(remote_path, "w", encoding="utf-8") as stream:
+                json.dump(remote, stream)
+            self.assertFalse(YouTubeArchive.cancel_upload_job(
+                remote_path, "must not cancel remote session"))
+            with open(remote_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["status"], "pending")
+
+            completed_path, _completed_media = queued_job("completed")
+            with open(completed_path, "r", encoding="utf-8") as stream:
+                completed = json.load(stream)
+            completed["status"] = "completed"
+            with open(completed_path, "w", encoding="utf-8") as stream:
+                json.dump(completed, stream)
+            self.assertFalse(YouTubeArchive.cancel_upload_job(
+                completed_path, "must preserve completed"))
+
+    def test_cancel_upload_job_loses_atomically_to_worker_claim(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(queue_dir, media, session)
+            claimed = threading.Event()
+            release = threading.Event()
+            errors = []
+
+            def resolve_profile(*_args):
+                claimed.set()
+                release.wait(timeout=2.0)
+                return "main", {"channel_id": "channel-main"}
+
+            def process():
+                try:
+                    YouTubeArchive.process_upload_job(
+                        job_path, os.path.join(folder, "channels.json"))
+                except RuntimeError as error:
+                    errors.append(str(error))
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    side_effect=resolve_profile), mock.patch.object(
+                        YouTubeArchive, "_access_token",
+                        side_effect=RuntimeError("stop after claim")):
+                thread = threading.Thread(target=process)
+                thread.start()
+                self.assertTrue(claimed.wait(timeout=2.0))
+                self.assertFalse(YouTubeArchive.cancel_upload_job(
+                    job_path, "too late"))
+                with open(job_path, "r", encoding="utf-8") as stream:
+                    self.assertEqual(json.load(stream)["status"], "uploading")
+                release.set()
+                thread.join(timeout=2.0)
+
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, ["stop after claim"])
+
+    def test_malformed_queue_job_is_quarantined_not_waiting_media(self):
+        with tempfile.TemporaryDirectory() as folder:
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(queue_dir)
+            job_path = os.path.join(queue_dir, "broken.json")
+            malformed = b'{"version": 1, "media_path": '
+            with open(job_path, "wb") as stream:
+                stream.write(malformed)
+
+            result = YouTubeArchive.process_upload_job(
+                job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "invalid_job")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                quarantined = json.load(stream)
+            self.assertEqual(quarantined["status"], "invalid_job")
+            self.assertFalse(
+                YouTubeArchive.upload_job_is_actionable(quarantined))
+            payload_path = quarantined["quarantined_payload_path"]
+            self.assertTrue(os.path.isfile(payload_path))
+            with open(payload_path, "rb") as stream:
+                self.assertEqual(stream.read(), malformed)
+            with mock.patch.object(
+                    YouTubeArchive, "process_upload_job") as process:
+                summary = YouTubeArchive.run_upload_queue(
+                    queue_dir, os.path.join(folder, "channels.json"),
+                    max_wait_seconds=0)
+            process.assert_not_called()
+            self.assertEqual(summary["failed"], 0)
+
+    def test_http_400_request_error_stops_after_one_attempt(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            store_path = os.path.join(folder, "channels.json")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(queue_dir, media, session)
+            error = RuntimeError(
+                'YouTube API HTTP 400: {"reason":"invalidDescription"}')
+
+            with mock.patch.object(
+                    YouTubeArchive, "process_upload_job",
+                    side_effect=error) as process:
+                summary = YouTubeArchive.run_upload_queue(
+                    queue_dir, store_path, max_wait_seconds=0)
+
+            self.assertEqual(summary["failed"], 1)
+            process.assert_called_once_with(job_path, store_path)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(
+                blocked["status"], YouTubeArchive.UPLOAD_ATTENTION_REQUIRED)
+            self.assertEqual(blocked["attempts"], 1)
+            self.assertIn("permanent_request_error_at", blocked)
+
+            # A later watchdog run must not migrate and retry the already
+            # sanitized request forever if YouTube still rejects it.
+            with mock.patch.object(
+                    YouTubeArchive, "process_upload_job") as second_process:
+                second = YouTubeArchive.run_upload_queue(
+                    queue_dir, store_path, max_wait_seconds=0)
+            second_process.assert_not_called()
+            self.assertEqual(second["failed"], 0)
+
+    def test_http_429_pauses_new_video_inserts_until_daily_retry_time(self):
+        with tempfile.TemporaryDirectory() as folder:
+            queue_dir = os.path.join(folder, "queue")
+            store_path = os.path.join(folder, "channels.json")
+            job_paths = []
+            for name in ("first", "second"):
+                session = os.path.join(folder, name)
+                os.makedirs(session)
+                media = os.path.join(session, "recording.mp4")
+                with open(media, "wb") as stream:
+                    stream.write(b"x" * 4096)
+                job_paths.append(enqueue_upload_job(
+                    queue_dir, media, session))
+            window_start = int(time.time())
+            error = YouTubeArchive.YouTubeVideoInsertQuotaExceeded(
+                "YouTube API HTTP 429: rateLimitExceeded; quota "
+                "Video Uploads per day; video_insert; "
+                '"window_start_time": {}'.format(window_start))
+            self.assertFalse(YouTubeArchive._is_youtube_quota_error(
+                "YouTube API HTTP 429: requests per minute quota exceeded"))
+
+            with mock.patch.object(
+                    YouTubeArchive, "process_upload_job",
+                    side_effect=error) as process:
+                summary = YouTubeArchive.run_upload_queue(
+                    queue_dir, store_path, max_wait_seconds=0)
+
+            self.assertEqual(summary["failed"], 1)
+            self.assertEqual(process.call_count, 1)
+            jobs = []
+            for path in job_paths:
+                with open(path, "r", encoding="utf-8") as stream:
+                    jobs.append(json.load(stream))
+            self.assertEqual(
+                [job["status"] for job in jobs].count(
+                    YouTubeArchive.QUOTA_WAITING), 1)
+            self.assertEqual(
+                [job["status"] for job in jobs].count("pending"), 1)
+            self.assertTrue(YouTubeArchive._active_quota_pause(queue_dir))
+            waiting = next(
+                job for job in jobs
+                if job["status"] == YouTubeArchive.QUOTA_WAITING)
+            self.assertGreater(
+                waiting["quota_retry_after_epoch"], time.time() + 23 * 3600)
+
+            with mock.patch.object(
+                    YouTubeArchive.subprocess, "Popen") as popen:
+                launched = YouTubeArchive.launch_upload_worker(
+                    queue_dir, store_path)
+            self.assertIs(launched, popen.return_value)
+            popen.assert_called_once()
+            with mock.patch.object(
+                    YouTubeArchive, "process_upload_job") as second_process:
+                second = YouTubeArchive.run_upload_queue(
+                    queue_dir, store_path, max_wait_seconds=0)
+            second_process.assert_not_called()
+            self.assertEqual(second["failed"], 0)
+
+    def test_http_403_quota_reasons_do_not_include_permission_errors(self):
+        for reason in (
+                "quotaExceeded", "uploadLimitExceeded",
+                "dailyLimitExceeded"):
+            error = ('YouTube API HTTP 403: {"error":{"errors":['
+                     '{"reason":"' + reason + '"}]}}')
+            self.assertTrue(
+                YouTubeArchive._is_youtube_quota_error(error), reason)
+        for error in (
+                'YouTube API HTTP 403: {"reason":"forbidden"}',
+                'YouTube API HTTP 403: {"reason":"insufficientPermissions"}',
+                'YouTube API HTTP 403: {"reason":"videoNotFound"}'):
+            self.assertFalse(
+                YouTubeArchive._is_youtube_quota_error(error), error)
+
+    def test_new_insert_quota_continues_later_cleanup_in_same_worker(self):
+        with tempfile.TemporaryDirectory() as folder:
+            queue_dir = os.path.join(folder, "queue")
+            store_path = os.path.join(folder, "channels.json")
+            job_paths = []
+            for name in ("first", "cleanup"):
+                session = os.path.join(folder, name)
+                os.makedirs(session)
+                media = os.path.join(session, "recording.mp4")
+                with open(media, "wb") as stream:
+                    stream.write(b"recording" * 1024)
+                job_paths.append(enqueue_upload_job(
+                    queue_dir, media, session))
+            first_path, cleanup_path = sorted(job_paths)
+            with open(cleanup_path, "r", encoding="utf-8") as stream:
+                cleanup_job = json.load(stream)
+            cleanup_job["status"] = "cleanup_pending"
+            with open(cleanup_path, "w", encoding="utf-8") as stream:
+                json.dump(cleanup_job, stream)
+            quota_error = YouTubeArchive.YouTubeVideoInsertQuotaExceeded(
+                "YouTube API HTTP 429: Video Uploads per day; video_insert")
+            calls = []
+
+            def process(path, _store_path):
+                calls.append(path)
+                if path == first_path:
+                    raise quota_error
+                with open(path, "r", encoding="utf-8") as stream:
+                    completed = json.load(stream)
+                completed["status"] = "completed"
+                with open(path, "w", encoding="utf-8") as stream:
+                    json.dump(completed, stream)
+                return "completed"
+
+            with mock.patch.object(
+                    YouTubeArchive, "process_upload_job",
+                    side_effect=process):
+                summary = YouTubeArchive.run_upload_queue(
+                    queue_dir, store_path, max_wait_seconds=0)
+
+            self.assertEqual(calls, [first_path, cleanup_path])
+            self.assertEqual(summary["failed"], 1)
+            self.assertEqual(summary["completed"], 1)
+
+    def test_daily_quota_pause_blocks_only_new_resumable_session(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "duration_seconds": 60.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+            YouTubeArchive._write_quota_pause(
+                queue_dir, time.time() + 3600.0, "daily insert pause")
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_initiate_resumable_upload") as initiate, \
+                    mock.patch.object(
+                        YouTubeArchive, "_upload_resumable") as upload:
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, YouTubeArchive.UPLOAD_INSERT_PAUSED)
+            initiate.assert_not_called()
+            upload.assert_not_called()
+            with open(job_path, "r", encoding="utf-8") as stream:
+                paused = json.load(stream)
+            self.assertEqual(paused["status"], "uploading")
+            self.assertFalse(paused["segments"][0].get("upload_url"))
+            self.assertFalse(paused["segments"][0].get("video_id"))
+
+    def test_daily_quota_pause_allows_existing_video_processing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            store_path = os.path.join(folder, "channels.json")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "status": "awaiting_processing",
+                "duration_seconds": 60.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 60.0, "status": "uploaded",
+                    "video_id": "remote-existing",
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+            YouTubeArchive._write_quota_pause(
+                queue_dir, time.time() + 3600.0, "daily insert pause")
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_processing_status",
+                        return_value="processed") as processing, \
+                    mock.patch.object(
+                        YouTubeArchive, "_initiate_resumable_upload") as initiate, \
+                    mock.patch.object(
+                        YouTubeArchive, "_upload_resumable") as upload:
+                summary = YouTubeArchive.run_upload_queue(
+                    queue_dir, store_path, max_wait_seconds=0)
+
+            self.assertEqual(summary["completed"], 1)
+            processing.assert_called_once_with("token", "remote-existing")
+            initiate.assert_not_called()
+            upload.assert_not_called()
+            with open(job_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["status"], "completed")
+
+    def test_daily_quota_pause_allows_cleanup_pending_without_api(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            job_path = enqueue_upload_job(queue_dir, media, session)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job["status"] = "cleanup_pending"
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+            YouTubeArchive._write_quota_pause(
+                queue_dir, time.time() + 3600.0, "daily insert pause")
+
+            with mock.patch.object(
+                    YouTubeArchive, "_finish_uploaded_recording_cleanup",
+                    return_value="completed") as cleanup, \
+                    mock.patch.object(
+                        YouTubeArchive, "_resolve_profile") as resolve, \
+                    mock.patch.object(
+                        YouTubeArchive, "_initiate_resumable_upload") as initiate:
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            cleanup.assert_called_once()
+            resolve.assert_not_called()
+            initiate.assert_not_called()
+
+    def test_daily_quota_pause_allows_existing_upload_url_put(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "duration_seconds": 60.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 60.0, "status": "uploading",
+                    "upload_url": "https://upload.example/existing",
+                    "upload_session_tracking_version": 1,
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+            YouTubeArchive._write_quota_pause(
+                queue_dir, time.time() + 3600.0, "daily insert pause")
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_initiate_resumable_upload") as initiate, \
+                    mock.patch.object(
+                        YouTubeArchive, "_upload_resumable",
+                        return_value="remote-existing") as upload, \
+                    mock.patch.object(
+                        YouTubeArchive, "_processing_status",
+                        return_value="processed"):
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            initiate.assert_not_called()
+            self.assertEqual(upload.call_count, 1)
+            self.assertEqual(
+                upload.call_args.args[2], "https://upload.example/existing")
+
+    def test_expired_upload_url_does_not_create_session_during_quota_pause(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "duration_seconds": 60.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 60.0, "status": "uploading",
+                    "upload_url": "https://upload.example/expired-unused",
+                    "upload_session_tracking_version": 1,
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+            YouTubeArchive._write_quota_pause(
+                queue_dir, time.time() + 3600.0, "daily insert pause")
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_initiate_resumable_upload") as initiate, \
+                    mock.patch.object(
+                        YouTubeArchive, "_upload_resumable",
+                        side_effect=YouTubeArchive.UploadSessionExpired(
+                            "expired")) as upload:
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, YouTubeArchive.UPLOAD_INSERT_PAUSED)
+            upload.assert_called_once()
+            initiate.assert_not_called()
+            with open(job_path, "r", encoding="utf-8") as stream:
+                paused = json.load(stream)
+            self.assertEqual(
+                paused["segments"][0]["upload_url"],
+                "https://upload.example/expired-unused")
+            self.assertFalse(paused["segments"][0].get("video_id"))
+
+    def test_quota_error_outside_videos_insert_does_not_pause_queue(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            store_path = os.path.join(folder, "channels.json")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            job_path = enqueue_upload_job(queue_dir, media, session)
+            error = RuntimeError(
+                'YouTube API HTTP 403: {"reason":"quotaExceeded"}')
+
+            with mock.patch.object(
+                    YouTubeArchive, "process_upload_job",
+                    side_effect=error) as process:
+                summary = YouTubeArchive.run_upload_queue(
+                    queue_dir, store_path, max_wait_seconds=0)
+
+            process.assert_called_once_with(job_path, store_path)
+            self.assertEqual(summary["failed"], 1)
+            self.assertFalse(os.path.exists(
+                YouTubeArchive._quota_pause_path(queue_dir)))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["status"], "failed")
+
+    def test_safe_title_sanitizes_forbidden_characters_and_keeps_part(self):
+        title = YouTubeArchive._safe_title({
+            "input_set": "Switch<No2>\n\t" + "A" * 120,
+            "command": "ZA\x00Story\x7f\x85",
+            "created_at": "2026-10-12T12:34:56",
+        }, part=12, total=34)
+
+        self.assertEqual(len(title), 100)
+        self.assertTrue(title.endswith(" (12/34)"))
+        self.assertNotIn("<", title)
+        self.assertNotIn(">", title)
+        self.assertNotIn("\n", title)
+        self.assertNotIn("\t", title)
+        self.assertFalse(any(
+            ord(character) < 0x20 or 0x7f <= ord(character) <= 0x9f
+            for character in title))
+        self.assertIn("Switch＜No2＞", title)
+
+    def test_queue_lock_does_not_append_marker_to_existing_file(self):
+        with tempfile.TemporaryDirectory() as queue_dir:
+            lock_path = os.path.join(queue_dir, "worker.lock")
+            with open(lock_path, "wb") as stream:
+                stream.write(b"existing-lock-marker")
+
+            with YouTubeArchive._queue_lock(queue_dir) as locked:
+                self.assertTrue(locked)
+
+            with open(lock_path, "rb") as stream:
+                self.assertEqual(stream.read(), b"existing-lock-marker")
+
+    def test_non_daily_http_429_uses_normal_bounded_retry(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            store_path = os.path.join(folder, "channels.json")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(queue_dir, media, session)
+            error = RuntimeError(
+                "YouTube API HTTP 429: requests per minute quota exceeded")
+
+            with mock.patch.object(
+                    YouTubeArchive, "process_upload_job",
+                    side_effect=error) as process:
+                summary = YouTubeArchive.run_upload_queue(
+                    queue_dir, store_path, max_wait_seconds=0)
+
+            process.assert_called_once_with(job_path, store_path)
+            self.assertEqual(summary["failed"], 1)
+            self.assertFalse(os.path.exists(
+                YouTubeArchive._quota_pause_path(queue_dir)))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                retryable = json.load(stream)
+            self.assertEqual(retryable["status"], "failed")
+            self.assertEqual(retryable["attempts"], 1)
+
+    def test_legacy_400_and_429_jobs_are_migrated_without_api_call(self):
+        with tempfile.TemporaryDirectory() as folder:
+            queue_dir = os.path.join(folder, "queue")
+            store_path = os.path.join(folder, "channels.json")
+            paths = []
+            for name in ("description", "quota-missing", "quota-known"):
+                session = os.path.join(folder, name)
+                os.makedirs(session)
+                media = os.path.join(session, "recording.mp4")
+                with open(media, "wb") as stream:
+                    stream.write(b"x" * 4096)
+                paths.append(enqueue_upload_job(queue_dir, media, session))
+
+            with open(paths[0], "r", encoding="utf-8") as stream:
+                description_job = json.load(stream)
+            description_job.update({
+                "status": YouTubeArchive.UPLOAD_ATTENTION_REQUIRED,
+                "attempts": 30,
+                "error": ("YouTube API HTTP 400: "
+                          "invalidDescription"),
+            })
+            with open(paths[0], "w", encoding="utf-8") as stream:
+                json.dump(description_job, stream)
+            with open(paths[1], "r", encoding="utf-8") as stream:
+                quota_job = json.load(stream)
+            quota_job.update({
+                "status": "failed",
+                "attempts": 30,
+                "error": ("YouTube API HTTP 429: rateLimitExceeded; "
+                          "quota Video Uploads per day; video_insert"),
+            })
+            with open(paths[1], "w", encoding="utf-8") as stream:
+                json.dump(quota_job, stream)
+            known_window_start = int(time.time())
+            with open(paths[2], "r", encoding="utf-8") as stream:
+                known_quota_job = json.load(stream)
+            known_quota_job.update({
+                "status": YouTubeArchive.UPLOAD_ATTENTION_REQUIRED,
+                "attempts": 30,
+                "error": (
+                    "YouTube API HTTP 429: rateLimitExceeded; quota "
+                    "Video Uploads per day; video_insert; "
+                    '"window_start_time": {}'.format(known_window_start)),
+            })
+            with open(paths[2], "w", encoding="utf-8") as stream:
+                json.dump(known_quota_job, stream)
+
+            self.assertTrue(YouTubeArchive.upload_job_is_actionable(
+                description_job))
+            self.assertTrue(YouTubeArchive.upload_job_is_actionable(
+                quota_job))
+            self.assertTrue(YouTubeArchive.upload_job_is_actionable(
+                known_quota_job))
+
+            with mock.patch.object(
+                    YouTubeArchive, "process_upload_job") as process:
+                summary = YouTubeArchive.run_upload_queue(
+                    queue_dir, store_path, max_wait_seconds=0)
+
+            process.assert_not_called()
+            self.assertEqual(summary["failed"], 0)
+            with open(paths[0], "r", encoding="utf-8") as stream:
+                migrated_description = json.load(stream)
+            with open(paths[1], "r", encoding="utf-8") as stream:
+                migrated_quota = json.load(stream)
+            with open(paths[2], "r", encoding="utf-8") as stream:
+                migrated_known_quota = json.load(stream)
+            self.assertEqual(migrated_description["status"], "pending")
+            self.assertEqual(migrated_description["attempts"], 0)
+            self.assertEqual(
+                migrated_description["legacy_invalid_description_attempts"],
+                30)
+            self.assertIn(
+                "invalidDescription",
+                migrated_description["previous_upload_error"])
+            self.assertEqual(
+                migrated_quota["status"], YouTubeArchive.QUOTA_WAITING)
+            self.assertEqual(migrated_quota["attempts"], 30)
+            self.assertEqual(migrated_quota["legacy_quota_attempts"], 30)
+            self.assertEqual(
+                migrated_known_quota["status"],
+                YouTubeArchive.QUOTA_WAITING)
+            expected_retry = known_window_start + 24 * 3600 + 5 * 60
+            self.assertEqual(
+                migrated_quota["quota_retry_after_epoch"], expected_retry)
+            self.assertEqual(
+                migrated_known_quota["quota_retry_after_epoch"],
+                expected_retry)
+
+    def test_enqueue_does_not_reactivate_cancelled_job(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            job_path = enqueue_upload_job(queue_dir, media, session)
+
+            self.assertTrue(YouTubeArchive.cancel_upload_job(
+                job_path, "recording discarded"))
+            self.assertEqual(
+                enqueue_upload_job(queue_dir, media, session), "")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                cancelled = json.load(stream)
+            self.assertEqual(cancelled["status"], "cancelled")
+            self.assertEqual(cancelled["cancel_reason"], "recording discarded")
+
+    def test_enqueue_quarantines_existing_malformed_job_without_overwrite(self):
+        with tempfile.TemporaryDirectory() as folder:
+            queue_dir = os.path.join(folder, "queue")
+
+            def new_job(name):
+                session = os.path.join(folder, name)
+                os.makedirs(session)
+                media = os.path.join(session, "recording.mp4")
+                with open(media, "wb") as stream:
+                    stream.write(b"x" * 4096)
+                return session, media, enqueue_upload_job(
+                    queue_dir, media, session)
+
+            session, media, job_path = new_job("malformed")
+            malformed = b'{"upload_url":"keep-this-session"'
+            with open(job_path, "wb") as stream:
+                stream.write(malformed)
+            self.assertEqual(
+                enqueue_upload_job(queue_dir, media, session), "")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                stub = json.load(stream)
+            self.assertEqual(stub["status"], "invalid_job")
+            with open(stub["quarantined_payload_path"], "rb") as stream:
+                self.assertEqual(stream.read(), malformed)
+
+            session2, media2, job_path2 = new_job("unknown-status")
+            with open(job_path2, "r", encoding="utf-8") as stream:
+                unknown = json.load(stream)
+            unknown["status"] = "future_partial_state"
+            unknown["segments"] = [{
+                "part": 1, "start_seconds": 0.0,
+                "duration_seconds": 60.0,
+                "upload_url": "https://upload.example/must-preserve",
+                "uploaded_bytes": 2048,
+            }]
+            with open(job_path2, "w", encoding="utf-8") as stream:
+                json.dump(unknown, stream)
+            self.assertEqual(
+                enqueue_upload_job(queue_dir, media2, session2), "")
+            with open(job_path2, "r", encoding="utf-8") as stream:
+                stub2 = json.load(stream)
+            self.assertEqual(stub2["status"], "invalid_job")
+            with open(stub2["quarantined_payload_path"],
+                      "r", encoding="utf-8") as stream:
+                preserved = json.load(stream)
+            self.assertEqual(preserved["status"], "future_partial_state")
+            self.assertEqual(
+                preserved["segments"][0]["upload_url"],
+                "https://upload.example/must-preserve")
+
+    def test_partial_remote_job_refuses_replaced_recording_source(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"original" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "duration_seconds": 60.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 60.0, "status": "uploading",
+                    "upload_url": "https://upload.example/session",
+                    "uploaded_bytes": 2048,
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+            os.remove(media)
+            with open(media, "wb") as stream:
+                stream.write(b"replacement" * 1024)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile") as resolve, \
+                    mock.patch.object(
+                        YouTubeArchive, "_initiate_resumable_upload") as initiate, \
+                    mock.patch.object(
+                        YouTubeArchive, "_upload_resumable") as upload:
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "source_verification_required")
+            resolve.assert_not_called()
+            initiate.assert_not_called()
+            upload.assert_not_called()
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(
+                blocked["status"], "source_verification_required")
+            self.assertEqual(
+                blocked["segments"][0]["upload_url"],
+                "https://upload.example/session")
+            self.assertEqual(blocked["segments"][0]["uploaded_bytes"], 2048)
+            self.assertTrue(os.path.isfile(media))
+            self.assertFalse(YouTubeArchive.upload_job_is_actionable(blocked))
+
+    def test_preupload_session_replacement_is_not_repinned_or_uploaded(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"original-recording" * 1024)
+            job_path = enqueue_upload_job(queue_dir, media, session)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                queued = json.load(stream)
+            original_session_identity = dict(queued["session_identity"])
+            os.remove(media)
+            os.rmdir(session)
+            os.makedirs(session)
+            with open(media, "wb") as stream:
+                stream.write(b"different-recording" * 1024)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile") as resolve, \
+                    mock.patch.object(
+                        YouTubeArchive, "_initiate_resumable_upload") as initiate, \
+                    mock.patch.object(
+                        YouTubeArchive, "_upload_resumable") as upload:
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "source_verification_required")
+            resolve.assert_not_called()
+            initiate.assert_not_called()
+            upload.assert_not_called()
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(
+                blocked["session_identity"], original_session_identity)
+            self.assertTrue(os.path.isfile(media))
+
+    def test_present_but_invalid_session_identity_is_never_repinned(self):
+        for label, invalid_identity in (
+                ("empty", {}), ("string", "corrupt"), ("null", None)):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as folder:
+                session = os.path.join(folder, "session")
+                queue_dir = os.path.join(folder, "queue")
+                os.makedirs(session)
+                media = os.path.join(session, "recording.mp4")
+                with open(media, "wb") as stream:
+                    stream.write(b"original-recording" * 1024)
+                job_path = enqueue_upload_job(queue_dir, media, session)
+                with open(job_path, "r", encoding="utf-8") as stream:
+                    queued = json.load(stream)
+                queued["session_identity"] = invalid_identity
+                with open(job_path, "w", encoding="utf-8") as stream:
+                    json.dump(queued, stream)
+                os.remove(media)
+                os.rmdir(session)
+                os.makedirs(session)
+                with open(media, "wb") as stream:
+                    stream.write(b"different-recording" * 1024)
+
+                with mock.patch.object(
+                        YouTubeArchive, "_resolve_profile") as resolve, \
+                        mock.patch.object(
+                            YouTubeArchive,
+                            "_initiate_resumable_upload") as initiate, \
+                        mock.patch.object(
+                            YouTubeArchive, "_upload_resumable") as upload:
+                    result = YouTubeArchive.process_upload_job(
+                        job_path, os.path.join(folder, "channels.json"))
+
+                self.assertEqual(result, "invalid_job")
+                resolve.assert_not_called()
+                initiate.assert_not_called()
+                upload.assert_not_called()
+                with open(job_path, "r", encoding="utf-8") as stream:
+                    stub = json.load(stream)
+                self.assertEqual(stub["status"], "invalid_job")
+                with open(stub["quarantined_payload_path"],
+                          "r", encoding="utf-8") as stream:
+                    preserved = json.load(stream)
+                self.assertEqual(
+                    preserved["session_identity"], invalid_identity)
+                self.assertTrue(os.path.isfile(media))
+
+    def test_preupload_pinned_media_replacement_is_not_refreshed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"original-recording" * 1024)
+            job_path = enqueue_upload_job(queue_dir, media, session)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                queued = json.load(stream)
+            original_media_identity = dict(
+                YouTubeArchive._recording_media_source_identity(queued))
+            os.remove(media)
+            with open(media, "wb") as stream:
+                stream.write(b"different-recording" * 1024)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile") as resolve, \
+                    mock.patch.object(
+                        YouTubeArchive, "_initiate_resumable_upload") as initiate, \
+                    mock.patch.object(
+                        YouTubeArchive, "_upload_resumable") as upload:
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "source_verification_required")
+            resolve.assert_not_called()
+            initiate.assert_not_called()
+            upload.assert_not_called()
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(
+                YouTubeArchive._recording_media_source_identity(blocked),
+                original_media_identity)
+            self.assertTrue(os.path.isfile(media))
+
+    def test_resumable_session_refuses_replaced_split_part(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            segment_dir = os.path.join(session, ".youtube_segments")
+            os.makedirs(segment_dir)
+            media = os.path.join(session, "recording.mp4")
+            part = os.path.join(segment_dir, "part_001.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            with open(part, "wb") as stream:
+                stream.write(b"part-original" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            part_identity = YouTubeArchive._source_identity_snapshot(job, part)
+            self.assertIsNotNone(part_identity)
+            job.update({
+                "duration_seconds": 1200.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 600.0, "status": "uploading",
+                    "local_path": part,
+                    "source_identity": part_identity,
+                    "upload_url": "https://upload.example/session",
+                    "uploaded_bytes": 4096,
+                }, {
+                    "part": 2, "start_seconds": 600.0,
+                    "duration_seconds": 600.0, "status": "uploaded",
+                    "video_id": "remote-part-2",
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+            os.remove(part)
+            with open(part, "wb") as stream:
+                stream.write(b"part-replacement" * 1024)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_initiate_resumable_upload") as initiate, \
+                    mock.patch.object(
+                        YouTubeArchive, "_upload_resumable") as upload:
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "source_verification_required")
+            initiate.assert_not_called()
+            upload.assert_not_called()
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(
+                blocked["segments"][0]["upload_url"],
+                "https://upload.example/session")
+            self.assertTrue(os.path.isfile(part))
+
+    def test_expired_session_after_ambiguous_completed_put_never_reuploads(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "duration_seconds": 60.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 60.0, "status": "uploading",
+                    "upload_url": "https://upload.example/expired",
+                    "upload_session_tracking_version": 1,
+                    "put_attempted_at": "2026-10-11T00:00:00",
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_initiate_resumable_upload") as initiate, \
+                    mock.patch.object(
+                        YouTubeArchive, "_upload_resumable",
+                        side_effect=YouTubeArchive.UploadSessionExpired(
+                            "expired")) as upload:
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "remote_verification_required")
+            upload.assert_called_once()
+            initiate.assert_not_called()
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(
+                blocked["segments"][0]["upload_url"],
+                "https://upload.example/expired")
+            self.assertEqual(
+                blocked["segments"][0]["put_attempted_at"],
+                "2026-10-11T00:00:00")
+            self.assertTrue(os.path.isfile(media))
+            self.assertFalse(YouTubeArchive.upload_job_is_actionable(blocked))
+
+    def test_expired_unattempted_tracked_session_can_restart_once(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "duration_seconds": 60.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 60.0, "status": "uploading",
+                    "upload_url": "https://upload.example/expired-unused",
+                    "upload_session_tracking_version": 1,
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_initiate_resumable_upload",
+                        return_value="https://upload.example/replacement") as initiate, \
+                    mock.patch.object(
+                        YouTubeArchive, "_upload_resumable",
+                        side_effect=[YouTubeArchive.UploadSessionExpired(
+                            "expired"), "remote-video-1"]) as upload, \
+                    mock.patch.object(
+                        YouTubeArchive, "_processing_status",
+                        return_value="processed"):
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            initiate.assert_called_once()
+            self.assertEqual(upload.call_count, 2)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                completed = json.load(stream)
+            self.assertEqual(
+                completed["segments"][0]["video_id"], "remote-video-1")
+            self.assertEqual(
+                completed["segments"][0]["expired_upload_urls"],
+                ["https://upload.example/expired-unused"])
+            self.assertEqual(
+                completed["segments"][0]["upload_url"],
+                "https://upload.example/replacement")
+
+    def test_upload_resumable_rechecks_source_before_each_put(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(queue_dir, media, session)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            identity = YouTubeArchive._source_identity_snapshot(job, media)
+            requests = []
+            put_markers = []
+            resume_error = YouTubeArchive.urllib.error.HTTPError(
+                "https://upload.example/session", 308,
+                "Resume Incomplete", {"Range": "bytes=0-2047"}, None)
+
+            def first_put(request, timeout=0):
+                requests.append(request)
+                with open(media, "r+b") as stream:
+                    stream.seek(0)
+                    stream.write(b"y" * 4096)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                raise resume_error
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resumable_upload_offset",
+                    return_value=(0, "")), mock.patch.object(
+                        YouTubeArchive.urllib.request, "urlopen",
+                        side_effect=first_put):
+                with self.assertRaises(YouTubeArchive.UploadSourceChanged):
+                    YouTubeArchive._upload_resumable(
+                        media, "token", "https://upload.example/session",
+                        chunk_size=2048, expected_identity=identity,
+                        before_put=lambda offset, size: put_markers.append(
+                            (offset, size, len(requests))))
+
+            self.assertEqual(len(requests), 1)
+            self.assertEqual(put_markers, [(0, 4096, 0)])
+            resume_error.close()
+
+    def test_uploaded_segment_does_not_delete_replaced_local_part(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            segment_dir = os.path.join(session, ".youtube_segments")
+            os.makedirs(segment_dir)
+            media = os.path.join(session, "recording.mp4")
+            part = os.path.join(segment_dir, "part_001.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            with open(part, "wb") as stream:
+                stream.write(b"part-original" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "duration_seconds": 1200.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 600.0, "status": "pending",
+                }, {
+                    "part": 2, "start_seconds": 600.0,
+                    "duration_seconds": 600.0, "status": "uploaded",
+                    "video_id": "remote-part-2",
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            def processing(_token, video_id):
+                if video_id == "remote-part-1":
+                    os.remove(part)
+                    with open(part, "wb") as stream:
+                        stream.write(b"replacement-unuploaded" * 1024)
+                return "processed"
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_initiate_resumable_upload",
+                        return_value="upload-1"), mock.patch.object(
+                            YouTubeArchive, "_upload_resumable",
+                            return_value="remote-part-1"), mock.patch.object(
+                                YouTubeArchive, "_processing_status",
+                                side_effect=processing):
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            self.assertTrue(os.path.isfile(part))
+            with open(part, "rb") as stream:
+                self.assertTrue(stream.read().startswith(
+                    b"replacement-unuploaded"))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                completed = json.load(stream)
+            self.assertIn(
+                part, completed["cleanup_skipped_replaced_targets"])
+
+    def test_segment_swap_after_identity_check_never_deletes_replacement(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            segment_dir = os.path.join(session, ".youtube_segments")
+            os.makedirs(segment_dir)
+            media = os.path.join(session, "recording.mp4")
+            part = os.path.join(segment_dir, "part_001.mp4")
+            uploaded_backup = os.path.join(folder, "uploaded-part.backup")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            with open(part, "wb") as stream:
+                stream.write(b"part-original" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "duration_seconds": 1200.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 600.0, "status": "pending",
+                }, {
+                    "part": 2, "start_seconds": 600.0,
+                    "duration_seconds": 600.0, "status": "uploaded",
+                    "video_id": "remote-part-2",
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            armed = {"value": False}
+            swapped = {"value": False}
+            real_match = YouTubeArchive._source_identity_matches
+
+            def processing(_token, _video_id):
+                armed["value"] = True
+                return "processed"
+
+            def swap_after_match(path, expected):
+                if (armed["value"] and not swapped["value"]
+                        and os.path.normcase(os.path.abspath(path))
+                        == os.path.normcase(os.path.abspath(part))):
+                    self.assertTrue(real_match(path, expected))
+                    os.rename(part, uploaded_backup)
+                    with open(part, "wb") as stream:
+                        stream.write(b"replacement-unuploaded" * 1024)
+                    swapped["value"] = True
+                    # Simulate a swap in the exact check -> delete window.
+                    return True
+                return real_match(path, expected)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_initiate_resumable_upload",
+                        return_value="upload-1"), mock.patch.object(
+                            YouTubeArchive, "_upload_resumable",
+                            return_value="remote-part-1"), mock.patch.object(
+                                YouTubeArchive, "_processing_status",
+                                side_effect=processing), mock.patch.object(
+                                    YouTubeArchive,
+                                    "_source_identity_matches",
+                                    side_effect=swap_after_match):
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(
+                result, YouTubeArchive.CLEANUP_ATTENTION_REQUIRED)
+            self.assertTrue(swapped["value"])
+            self.assertTrue(os.path.isfile(uploaded_backup))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                completed = json.load(stream)
+            self.assertEqual(
+                completed["status"],
+                YouTubeArchive.CLEANUP_ATTENTION_REQUIRED)
+            quarantines = completed["cleanup_quarantined_replacements"]
+            preserved = [path for entry in quarantines
+                         for path in entry["preserved_paths"]
+                         if os.path.isfile(path)]
+            self.assertTrue(preserved)
+            preserved_contents = []
+            for path in preserved:
+                with open(path, "rb") as stream:
+                    preserved_contents.append(stream.read())
+            self.assertTrue(any(content.startswith(
+                b"replacement-unuploaded")
+                for content in preserved_contents))
+            self.assertIn(
+                part, completed["cleanup_skipped_replaced_targets"])
+            self.assertFalse(YouTubeArchive.upload_job_is_actionable(completed))
+
+    def test_segment_tombstone_delete_failure_never_silently_completes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            segment_dir = os.path.join(session, ".youtube_segments")
+            os.makedirs(segment_dir)
+            media = os.path.join(session, "recording.mp4")
+            part = os.path.join(segment_dir, "part_001.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            with open(part, "wb") as stream:
+                stream.write(b"part-original" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "duration_seconds": 1200.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 600.0, "status": "pending",
+                }, {
+                    "part": 2, "start_seconds": 600.0,
+                    "duration_seconds": 600.0, "status": "uploaded",
+                    "video_id": "remote-part-2",
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            real_remove = YouTubeArchive.os.remove
+
+            def refuse_tombstone(path):
+                if str(path).endswith(".tombstone"):
+                    raise PermissionError("temporary part is busy")
+                return real_remove(path)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_initiate_resumable_upload",
+                        return_value="upload-1"), mock.patch.object(
+                            YouTubeArchive, "_upload_resumable",
+                            return_value="remote-part-1"), mock.patch.object(
+                                YouTubeArchive, "_processing_status",
+                                return_value="processed"), mock.patch.object(
+                                    YouTubeArchive.os, "remove",
+                                    side_effect=refuse_tombstone):
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "cleanup_pending")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                pending = json.load(stream)
+            self.assertEqual(pending["status"], "cleanup_pending")
+            self.assertTrue(YouTubeArchive.upload_job_is_actionable(pending))
+            self.assertTrue(os.path.isfile(media))
+            tombstones = pending["cleanup_delete_tombstones"]
+            self.assertTrue(tombstones)
+            self.assertTrue(os.path.isfile(tombstones[0]["path"]))
+
+            pending["cleanup_attempts"] = YouTubeArchive.MAX_CLEANUP_ATTEMPTS - 1
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(pending, stream)
+            with mock.patch.object(
+                    YouTubeArchive.os, "remove",
+                    side_effect=refuse_tombstone):
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(
+                result, YouTubeArchive.CLEANUP_ATTENTION_REQUIRED)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(
+                blocked["status"],
+                YouTubeArchive.CLEANUP_ATTENTION_REQUIRED)
+            self.assertFalse(YouTubeArchive.upload_job_is_actionable(blocked))
+            self.assertTrue(os.path.isfile(media))
+            self.assertTrue(any(os.path.isfile(target["path"])
+                                for target in blocked[
+                                    "cleanup_delete_tombstones"]))
+
+    def test_segment_cleanup_crash_before_first_rename_retries_on_restart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            segment_dir = os.path.join(session, ".youtube_segments")
+            os.makedirs(segment_dir)
+            media = os.path.join(session, "recording.mp4")
+            part = os.path.join(segment_dir, "part_001.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            with open(part, "wb") as stream:
+                stream.write(b"part-original" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "duration_seconds": 1200.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 600.0, "status": "pending",
+                }, {
+                    "part": 2, "start_seconds": 600.0,
+                    "duration_seconds": 600.0, "status": "uploaded",
+                    "video_id": "remote-part-2",
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_initiate_resumable_upload",
+                        return_value="upload-1"), mock.patch.object(
+                            YouTubeArchive, "_upload_resumable",
+                            return_value="remote-part-1"), mock.patch.object(
+                                YouTubeArchive, "_processing_status",
+                                return_value="processed"), mock.patch.object(
+                                    YouTubeArchive.os, "rename",
+                                    side_effect=RuntimeError(
+                                        "simulated crash before first rename")):
+                with self.assertRaisesRegex(RuntimeError, "first rename"):
+                    YouTubeArchive.process_upload_job(
+                        job_path, os.path.join(folder, "channels.json"))
+
+            with open(job_path, "r", encoding="utf-8") as stream:
+                crashed = json.load(stream)
+            self.assertEqual(
+                crashed["segments"][0]["video_id"], "remote-part-1")
+            self.assertEqual(len(crashed["cleanup_tombstone_intents"]), 1)
+            self.assertTrue(os.path.isfile(part))
+            self.assertFalse(os.path.exists(
+                crashed["cleanup_tombstone_intents"][0]["tombstone_path"]))
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_processing_status",
+                        return_value="processed"), mock.patch.object(
+                            YouTubeArchive,
+                            "_initiate_resumable_upload") as initiate, \
+                    mock.patch.object(
+                        YouTubeArchive, "_upload_resumable") as upload:
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            initiate.assert_not_called()
+            upload.assert_not_called()
+            self.assertFalse(os.path.exists(part))
+            self.assertTrue(os.path.isfile(media))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                completed = json.load(stream)
+            self.assertEqual(completed["cleanup_tombstone_intents"], [])
+            self.assertEqual(completed["cleanup_delete_tombstones"], [])
+
+    def test_segment_tombstone_rename_failure_never_silently_completes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            segment_dir = os.path.join(session, ".youtube_segments")
+            os.makedirs(segment_dir)
+            media = os.path.join(session, "recording.mp4")
+            part = os.path.join(segment_dir, "part_001.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            with open(part, "wb") as stream:
+                stream.write(b"part-original" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "duration_seconds": 1200.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 600.0, "status": "pending",
+                }, {
+                    "part": 2, "start_seconds": 600.0,
+                    "duration_seconds": 600.0, "status": "uploaded",
+                    "video_id": "remote-part-2",
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_initiate_resumable_upload",
+                        return_value="upload-1"), mock.patch.object(
+                            YouTubeArchive, "_upload_resumable",
+                            return_value="remote-part-1"), mock.patch.object(
+                                YouTubeArchive, "_processing_status",
+                                return_value="processed"), mock.patch.object(
+                                    YouTubeArchive.os, "rename",
+                                    side_effect=PermissionError(
+                                        "part is still open")):
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "cleanup_pending")
+            self.assertTrue(os.path.isfile(part))
+            self.assertTrue(os.path.isfile(media))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                pending = json.load(stream)
+            self.assertEqual(pending["status"], "cleanup_pending")
+            self.assertTrue(YouTubeArchive.upload_job_is_actionable(pending))
+            self.assertIn(
+                "uploaded_part:" + part, pending["cleanup_remaining"])
+
+            result = YouTubeArchive.process_upload_job(
+                job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            self.assertFalse(os.path.exists(part))
+            self.assertTrue(os.path.isfile(media))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                completed = json.load(stream)
+            self.assertEqual(completed["cleanup_tombstone_intents"], [])
+            self.assertEqual(completed["cleanup_delete_tombstones"], [])
+
+    def test_processing_wait_bounds_temporary_tombstone_cleanup_retries(self):
+        def prepare_uploaded_part(folder, cleanup_attempts=0):
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            segment_dir = os.path.join(session, ".youtube_segments")
+            os.makedirs(segment_dir)
+            media = os.path.join(session, "recording.mp4")
+            part = os.path.join(segment_dir, "part_001.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            with open(part, "wb") as stream:
+                stream.write(b"part-original" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            source_identity = YouTubeArchive._source_identity_snapshot(
+                job, part)
+            job.update({
+                "status": "awaiting_processing",
+                "duration_seconds": 600.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "cleanup_attempts": cleanup_attempts,
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 600.0, "status": "uploaded",
+                    "video_id": "remote-part-1", "local_path": part,
+                    "source_identity": source_identity,
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+            return job_path, media, part
+
+        with tempfile.TemporaryDirectory() as folder:
+            job_path, media, part = prepare_uploaded_part(
+                folder, YouTubeArchive.MAX_CLEANUP_ATTEMPTS - 1)
+            real_remove = YouTubeArchive.os.remove
+
+            def refuse_tombstone(path):
+                if str(path).endswith(".tombstone"):
+                    raise PermissionError("temporary part is busy")
+                return real_remove(path)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_processing_status",
+                        return_value="processing"), mock.patch.object(
+                            YouTubeArchive.os, "remove",
+                            side_effect=refuse_tombstone):
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(
+                result, YouTubeArchive.CLEANUP_ATTENTION_REQUIRED)
+            self.assertTrue(os.path.isfile(media))
+            self.assertFalse(os.path.exists(part))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(
+                blocked["status"],
+                YouTubeArchive.CLEANUP_ATTENTION_REQUIRED)
+            self.assertEqual(
+                blocked["cleanup_attempts"],
+                YouTubeArchive.MAX_CLEANUP_ATTEMPTS)
+            self.assertFalse(YouTubeArchive.upload_job_is_actionable(blocked))
+            self.assertTrue(any(os.path.isfile(target["path"])
+                                for target in blocked[
+                                    "cleanup_delete_tombstones"]))
+
+        with tempfile.TemporaryDirectory() as folder:
+            job_path, media, part = prepare_uploaded_part(folder)
+            common_patches = (
+                mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})),
+                mock.patch.object(
+                    YouTubeArchive, "_access_token", return_value="token"),
+            )
+            with common_patches[0], common_patches[1], mock.patch.object(
+                    YouTubeArchive, "_processing_status",
+                    return_value="processing"):
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "awaiting_processing")
+            self.assertFalse(os.path.exists(part))
+            self.assertTrue(os.path.isfile(media))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                awaiting = json.load(stream)
+            self.assertEqual(awaiting["status"], "awaiting_processing")
+            self.assertTrue(YouTubeArchive.upload_job_is_actionable(awaiting))
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_processing_status",
+                        return_value="processed"):
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            self.assertTrue(os.path.isfile(media))
+
+    def test_cleanup_does_not_journal_replaced_or_untracked_segment_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            segment_dir = os.path.join(session, ".youtube_segments")
+            os.makedirs(segment_dir)
+            media = os.path.join(session, "recording.mp4")
+            replaced_part = os.path.join(segment_dir, "part_001.mp4")
+            untracked_part = os.path.join(segment_dir, "manual-copy.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            with open(replaced_part, "wb") as stream:
+                stream.write(b"uploaded-part" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=True)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            source_identity = YouTubeArchive._source_identity_snapshot(
+                job, replaced_part)
+            job["segments"] = [{
+                "part": 1, "start_seconds": 0.0,
+                "duration_seconds": 60.0, "status": "uploaded",
+                "video_id": "remote-part-1",
+                "source_identity": source_identity,
+            }]
+            os.remove(replaced_part)
+            with open(replaced_part, "wb") as stream:
+                stream.write(b"replacement-unuploaded" * 1024)
+            with open(untracked_part, "wb") as stream:
+                stream.write(b"manual-unuploaded" * 1024)
+
+            result = YouTubeArchive._finish_uploaded_recording_cleanup(
+                job_path, job)
+
+            self.assertEqual(result, "completed")
+            self.assertFalse(os.path.exists(media))
+            self.assertTrue(os.path.isfile(replaced_part))
+            self.assertTrue(os.path.isfile(untracked_part))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                completed = json.load(stream)
+            target_paths = [target["path"] for target in
+                            completed.get("cleanup_targets", [])]
+            self.assertNotIn(replaced_part, target_paths)
+            self.assertNotIn(untracked_part, target_paths)
+            self.assertIn(
+                replaced_part,
+                completed["cleanup_skipped_replaced_targets"])
+            self.assertIn(
+                untracked_part,
+                completed["cleanup_skipped_untracked_segment_targets"])
+
+    def test_cleanup_swap_after_identity_check_never_deletes_replacement(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            uploaded_backup = os.path.join(folder, "uploaded.backup")
+            with open(media, "wb") as stream:
+                stream.write(b"uploaded-original" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=True)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job["status"] = "cleanup_pending"
+            job["cleanup_targets"] = (
+                YouTubeArchive._snapshot_uploaded_recording_cleanup_targets(
+                    job))
+
+            calls = {"value": 0}
+            real_match = YouTubeArchive._cleanup_target_matches
+
+            def swap_after_match(job_value, target):
+                target_path = os.path.abspath(str(
+                    target.get("path", "") or ""))
+                if (target.get("kind") == "file"
+                        and os.path.normcase(target_path)
+                        == os.path.normcase(os.path.abspath(media))):
+                    calls["value"] += 1
+                    if calls["value"] == 2:
+                        self.assertTrue(real_match(job_value, target))
+                        os.rename(media, uploaded_backup)
+                        with open(media, "wb") as stream:
+                            stream.write(b"replacement-unuploaded" * 1024)
+                        # Simulate a swap in the exact check -> delete window.
+                        return True
+                return real_match(job_value, target)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_cleanup_target_matches",
+                    side_effect=swap_after_match):
+                result = YouTubeArchive._finish_uploaded_recording_cleanup(
+                    job_path, job)
+
+            self.assertEqual(
+                result, YouTubeArchive.CLEANUP_ATTENTION_REQUIRED)
+            self.assertTrue(os.path.isfile(uploaded_backup))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(
+                blocked["status"],
+                YouTubeArchive.CLEANUP_ATTENTION_REQUIRED)
+            quarantines = blocked["cleanup_quarantined_replacements"]
+            preserved = [path for entry in quarantines
+                         for path in entry["preserved_paths"]
+                         if os.path.isfile(path)]
+            self.assertTrue(preserved)
+            preserved_contents = []
+            for path in preserved:
+                with open(path, "rb") as stream:
+                    preserved_contents.append(stream.read())
+            self.assertTrue(any(content.startswith(
+                b"replacement-unuploaded")
+                for content in preserved_contents))
+            self.assertFalse(YouTubeArchive.upload_job_is_actionable(blocked))
+
+    def test_cleanup_crash_after_tombstone_rename_is_recovered_on_restart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"uploaded-original" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=True)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job["status"] = "cleanup_pending"
+            job["cleanup_targets"] = (
+                YouTubeArchive._snapshot_uploaded_recording_cleanup_targets(
+                    job))
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            real_rename = YouTubeArchive.os.rename
+
+            def rename_then_crash(source, destination):
+                real_rename(source, destination)
+                raise RuntimeError("simulated hard crash after rename")
+
+            with mock.patch.object(
+                    YouTubeArchive.os, "rename",
+                    side_effect=rename_then_crash):
+                with self.assertRaisesRegex(RuntimeError, "hard crash"):
+                    YouTubeArchive._finish_uploaded_recording_cleanup(
+                        job_path, job)
+
+            with open(job_path, "r", encoding="utf-8") as stream:
+                crashed = json.load(stream)
+            self.assertEqual(len(crashed["cleanup_tombstone_intents"]), 1)
+            tombstone = crashed["cleanup_tombstone_intents"][0][
+                "tombstone_path"]
+            self.assertFalse(os.path.exists(media))
+            self.assertTrue(os.path.isfile(tombstone))
+
+            result = YouTubeArchive.process_upload_job(
+                job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            self.assertFalse(os.path.exists(tombstone))
+            self.assertFalse(any(name.endswith(".tombstone")
+                                 for name in os.listdir(session)))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                completed = json.load(stream)
+            self.assertEqual(completed["status"], "completed")
+            self.assertEqual(completed["cleanup_tombstone_intents"], [])
+            self.assertEqual(completed["cleanup_delete_tombstones"], [])
+
+    def test_cleanup_retry_crash_before_second_rename_readopts_tombstone(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"uploaded-original" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=True)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job["status"] = "cleanup_pending"
+            job["cleanup_targets"] = (
+                YouTubeArchive._snapshot_uploaded_recording_cleanup_targets(
+                    job))
+
+            with mock.patch.object(
+                    YouTubeArchive.os, "remove",
+                    side_effect=PermissionError("busy")), mock.patch.object(
+                        YouTubeArchive.os, "unlink",
+                        side_effect=PermissionError("busy")):
+                self.assertEqual(
+                    YouTubeArchive._finish_uploaded_recording_cleanup(
+                        job_path, job),
+                    "cleanup_pending")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                pending = json.load(stream)
+            first_tombstone = pending["cleanup_delete_tombstones"][0]["path"]
+            self.assertTrue(os.path.isfile(first_tombstone))
+
+            with mock.patch.object(
+                    YouTubeArchive.os, "rename",
+                    side_effect=RuntimeError(
+                        "simulated crash before tracked retry rename")):
+                with self.assertRaisesRegex(RuntimeError, "tracked retry"):
+                    YouTubeArchive.process_upload_job(
+                        job_path, os.path.join(folder, "channels.json"))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                crashed = json.load(stream)
+            self.assertEqual(crashed["cleanup_delete_tombstones"], [])
+            self.assertEqual(len(crashed["cleanup_tombstone_intents"]), 1)
+            self.assertTrue(os.path.isfile(first_tombstone))
+            self.assertFalse(os.path.exists(
+                crashed["cleanup_tombstone_intents"][0]["tombstone_path"]))
+
+            os.remove(media)
+            with open(media, "wb") as stream:
+                stream.write(b"replacement-unuploaded" * 1024)
+            result = YouTubeArchive.process_upload_job(
+                job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            self.assertFalse(os.path.exists(first_tombstone))
+            with open(media, "rb") as stream:
+                self.assertTrue(stream.read().startswith(
+                    b"replacement-unuploaded"))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                completed = json.load(stream)
+            self.assertEqual(completed["cleanup_tombstone_intents"], [])
+            self.assertEqual(completed["cleanup_delete_tombstones"], [])
+            self.assertIn(
+                media, completed["cleanup_skipped_replaced_targets"])
+
+    def test_tracked_tombstone_rename_failure_keeps_cleanup_journal(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"uploaded-original" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=True)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job["status"] = "cleanup_pending"
+            job["cleanup_targets"] = (
+                YouTubeArchive._snapshot_uploaded_recording_cleanup_targets(
+                    job))
+
+            with mock.patch.object(
+                    YouTubeArchive.os, "remove",
+                    side_effect=PermissionError("busy")), mock.patch.object(
+                        YouTubeArchive.os, "unlink",
+                        side_effect=PermissionError("busy")):
+                self.assertEqual(
+                    YouTubeArchive._finish_uploaded_recording_cleanup(
+                        job_path, job),
+                    "cleanup_pending")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                pending = json.load(stream)
+            first_tombstone = pending["cleanup_delete_tombstones"][0]["path"]
+            self.assertTrue(os.path.isfile(first_tombstone))
+
+            with mock.patch.object(
+                    YouTubeArchive.os, "rename",
+                    side_effect=PermissionError("tombstone is busy")):
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "cleanup_pending")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                retriable = json.load(stream)
+            self.assertTrue(YouTubeArchive.upload_job_is_actionable(retriable))
+            self.assertEqual(
+                retriable["cleanup_delete_tombstones"][0]["path"],
+                first_tombstone)
+            self.assertTrue(os.path.isfile(first_tombstone))
+
+            result = YouTubeArchive.process_upload_job(
+                job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            self.assertFalse(os.path.exists(first_tombstone))
+            self.assertFalse(os.path.exists(media))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                completed = json.load(stream)
+            self.assertEqual(completed["cleanup_delete_tombstones"], [])
+
+    def test_tracked_rename_failure_crash_keeps_durable_intent(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"uploaded-original" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=True)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job["status"] = "cleanup_pending"
+            job["cleanup_targets"] = (
+                YouTubeArchive._snapshot_uploaded_recording_cleanup_targets(
+                    job))
+            with mock.patch.object(
+                    YouTubeArchive.os, "remove",
+                    side_effect=PermissionError("busy")), mock.patch.object(
+                        YouTubeArchive.os, "unlink",
+                        side_effect=PermissionError("busy")):
+                self.assertEqual(
+                    YouTubeArchive._finish_uploaded_recording_cleanup(
+                        job_path, job),
+                    "cleanup_pending")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                pending = json.load(stream)
+            first_tombstone = pending["cleanup_delete_tombstones"][0]["path"]
+            self.assertTrue(os.path.isfile(first_tombstone))
+
+            real_delete = YouTubeArchive._atomic_delete_pinned_file
+
+            def crash_after_failed_rename(*args, **kwargs):
+                result = real_delete(*args, **kwargs)
+                self.assertEqual(result, ("retry", None))
+                raise RuntimeError("crash after tracked rename failure")
+
+            with mock.patch.object(
+                    YouTubeArchive.os, "rename",
+                    side_effect=PermissionError("tombstone is busy")), \
+                    mock.patch.object(
+                        YouTubeArchive, "_atomic_delete_pinned_file",
+                        side_effect=crash_after_failed_rename):
+                with self.assertRaisesRegex(RuntimeError, "tracked rename"):
+                    YouTubeArchive.process_upload_job(
+                        job_path, os.path.join(folder, "channels.json"))
+
+            with open(job_path, "r", encoding="utf-8") as stream:
+                crashed = json.load(stream)
+            self.assertEqual(crashed["cleanup_delete_tombstones"], [])
+            self.assertTrue(crashed["cleanup_tombstone_intents"])
+            self.assertTrue(os.path.isfile(first_tombstone))
+
+            result = YouTubeArchive.process_upload_job(
+                job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            self.assertFalse(os.path.exists(first_tombstone))
+            self.assertFalse(os.path.exists(media))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                completed = json.load(stream)
+            self.assertEqual(completed["cleanup_tombstone_intents"], [])
+            self.assertEqual(completed["cleanup_delete_tombstones"], [])
+
+    def test_cleanup_directory_swap_after_check_is_quarantined(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            segment_dir = os.path.join(session, ".youtube_segments")
+            uploaded_dir_backup = os.path.join(folder, "uploaded-segments")
+            os.makedirs(segment_dir)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"uploaded-original" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=True)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job["status"] = "cleanup_pending"
+            job["cleanup_targets"] = (
+                YouTubeArchive._snapshot_uploaded_recording_cleanup_targets(
+                    job))
+
+            calls = {"value": 0}
+            real_match = YouTubeArchive._cleanup_target_matches
+
+            def swap_directory_after_match(job_value, target):
+                target_path = os.path.abspath(str(
+                    target.get("path", "") or ""))
+                if (target.get("kind") == "directory"
+                        and os.path.normcase(target_path)
+                        == os.path.normcase(os.path.abspath(segment_dir))):
+                    calls["value"] += 1
+                    if calls["value"] == 2:
+                        self.assertTrue(real_match(job_value, target))
+                        os.rename(segment_dir, uploaded_dir_backup)
+                        os.makedirs(segment_dir)
+                        return True
+                return real_match(job_value, target)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_cleanup_target_matches",
+                    side_effect=swap_directory_after_match):
+                result = YouTubeArchive._finish_uploaded_recording_cleanup(
+                    job_path, job)
+
+            self.assertEqual(
+                result, YouTubeArchive.CLEANUP_ATTENTION_REQUIRED)
+            self.assertTrue(os.path.isdir(uploaded_dir_backup))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            quarantines = blocked["cleanup_quarantined_replacements"]
+            preserved = [path for entry in quarantines
+                         for path in entry["preserved_paths"]
+                         if os.path.isdir(path)]
+            self.assertTrue(preserved)
+            self.assertFalse(os.path.isdir(segment_dir))
+            self.assertFalse(YouTubeArchive.upload_job_is_actionable(blocked))
+
+    def test_remote_index_never_writes_into_replaced_session_directory(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            job_path = enqueue_upload_job(queue_dir, media, session)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job["segments"] = [{
+                "part": 1, "start_seconds": 0.0,
+                "duration_seconds": 60.0, "status": "uploaded",
+                "video_id": "remote-video-1",
+            }]
+            os.remove(media)
+            os.rmdir(session)
+            os.makedirs(session)
+            index_path = os.path.join(session, "common_function_index.json")
+            original_index = {"occurrences": [{"start_seconds": 1.0}]}
+            with open(index_path, "w", encoding="utf-8") as stream:
+                json.dump(original_index, stream)
+
+            YouTubeArchive._write_remote(
+                job, "main", {"channel_id": "channel-main"})
+
+            self.assertFalse(os.path.exists(os.path.join(
+                session, YouTubeArchive.REMOTE_FILE_NAME)))
+            with open(index_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream), original_index)
+            self.assertEqual(
+                job["remote_index_skip_reason"],
+                "session_identity_unverified")
+
+    def test_remote_index_failure_preserves_terminal_status(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            job_path = enqueue_upload_job(queue_dir, media, session)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job["segments"] = [{
+                "part": 1, "start_seconds": 0.0,
+                "duration_seconds": 60.0, "status": "uploaded",
+                "video_id": "remote-video-1",
+            }]
+            real_atomic_json = YouTubeArchive._atomic_json
+
+            def fail_remote_index(path, payload):
+                if os.path.basename(path) == YouTubeArchive.REMOTE_FILE_NAME:
+                    raise PermissionError("remote index is read-only")
+                return real_atomic_json(path, payload)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_atomic_json",
+                    side_effect=fail_remote_index):
+                result = YouTubeArchive._mark_remote_upload_blocked(
+                    job_path, job,
+                    YouTubeArchive.REMOTE_VERIFICATION_REQUIRED,
+                    "manual verification required", "main",
+                    {"channel_id": "channel-main"})
+
+            self.assertEqual(result, "remote_verification_required")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(
+                blocked["status"], "remote_verification_required")
+            self.assertEqual(blocked["error"], "manual verification required")
+            self.assertIn("remote index is read-only",
+                          blocked["remote_index_error"])
+            self.assertFalse(YouTubeArchive.upload_job_is_actionable(blocked))
+
+    def test_post_terminal_checkpoint_failure_never_regresses_to_failed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            store_path = os.path.join(folder, "channels.json")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            job_path = enqueue_upload_job(queue_dir, media, session)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "duration_seconds": 60.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 60.0, "status": "uploaded",
+                    "video_id": "remote-video-1",
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+            real_atomic_json = YouTubeArchive._atomic_json
+            terminal_job_writes = 0
+
+            def fail_second_terminal_checkpoint(path, payload):
+                nonlocal terminal_job_writes
+                if (os.path.abspath(path) == os.path.abspath(job_path)
+                        and payload.get("status")
+                        == YouTubeArchive.REMOTE_PROCESSING_FAILED):
+                    terminal_job_writes += 1
+                    if terminal_job_writes == 2:
+                        raise PermissionError(
+                            "post-terminal checkpoint interrupted")
+                return real_atomic_json(path, payload)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_processing_status",
+                        return_value="failed"), mock.patch.object(
+                            YouTubeArchive, "_atomic_json",
+                            side_effect=fail_second_terminal_checkpoint):
+                summary = YouTubeArchive.run_upload_queue(
+                    queue_dir, store_path, max_wait_seconds=0)
+
+            self.assertEqual(terminal_job_writes, 2)
+            self.assertEqual(summary["failed"], 1)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(
+                blocked["status"], "remote_processing_failed")
+            self.assertEqual(
+                blocked["segments"][0]["video_id"], "remote-video-1")
+            self.assertFalse(YouTubeArchive.upload_job_is_actionable(blocked))
+
+    def test_persistent_upload_failure_requires_attention_across_workers(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            store_path = os.path.join(folder, "channels.json")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            job_path = enqueue_upload_job(queue_dir, media, session)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job["attempts"] = YouTubeArchive.MAX_UPLOAD_ATTEMPTS - 2
+            job["segments"] = [{
+                "part": 1, "start_seconds": 0.0,
+                "duration_seconds": 60.0, "status": "uploading",
+                "video_id": "remote-id-must-survive",
+                "upload_url": "https://upload.example/must-survive",
+            }]
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            with mock.patch.object(
+                    YouTubeArchive, "process_upload_job",
+                    side_effect=RuntimeError(
+                        "FFmpeg is permanently unavailable")) as process:
+                first = YouTubeArchive.run_upload_queue(
+                    queue_dir, store_path, max_wait_seconds=0)
+                second = YouTubeArchive.run_upload_queue(
+                    queue_dir, store_path, max_wait_seconds=0)
+
+            self.assertEqual(first["failed"], 1)
+            self.assertEqual(second["failed"], 1)
+            self.assertEqual(process.call_count, 2)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(blocked["status"], "upload_attention_required")
+            self.assertEqual(
+                blocked["attempts"], YouTubeArchive.MAX_UPLOAD_ATTEMPTS)
+            self.assertEqual(
+                blocked["segments"][0]["video_id"],
+                "remote-id-must-survive")
+            self.assertEqual(
+                blocked["segments"][0]["upload_url"],
+                "https://upload.example/must-survive")
+            self.assertTrue(os.path.isfile(media))
+            self.assertTrue(os.path.isdir(session))
+            self.assertFalse(YouTubeArchive.upload_job_is_actionable(blocked))
+
+            with mock.patch.object(
+                    YouTubeArchive, "process_upload_job") as stopped:
+                third = YouTubeArchive.run_upload_queue(
+                    queue_dir, store_path, max_wait_seconds=0)
+            stopped.assert_not_called()
+            self.assertEqual(third["failed"], 0)
+
+    def test_remote_terminal_catches_unexpected_index_writer_exception(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            job_path = enqueue_upload_job(queue_dir, media, session)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job["segments"] = [{
+                "part": 1, "start_seconds": 0.0,
+                "duration_seconds": 60.0, "status": "uploaded",
+                "video_id": "remote-video-1",
+            }]
+
+            with mock.patch.object(
+                    YouTubeArchive, "_write_remote",
+                    side_effect=PermissionError("index writer failed")):
+                result = YouTubeArchive._mark_remote_upload_blocked(
+                    job_path, job,
+                    YouTubeArchive.REMOTE_PROCESSING_FAILED,
+                    "remote processing failed", "main",
+                    {"channel_id": "channel-main"})
+
+            self.assertEqual(result, "remote_processing_failed")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(blocked["status"], "remote_processing_failed")
+            self.assertIn("index writer failed", blocked["remote_index_error"])
+            self.assertFalse(YouTubeArchive.upload_job_is_actionable(blocked))
+
+    def test_upload_resumable_308_without_range_retries_same_chunk(self):
+        class Response:
+            status = 201
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read():
+                return b'{"id":"video-1"}'
+
+        with tempfile.TemporaryDirectory() as folder:
+            media = os.path.join(folder, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            resume_error = YouTubeArchive.urllib.error.HTTPError(
+                "https://upload.example/session", 308,
+                "Resume Incomplete", {}, None)
+            responses = iter((resume_error, Response()))
+            requests = []
+
+            def urlopen(request, timeout=0):
+                requests.append(request)
+                response = next(responses)
+                if isinstance(response, Exception):
+                    raise response
+                return response
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resumable_upload_offset",
+                    return_value=(0, "")) as offset, mock.patch.object(
+                        YouTubeArchive.urllib.request, "urlopen",
+                        side_effect=urlopen):
+                video_id = YouTubeArchive._upload_resumable(
+                    media, "token", "https://upload.example/session")
+
+            self.assertEqual(video_id, "video-1")
+            self.assertEqual(offset.call_count, 2)
+            self.assertEqual(len(requests), 2)
+            self.assertEqual(
+                [request.get_header("Content-range") for request in requests],
+                ["bytes 0-4095/4096", "bytes 0-4095/4096"])
+            resume_error.close()
+
+    def test_resumable_success_without_video_id_keeps_session_and_media(self):
+        class EmptyCompletion:
+            status = 201
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read():
+                return b"{}"
+
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=True)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "duration_seconds": 60.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 60.0, "status": "pending",
+                    "upload_url": "https://upload.example/session",
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_materialize_segment",
+                        return_value=media), mock.patch.object(
+                            YouTubeArchive, "_resumable_upload_offset",
+                            return_value=(0, "")), mock.patch.object(
+                                YouTubeArchive.urllib.request, "urlopen",
+                                return_value=EmptyCompletion()):
+                with self.assertRaisesRegex(RuntimeError, "video ID"):
+                    YouTubeArchive.process_upload_job(
+                        job_path, os.path.join(folder, "channels.json"))
+
+            with open(job_path, "r", encoding="utf-8") as stream:
+                preserved = json.load(stream)
+            self.assertEqual(
+                preserved["segments"][0]["upload_url"],
+                "https://upload.example/session")
+            self.assertNotIn("video_id", preserved["segments"][0])
+            self.assertNotEqual(
+                preserved["segments"][0].get("status"), "uploaded")
+            self.assertTrue(os.path.isfile(media))
+
+    def test_resumable_status_success_without_video_id_is_rejected(self):
+        class EmptyCompletion:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read():
+                return b"{}"
+
+        with mock.patch.object(
+                YouTubeArchive.urllib.request, "urlopen",
+                return_value=EmptyCompletion()):
+            with self.assertRaisesRegex(RuntimeError, "video ID"):
+                YouTubeArchive._resumable_upload_offset(
+                    "https://upload.example/session", "token", 4096)
+
+    def test_missing_uploaded_video_requires_manual_verification_after_threshold(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "duration_seconds": 60.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 60.0, "status": "uploaded",
+                    "video_id": "remote-existing", "missing_checks": 19,
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_processing_status",
+                        return_value="missing"), mock.patch.object(
+                            YouTubeArchive, "_initiate_resumable_upload") as initiate, \
+                    mock.patch.object(
+                        YouTubeArchive, "_upload_resumable") as upload:
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "remote_verification_required")
+            initiate.assert_not_called()
+            upload.assert_not_called()
+            with open(job_path, "r", encoding="utf-8") as stream:
+                preserved = json.load(stream)
+            self.assertEqual(
+                preserved["segments"][0]["video_id"], "remote-existing")
+            self.assertEqual(preserved["segments"][0]["missing_checks"], 20)
+            self.assertEqual(
+                preserved["status"], "remote_verification_required")
+            self.assertFalse(YouTubeArchive.upload_job_is_actionable(preserved))
+
+    def test_uploaded_segments_poll_without_local_media(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "duration_seconds": 60.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 60.0, "status": "uploaded",
+                    "video_id": "remote-existing",
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+            os.remove(media)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_processing_status",
+                        return_value="processed") as processing, \
+                    mock.patch.object(
+                        YouTubeArchive,
+                        "_request_missing_media_finalization") as finalize:
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            processing.assert_called_once_with("token", "remote-existing")
+            finalize.assert_not_called()
+            with open(job_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["status"], "completed")
+
+    def test_missing_session_waits_but_replacement_requires_verification(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            store_path = os.path.join(folder, "channels.json")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                stale = json.load(stream)
+            stale_error_at = stale["updated_at"]
+            stale["error"] = "YouTube API HTTP 429 from an older attempt"
+            stale["quota_waiting_at"] = "2026-10-12T12:00:00"
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(stale, stream)
+            os.remove(media)
+            os.rmdir(session)
+
+            result = YouTubeArchive.process_upload_job(job_path, store_path)
+
+            self.assertEqual(result, "waiting_media")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                waiting = json.load(stream)
+            self.assertEqual(waiting["status"], "waiting_media")
+            self.assertIn("media_missing_since", waiting)
+            self.assertNotIn("error", waiting)
+            self.assertEqual(
+                waiting["previous_upload_error"],
+                "YouTube API HTTP 429 from an older attempt")
+            self.assertEqual(
+                waiting["previous_upload_error_at"], stale_error_at)
+            self.assertEqual(
+                waiting["quota_waiting_at"], "2026-10-12T12:00:00")
+
+            os.makedirs(session)
+            with open(media, "wb") as stream:
+                stream.write(b"restored" * 1024)
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile") as resolve, \
+                    mock.patch.object(
+                        YouTubeArchive,
+                        "_initiate_resumable_upload") as initiate, \
+                    mock.patch.object(
+                        YouTubeArchive, "_upload_resumable") as upload:
+                result = YouTubeArchive.process_upload_job(
+                    job_path, store_path)
+
+            self.assertEqual(result, "source_verification_required")
+            resolve.assert_not_called()
+            initiate.assert_not_called()
+            upload.assert_not_called()
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(
+                blocked["status"], "source_verification_required")
+            self.assertTrue(os.path.isfile(media))
+
+    def test_partial_remote_waiting_media_clears_previous_http_error(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            store_path = os.path.join(folder, "channels.json")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            stale_error_at = job["updated_at"]
+            job.update({
+                "duration_seconds": 120.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "error": "YouTube API HTTP 400 from an older attempt",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 60.0, "status": "uploaded",
+                    "video_id": "remote-existing",
+                }, {
+                    "part": 2, "start_seconds": 60.0,
+                    "duration_seconds": 60.0, "status": "pending",
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+            os.remove(media)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_processing_status",
+                        return_value="processed") as processing:
+                result = YouTubeArchive.process_upload_job(
+                    job_path, store_path)
+
+            self.assertEqual(result, "waiting_media")
+            processing.assert_called_once_with("token", "remote-existing")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                waiting = json.load(stream)
+            self.assertEqual(waiting["status"], "waiting_media")
+            self.assertIn("media_missing_since", waiting)
+            self.assertNotIn("error", waiting)
+            self.assertEqual(
+                waiting["previous_upload_error"],
+                "YouTube API HTTP 400 from an older attempt")
+            self.assertEqual(
+                waiting["previous_upload_error_at"], stale_error_at)
+
+    def test_terminated_without_processed_requires_manual_verification(self):
+        response = {"items": [{
+            "status": {"uploadStatus": "uploaded"},
+            "processingDetails": {"processingStatus": "terminated"},
+        }]}
+        with mock.patch.object(
+                YouTubeArchive, "_api_json", return_value=(response, {})):
+            self.assertEqual(
+                YouTubeArchive._processing_status("token", "video-1"),
+                "terminated")
+
+    def test_processed_upload_wins_when_processing_information_is_terminated(self):
+        response = {"items": [{
+            "status": {"uploadStatus": "processed"},
+            "processingDetails": {"processingStatus": "terminated"},
+        }]}
+        with mock.patch.object(
+                YouTubeArchive, "_api_json", return_value=(response, {})):
+            self.assertEqual(
+                YouTubeArchive._processing_status("token", "video-1"),
+                "processed")
+
+    def test_terminal_processing_failure_is_not_retried_by_queue(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            store_path = os.path.join(folder, "channels.json")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=True)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "duration_seconds": 60.0,
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "start_seconds": 0.0,
+                    "duration_seconds": 60.0, "status": "uploaded",
+                    "video_id": "remote-existing",
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), \
+                    mock.patch.object(
+                        YouTubeArchive, "_access_token", return_value="token"), \
+                    mock.patch.object(
+                        YouTubeArchive, "_processing_status",
+                        return_value="failed"):
+                result = YouTubeArchive.process_upload_job(
+                    job_path, store_path)
+
+            self.assertEqual(result, "remote_processing_failed")
+            self.assertTrue(os.path.isfile(media))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(blocked["status"], "remote_processing_failed")
+            self.assertEqual(
+                blocked["segments"][0]["video_id"], "remote-existing")
+            self.assertFalse(YouTubeArchive.upload_job_is_actionable(blocked))
+            with mock.patch.object(
+                    YouTubeArchive, "process_upload_job") as process:
+                summary = YouTubeArchive.run_upload_queue(
+                    queue_dir, store_path, max_wait_seconds=0)
+            process.assert_not_called()
+            self.assertEqual(summary["failed"], 0)
+
     def test_upload_job_writes_remote_index_then_deletes_only_large_media(self):
         with tempfile.TemporaryDirectory() as folder:
             session = os.path.join(folder, "session")
@@ -27467,6 +42579,1844 @@ class YouTubeArchiveAndCommonFunctionIndexTests(unittest.TestCase):
             self.assertEqual(index["occurrences"][0]["youtube"]["video_id"],
                              "video-2")
             self.assertEqual(index["occurrences"][0]["youtube"]["seconds"], 50.0)
+
+    def test_uploaded_video_id_is_checkpointed_before_processing_poll(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            store_path = os.path.join(folder, "channels.json")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, channel_profile="main",
+                delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "updated_at": "before-upload",
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            profile = {
+                "channel_id": "channel-main", "channel_title": "Main"}
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", profile)), mock.patch.object(
+                        YouTubeArchive, "_access_token",
+                        return_value="token"), mock.patch.object(
+                            YouTubeArchive, "_probe_duration",
+                            return_value=60.0), mock.patch.object(
+                                YouTubeArchive, "_materialize_segment",
+                                return_value=media) as materialize, \
+                    mock.patch.object(
+                        YouTubeArchive, "_initiate_resumable_upload",
+                        return_value="upload-1") as initiate, \
+                    mock.patch.object(
+                        YouTubeArchive, "_upload_resumable",
+                        return_value="video-1") as upload, \
+                    mock.patch.object(
+                        YouTubeArchive, "_processing_status",
+                        side_effect=[RuntimeError("status unavailable"),
+                                     "processed"]) as processing:
+                with self.assertRaisesRegex(
+                        RuntimeError, "status unavailable"):
+                    YouTubeArchive.process_upload_job(job_path, store_path)
+
+                with open(job_path, "r", encoding="utf-8") as stream:
+                    checkpoint = json.load(stream)
+                self.assertEqual(
+                    checkpoint["segments"][0]["video_id"], "video-1")
+                self.assertEqual(
+                    checkpoint["segments"][0]["status"], "uploaded")
+                self.assertNotEqual(checkpoint["updated_at"], "before-upload")
+
+                result = YouTubeArchive.process_upload_job(
+                    job_path, store_path)
+
+            self.assertEqual(result, "completed")
+            upload.assert_called_once()
+            initiate.assert_called_once()
+            materialize.assert_called_once()
+            self.assertEqual(processing.call_count, 2)
+
+    def test_invalid_grant_waits_for_reauthentication_without_retry_loop(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            store_path = os.path.join(folder, "channels.json")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, channel_profile="main")
+
+            with mock.patch.object(
+                    YouTubeArchive, "_resolve_profile",
+                    return_value=("main", {"channel_id": "channel-main"})), mock.patch.object(
+                        YouTubeArchive, "_access_token",
+                        side_effect=YouTubeArchive.YouTubeAuthenticationRequired(
+                            "invalid_grant: Token has been expired or revoked.")) as token:
+                result = YouTubeArchive.run_upload_queue(
+                    queue_dir, store_path, max_wait_seconds=0)
+
+            self.assertEqual(result["failed"], 1)
+            token.assert_called_once()
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(blocked["status"], "authentication_required")
+            self.assertEqual(blocked["authentication_profile"], "main")
+            self.assertEqual(blocked["channel_profile_resolved"], "main")
+            self.assertEqual(blocked["channel_id_resolved"], "channel-main")
+
+            # Re-enqueue must not erase the actionable authentication error.
+            self.assertEqual(
+                enqueue_upload_job(
+                    queue_dir, media, session, channel_profile="main"),
+                job_path)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(
+                    json.load(stream)["status"], "authentication_required")
+
+            with mock.patch.object(
+                    YouTubeArchive, "load_channel_store", return_value={
+                        "version": 1, "default_profile": "main",
+                        "profiles": {"main": {
+                            "channel_id": "channel-main"}}}):
+                resumed = YouTubeArchive.resume_upload_jobs_for_profile(
+                    queue_dir, store_path, "main")
+            self.assertEqual(resumed, [job_path])
+            with open(job_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["status"], "pending")
+
+    def test_reauthorize_rereads_job_after_claim_transition(self):
+        import contextlib
+
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            store_path = os.path.join(folder, "channels.json")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, channel_profile="main")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "status": "authentication_required",
+                "authentication_profile": "main",
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+            })
+            YouTubeArchive._atomic_json(job_path, job)
+            real_lock = YouTubeArchive._upload_job_state_lock
+
+            @contextlib.contextmanager
+            def claim_before_resume_read(path):
+                with real_lock(path):
+                    with open(path, "r", encoding="utf-8") as stream:
+                        claimed = json.load(stream)
+                    claimed["status"] = "uploading"
+                    claimed["segments"] = [{
+                        "part": 1, "start_seconds": 0.0,
+                        "duration_seconds": 1.0, "uploaded_bytes": 128,
+                        "upload_url": "https://upload.invalid/session",
+                    }]
+                    YouTubeArchive._atomic_json(path, claimed)
+                    yield
+
+            with mock.patch.object(
+                    YouTubeArchive, "load_channel_store", return_value={
+                        "version": 1, "default_profile": "main",
+                        "profiles": {"main": {
+                            "channel_id": "channel-main"}}}), \
+                    mock.patch.object(
+                        YouTubeArchive, "_upload_job_state_lock",
+                        side_effect=claim_before_resume_read):
+                resumed = YouTubeArchive.resume_upload_jobs_for_profile(
+                    queue_dir, store_path, "main")
+
+            self.assertEqual(resumed, [])
+            with open(job_path, "r", encoding="utf-8") as stream:
+                claimed = json.load(stream)
+            self.assertEqual(claimed["status"], "uploading")
+            self.assertEqual(
+                claimed["segments"][0]["upload_url"],
+                "https://upload.invalid/session")
+            self.assertEqual(claimed["segments"][0]["uploaded_bytes"], 128)
+
+    def test_authentication_marker_merges_fresh_claim_checkpoint(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, channel_profile="main")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                stale = json.load(stream)
+            fresh = dict(stale)
+            fresh["status"] = "uploading"
+            fresh["segments"] = [{
+                "part": 1, "start_seconds": 0.0, "duration_seconds": 1.0,
+                "uploaded_bytes": 128,
+                "upload_url": "https://upload.invalid/session",
+            }]
+            YouTubeArchive._atomic_json(job_path, fresh)
+            error = YouTubeArchive.YouTubeAuthenticationRequired(
+                "invalid_grant", profile_name="main")
+
+            self.assertTrue(
+                YouTubeArchive._mark_job_authentication_required(
+                    job_path, stale, error, profile_name="main"))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(blocked["status"], "authentication_required")
+            self.assertEqual(
+                blocked["segments"][0]["upload_url"],
+                "https://upload.invalid/session")
+            self.assertEqual(blocked["segments"][0]["uploaded_bytes"], 128)
+
+    def test_completed_upload_retries_local_media_cleanup_until_gone(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            evidence = os.path.join(session, "steps.jsonl")
+            with open(evidence, "w", encoding="utf-8") as stream:
+                stream.write("{}\n")
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=True)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job["status"] = "cleanup_pending"
+            job["cleanup_targets"] = (
+                YouTubeArchive._snapshot_uploaded_recording_cleanup_targets(job))
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            with mock.patch.object(
+                    YouTubeArchive.os, "remove",
+                    side_effect=PermissionError("recording is still open")):
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+            self.assertEqual(result, "cleanup_pending")
+            self.assertTrue(os.path.isfile(media))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["status"], "cleanup_pending")
+
+            result = YouTubeArchive.process_upload_job(
+                job_path, os.path.join(folder, "channels.json"))
+            self.assertEqual(result, "completed")
+            self.assertFalse(os.path.exists(media))
+            self.assertTrue(os.path.isfile(evidence))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                completed = json.load(stream)
+            self.assertEqual(completed["status"], "completed")
+            self.assertNotIn("cleanup_error", completed)
+
+    def test_cleanup_permission_failure_eventually_requires_attention(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=True)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "status": "cleanup_pending",
+                "cleanup_attempts": YouTubeArchive.MAX_CLEANUP_ATTEMPTS - 1,
+                "cleanup_targets": (
+                    YouTubeArchive._snapshot_uploaded_recording_cleanup_targets(
+                        job)),
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            with mock.patch.object(
+                    YouTubeArchive.os, "remove",
+                    side_effect=PermissionError("recording is still open")):
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "cleanup_attention_required")
+            self.assertTrue(os.path.isfile(media))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(blocked["status"], "cleanup_attention_required")
+            self.assertFalse(YouTubeArchive.upload_job_is_actionable(blocked))
+
+    def test_reauthorize_different_channel_does_not_resume_pinned_job(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, channel_profile="main")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "status": "authentication_required",
+                "authentication_profile": "main",
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-original",
+                "segments": [{"part": 1, "video_id": "video-existing"}],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            with mock.patch.object(
+                    YouTubeArchive, "load_channel_store", return_value={
+                        "version": 1, "default_profile": "main",
+                        "profiles": {"main": {
+                            "channel_id": "channel-different"}}}):
+                resumed = YouTubeArchive.resume_upload_jobs_for_profile(
+                    queue_dir, os.path.join(folder, "channels.json"), "main")
+
+            self.assertEqual(resumed, [])
+            with open(job_path, "r", encoding="utf-8") as stream:
+                blocked = json.load(stream)
+            self.assertEqual(blocked["status"], "authentication_required")
+            self.assertEqual(
+                blocked["channel_id_resolved"], "channel-original")
+            self.assertEqual(
+                blocked["segments"][0]["video_id"], "video-existing")
+            self.assertEqual(
+                blocked["authentication_error"], "channel_identity_mismatch")
+
+    def test_reauthorization_resumes_uploaded_segment_without_local_media(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            store_path = os.path.join(folder, "channels.json")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, channel_profile="main")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "status": "authentication_required",
+                "authentication_profile": "main",
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [{
+                    "part": 1, "status": "uploaded",
+                    "video_id": "remote-existing",
+                }],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+            os.remove(media)
+
+            with mock.patch.object(
+                    YouTubeArchive, "load_channel_store", return_value={
+                        "version": 1, "default_profile": "main",
+                        "profiles": {"main": {
+                            "channel_id": "channel-main"}}}):
+                resumed = YouTubeArchive.resume_upload_jobs_for_profile(
+                    queue_dir, store_path, "main")
+
+            self.assertEqual(resumed, [job_path])
+            with open(job_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["status"], "pending")
+
+    def test_reauthorization_unblocks_job_while_media_temporarily_missing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            store_path = os.path.join(folder, "channels.json")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, channel_profile="main")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job.update({
+                "status": "authentication_required",
+                "authentication_profile": "main",
+                "channel_profile_resolved": "main",
+                "channel_id_resolved": "channel-main",
+                "segments": [],
+            })
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+            os.remove(media)
+
+            with mock.patch.object(
+                    YouTubeArchive, "load_channel_store", return_value={
+                        "version": 1, "default_profile": "main",
+                        "profiles": {"main": {
+                            "channel_id": "channel-main"}}}):
+                resumed = YouTubeArchive.resume_upload_jobs_for_profile(
+                    queue_dir, store_path, "main")
+
+            self.assertEqual(resumed, [job_path])
+            with open(job_path, "r", encoding="utf-8") as stream:
+                resumed_job = json.load(stream)
+            self.assertEqual(resumed_job["status"], "pending")
+            self.assertEqual(
+                YouTubeArchive.process_upload_job(job_path, store_path),
+                "waiting_media")
+
+    def test_completed_job_never_deletes_recreated_media(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"old" * 2048)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=True)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job["cleanup_targets"] = (
+                YouTubeArchive._snapshot_uploaded_recording_cleanup_targets(job))
+            job["status"] = "completed"
+            job["segments"] = [{
+                "part": 1, "start_seconds": 0.0, "duration_seconds": 1.0,
+                "uploaded_bytes": 4096, "video_id": "durable-video-id",
+            }]
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+            os.remove(media)
+            with open(media, "wb") as stream:
+                stream.write(b"new" * 2048)
+
+            self.assertEqual(
+                YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json")),
+                "completed")
+            self.assertTrue(os.path.isfile(media))
+
+    def test_cleanup_retry_skips_replaced_identity_and_completes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"old" * 2048)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=True)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job["cleanup_targets"] = (
+                YouTubeArchive._snapshot_uploaded_recording_cleanup_targets(job))
+            job["status"] = "cleanup_pending"
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+            os.remove(media)
+            with open(media, "wb") as stream:
+                stream.write(b"replacement" * 1024)
+
+            result = YouTubeArchive.process_upload_job(
+                job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            self.assertTrue(os.path.isfile(media))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                completed = json.load(stream)
+            self.assertEqual(completed["status"], "completed")
+            self.assertEqual(
+                completed["cleanup_skipped_replaced_targets"], [media])
+
+    def test_cleanup_refuses_media_replaced_before_cleanup_journal(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"uploaded-original" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=True)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            self.assertTrue(job.get("recording_cleanup_targets"))
+
+            os.remove(media)
+            with open(media, "wb") as stream:
+                stream.write(b"new-not-uploaded" * 1024)
+
+            result = YouTubeArchive._finish_uploaded_recording_cleanup(
+                job_path, job)
+
+            self.assertEqual(result, "completed")
+            self.assertTrue(os.path.isfile(media))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                completed = json.load(stream)
+            self.assertEqual(completed["status"], "completed")
+            self.assertEqual(
+                completed["cleanup_skipped_replaced_targets"], [media])
+            self.assertIn(
+                "cleanup_skipped_replaced_targets_at", completed)
+
+    def test_cleanup_never_deletes_from_replaced_session_directory(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            original_session = os.path.join(folder, "original-session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            original_media = os.path.join(session, "recording.mp4")
+            with open(original_media, "wb") as stream:
+                stream.write(b"original" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, original_media, session, delete_local=True)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            self.assertIn("session_identity", job)
+
+            os.replace(session, original_session)
+            os.makedirs(session)
+            replacement_media = os.path.join(session, "recording.mp4")
+            with open(replacement_media, "wb") as stream:
+                stream.write(b"replacement" * 1024)
+            job["status"] = "cleanup_pending"
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            result = YouTubeArchive.process_upload_job(
+                job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            self.assertTrue(os.path.isfile(replacement_media))
+            self.assertTrue(os.path.isfile(os.path.join(
+                original_session, "recording.mp4")))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                completed = json.load(stream)
+            self.assertEqual(
+                completed["cleanup_skip_reason"],
+                "session_identity_unverified")
+            self.assertIn("cleanup_skipped_session_identity_at", completed)
+
+    def test_cleanup_never_traverses_reparse_session_to_external_media(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            original_session = os.path.join(folder, "original-session")
+            external = os.path.join(folder, "external")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            os.makedirs(external)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"original" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=True)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+
+            os.replace(session, original_session)
+            external_media = os.path.join(external, "recording.mp4")
+            with open(external_media, "wb") as stream:
+                stream.write(b"external" * 1024)
+            try:
+                os.symlink(external, session, target_is_directory=True)
+            except (NotImplementedError, OSError) as error:
+                self.skipTest("directory symlink unavailable: {}".format(error))
+            job["status"] = "cleanup_pending"
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            result = YouTubeArchive.process_upload_job(
+                job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            self.assertTrue(os.path.isfile(external_media))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                completed = json.load(stream)
+            self.assertEqual(
+                completed["cleanup_skip_reason"],
+                "session_identity_unverified")
+
+    def test_cleanup_rejects_session_reported_as_reparse_point(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"recording" * 1024)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=True)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job["status"] = "cleanup_pending"
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            original_check = YouTubeArchive._is_link_or_reparse_point
+
+            def report_session_reparse(path):
+                if os.path.normcase(os.path.abspath(path)) == \
+                        os.path.normcase(os.path.abspath(session)):
+                    return True
+                return original_check(path)
+
+            with mock.patch.object(
+                    YouTubeArchive, "_is_link_or_reparse_point",
+                    side_effect=report_session_reparse):
+                result = YouTubeArchive.process_upload_job(
+                    job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            self.assertTrue(os.path.isfile(media))
+            with open(job_path, "r", encoding="utf-8") as stream:
+                completed = json.load(stream)
+            self.assertEqual(
+                completed["cleanup_skip_reason"],
+                "session_identity_unverified")
+
+    def test_cleanup_pending_with_delete_disabled_persists_completed(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session = os.path.join(folder, "session")
+            queue_dir = os.path.join(folder, "queue")
+            os.makedirs(session)
+            media = os.path.join(session, "recording.mp4")
+            with open(media, "wb") as stream:
+                stream.write(b"x" * 4096)
+            job_path = enqueue_upload_job(
+                queue_dir, media, session, delete_local=False)
+            with open(job_path, "r", encoding="utf-8") as stream:
+                job = json.load(stream)
+            job["status"] = "cleanup_pending"
+            with open(job_path, "w", encoding="utf-8") as stream:
+                json.dump(job, stream)
+
+            result = YouTubeArchive.process_upload_job(
+                job_path, os.path.join(folder, "channels.json"))
+
+            self.assertEqual(result, "completed")
+            with open(job_path, "r", encoding="utf-8") as stream:
+                self.assertEqual(json.load(stream)["status"], "completed")
+            self.assertTrue(os.path.isfile(media))
+
+
+class StoryLastEventMarkerRecoveryTests(unittest.TestCase):
+    @staticmethod
+    def _source_class():
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, "r", encoding="utf-8-sig") as stream:
+            source_tree = ast.parse(stream.read())
+        source_class = next(
+            node for node in source_tree.body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "ZA_story_Base")
+        return source_path, source_class
+
+    def test_story_last_event_entries_configure_five_set_recovery(self):
+        _source_path, source_class = self._source_class()
+        assignments = {
+            node.targets[0].id: node.value
+            for node in source_class.body
+            if (isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name))
+        }
+        self.assertEqual(ast.literal_eval(assignments[
+            "ZA_STORY_EVENT_MARKER_NO_PROGRESS_SETS"]), 5)
+
+        expected = {
+            "_8_story_story_last_11": "8_STORY_STORY_LAST_10_0",
+            "_8_story_story_last_16": "8_STORY_STORY_LAST_14_0",
+            "_8_story_story_last_23": "8_STORY_STORY_LAST_21_0",
+            "_8_story_story_last_29": "8_STORY_STORY_LAST_26_0",
+            "_8_story_story_last_33": "8_STORY_STORY_LAST_32_0",
+            "_8_story_story_last_41": "8_STORY_STORY_LAST_40_0",
+        }
+        methods = {
+            node.name: node
+            for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+        }
+        for method_name, fallback in expected.items():
+            with self.subTest(method=method_name):
+                call = next(
+                    node for node in ast.walk(methods[method_name])
+                    if (isinstance(node, ast.Call)
+                        and isinstance(node.func, ast.Attribute)
+                        and node.func.attr
+                        == "ZA_story_Template_battle_before_renda_route"))
+                keywords = {
+                    keyword.arg: keyword.value for keyword in call.keywords}
+                self.assertEqual(ast.literal_eval(keywords[
+                    "event_marker_missing_fallback"]), fallback)
+                self.assertIs(keywords[
+                    "event_marker_seen_resets_missing_sets"].value, False)
+                limit_node = keywords["event_marker_missing_sets"]
+                self.assertIsInstance(limit_node, ast.Attribute)
+                self.assertEqual(
+                    limit_node.attr,
+                    "ZA_STORY_EVENT_MARKER_NO_PROGRESS_SETS")
+
+        self.assertIn("_8_story_story_last_14_0", methods)
+        self.assertIn("_8_story_story_last_40_0", methods)
+        namespace = {}
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[methods["_8_story_story_last_14_0"],
+                  methods["_8_story_story_last_40_0"]], type_ignores=[])),
+            _source_path, "exec"), namespace)
+
+        class ResetCommand:
+            def __init__(self):
+                self.reset_calls = 0
+
+            @staticmethod
+            def image_check(picture):
+                return picture == "POKEMON_ZA_FILED_HARD_CHECK_0"
+
+            def ZA_gamereset(self):
+                self.reset_calls += 1
+
+        reset_command = ResetCommand()
+        self.assertEqual(
+            namespace["_8_story_story_last_14_0"](reset_command),
+            "8_STORY_STORY_LAST_14")
+        self.assertEqual(reset_command.reset_calls, 1)
+        self.assertEqual(
+            namespace["_8_story_story_last_40_0"](reset_command),
+            "8_STORY_STORY_LAST_40")
+        self.assertEqual(reset_command.reset_calls, 2)
+
+    def test_event_seen_field_no_progress_falls_back_on_fifth_set(self):
+        source_path, source_class = self._source_class()
+        method_names = {
+            "_ZA_story_battle_flow_state",
+            "_ZA_story_battle_flow_mark",
+            "_ZA_story_battle_flow_reset",
+            "ZA_story_Template_battle_before_renda_route",
+        }
+        methods = [
+            node for node in source_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in method_names]
+        namespace = {
+            "Button": types.SimpleNamespace(A="A", B="B"),
+            "Stick": types.SimpleNamespace(LEFT="LEFT"),
+            "Direction": lambda stick, angle: (stick, angle),
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=methods, type_ignores=[])), source_path, "exec"), namespace)
+
+        class Command:
+            _ZA_story_battle_flow_state = namespace[
+                "_ZA_story_battle_flow_state"]
+            _ZA_story_battle_flow_mark = namespace[
+                "_ZA_story_battle_flow_mark"]
+            _ZA_story_battle_flow_reset = namespace[
+                "_ZA_story_battle_flow_reset"]
+            ZA_story_Template_battle_before_renda_route = namespace[
+                "ZA_story_Template_battle_before_renda_route"]
+
+            def __init__(self):
+                self.stop_reason = "field"
+                self.event_seen = True
+                self._za_markerdir_marker_seen_POKEMON_ZA_EVENT_MARKER = True
+
+            def _ZA_story_battle_before_safe_renda_once(self, **_kwargs):
+                return self.stop_reason, "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"
+
+            def ZA_markerdir(self, markertype, *_args, **_kwargs):
+                if markertype == "EVENT":
+                    self._za_markerdir_marker_seen_POKEMON_ZA_EVENT_MARKER = (
+                        self.event_seen)
+                    return self.event_seen
+                return False
+
+            @staticmethod
+            def press(*_args, **_kwargs):
+                return None
+
+            @staticmethod
+            def image_check(_picture):
+                return False
+
+        command = Command()
+        options = {
+            "noprg_ret": "BACK",
+            "prg_ret": "BATTLE",
+            "event_marker_missing_sets": 5,
+            "event_marker_missing_fallback": "RESET_STEP",
+            "event_marker_seen_resets_missing_sets": False,
+        }
+        for expected_count in range(1, 5):
+            self.assertEqual(
+                command.ZA_story_Template_battle_before_renda_route(
+                    **options),
+                "BACK")
+            self.assertEqual(
+                command._za_story_event_marker_missing_counts["BATTLE"],
+                expected_count)
+        self.assertEqual(
+            command.ZA_story_Template_battle_before_renda_route(**options),
+            "RESET_STEP")
+        self.assertNotIn(
+            "BATTLE", command._za_story_event_marker_missing_counts)
+
+        # 既定値は従来どおり、EVENTを一度でも検知すると0へ戻す。
+        default_command = Command()
+        default_command.event_seen = False
+        default_options = dict(options)
+        del default_options["event_marker_seen_resets_missing_sets"]
+        self.assertEqual(
+            default_command.ZA_story_Template_battle_before_renda_route(
+                **default_options),
+            "BACK")
+        self.assertEqual(
+            default_command._za_story_event_marker_missing_counts["BATTLE"],
+            1)
+        default_command.event_seen = True
+        self.assertEqual(
+            default_command.ZA_story_Template_battle_before_renda_route(
+                **default_options),
+            "BACK")
+        self.assertNotIn(
+            "BATTLE", default_command._za_story_event_marker_missing_counts)
+
+        # FIELD以外へ進めた場合は、次の挑戦へ回数を持ち越さない。
+        command.ZA_story_Template_battle_before_renda_route(**options)
+        command.stop_reason = "active_level"
+        self.assertEqual(
+            command.ZA_story_Template_battle_before_renda_route(**options),
+            "BATTLE")
+        self.assertNotIn(
+            "BATTLE", command._za_story_event_marker_missing_counts)
+
+
+class Last48UncheckedCoverAttackTests(unittest.TestCase):
+    @staticmethod
+    def _combat_update(path, encoding):
+        with open(path, "r", encoding=encoding) as stream:
+            tree = ast.parse(stream.read())
+        return next(
+            node for node in ast.walk(tree)
+            if (isinstance(node, ast.FunctionDef)
+                and node.name == "ZA_mega_mode5_testmode1_combat_update"))
+
+    def test_blue_and_red_cover_attack_press_a_then_b_without_skill_check(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        fragment_path = os.path.join(
+            SERIAL_CONTROLLER, "DevTemplates", "Fragments", "Pokemon_ZA",
+            "ZA_MovementAndEvent", "ZA_MovementAndEvent.pyfrag")
+        source_function = self._combat_update(source_path, "utf-8-sig")
+        fragment_function = self._combat_update(fragment_path, "utf-8")
+        self.assertEqual(
+            normalized_function_ast_dump(source_function),
+            normalized_function_ast_dump(fragment_function))
+
+        phase_branches = {}
+        for node in ast.walk(source_function):
+            if not isinstance(node, ast.If):
+                continue
+            test = node.test
+            if not (isinstance(test, ast.Compare)
+                    and isinstance(test.left, ast.Name)
+                    and test.left.id == "phase"
+                    and len(test.ops) == 1
+                    and isinstance(test.ops[0], ast.Eq)
+                    and len(test.comparators) == 1
+                    and isinstance(test.comparators[0], ast.Constant)):
+                continue
+            phase_branches[test.comparators[0].value] = node.body
+
+        for phase in ("RED_COVER_ATTACK", "COVER_ATTACK"):
+            with self.subTest(phase=phase):
+                branch_nodes = [
+                    child
+                    for statement in phase_branches[phase]
+                    for child in ast.walk(statement)]
+                button_presses = [
+                    child.args[0].attr
+                    for child in branch_nodes
+                    if (isinstance(child, ast.Call)
+                        and isinstance(child.func, ast.Attribute)
+                        and child.func.attr == "press"
+                        and child.args
+                        and isinstance(child.args[0], ast.Attribute)
+                        and isinstance(child.args[0].value, ast.Name)
+                        and child.args[0].value.id == "Button")]
+                self.assertEqual(button_presses, ["A", "B"])
+                self.assertFalse(any(
+                    isinstance(child, ast.Call)
+                    and isinstance(child.func, ast.Attribute)
+                    and child.func.attr == "ZA_mega_mode5_skill_attack_ready"
+                    for child in branch_nodes))
+
+
+class OperationStepPlanTests(unittest.TestCase):
+    @staticmethod
+    def _rows():
+        return [
+            {"kind": "input", "line": 1, "time": 0.0,
+             "message": "0x0002 8 ff 80", "source": "pc_gamepad"},
+            {"kind": "input", "line": 2, "time": 0.1,
+             "message": "0x0010 8", "source": "pc_gamepad"},
+            {"kind": "input", "line": 3, "time": 0.2,
+             "message": "0x0000 8", "source": "pc_gamepad"},
+            {"kind": "input", "line": 4, "time": 0.3,
+             "message": "0x0002 8 80 80", "source": "pc_gamepad"},
+            {"kind": "input", "line": 5, "time": 0.4,
+             "message": "0x0000 6", "source": "pc_gamepad"},
+            {"kind": "input", "line": 6, "time": 0.5,
+             "message": "0x0000 8", "source": "pc_gamepad"},
+        ]
+
+    @staticmethod
+    def _write_inputs(folder, rows):
+        path = os.path.join(folder, "inputs.jsonl")
+        with open(path, "w", encoding="utf-8", newline="\n") as stream:
+            for row in rows:
+                stream.write(json.dumps(row, ensure_ascii=False) + "\n")
+        return path
+
+    def test_recording_frame_capture_saves_unicode_path_and_registration_row(self):
+        with tempfile.TemporaryDirectory() as folder:
+            session_dir = os.path.join(folder, "session")
+            image_root = os.path.join(folder, "画像")
+            os.makedirs(session_dir)
+            frame = numpy.zeros((72, 128, 3), dtype=numpy.uint8)
+            frame[20:50, 10:60] = (20, 100, 220)
+
+            metadata = save_frame_capture(
+                frame, [10, 20, 60, 50], session_dir,
+                {"session_id": "capture-session"}, 12.5, "READY_MARK",
+                image_root=image_root, threshold=0.91, use_gray=False,
+                extra_metadata={"input_time": 11.25,
+                                "source_video_label": "1280x720 元映像"})
+            row = frame_capture_detection_row(metadata)
+
+            self.assertEqual(
+                os.path.join(image_root, "READY_MARK.png"),
+                metadata["template_path"])
+            self.assertTrue(os.path.isfile(metadata["template_path"]))
+            saved = cv2.imdecode(
+                numpy.fromfile(metadata["template_path"], dtype=numpy.uint8),
+                cv2.IMREAD_COLOR)
+            self.assertEqual((30, 50), saved.shape[:2])
+            sidecar = metadata["metadata_path"]
+            with open(sidecar, "r", encoding="utf-8") as stream:
+                persisted = json.load(stream)
+            self.assertEqual(2, persisted["schema_version"])
+            self.assertEqual(11.25, persisted["input_time"])
+            self.assertEqual("READY_MARK", row["name"])
+            self.assertEqual([10, 20, 60, 50], row["crop"])
+            self.assertEqual(0.91, row["threshold"])
+            self.assertFalse(row["use_gray"])
+            with self.assertRaises(FileExistsError):
+                save_frame_capture(
+                    frame, [10, 20, 60, 50], session_dir,
+                    {"session_id": "capture-session"}, 12.5,
+                    "READY_MARK", image_root=image_root)
+
+            japanese = save_frame_capture(
+                frame, [10, 20, 60, 50], session_dir,
+                {"session_id": "capture-session"}, 13.0,
+                "戦闘開始", image_root=image_root)
+            self.assertEqual("戦闘開始.png", os.path.basename(
+                japanese["template_path"]))
+
+            first_collision = save_frame_capture(
+                frame, [10, 20, 60, 50], session_dir,
+                {"session_id": "capture-session"}, 14.0,
+                "A:B", image_root=image_root)
+            second_collision = save_frame_capture(
+                frame, [10, 20, 60, 50], session_dir,
+                {"session_id": "capture-session"}, 15.0,
+                "A?B", image_root=image_root)
+            self.assertNotEqual(
+                os.path.normcase(first_collision["template_path"]),
+                os.path.normcase(second_collision["template_path"]))
+
+            other_session_dir = os.path.join(folder, "other-session")
+            os.makedirs(other_session_dir)
+            cross_session = save_frame_capture(
+                frame, [10, 20, 60, 50], other_session_dir,
+                {"session_id": "other-session"}, 16.0,
+                "A:B", image_root=image_root)
+            self.assertNotEqual(
+                os.path.normcase(first_collision["template_path"]),
+                os.path.normcase(cross_session["template_path"]))
+
+            manual_path = os.path.join(image_root, "MANUAL.png")
+            with open(manual_path, "wb") as stream:
+                stream.write(b"keep")
+            protected_manual = save_frame_capture(
+                frame, [10, 20, 60, 50], session_dir,
+                {"session_id": "capture-session"}, 17.0,
+                "MANUAL", image_root=image_root)
+            self.assertNotEqual(
+                os.path.normcase(manual_path),
+                os.path.normcase(protected_manual["template_path"]))
+            with open(manual_path, "rb") as stream:
+                self.assertEqual(b"keep", stream.read())
+
+            image_root_b = os.path.join(folder, "画像B")
+            root_a_capture = save_frame_capture(
+                frame, [10, 20, 60, 50], session_dir,
+                {"session_id": "capture-session"}, 18.0,
+                "ROOT_SWITCH", image_root=image_root)
+            root_b_capture = save_frame_capture(
+                frame, [10, 20, 60, 50], session_dir,
+                {"session_id": "capture-session"}, 19.0,
+                "ROOT_SWITCH", image_root=image_root_b)
+            root_a_again = save_frame_capture(
+                frame, [10, 20, 60, 50], session_dir,
+                {"session_id": "capture-session"}, 20.0,
+                "ROOT_SWITCH", image_root=image_root, overwrite=True)
+            self.assertEqual(
+                os.path.normcase(root_a_capture["template_path"]),
+                os.path.normcase(root_a_again["template_path"]))
+            self.assertNotEqual(
+                os.path.normcase(root_a_capture["template_path"]),
+                os.path.normcase(root_b_capture["template_path"]))
+            self.assertNotEqual(
+                os.path.normcase(root_a_capture["metadata_path"]),
+                os.path.normcase(root_b_capture["metadata_path"]))
+
+    def test_capture_anchor_converts_video_time_back_to_input_timeline(self):
+        studio = LightweightOperationStudio.__new__(LightweightOperationStudio)
+        studio.video_origin = 100.0
+        studio.current_time = 4.5
+
+        class Value(object):
+            def get(self):
+                return "1.250"
+
+        class Index(object):
+            def __init__(self):
+                self.requested = None
+
+            def line_at_time(self, value):
+                self.requested = value
+                return 42
+
+        studio.video_sync = Value()
+        studio.input_index = Index()
+        anchor = studio._capture_anchor()
+
+        self.assertAlmostEqual(103.25, studio.input_index.requested)
+        self.assertEqual(42, anchor["input_start"])
+        self.assertEqual(42, anchor["input_end"])
+        self.assertAlmostEqual(103.25, anchor["video_start"])
+
+    def test_capture_dialog_rolls_back_files_when_registration_is_cancelled(self):
+        try:
+            import tkinter as tk
+            root = tk.Tk()
+        except Exception as error:
+            self.skipTest("Tk unavailable: {}".format(error))
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                image_root = os.path.join(folder, "images")
+                dialog = FrameCaptureDialog(
+                    root, numpy.zeros((72, 128, 3), dtype=numpy.uint8),
+                    folder, {"session_id": "rollback"}, 3.0, None,
+                    image_roots=[image_root],
+                    details_callback=lambda *_args: False)
+                self.assertIn("rollback", dialog.name.get())
+                dialog.name.set("ROLLBACK_CAPTURE")
+                dialog.save(True)
+
+                self.assertFalse(os.path.exists(os.path.join(
+                    image_root, "ROLLBACK_CAPTURE.png")))
+                self.assertEqual([], os.listdir(os.path.join(
+                    folder, "captures")))
+                self.assertTrue(dialog.winfo_exists())
+                dialog.destroy()
+        finally:
+            root.destroy()
+
+    def test_failed_source_registration_does_not_insert_image_branch(self):
+        studio = LightweightOperationStudio.__new__(LightweightOperationStudio)
+        items = []
+        step = {"id": "step-1", "items": items}
+        studio._content_insertion = lambda: (step, items, 0, {})
+        studio._capture_anchor = lambda _metadata=None: {
+            "input_start": 1, "input_end": 1,
+            "video_start": 0.5, "video_end": 0.5}
+
+        class Value(object):
+            def get(self):
+                return "command.py"
+
+        studio.source_path = Value()
+
+        def fail_registration(_row, _path):
+            raise ValueError("source changed")
+
+        studio.register_image_check_callback = fail_registration
+        metadata = {
+            "logical_name": "READY", "template_path": os.path.join(
+                tempfile.gettempdir(), "READY.png"),
+            "crop": [0, 0, 20, 20], "threshold": 0.8,
+            "use_gray": True,
+        }
+        with self.assertRaisesRegex(ValueError, "source changed"):
+            studio._captured_frame_registration(metadata, True, True)
+        self.assertEqual([], items)
+
+    def test_frame_capture_rejects_changed_session_source_or_step(self):
+        studio = LightweightOperationStudio.__new__(LightweightOperationStudio)
+        studio._load_generation = 4
+        studio.session_dir = os.path.join(tempfile.gettempdir(), "new-session")
+
+        class Value(object):
+            def get(self):
+                return "new-command.py"
+
+        class Tree(object):
+            def selection(self):
+                return ("new-step",)
+
+        studio.source_path = Value()
+        studio.tree = Tree()
+        context = {
+            "load_generation": 3,
+            "session_dir": os.path.normcase(os.path.abspath(
+                os.path.join(tempfile.gettempdir(), "old-session"))),
+            "source_path": "old-command.py",
+            "selection": ("old-step",),
+        }
+        with mock.patch(
+                "LightweightOperationStudio.messagebox.showerror") as error:
+            completed = studio._captured_frame_registration(
+                {"template_path": "capture.png"}, True, True,
+                capture_context=context)
+        self.assertFalse(completed)
+        self.assertEqual(1, error.call_count)
+        message = error.call_args[0][1]
+        self.assertIn("操作記録", message)
+        self.assertIn("ソース", message)
+        self.assertIn("Step選択", message)
+
+    def test_readable_operations_keep_source_and_video_provenance(self):
+        rows = self._rows()
+        operations = readable_switch_operations(rows)
+        self.assertEqual(
+            [item["code"] for item in operations],
+            readable_switch_input_lines(rows, indent=""))
+        press = next(item for item in operations if "self.press(Button.A" in item["code"])
+        self.assertEqual((press["start_line"], press["end_line"]), (2, 3))
+        self.assertEqual(press["time"], 0.1)
+        self.assertFalse(any("0x" in item["code"] for item in operations))
+        malformed = readable_switch_operations([
+            {"line": 1, "time": 1.0, "message": "0x0010 8"},
+            {"line": 2, "time": 1.1, "message": "not-a-packet"},
+            {"line": 3, "time": 1.2, "message": "0x0000 8"},
+        ])
+        self.assertEqual([item["time"] for item in malformed],
+                         sorted(item["time"] for item in malformed))
+        self.assertIn("self.press(Button.A", malformed[0]["code"])
+        self.assertTrue(malformed[1]["code"].startswith("# 未解読入力"))
+
+    def test_jsonl_index_is_lazy_compact_and_preserves_held_state(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "inputs.jsonl")
+            with open(path, "w", encoding="utf-8", newline="") as stream:
+                stream.write("{broken json\r\n")
+                stream.write(json.dumps({
+                    "kind": "input", "line": 99, "time": 0.0,
+                    "message": "keyboard", "summary": "日本語キーボード",
+                    "source": "pc_keyboard",
+                }, ensure_ascii=False) + "\r\n")
+                for row in self._rows():
+                    value = dict(row)
+                    value["summary"] = "日本語入力{}".format(row["line"])
+                    stream.write(json.dumps(value, ensure_ascii=False) + "\r\n")
+            index = JsonlInputIndex(path, checkpoint_lines=[2, 5])
+            self.assertEqual(len(index), 6)
+            self.assertEqual(type(index.lines).__name__, "array")
+            self.assertEqual(type(index.times).__name__, "array")
+            self.assertEqual(type(index.offsets).__name__, "array")
+            self.assertEqual(index._range_cache, {})
+            # Ask out of order to prove each checkpoint represents state
+            # before that row rather than depending on expansion order.
+            state_five = index.state_before(5)
+            state_two = index.state_before(2)
+            self.assertIsNone(state_five["left"])
+            self.assertIsNotNone(state_two["left"])
+            suffix = readable_switch_operations(
+                index.read_range(2, 4), initial_state=state_two)
+            text = "\n".join(item["code"] for item in suffix)
+            self.assertIn("self.press(Button.A", text)
+            self.assertIn("self.holdEnd(Direction(Stick.LEFT", text)
+            self.assertEqual(index.line_at_time(0.41), 5)
+            self.assertEqual(index.time_for_line(6), 0.5)
+            index.read_range(1, 1)
+            index.read_range(2, 2)
+            index.read_range(3, 3)
+            self.assertLessEqual(len(index._range_cache), 2)
+
+            worker_index = index.fork_reader()
+            self.assertIs(worker_index.lines, index.lines)
+            self.assertIsNot(worker_index._range_cache, index._range_cache)
+            worker_index.read_range(4, 6)
+            self.assertTrue(worker_index._range_cache)
+            original_cache = copy.deepcopy(index._range_cache)
+            worker_index.clear_cache()
+            self.assertEqual(index._range_cache, original_cache)
+
+    def test_plan_migrates_without_changing_mappings_and_persists_order(self):
+        mappings = [{
+            "id": "s1", "kind": "step", "start_line": 1, "end_line": 4,
+            "step_name": "STEP_A", "next_step": "STEP_B", "notes": "A",
+        }, {
+            "id": "s2", "kind": "step", "start_line": 5, "end_line": 6,
+            "step_name": "STEP_B", "next_step": "STEP_END", "notes": "B",
+        }]
+        with tempfile.TemporaryDirectory() as folder:
+            mapping_path = os.path.join(folder, "mappings.json")
+            original = json.dumps({"schema_version": 1, "mappings": mappings},
+                                  ensure_ascii=False, indent=2).encode("utf-8")
+            with open(mapping_path, "wb") as stream:
+                stream.write(original)
+            plan, existed = load_step_plan(
+                folder, {"session_id": "s"}, mappings)
+            self.assertFalse(existed)
+            self.assertEqual(len(plan["steps"]), 2)
+            self.assertEqual(plan["steps"][0]["items"][0]["kind"], "recorded")
+            before_links = [step["next_step"] for step in plan["steps"]]
+            self.assertTrue(move_step(plan, "s2", -1))
+            self.assertEqual([step["name"] for step in plan["steps"]],
+                             ["STEP_B", "STEP_A"])
+            self.assertEqual(sorted(step["next_step"] for step in plan["steps"]),
+                             sorted(before_links))
+            saved = save_step_plan(folder, plan)
+            loaded, existed = load_step_plan(folder)
+            self.assertTrue(existed)
+            self.assertEqual([step["name"] for step in loaded["steps"]],
+                             ["STEP_B", "STEP_A"])
+            self.assertEqual(loaded["revision"], saved["revision"])
+            with open(mapping_path, "rb") as stream:
+                self.assertEqual(stream.read(), original)
+
+    def test_materialized_step_supports_function_leaf_and_image_branch(self):
+        rows = self._rows()
+        with tempfile.TemporaryDirectory() as folder:
+            index = JsonlInputIndex(self._write_inputs(folder, rows), [1])
+            plan = migrate_mappings({"session_id": "branch"}, [{
+                "id": "s1", "kind": "step", "start_line": 1, "end_line": 6,
+                "step_name": "STEP_A", "next_step": "STEP_END",
+            }])
+            step = plan["steps"][0]
+            materialize_step(step, index)
+            self.assertTrue(step["materialized"])
+            self.assertFalse(any(item["kind"] == "recorded" for item in step["items"]))
+            original = step["items"].pop(0)
+            branch = new_branch(
+                "image_check", 'SSR3_結果"確認', wrapped_item=original)
+            branch["branches"][0]["items"].append(new_call("handle_result"))
+            branch["branches"][1]["items"].append(new_return("RETRY"))
+            step["items"].insert(0, branch)
+            source, source_map, warnings = render_plan(plan, index)
+            ast.parse(source)
+            self.assertIn("if self.image_check('SSR3_結果\"確認'):", source)
+            self.assertIn("self.handle_result()", source)
+            self.assertIn("else:", source)
+            self.assertIn("return 'RETRY'", source)
+            self.assertNotIn("direct_serial", source)
+            self.assertNotRegex(source, r"\b0x[0-9a-fA-F]+\b")
+            call = branch["branches"][0]["items"][-1]
+            self.assertEqual(call["kind"], "call")
+            self.assertNotIn("items", call)
+            self.assertTrue(source_map)
+            self.assertEqual(warnings, [])
+            condition_text = _condition_text({
+                "kind": "image_check", "target": "a'b\"c",
+                "negate": False,
+            })
+            self.assertIn(repr("a'b\"c"), condition_text)
+            ast.parse("if {}:\n    pass\n".format(condition_text))
+
+    def test_step_boundaries_preserve_recorded_waits(self):
+        rows = [
+            {"kind": "input", "line": 1, "time": 0.0,
+             "message": "0x0000 8", "source": "pc_gamepad"},
+            {"kind": "input", "line": 2, "time": 1.0,
+             "message": "0x0010 8", "source": "pc_gamepad"},
+            {"kind": "input", "line": 3, "time": 5.0,
+             "message": "0x0000 8", "source": "pc_gamepad"},
+            {"kind": "input", "line": 4, "time": 6.0,
+             "message": "0x0000 8", "source": "pc_gamepad"},
+        ]
+        mappings = [{
+            "id": "first", "kind": "step", "start_line": 1,
+            "end_line": 2, "step_name": "FIRST", "next_step": "SECOND",
+        }, {
+            "id": "second", "kind": "step", "start_line": 3,
+            "end_line": 4, "step_name": "SECOND", "next_step": "STEP_END",
+        }]
+        generated = generate_intermediate(
+            {"session_id": "boundary"}, rows, mappings)
+        second_source = generated.split("def SECOND(self):", 1)[1]
+        self.assertIn("    self.wait(4)", second_source)
+        with tempfile.TemporaryDirectory() as folder:
+            index = JsonlInputIndex(self._write_inputs(folder, rows), [1, 3])
+            plan = migrate_mappings({"session_id": "boundary"}, mappings)
+            preview, _source_map, _warnings = render_plan(plan, index)
+            second_preview = preview.split("def SECOND(self):", 1)[1]
+            self.assertIn("    self.wait(4)", second_preview)
+            materialize_step(plan["steps"][1], index)
+            materialized = [
+                item.get("source", "")
+                for item in plan["steps"][1]["items"]
+                if item.get("kind") == "operation"]
+            self.assertIn("self.wait(4)", materialized)
+
+        function_rows = [
+            {"kind": "input", "line": 1, "time": 2.5,
+             "message": "0x0010 8", "source": "pc_gamepad"},
+            {"kind": "input", "line": 2, "time": 3.0,
+             "message": "0x0000 8", "source": "pc_gamepad"},
+        ]
+        function_mappings = [{
+            "id": "function-step", "kind": "step", "start_line": 1,
+            "end_line": 2, "step_name": "FUNCTION_STEP",
+            "next_step": "STEP_END",
+        }, {
+            "id": "function", "kind": "function", "start_line": 1,
+            "end_line": 2, "function_name": "helper",
+            "call_from_step": "FUNCTION_STEP",
+        }]
+        with tempfile.TemporaryDirectory() as folder:
+            index = JsonlInputIndex(
+                self._write_inputs(folder, function_rows), [1])
+            plan = migrate_mappings(
+                {"session_id": "function-boundary"}, function_mappings)
+            preview, _source_map, _warnings = render_plan(plan, index)
+            step_source = preview.split("def FUNCTION_STEP(self):", 1)[1]
+            self.assertIn("    self.wait(2.5)", step_source)
+            self.assertIn("    self.helper()", step_source)
+
+    def test_multiline_labels_and_comments_stay_comments(self):
+        plan = normalise_plan({"session_id": "comments", "steps": [{
+            "id": "s", "name": "SAFE", "label": "説明\nself.injected()",
+            "materialized": True,
+            "items": [
+                {"kind": "comment", "text": "補足\nself.injected()"},
+                {"kind": "ignore", "text": "除外\nself.injected()"},
+            ],
+        }]})
+        source, _source_map, _warnings = render_plan(plan)
+        ast.parse(source)
+        source_lines = source.splitlines()
+        self.assertIn("    # self.injected()", source_lines)
+        self.assertIn("    # 反映不要: self.injected()", source_lines)
+        self.assertFalse(any(line == "self.injected()" for line in source_lines))
+
+    def test_split_step_updates_explicit_links_and_rejects_crossing_operation(self):
+        plan = normalise_plan({"session_id": "split", "steps": [{
+            "id": "s1", "name": "STEP_A", "next_step": "STEP_C",
+            "input_start": 1, "input_end": 10,
+            "items": [{"kind": "recorded", "input_start": 1, "input_end": 10}],
+        }, {"id": "s3", "name": "STEP_C", "next_step": "STEP_END",
+            "materialized": True, "items": []}]})
+        created = split_step(plan, "s1", 6, "STEP_B")
+        self.assertEqual((plan["steps"][0]["input_start"],
+                          plan["steps"][0]["input_end"]), (1, 5))
+        self.assertEqual((created["input_start"], created["input_end"]), (6, 10))
+        self.assertEqual(plan["steps"][0]["next_step"], "STEP_B")
+        self.assertEqual(created["next_step"], "STEP_C")
+        crossing = normalise_plan({"steps": [{
+            "id": "x", "name": "X", "input_start": 1, "input_end": 10,
+            "materialized": True,
+            "items": [{"kind": "operation", "source": "self.wait(1)",
+                       "input_start": 4, "input_end": 7}],
+        }]})
+        with self.assertRaises(ValueError):
+            split_step(crossing, "x", 6, "Y")
+        unchanged = copy.deepcopy(plan)
+        with self.assertRaises(ValueError):
+            split_step(plan, "s1", 3, "")
+        self.assertEqual(plan, unchanged)
+        with self.assertRaises(ValueError):
+            split_step(plan, "s1", 3, "STEP_C")
+        self.assertEqual(plan, unchanged)
+
+        materialized = normalise_plan({"steps": [{
+            "id": "shared", "name": "SHARED", "input_start": 1,
+            "input_end": 4, "materialized": True,
+            "items": [
+                {"id": "first-op", "kind": "operation",
+                 "source": "self.wait(1)", "input_start": 1,
+                 "input_end": 2},
+                {"id": "second-op", "kind": "operation",
+                 "source": "self.press(Button.A, wait=0.0)",
+                 "input_start": 2, "input_end": 4},
+            ],
+        }]})
+        created = split_step(
+            materialized, "shared", 2, "SHARED_2",
+            split_node_id="second-op")
+        self.assertEqual(
+            [item["id"] for item in materialized["steps"][0]["items"]],
+            ["first-op"])
+        self.assertEqual([item["id"] for item in created["items"]],
+                         ["second-op"])
+
+    def test_rename_updates_returns_and_invalid_loaded_plan_is_rejected(self):
+        plan = normalise_plan({"steps": [{
+            "id": "from", "name": "FROM", "next_step": "OLD",
+            "materialized": True,
+            "items": [new_return("OLD")],
+        }, {
+            "id": "old", "name": "OLD", "materialized": True,
+            "items": [],
+        }]})
+        self.assertEqual(rename_step_references(plan, "OLD", "NEW"), 2)
+        self.assertEqual(plan["steps"][0]["next_step"], "NEW")
+        self.assertEqual(plan["steps"][0]["items"][0]["target"], "NEW")
+
+        with tempfile.TemporaryDirectory() as folder:
+            cases = [
+                ({"schema_version": 99, "steps": []}, "schema_version"),
+                ({"schema_version": 1, "session_id": "other", "steps": []},
+                 "session_id"),
+                ({"schema_version": 1, "session_id": "expected", "steps": [
+                    {"id": "same", "name": "A", "items": []},
+                    {"id": "same", "name": "B", "items": []},
+                ]}, "ID"),
+                ({"schema_version": 1, "session_id": "expected",
+                  "steps": "not-a-list"}, "steps"),
+                ({"schema_version": 1, "session_id": "expected", "steps": [
+                    {"id": "bad-items", "name": "BAD",
+                     "items": "not-a-list"},
+                ]}, "items"),
+                ({"schema_version": 1, "session_id": "expected", "steps": [
+                    {"id": "bad-branches", "name": "BAD", "items": [
+                        {"kind": "branch", "branches": "not-a-list"},
+                    ]},
+                ]}, "branches"),
+                ({"schema_version": 1, "session_id": "expected",
+                  "generation": "not-an-object", "steps": []},
+                 "generation"),
+                ({"schema_version": 1, "session_id": "expected", "steps": [
+                    {"id": "bad-condition", "name": "BAD", "items": [
+                        {"kind": "branch", "branches": [{
+                            "condition": [["kind", "expression"]],
+                            "items": [],
+                        }]},
+                    ]},
+                ]}, "condition"),
+            ]
+            for value, problem in cases:
+                with open(step_plan_path(folder), "w", encoding="utf-8") as stream:
+                    json.dump(value, stream)
+                with self.assertRaisesRegex(ValueError, problem):
+                    load_step_plan(
+                        folder, session={"session_id": "expected"})
+
+    def test_validation_rejects_missing_recorded_range_and_call_body(self):
+        with tempfile.TemporaryDirectory() as folder:
+            index = JsonlInputIndex(
+                self._write_inputs(folder, self._rows()), [1])
+            plan = normalise_plan({"steps": [{
+                "id": "bad", "name": "BAD", "input_start": 100,
+                "input_end": 110, "items": [
+                    {"kind": "recorded", "input_start": 100,
+                     "input_end": 110},
+                    new_call("helper", source="self.wait(99)"),
+                ],
+            }]})
+            validation = validate_plan(plan, input_index=index)
+            self.assertTrue(any("記録範囲に入力がありません" in item
+                                for item in validation["errors"]))
+            self.assertTrue(any("関数名のみ" in item
+                                for item in validation["errors"]))
+
+    def test_preview_is_separate_atomic_and_rejects_raw_packets(self):
+        with tempfile.TemporaryDirectory() as folder:
+            final_path = os.path.join(folder, "SSR3_Story.py")
+            final_source = b"class SSR3_Story(object):\n    MINIGAME = True\n"
+            with open(final_path, "wb") as stream:
+                stream.write(final_source)
+            plan = normalise_plan({
+                "session_id": "preview", "source_path": final_path,
+                "steps": [{
+                    "id": "s1", "name": "STEP_A", "next_step": "STEP_END",
+                    "materialized": True,
+                    "items": [new_operation("self.wait(0.1)")],
+                }],
+            })
+            paths, warnings = save_preview(folder, plan)
+            self.assertEqual(paths, preview_paths(folder))
+            self.assertTrue(os.path.isfile(paths["source"]))
+            self.assertTrue(os.path.isfile(paths["map"]))
+            with open(final_path, "rb") as stream:
+                self.assertEqual(stream.read(), final_source)
+            self.assertEqual(warnings, [])
+            plan["steps"][0]["items"] = [new_operation(
+                "self.direct_serial(['0x0010 8'], [])")]
+            validation = validate_plan(plan)
+            self.assertTrue(any("生パケット" in item
+                                for item in validation["errors"]))
+            for bypass in (
+                    "self.direct_serial (['0010 8'], [])",
+                    "self.send('0X0010')",
+                    "self.send(0x_0010)",
+                    "self.send(0x00_10)",
+                    "self.direct_serial.__call__(['0010 8'], [])",
+                    "getattr(self, 'direct_serial')(['0010 8'], [])",
+                    "f = self.direct_serial\nf(['0010 8'], [])",
+                    "self.send('0' 'X0010 8')"):
+                plan["steps"][0]["items"] = [new_operation(bypass)]
+                validation = validate_plan(plan)
+                self.assertTrue(any("生パケット" in item
+                                    for item in validation["errors"]), bypass)
+            invalid_names = normalise_plan({"steps": [{
+                "id": "a", "name": "A-B", "materialized": True,
+                "items": [new_call("for")],
+            }, {
+                "id": "b", "name": "A B", "materialized": True,
+                "items": [],
+            }]})
+            validation = validate_plan(invalid_names)
+            self.assertTrue(any("関数名" in item for item in validation["errors"]))
+            self.assertTrue(any("メソッド名が重複" in item
+                                for item in validation["errors"]))
+            bad_branch = normalise_plan({"steps": [{
+                "id": "branch", "name": "BRANCH", "materialized": True,
+                "items": [{"kind": "branch", "branches": [
+                    {"condition": None, "items": []},
+                    {"condition": {"kind": "expression", "source": "True"},
+                     "items": []},
+                ]}],
+            }]})
+            validation = validate_plan(bad_branch)
+            self.assertTrue(any("else" in item or "先頭" in item
+                                for item in validation["errors"]))
+            raw_condition = normalise_plan({"steps": [{
+                "id": "raw-condition-step", "name": "RAW_CONDITION",
+                "items": [{"id": "raw-condition", "kind": "branch",
+                           "branches": [{
+                               "condition": {
+                                   "kind": "expression",
+                                   "source": ("self.direct_serial "
+                                              "(['0X0010 8'], []) or True"),
+                               },
+                               "items": [],
+                           }] }],
+            }]})
+            validation = validate_plan(raw_condition)
+            self.assertTrue(any("生パケット" in item
+                                for item in validation["errors"]))
+            duplicate_arm = normalise_plan({"steps": [{
+                "id": "duplicate-arm-step", "name": "DUPLICATE_ARM",
+                "items": [{"id": "duplicate-arm-branch", "kind": "branch",
+                           "branches": [
+                               {"id": "same-arm", "condition": {
+                                   "kind": "expression", "source": "True"},
+                                "items": []},
+                               {"id": "same-arm", "condition": None,
+                                "items": []},
+                           ]}],
+            }]})
+            validation = validate_plan(duplicate_arm)
+            self.assertTrue(any("same-arm" in item
+                                for item in validation["errors"]))
+
+    def test_relocated_session_video_paths_resolve_locally(self):
+        with tempfile.TemporaryDirectory() as folder:
+            clean = os.path.join(folder, "recording_clean.mp4")
+            with open(clean, "wb") as stream:
+                stream.write(b"video")
+            sources = operation_video_sources({
+                "active_duration": 12.0,
+                "outputs": {"clean_video": r"D:\stale\recording_clean.mp4"},
+                "segments": [],
+            }, folder)
+            self.assertEqual(len(sources), 1)
+            self.assertEqual(sources[0]["path"], clean)
+            os.remove(clean)
+            local_segment = os.path.join(folder, "segments", "old-segment")
+            os.makedirs(local_segment)
+            local_video = os.path.join(local_segment, "recording.mp4")
+            with open(local_video, "wb") as stream:
+                stream.write(b"video")
+            sources = operation_video_sources({
+                "outputs": {}, "segments": [{
+                    "number": 1,
+                    "recorder_dir": r"D:\stale\old-segment",
+                    "timeline_start": 3.0, "duration": 4.0,
+                }],
+            }, folder)
+            self.assertEqual(sources[0]["path"], local_video)
+            self.assertEqual(sources[0]["timeline_start"], 3.0)
+
+    def test_lightweight_hierarchy_pages_and_video_boundaries(self):
+        with tempfile.TemporaryDirectory() as folder:
+            rows = []
+            for line in range(1, 452):
+                rows.append({
+                    "kind": "input", "line": line, "time": line / 10.0,
+                    "message": "0x0000 8", "source": "pc_gamepad",
+                })
+            index = JsonlInputIndex(self._write_inputs(folder, rows))
+            pages = recorded_page_ranges(index, 1, 451)
+            self.assertEqual([page["count"] for page in pages], [200, 200, 51])
+            self.assertEqual((pages[1]["start_line"], pages[1]["end_line"]),
+                             (201, 400))
+            sources = [{
+                "label": "区間 01", "path": "first.mp4",
+                "timeline_start": 0.0, "duration": 10.0,
+            }, {
+                "label": "区間 02", "path": "second.mp4",
+                "timeline_start": 10.0, "duration": 5.0,
+            }]
+            selected = select_video_source_for_time(sources, 10.0)
+            self.assertEqual(selected["label"], "区間 02")
+            target = video_target_for_input(sources, 9.75, sync_offset=0.25)
+            self.assertEqual(target["source"]["label"], "区間 02")
+            self.assertEqual(target["local_time"], 0.0)
+
+    def test_invalid_plan_is_not_saved_over_existing_plan(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = step_plan_path(folder)
+            original = b'{"preserve": true}\n'
+            with open(path, "wb") as stream:
+                stream.write(original)
+            invalid = normalise_plan({"steps": [{
+                "id": "raw", "name": "RAW", "materialized": True,
+                "items": [new_operation(
+                    "self.direct_serial(['0x0010 8'], [])")],
+            }]})
+            with self.assertRaises(ValueError):
+                save_step_plan(folder, invalid)
+            with open(path, "rb") as stream:
+                self.assertEqual(stream.read(), original)
+            with self.assertRaises(ValueError):
+                save_step_plan(folder, {"steps": "not-a-list"})
+            with open(path, "rb") as stream:
+                self.assertEqual(stream.read(), original)
+
+    def test_lightweight_tk_tree_expands_lazily_and_function_is_leaf(self):
+        try:
+            import tkinter as tk
+        except ImportError as error:
+            self.skipTest("Tkを利用できません: {}".format(error))
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest("Tkを利用できません: {}".format(error))
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                index = JsonlInputIndex(
+                    self._write_inputs(folder, self._rows()), [1])
+                plan = normalise_plan({"steps": [{
+                    "id": "s1", "name": "STEP_A", "input_start": 1,
+                    "input_end": 6, "items": [
+                        {"id": "recorded", "kind": "recorded",
+                         "input_start": 1, "input_end": 6},
+                        new_call("minigame_helper"),
+                    ],
+                }]})
+                hydrate_plan_times(plan, index)
+                studio = LightweightOperationStudio(root)
+                studio.pack(fill="both", expand=True)
+                studio.input_index = index
+                studio.plan = plan
+                studio._populate_roots()
+                roots = studio.tree.get_children("")
+                self.assertEqual(len(roots), 1)
+                self.assertEqual(
+                    studio._tree_meta[studio.tree.get_children(roots[0])[0]]["type"],
+                    "placeholder")
+                studio._expand_tree_item(roots[0])
+                children = studio.tree.get_children(roots[0])
+                call_iid = next(
+                    iid for iid in children
+                    if studio._tree_meta[iid].get("node_kind") == "call")
+                recorded_iid = next(
+                    iid for iid in children
+                    if studio._tree_meta[iid].get("type") == "recorded")
+                self.assertEqual(studio.tree.get_children(call_iid), ())
+                studio._expand_tree_item(recorded_iid)
+                operation_iid = studio.tree.get_children(recorded_iid)[0]
+                jumped = []
+                studio.seek_input_time = lambda value: jumped.append(value) or True
+                studio.tree.selection_set(operation_iid)
+                studio._on_tree_select()
+                self.assertEqual(len(jumped), 1)
+                self.assertIsNone(studio.video_capture)
+
+                studio.current_frame = numpy.zeros(
+                    (72, 128, 3), dtype=numpy.uint8)
+                studio.current_time = 4.0
+                studio.video_origin = 9.0
+                studio.video_duration = 10.0
+                studio._clear_video_frame(
+                    reset_time=True, text="映像を開けません。")
+                self.assertIsNone(studio.current_frame)
+                self.assertEqual(0.0, studio.current_time)
+                self.assertEqual(0.0, studio.video_origin)
+                self.assertEqual("映像を開けません。", studio.video_label.cget(
+                    "text"))
+
+                studio.session_dir = folder
+                studio._set_dirty(False)
+                studio.source_path.set(os.path.join(folder, "manual.py"))
+                self.assertTrue(studio.dirty)
+                self.assertEqual(
+                    studio.plan["source_path"],
+                    os.path.join(folder, "manual.py"))
+                studio._set_dirty(False)
+                studio._set_source_path(os.path.join(folder, "loaded.py"))
+                self.assertFalse(studio.dirty)
+
+                studio.session_path.set(folder)
+                studio._set_dirty(True)
+                with mock.patch(
+                        "LightweightOperationStudio.filedialog.askdirectory",
+                        return_value=os.path.join(folder, "other")), \
+                        mock.patch(
+                            "LightweightOperationStudio.messagebox.askyesno",
+                            return_value=False):
+                    self.assertIsNone(studio.choose_session())
+                self.assertEqual(studio.session_path.get(), folder)
+
+                studio._exporting = True
+                with mock.patch(
+                        "LightweightOperationStudio.messagebox.showinfo") as shown:
+                    studio.request_close()
+                shown.assert_called_once()
+                self.assertTrue(studio.winfo_exists())
+                studio._exporting = False
+                studio.destroy()
+        finally:
+            root.destroy()
+
+    def test_lightweight_tree_decodes_across_pages_without_cancel_mutation(self):
+        try:
+            import tkinter as tk
+        except ImportError as error:
+            self.skipTest("Tkを利用できません: {}".format(error))
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest("Tkを利用できません: {}".format(error))
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                rows = []
+                for line in range(1, 202):
+                    rows.append({
+                        "kind": "input", "line": line,
+                        "time": (line - 1) / 100.0,
+                        # A starts on raw row 200 and ends on row 201.  A
+                        # raw-row page split here used to render hold/holdEnd.
+                        "message": ("0x0010 8" if line == 200
+                                    else "0x0000 8"),
+                        "source": "pc_gamepad",
+                    })
+                index = JsonlInputIndex(
+                    self._write_inputs(folder, rows), [1])
+                plan = normalise_plan({"steps": [{
+                    "id": "boundary", "name": "BOUNDARY",
+                    "input_start": 1, "input_end": 201,
+                    "items": [{
+                        "id": "recorded", "kind": "recorded",
+                        "input_start": 1, "input_end": 201,
+                    }],
+                }]})
+                studio = LightweightOperationStudio(root)
+                studio.pack(fill="both", expand=True)
+                studio.input_index = index
+                studio.plan = plan
+                studio._populate_roots()
+                step_iid = studio.tree.get_children("")[0]
+                studio._expand_tree_item(step_iid)
+                recorded_iid = next(
+                    iid for iid in studio.tree.get_children(step_iid)
+                    if studio._tree_meta[iid].get("type") == "recorded")
+                studio._expand_tree_item(recorded_iid)
+
+                operation_iids = []
+                for iid in studio.tree.get_children(recorded_iid):
+                    if studio._tree_meta[iid].get("type") == "operation_page":
+                        studio._expand_tree_item(iid)
+                        operation_iids.extend(studio.tree.get_children(iid))
+                    else:
+                        operation_iids.append(iid)
+                texts = [studio.tree.item(iid, "text")
+                         for iid in operation_iids]
+                self.assertTrue(any("self.press(Button.A" in value
+                                    for value in texts))
+                self.assertFalse(any("hold(Button.A" in value
+                                     or "holdEnd(Button.A" in value
+                                     for value in texts))
+
+                press_iid = next(
+                    iid for iid in operation_iids
+                    if "self.press(Button.A" in studio.tree.item(iid, "text"))
+                studio.tree.selection_set(press_iid)
+                before = copy.deepcopy(plan["steps"][0])
+                with mock.patch(
+                        "LightweightOperationStudio.ask_fields",
+                        return_value=None):
+                    studio.edit_selected()
+                self.assertEqual(plan["steps"][0], before)
+                with mock.patch(
+                        "LightweightOperationStudio.messagebox.askyesno",
+                        return_value=False):
+                    studio.delete_selected()
+                self.assertEqual(plan["steps"][0], before)
+
+                studio.tree.selection_set(operation_iids[0])
+                studio.move_selected(-1)
+                self.assertEqual(plan["steps"][0], before)
+
+                paged_items = [
+                    dict(new_operation("self.wait(0.01)"),
+                         id="operation-{}".format(index_value))
+                    for index_value in range(401)]
+                studio.plan = normalise_plan({"steps": [{
+                    "id": "paged", "name": "PAGED",
+                    "materialized": True, "items": paged_items,
+                }]})
+                studio._refresh_tree_selection(
+                    "paged", node_id="operation-400")
+                paged_root = studio.tree.get_children("")[0]
+                page_iids = studio.tree.get_children(paged_root)
+                loaded_pages = [
+                    iid for iid in page_iids
+                    if studio._tree_meta[iid].get("loaded")]
+                self.assertEqual(len(page_iids), 3)
+                self.assertEqual(len(loaded_pages), 1)
+                self.assertEqual(
+                    studio._tree_meta[loaded_pages[0]].get("start"), 400)
+                studio.destroy()
+        finally:
+            root.destroy()
 
 
 if __name__ == "__main__":

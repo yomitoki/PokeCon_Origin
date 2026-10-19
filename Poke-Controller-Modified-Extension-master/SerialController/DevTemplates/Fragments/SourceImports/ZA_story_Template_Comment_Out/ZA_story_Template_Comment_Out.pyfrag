@@ -1,4 +1,11 @@
-def ZA_story_Template_Comment_Out(self,substitute=0,green_check=1,black_check=1,endpicture7="RETURN_FALSE",sub9_button="A",sub9_picture="RETURN_FALSE",selected_pic="RETURN FALSE",selected_target=0,mode=0,sleeptime=0.5):
+def ZA_story_Template_Comment_Out(self,substitute=0,green_check=1,black_check=1,endpicture7="RETURN_FALSE",sub9_button="A",sub9_picture="RETURN_FALSE",selected_pic="RETURN FALSE",selected_target=0,mode=0,sleeptime=0.5,timeout_seconds=0.0):
+    started_at = time.monotonic()
+    timeout_limit = max(0.0, float(timeout_seconds))
+
+    def recovery_timed_out():
+        return (timeout_limit > 0.0
+                and time.monotonic() - started_at >= timeout_limit)
+
     selected_out_check=0
 
     if mode == 0:
@@ -8,6 +15,10 @@ def ZA_story_Template_Comment_Out(self,substitute=0,green_check=1,black_check=1,
     nofiled_check=0
     #コメントチェックができるまでループ
     for i in range(30):
+        if recovery_timed_out():
+            return False
+        if self.image_check("POKEMON_ZA_IN_ICON"):#TODO
+            return True
         if (not (self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0"))):
             nofiled_check=1
         if self.image_check("POKEMON_ZA_EYE_CHECK_HIGH_POKE"):
@@ -43,6 +54,7 @@ def ZA_story_Template_Comment_Out(self,substitute=0,green_check=1,black_check=1,
             break
         elif (nofiled_check==0 and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")):
             return False 
+
         #elif (nofiled_check==1 and((not (self.image_check("BATTLE_BALL_CHECK") or self.image_check("ESCAPE")))and (self.image_check("Filed_Hard_Check_0")))):
         #    if filed_check_count > 5:
         #        break
@@ -57,13 +69,20 @@ def ZA_story_Template_Comment_Out(self,substitute=0,green_check=1,black_check=1,
 
     while True:
         self.checkIfAlive()
+        if recovery_timed_out():
+            return False
+        renda_timeout_options = {}
+        if timeout_limit > 0.0:
+            renda_timeout_options["timeout_seconds"] = max(
+                0.001, timeout_limit - (time.monotonic() - started_at))
         selected_out_check=0
-        if self.ZA_renda_button(rendabutton="B",
+        renda_result = self.ZA_renda_button(rendabutton="B",
                              endpicture="POKEMON_ZA_BATTLE_BALL_CHECK",
                              endpicture2="POKEMON_ZA_ESCAPE",
                              endpicture3=selected_pic,
                              endpicture4=endpicture4,
                              endpicture5="POKEMON_ZA_EYE_CHECK_HIGH_POKE",
+                             endpicture6="POKEMON_ZA_IN_ICON",#TODO
                              endpicture7=endpicture7,
                              not_endpicture="POKEMON_ZA_ZA_ROYALE",
                              sub_button="A",sub_picture="POKEMON_ZA_TEXT_BLACK_COMMENT",
@@ -75,19 +94,35 @@ def ZA_story_Template_Comment_Out(self,substitute=0,green_check=1,black_check=1,
                              sub7_button="A",sub7_picture="POKEMON_ZA_MORNING",
                              sub8_button="A",sub8_picture="POKEMON_ZA_NIGHT",
                              sub9_button=sub9_button,sub9_picture=sub9_picture,
-                             sleeptime=sleeptime):
+                             sleeptime=sleeptime,**renda_timeout_options)
+        if recovery_timed_out():
+            return False
+        if renda_result:
             print(f"5rt2{nofiled_check}")
             selected_out_check=0
             filed_check_count=0
             for i in range(30):
+                if recovery_timed_out():
+                    return False
                 self.wait(0.5)
-                if self.image_check(selected_pic):
+                # mode=1（屋内FIELD）ではZA_renda_button側が終了画像を
+                # 検知しても、従来はこの後の分岐がFILED_HARD_CHECK_0しか
+                # 確認しないため外側の連打へ戻り続けていた。連打終了後の
+                # 実画面でも指定されたFIELDを確認して会話完了とする。
+                if self.image_check(endpicture4):
+                    print(
+                        "[COMMENT_OUT] complete: {} detected".format(
+                            endpicture4))
+                    return True
+                elif self.image_check(selected_pic):
                     selected_out_check=1
                     self.wait(1.0)
                     for i in range(selected_target):
                         self.etc_sendCommand("Lbutton_down")
                         self.wait(0.5)
                     self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                    break
+                elif self.image_check("POKEMON_ZA_IN_ICON"):#TODO
                     break
                 elif self.image_check(endpicture7):
                     break
@@ -130,6 +165,7 @@ def ZA_story_Template_Comment_Out(self,substitute=0,green_check=1,black_check=1,
                 elif (nofiled_check==1 and self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0")):
                     break
 
+
                     #if filed_check_count > 5:
                     #    break
                     #filed_check_count+=1
@@ -140,6 +176,8 @@ def ZA_story_Template_Comment_Out(self,substitute=0,green_check=1,black_check=1,
             continue
         self.wait(0.5)
         if self.image_check(endpicture7):
+            break
+        elif self.image_check("POKEMON_ZA_IN_ICON"):#TODO
             break
         elif self.image_check("POKEMON_ZA_MISSION_COMPLETE"):
             break   

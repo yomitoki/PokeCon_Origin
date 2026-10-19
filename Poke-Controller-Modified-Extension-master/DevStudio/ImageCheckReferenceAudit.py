@@ -11,6 +11,8 @@ import textwrap
 
 LIBRARY_IMPORT_BEGIN = "# POKECON_IMAGE_CHECK_LIBRARY_IMPORTS_BEGIN"
 LIBRARY_IMPORT_END = "# POKECON_IMAGE_CHECK_LIBRARY_IMPORTS_END"
+GENERATED_IMAGE_CHECK_BEGIN = "# POKECON_IMAGE_CHECK_BEGIN"
+GENERATED_IMAGE_CHECK_END = "# POKECON_IMAGE_CHECK_END"
 
 
 def _literal_string(node):
@@ -427,6 +429,213 @@ def audit_image_check_references(source):
         "set_names": sorted(set_names, key=str.lower),
         "exception_names": sorted(exception_names, key=str.lower),
     }
+
+
+def _static_string_values(node, variables, limit=512):
+    """Best-effort string evaluation for source-only dependency discovery."""
+    value = _literal_string(node)
+    if value is not None:
+        return {value}
+    if isinstance(node, ast.Name):
+        return set(variables.get(node.id, ()))
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left = _static_string_values(node.left, variables, limit)
+        right = _static_string_values(node.right, variables, limit)
+        if not left or not right or len(left) * len(right) > limit:
+            return set()
+        return {
+            first + second for first in left for second in right
+            if len(first) + len(second) <= 1024
+        }
+    if isinstance(node, ast.IfExp):
+        return (_static_string_values(node.body, variables, limit) |
+                _static_string_values(node.orelse, variables, limit))
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        result = set()
+        for item in node.elts:
+            result.update(_static_string_values(item, variables, limit))
+            if len(result) > limit:
+                return set()
+        return result
+    if isinstance(node, ast.JoinedStr):
+        parts = [set([""])]
+        for item in node.values:
+            if isinstance(item, ast.FormattedValue):
+                values = _static_string_values(item.value, variables, limit)
+            else:
+                values = _static_string_values(item, variables, limit)
+            if not values or len(parts[-1]) * len(values) > limit:
+                return set()
+            parts.append({
+                first + second for first in parts[-1] for second in values
+                if len(first) + len(second) <= 1024
+            })
+        return parts[-1]
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+            and node.func.attr == "format":
+        formats = _static_string_values(node.func.value, variables, limit)
+        positional = [
+            _static_string_values(argument, variables, limit)
+            for argument in node.args
+        ]
+        if not formats or any(not values for values in positional):
+            return set()
+        combinations = [()]
+        for values in positional:
+            if len(combinations) * len(values) > limit:
+                return set()
+            combinations = [
+                previous + (value,)
+                for previous in combinations for value in values
+            ]
+        result = set()
+        for template in formats:
+            for arguments in combinations:
+                try:
+                    result.add(template.format(*arguments))
+                except (IndexError, KeyError, ValueError):
+                    continue
+        return result
+    return set()
+
+
+def source_used_library_targets(source, library, dependency_texts=()):
+    """Return registered image targets referenced by user source.
+
+    The generated image-check block contains every target that was previously
+    applied.  Counting string literals from that block would therefore report
+    registrations as source usage and make a "used targets" operation behave
+    like "apply all".  Replace that block with ``pass`` before parsing, then
+    collect exact registered target names from the remaining Python source.
+
+    Looking at all remaining string literals (rather than only direct
+    ``image_check`` calls) intentionally includes helper arguments such as
+    ``endpicture`` and ``sub_picture`` as well as literal target collections.
+    A small static string evaluator also follows deterministic assignments and
+    concatenations such as ``marker + "_CENTER"``.  Optional related config
+    texts cover registered names loaded through files such as ``zones.jsonc``.
+    """
+    library_targets = library.get("targets", {}) if isinstance(library, dict) else {}
+    registered = set(library_targets)
+    if not registered:
+        return []
+
+    generated_pattern = re.compile(
+        r"(?ms)^(?P<indent>[ \t]*)" +
+        re.escape(GENERATED_IMAGE_CHECK_BEGIN) +
+        r"\n.*?^(?P=indent)" +
+        re.escape(GENERATED_IMAGE_CHECK_END) + r"[ \t]*$")
+    user_pattern = re.compile(
+        r"(?ms)^(?P<indent>[ \t]*)# POKECON_IMAGE_CHECK_USER_BEGIN\n"
+        r".*?^(?P=indent)# POKECON_IMAGE_CHECK_USER_END[ \t]*$")
+
+    def generated_replacement(match):
+        # The USER section is intentionally hand-written and may be the only
+        # caller of a target.  Keep it in the analysis copy while dropping the
+        # generated dictionaries/boilerplate that would make every registered
+        # item appear used.
+        user = user_pattern.search(match.group(0))
+        replacement = match.group("indent") + \
+            "pass  # generated image_check omitted"
+        if user is not None:
+            replacement += "\n" + user.group(0)
+        return replacement
+
+    analysis_source = generated_pattern.sub(
+        generated_replacement,
+        source,
+        count=1)
+    tree = ast.parse(analysis_source)
+
+    occurrences = []
+    for node in ast.walk(tree):
+        name = _literal_string(node)
+        if name not in registered:
+            continue
+        occurrences.append((
+            int(getattr(node, "lineno", 1)),
+            int(getattr(node, "col_offset", 0)),
+            name,
+        ))
+
+    variables = {}
+    assignments = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assignments.append((target.id, node.value, node))
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            assignments.append((node.target.id, node.value, node))
+        elif isinstance(node, (ast.For, ast.comprehension)) \
+                and isinstance(node.target, ast.Name):
+            assignments.append((node.target.id, node.iter, node))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            parameters = list(node.args.args)
+            defaults = list(node.args.defaults)
+            if defaults:
+                parameters = parameters[-len(defaults):]
+                for parameter, default in zip(parameters, defaults):
+                    assignments.append((parameter.arg, default, node))
+
+    # Assignments may reference values declared later in AST traversal.  A
+    # bounded fixed point is enough for the short alias chains used by command
+    # sources and avoids importing/executing them.
+    for _ in range(len(assignments) + 1):
+        changed = False
+        for variable, expression, _node in assignments:
+            values = _static_string_values(expression, variables)
+            if not values:
+                continue
+            current = variables.setdefault(variable, set())
+            before = len(current)
+            current.update(values)
+            if len(current) != before:
+                changed = True
+        if not changed:
+            break
+
+    for _variable, expression, node in assignments:
+        for name in _static_string_values(expression, variables):
+            if name in registered:
+                occurrences.append((
+                    int(getattr(node, "lineno", 1)),
+                    int(getattr(node, "col_offset", 0)),
+                    name,
+                ))
+
+    # A target can be assembled directly at its use site without an
+    # intermediate assignment, for example ``image_check("A" + "B")`` or
+    # ``image_check("{}_ICON".format(prefix))``.  Evaluate expression nodes
+    # after the assignment fixed point so those call-site constructions are
+    # included as well.  Exact literals have already been collected above;
+    # duplicate occurrences are removed when the ordered result is built.
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.expr):
+            continue
+        for name in _static_string_values(node, variables):
+            if name in registered:
+                occurrences.append((
+                    int(getattr(node, "lineno", 1)),
+                    int(getattr(node, "col_offset", 0)),
+                    name,
+                ))
+
+    dependency_line = max(
+        [int(getattr(node, "lineno", 1)) for node in ast.walk(tree)] or [1]) + 1
+    quoted_string = re.compile(r"[\"']([^\"']+)[\"']")
+    for offset, dependency_text in enumerate(dependency_texts):
+        if not isinstance(dependency_text, str):
+            continue
+        for name in quoted_string.findall(dependency_text):
+            if name in registered:
+                occurrences.append((dependency_line + offset, 0, name))
+    occurrences.sort(key=lambda item: (item[0], item[1]))
+    result = []
+    for _, _, name in occurrences:
+        if name not in result:
+            result.append(name)
+    return result
 
 
 def _library_import_match(source):

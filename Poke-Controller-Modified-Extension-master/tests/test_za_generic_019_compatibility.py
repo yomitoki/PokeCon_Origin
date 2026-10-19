@@ -256,6 +256,44 @@ class ZaGeneric019CompatibilityTests(unittest.TestCase):
             show_portable_start_dialog(_PortableZaStory()),
             PORTABLE_START_CANCEL)
 
+    def test_portable_selector_exposes_debug_modes_and_default_clears_them(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "LocalFunction", "CommandStartSelector.py")
+        with open(source_path, encoding="utf-8") as stream:
+            tree = ast.parse(stream.read(), source_path)
+        function = next(
+            node for node in tree.body
+            if (isinstance(node, ast.FunctionDef)
+                and node.name == "show_portable_start_dialog"))
+        constants = {
+            node.value for node in ast.walk(function)
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        reset_assignments = [
+            node for node in ast.walk(function)
+            if (isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Attribute)
+                    and target.attr == "ResetDebug"
+                    for target in node.targets))
+        ]
+        self.assertIn(
+            "ResetDebug（初回だけ20秒待機して復帰処理を検証）",
+            constants)
+        self.assertGreaterEqual(len(reset_assignments), 2)
+        battle_assignments = [
+            node for node in ast.walk(function)
+            if (isinstance(node, ast.Assign)
+                and any(
+                    isinstance(target, ast.Attribute)
+                    and target.attr == "BATTLE_DEBUG"
+                    for target in node.targets))
+        ]
+        self.assertIn(
+            "BATTLE_DEBUG（敗戦復帰対象の各戦闘で初回敗戦を確認）",
+            constants)
+        self.assertGreaterEqual(len(battle_assignments), 2)
+
     def test_portable_canari6_start_sets_child_and_main_parent(self):
         command = _PortableZaStory()
 
