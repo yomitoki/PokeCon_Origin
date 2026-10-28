@@ -11,7 +11,8 @@ import uuid
 
 
 REGISTRY_VERSION = 1
-DEVICE_KINDS = ("camera", "serial", "audio", "audio_output")
+DEVICE_KINDS = ("camera", "serial", "audio", "audio_output",
+                "camera_secondary", "serial_secondary", "audio_secondary")
 
 
 def default_window_activity_registry_path():
@@ -217,8 +218,10 @@ def device_usage_conflicts(entries, kind, key):
     result = []
     for entry in entries or []:
         devices = entry.get("devices", {}) if isinstance(entry, dict) else {}
-        device = devices.get(kind, {}) if isinstance(devices, dict) else {}
-        if isinstance(device, dict) and str(device.get("key", "")) == key:
+        candidates = [devices.get(kind, {}), devices.get(kind + "_secondary", {})] \
+            if isinstance(devices, dict) else []
+        if any(isinstance(device, dict) and str(device.get("key", "")) == key
+               for device in candidates):
             result.append(entry)
     return result
 

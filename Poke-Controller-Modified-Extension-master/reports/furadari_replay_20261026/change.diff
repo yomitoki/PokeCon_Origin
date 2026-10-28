@@ -1,0 +1,158 @@
+--- before/ZA_story.py
++++ after/ZA_story.py
+@@ -35796,20 +35796,23 @@
+     
+     def _7_story_guri_92(self):
+         #電源装置
+-        # A待ちの再入場では、済んだ方向移動を繰り返さない。
+-        if self.ZA_story_movement_a_pending('_7_story_guri_92'):
+-            return self.ZA_story_resume_movement_a('_7_story_guri_92')
++        # 区間再試行では操作済みの装置も通るため、追加したA確認は無効。
++        # A表示がなくても従来の入力へ進み、後続93のFIELD確認に任せる。
++        # if self.ZA_story_movement_a_pending('_7_story_guri_92'):
++        #     return self.ZA_story_resume_movement_a('_7_story_guri_92')
+         if self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0"):
+             self.press(Direction(Stick.LEFT,90), duration=3.0, wait=0.0)
+             self.press(Direction(Stick.LEFT,180), duration=2.0, wait=0.0)
+             def _after_checked_a_1():
+                 self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.0, interval=0.1)
+                 return "7_STORY_GURI_93"
+-            # ZIP動画ではAの画角未確認／範囲外。最後の移動方向へ視点を合わせる。
+-            self.pressRep(Button.L, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+-            return self.ZA_story_checked_movement_action(
+-                '_7_story_guri_92', ('POKEMON_ZA_DOOR_A',),
+-                _after_checked_a_1, '7_STORY_GURI_92', dialogue_state='7_STORY_GURI_93')
++            # A確認用に追加したLも外し、ZIP内の元処理と同じ視点を保つ。
++            # self.pressRep(Button.L, repeat=1, duration=0.15, wait=0.5, interval=0.1)
++            # return self.ZA_story_checked_movement_action(
++            #     '_7_story_guri_92', ('POKEMON_ZA_DOOR_A',),
++            #     _after_checked_a_1, '7_STORY_GURI_92', dialogue_state='7_STORY_GURI_93')
++            self.checkIfAlive()
++            return _after_checked_a_1()
+         return "7_STORY_GURI_92"
+     
+     def _7_story_guri_93(self):
+@@ -35849,9 +35852,10 @@
+     
+     def _7_story_guri_95(self):
+         #ラボのカードキーB
+-        # A待ちの再入場では、済んだ方向移動を繰り返さない。
+-        if self.ZA_story_movement_a_pending('_7_story_guri_95'):
+-            return self.ZA_story_resume_movement_a('_7_story_guri_95')
++        # 区間再試行では取得済みの場所も通るため、追加したA確認は無効。
++        # 後続96の白コメントなし通過は既存のタイムアウト処理を使う。
++        # if self.ZA_story_movement_a_pending('_7_story_guri_95'):
++        #     return self.ZA_story_resume_movement_a('_7_story_guri_95')
+         if self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0"):
+             self.press(Direction(Stick.LEFT,90), duration=3.0, wait=0.0)
+             self.press(Direction(Stick.LEFT,180), duration=3.5, wait=0.0)
+@@ -35865,11 +35869,13 @@
+             def _after_checked_a_1():
+                 self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.0, interval=0.1)
+                 return "7_STORY_GURI_96"
+-            # ZIP動画ではAの画角未確認／範囲外。最後の移動方向へ視点を合わせる。
+-            self.pressRep(Button.L, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+-            return self.ZA_story_checked_movement_action(
+-                '_7_story_guri_95', ('POKEMON_ZA_DOOR_A',),
+-                _after_checked_a_1, '7_STORY_GURI_95', dialogue_state='7_STORY_GURI_96')
++            # A確認用に追加したLも外し、ZIP内の元処理と同じ視点を保つ。
++            # self.pressRep(Button.L, repeat=1, duration=0.15, wait=0.5, interval=0.1)
++            # return self.ZA_story_checked_movement_action(
++            #     '_7_story_guri_95', ('POKEMON_ZA_DOOR_A',),
++            #     _after_checked_a_1, '7_STORY_GURI_95', dialogue_state='7_STORY_GURI_96')
++            self.checkIfAlive()
++            return _after_checked_a_1()
+         return "7_STORY_GURI_95"
+     
+     def _7_story_guri_96(self):
+@@ -35918,9 +35924,10 @@
+     
+     def _7_story_guri_102(self):
+         #ラボのカードキーB_オープン1
+-        # A待ちの再入場では、済んだ方向移動を繰り返さない。
+-        if self.ZA_story_movement_a_pending('_7_story_guri_102'):
+-            return self.ZA_story_resume_movement_a('_7_story_guri_102')
++        # 区間再試行では解錠済みの場所も通るため、追加したA確認は無効。
++        # 後続103の白コメントなし通過は既存のタイムアウト処理を使う。
++        # if self.ZA_story_movement_a_pending('_7_story_guri_102'):
++        #     return self.ZA_story_resume_movement_a('_7_story_guri_102')
+         if self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0"):
+             self.press(Direction(Stick.LEFT,90), duration=3.0, wait=0.0)
+             self.press(Direction(Stick.LEFT,180), duration=3.5, wait=0.0)
+@@ -35935,11 +35942,13 @@
+             def _after_checked_a_1():
+                 self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.0, interval=0.1)
+                 return "7_STORY_GURI_103"
+-            # ZIP動画ではAの画角未確認／範囲外。最後の移動方向へ視点を合わせる。
+-            self.pressRep(Button.L, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+-            return self.ZA_story_checked_movement_action(
+-                '_7_story_guri_102', ('POKEMON_ZA_DOOR_A',),
+-                _after_checked_a_1, '7_STORY_GURI_102', dialogue_state='7_STORY_GURI_103')
++            # A確認用に追加したLも外し、ZIP内の元処理と同じ視点を保つ。
++            # self.pressRep(Button.L, repeat=1, duration=0.15, wait=0.5, interval=0.1)
++            # return self.ZA_story_checked_movement_action(
++            #     '_7_story_guri_102', ('POKEMON_ZA_DOOR_A',),
++            #     _after_checked_a_1, '7_STORY_GURI_102', dialogue_state='7_STORY_GURI_103')
++            self.checkIfAlive()
++            return _after_checked_a_1()
+         return "7_STORY_GURI_102"
+     
+     def _7_story_guri_103(self):
+@@ -35962,9 +35971,10 @@
+        
+     def _7_story_guri_106(self):
+         #ラボのカードキーC
+-        # A待ちの再入場では、済んだ方向移動を繰り返さない。
+-        if self.ZA_story_movement_a_pending('_7_story_guri_106'):
+-            return self.ZA_story_resume_movement_a('_7_story_guri_106')
++        # 区間再試行では取得済みの場所も通るため、追加したA確認は無効。
++        # 後続107の白コメントなし通過は既存のタイムアウト処理を使う。
++        # if self.ZA_story_movement_a_pending('_7_story_guri_106'):
++        #     return self.ZA_story_resume_movement_a('_7_story_guri_106')
+         if self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0"):
+             self.press(Direction(Stick.LEFT,90), duration=3.0, wait=0.0)
+             self.press(Direction(Stick.LEFT,180), duration=3.5, wait=0.0)
+@@ -35986,9 +35996,11 @@
+             def _after_checked_a_1():
+                 self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.0, interval=0.1)
+                 return "7_STORY_GURI_107"
+-            return self.ZA_story_checked_movement_action(
+-                '_7_story_guri_106', ('POKEMON_ZA_INVESTIGATE_MARKER',),
+-                _after_checked_a_1, '7_STORY_GURI_106', dialogue_state='7_STORY_GURI_107')
++            # return self.ZA_story_checked_movement_action(
++            #     '_7_story_guri_106', ('POKEMON_ZA_INVESTIGATE_MARKER',),
++            #     _after_checked_a_1, '7_STORY_GURI_106', dialogue_state='7_STORY_GURI_107')
++            self.checkIfAlive()
++            return _after_checked_a_1()
+         return "7_STORY_GURI_106" 
+        
+     def _7_story_guri_107(self):
+@@ -36036,9 +36048,10 @@
+        
+     def _7_story_guri_111(self):
+         #ラボのカードキーC_オープン3
+-        # A待ちの再入場では、済んだ方向移動を繰り返さない。
+-        if self.ZA_story_movement_a_pending('_7_story_guri_111'):
+-            return self.ZA_story_resume_movement_a('_7_story_guri_111')
++        # 区間再試行では解錠済みの場所も通るため、追加したA確認は無効。
++        # 後続112の白コメントなし通過は既存のタイムアウト処理を使う。
++        # if self.ZA_story_movement_a_pending('_7_story_guri_111'):
++        #     return self.ZA_story_resume_movement_a('_7_story_guri_111')
+         if self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0"):
+             self.press(Direction(Stick.LEFT,90), duration=2.5, wait=0.0)
+             self.press(Direction(Stick.LEFT,60), duration=2.0, wait=0.0)
+@@ -36053,9 +36066,11 @@
+             def _after_checked_a_1():
+                 self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.0, interval=0.1)
+                 return "7_STORY_GURI_112"           
+-            return self.ZA_story_checked_movement_action(
+-                '_7_story_guri_111', ('POKEMON_ZA_INVESTIGATE_MARKER',),
+-                _after_checked_a_1, '7_STORY_GURI_111', dialogue_state='7_STORY_GURI_112', allow_recenter=False)
++            # return self.ZA_story_checked_movement_action(
++            #     '_7_story_guri_111', ('POKEMON_ZA_INVESTIGATE_MARKER',),
++            #     _after_checked_a_1, '7_STORY_GURI_111', dialogue_state='7_STORY_GURI_112', allow_recenter=False)
++            self.checkIfAlive()
++            return _after_checked_a_1()
+         return "7_STORY_GURI_111" 
+        
+     def _7_story_guri_112(self):

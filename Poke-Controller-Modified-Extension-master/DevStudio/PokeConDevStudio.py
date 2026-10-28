@@ -7791,7 +7791,21 @@ class DevStudio(tk.Tk):
         data = self._read_sample_lists() if data is None else data
         preview = compose_preview(fragment_root, data, name)
         safe = python_identifier(name) + "SampleCommand"
-        imports = self._generated_region("IMPORTS", "\n".join(preview["imports"]), "")
+        image_import_prefix = "from LocalFunction.ImageDetection import "
+        portable_imports = []
+        for statement in preview["imports"]:
+            if statement.strip().startswith(image_import_prefix):
+                statement = (
+                    "try:\n" + textwrap.indent(statement.replace(
+                        image_import_prefix,
+                        "from Commands.PythonCommands.LocalFunction.ImageDetection import ", 1), "    ")
+                    + "\nexcept ModuleNotFoundError as error:\n"
+                    "    if error.name not in ('Commands', 'Commands.PythonCommands',\n"
+                    "                          'Commands.PythonCommands.LocalFunction',\n"
+                    "                          'Commands.PythonCommands.LocalFunction.ImageDetection'):\n"
+                    "        raise\n" + textwrap.indent(statement, "    "))
+            portable_imports.append(statement)
+        imports = self._generated_region("IMPORTS", "\n".join(portable_imports), "")
         variables = self._generated_region("CLASS_VARIABLES", "\n".join("    " + line for line in preview["class_variables"]), "    ")
         initializer_body = "\n".join(self._indent_source(value, "        ") for value in preview.get("initializers", []))
         initializers = self._generated_region("INITIALIZERS", initializer_body or "        pass", "        ")
@@ -7806,8 +7820,16 @@ class DevStudio(tk.Tk):
         helper_source = "\n".join(helper_blocks)
         image_code = self._image_code_for_target_names(
             preview.get("image_targets", []), data=image_library)
-        image_import = ("from LocalFunction.ImageDetection import SimilarityHistory, detect_image\n"
-                        if image_code else "")
+        image_import = (
+            "try:\n"
+            "    from Commands.PythonCommands.LocalFunction.ImageDetection import SimilarityHistory, detect_image\n"
+            "except ModuleNotFoundError as error:\n"
+            "    if error.name not in ('Commands', 'Commands.PythonCommands',\n"
+            "                          'Commands.PythonCommands.LocalFunction',\n"
+            "                          'Commands.PythonCommands.LocalFunction.ImageDetection'):\n"
+            "        raise\n"
+            "    from LocalFunction.ImageDetection import SimilarityHistory, detect_image\n"
+            if image_code else "")
         image_source = textwrap.indent(image_code.rstrip(), "    ") + "\n\n" if image_code else ""
         return ("#!/usr/bin/env python3\n# -*- coding: utf-8 -*-\n"
                 "# Authored by PokeCon Dev Studio from sample list: {name}\n"
@@ -7922,8 +7944,20 @@ class DevStudio(tk.Tk):
             image_check_block = self._extract_image_check_block(current)
             if image_check_block and "POKECON_IMAGE_CHECK_BEGIN" not in fresh:
                 image_import = "from LocalFunction.ImageDetection import SimilarityHistory, detect_image"
-                if image_import not in updated:
-                    class_at = updated.find("class "); updated = updated[:class_at] + image_import + "\n\n" + updated[class_at:]
+                portable_import = (
+                    "try:\n"
+                    "    from Commands.PythonCommands.LocalFunction.ImageDetection import SimilarityHistory, detect_image\n"
+                    "except ModuleNotFoundError as error:\n"
+                    "    if error.name not in ('Commands', 'Commands.PythonCommands',\n"
+                    "                          'Commands.PythonCommands.LocalFunction',\n"
+                    "                          'Commands.PythonCommands.LocalFunction.ImageDetection'):\n"
+                    "        raise\n"
+                    "    " + image_import)
+                flat_import = re.compile(r"(?m)^" + re.escape(image_import) + r"[ \t]*$")
+                if flat_import.search(updated):
+                    updated = flat_import.sub(lambda match: portable_import, updated)
+                elif image_import not in updated:
+                    class_at = updated.find("class "); updated = updated[:class_at] + portable_import + "\n\n" + updated[class_at:]
                 marker = "    # POKECON_USER_METHODS_BEGIN"
                 updated = updated.replace(marker, image_check_block + "\n\n" + marker, 1)
         try:
@@ -8535,8 +8569,23 @@ class DevStudio(tk.Tk):
         if preserved_user is not None: code = self._replace_image_check_user(code, textwrap.dedent(preserved_user))
         code = preserve_library_import_block(code, source)
         import_line = "from LocalFunction.ImageDetection import SimilarityHistory, detect_image"
-        if import_line not in source:
-            class_at = source.find("class "); source = source[:class_at] + import_line + "\n\n" + source[class_at:]
+        portable_import = (
+            "try:\n"
+            "    from Commands.PythonCommands.LocalFunction.ImageDetection import SimilarityHistory, detect_image\n"
+            "except ModuleNotFoundError as error:\n"
+            "    if error.name not in ('Commands', 'Commands.PythonCommands',\n"
+            "                          'Commands.PythonCommands.LocalFunction',\n"
+            "                          'Commands.PythonCommands.LocalFunction.ImageDetection'):\n"
+            "        raise\n"
+            "    " + import_line)
+        flat_import = re.compile(r"(?m)^" + re.escape(import_line) + r"[ \t]*$")
+        if flat_import.search(source):
+            source = flat_import.sub(lambda match: portable_import, source)
+        elif (import_line not in source
+              and "from Commands.PythonCommands.LocalFunction.ImageDetection import SimilarityHistory, detect_image" not in source
+              and not ("SimilarityHistory = _image_detection.SimilarityHistory" in source
+                       and "detect_image = _image_detection.detect_image" in source)):
+            class_at = source.find("class "); source = source[:class_at] + portable_import + "\n\n" + source[class_at:]
         indented = textwrap.indent(code.rstrip(), "    ")
         pattern = re.compile(r"(?ms)^[ \t]*# POKECON_IMAGE_CHECK_BEGIN\n.*?^[ \t]*# POKECON_IMAGE_CHECK_END[ \t]*$")
         if pattern.search(source):

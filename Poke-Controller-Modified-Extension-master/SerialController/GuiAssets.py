@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from __future__ import annotations
+from CaptureGeometry import capture_frame_size, display_rect_to_capture
 # from typing import Tuple
 
 import cv2
@@ -432,7 +433,7 @@ class CaptureArea(tk.Canvas):
         # Windows sends a short burst of Configure events while maximizing or
         # dragging the outer frame. Rendering 720p PhotoImages at 60 FPS during
         # that burst can starve Tk's own resize messages.
-        self.winfo_toplevel().bind(
+        self._preview_layout_binding = self.winfo_toplevel().bind(
             "<Configure>", self._note_layout_change, add="+")
         if self._native_preview is not None:
             self._native_render_thread = threading.Thread(
@@ -525,8 +526,8 @@ class CaptureArea(tk.Canvas):
             self.min_x, self.min_y, self.min_x + 1, self.min_y + 1, width=3.0, outline="red", tag="SelectArea"
         )
 
-        ratio_x = float(self.camera.capture_size[0] / self.show_size[0])
-        ratio_y = float(self.camera.capture_size[1] / self.show_size[1])
+        ratio_x = float(capture_frame_size(self.camera)[0] / self.show_size[0])
+        ratio_y = float(capture_frame_size(self.camera)[1] / self.show_size[1])
         print(
             "Mouse down: Show ({}, {}) / Capture ({}, {})".format(
                 self.min_x, self.min_y, int(self.min_x * ratio_x), int(self.min_y * ratio_y)
@@ -635,10 +636,8 @@ class CaptureArea(tk.Canvas):
         self.coords("OutputRegion", x1, y1, x2, y2)
         if not self.region_listener or not hasattr(self.camera, "image_bgr"):
             return
-        ratio_x = self.camera.capture_size[0] / self.show_width
-        ratio_y = self.camera.capture_size[1] / self.show_height
-        sx, sy = int(x1 * ratio_x), int(y1 * ratio_y)
-        ex, ey = int(x2 * ratio_x), int(y2 * ratio_y)
+        sx, sy, ex, ey = display_rect_to_capture(
+            (x1, y1, x2, y2), self.show_size, capture_frame_size(self.camera))
         image = self.camera.image_bgr[sy:ey, sx:ex].copy()
         if image.size:
             self.region_listener(image, (sx, sy, ex - sx, ey - sy))
@@ -657,8 +656,8 @@ class CaptureArea(tk.Canvas):
 
     def ReleaseRangeSS(self, event):
         # self.max_x, self.max_y = event.x, event.y
-        ratio_x = float(self.camera.capture_size[0] / self.show_size[0])
-        ratio_y = float(self.camera.capture_size[1] / self.show_size[1])
+        ratio_x = float(capture_frame_size(self.camera)[0] / self.show_size[0])
+        ratio_y = float(capture_frame_size(self.camera)[1] / self.show_size[1])
         print(
             "Mouse up: Show ({}, {}) / Capture ({}, {})".format(
                 self.max_x, self.max_y, int(self.max_x * ratio_x), int(self.max_y * ratio_y)
@@ -674,15 +673,10 @@ class CaptureArea(tk.Canvas):
         if self.min_y > self.max_y:
             self.min_y, self.max_y = self.max_y, self.min_y
 
-        self.camera.saveCapture(
-            crop=1,
-            crop_ax=[
-                int(self.min_x * ratio_x),
-                int(self.min_y * ratio_x),
-                int(self.max_x * ratio_x),
-                int(self.max_y * ratio_x),
-            ],
-        )
+        crop = display_rect_to_capture((self.min_x, self.min_y, self.max_x, self.max_y),
+                                       self.show_size, capture_frame_size(self.camera))
+        if crop[2] > crop[0] and crop[3] > crop[1]:
+            self.camera.saveCapture(crop=1, crop_ax=list(crop))
 
         # t = 0
         self.after(250, self.delete("SelectArea"))
@@ -694,8 +688,8 @@ class CaptureArea(tk.Canvas):
 
     def ReleaseRangeSS_asksaveasfilename(self, event):
         # self.max_x, self.max_y = event.x, event.y
-        ratio_x = float(self.camera.capture_size[0] / self.show_size[0])
-        ratio_y = float(self.camera.capture_size[1] / self.show_size[1])
+        ratio_x = float(capture_frame_size(self.camera)[0] / self.show_size[0])
+        ratio_y = float(capture_frame_size(self.camera)[1] / self.show_size[1])
         print(
             "Mouse up: Show ({}, {}) / Capture ({}, {})".format(
                 self.max_x, self.max_y, int(self.max_x * ratio_x), int(self.max_y * ratio_y)
@@ -714,16 +708,13 @@ class CaptureArea(tk.Canvas):
         filename = filedialog.asksaveasfilename(
             title="名前を付けて保存", filetypes=[("PNG", ".png")], initialdir="./TEMPLATE/", defaultextension="png"
         )
-        if filename != "":
+        crop = display_rect_to_capture((self.min_x, self.min_y, self.max_x, self.max_y),
+                                       self.show_size, capture_frame_size(self.camera))
+        if filename != "" and crop[2] > crop[0] and crop[3] > crop[1]:
             self.camera.saveCapture(
                 filename=filename[:-4],
                 crop=1,
-                crop_ax=[
-                    int(self.min_x * ratio_x),
-                    int(self.min_y * ratio_x),
-                    int(self.max_x * ratio_x),
-                    int(self.max_y * ratio_x),
-                ],
+                crop_ax=list(crop),
             )
 
         # t = 0
@@ -809,6 +800,9 @@ class CaptureArea(tk.Canvas):
     def setShowsize(self, show_height, show_width):
         self._discard_prepared_preview()
         self._leave_native_preview()
+        # Selection coordinates belong to the previous display geometry.
+        self.delete("SelectArea", "SelectAreaFilled", "OutputRegion")
+        self.min_x = self.min_y = self.max_x = self.max_y = 0
         self.show_width = int(show_width)
         self.show_height = int(show_height)
         self.show_size = (self.show_width, self.show_height)
@@ -860,8 +854,8 @@ class CaptureArea(tk.Canvas):
         if self.master.is_use_left_stick_mouse.get():
             self.UnbindLeftClick()
         x, y = event.x, event.y
-        ratio_x = float(self.camera.capture_size[0] / self.show_size[0])
-        ratio_y = float(self.camera.capture_size[1] / self.show_size[1])
+        ratio_x = float(capture_frame_size(self.camera)[0] / self.show_size[0])
+        ratio_y = float(capture_frame_size(self.camera)[1] / self.show_size[1])
         print("Mouse down: Show ({}, {}) / Capture ({}, {})".format(x, y, int(x * ratio_x), int(y * ratio_y)))
         print(
             f"Color [R: {_img[int(y * ratio_y), int(x * ratio_x)][0]}, "
@@ -1173,7 +1167,7 @@ class CaptureArea(tk.Canvas):
         delay = compensated_after_delay(interval, started_at)
         if high_precision:
             delay = min(4, delay)
-        self.after(delay, self.capture)
+        self._capture_after_id = self.after(delay, self.capture)
 
     @staticmethod
     def _prepare_preview_frame(image_bgr, show_size, frame_sequence,
@@ -1740,6 +1734,12 @@ class CaptureArea(tk.Canvas):
         self._schedule_next_capture(capture_interval, cycle_started)
 
     def destroy(self):
+        pending = getattr(self, "_capture_after_id", None)
+        if pending is not None:
+            self.after_cancel(pending)
+        binding = getattr(self, "_preview_layout_binding", None)
+        if binding:
+            self.winfo_toplevel().unbind("<Configure>", binding)
         self._native_render_stop.set()
         with self._native_render_mode_lock:
             self._native_render_enabled = False
@@ -1767,8 +1767,8 @@ class CaptureArea(tk.Canvas):
         if self._feature_limited \
                 or CaptureArea._gui_resource_pressure_active(self):
             return None
-        ratio_x = float(self.show_size[0] / self.camera.capture_size[0])
-        ratio_y = float(self.show_size[1] / self.camera.capture_size[1])
+        ratio_x = float(self.show_size[0] / capture_frame_size(self.camera)[0])
+        ratio_y = float(self.show_size[1] / capture_frame_size(self.camera)[1])
         try:
             self.create_rectangle(
                 (x1 - 1.0) * ratio_x,
@@ -1802,8 +1802,8 @@ class CaptureArea(tk.Canvas):
         if self._feature_limited \
                 or CaptureArea._gui_resource_pressure_active(self):
             return None
-        ratio_x = float(self.show_size[0] / self.camera.capture_size[0])
-        ratio_y = float(self.show_size[1] / self.camera.capture_size[1])
+        ratio_x = float(self.show_size[0] / capture_frame_size(self.camera)[0])
+        ratio_y = float(self.show_size[1] / capture_frame_size(self.camera)[1])
         str_len = 0.3528 * ft[1] * len(txt)  # 1[pt] = 0.3528[mm]
         try:
             self.create_text(

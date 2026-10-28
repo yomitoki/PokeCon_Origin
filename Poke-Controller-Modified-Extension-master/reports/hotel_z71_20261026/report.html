@@ -1,0 +1,27 @@
+<!doctype html><html lang="ja"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>HOTEL_Z_71 停滞と再開位置の調査</title>
+<style>body{font-family:Meiryo,sans-serif;max-width:1200px;margin:32px auto;padding:0 24px;color:#192c3b;background:#f7f8fa;line-height:1.8}h1{font-size:28px}h2{font-size:21px;margin-top:32px}table{border-collapse:collapse;width:100%;background:white}th,td{padding:12px;border:1px solid #d4dce3;text-align:left}img{max-width:100%;height:auto}figure{margin:0;background:white;border:1px solid #d4dce3}figcaption{padding:12px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px}.lead{padding:20px;background:#e8f2f7;border-left:5px solid #246b89}code{background:#e8edf1;padding:2px 5px}a{color:#075b91}@media(max-width:700px){.grid{grid-template-columns:1fr}}</style>
+<h1>HOTEL_Z_71：PIN探索の停滞と再開位置</h1><p>2026-10-26 / 対象セッション <code>20261026_003707_489722</code></p>
+<p class="lead">71番はPINマーカーの方向合わせ。今回の直接原因は、68番の追加L入力後にカメラの向きが反転し、その向きのまま70番の固定移動を行ったこと。2回のゲームリセット後の保存地点は67番と整合する。</p>
+<h2>追補：68番の追加Lを撤去</h2>
+<p class="lead">後続70番の移動方向を変えていた68番の追加Lを撤去した。A未検知時の共通処理から送るLも、68番に限って無効。Aチェックは残し、未検知中の位置保持と12秒未検知時の67番へのゲームリセット復旧を維持する。70・71番の移動処理は変更していない。</p>
+<p>元の視点の保存画像（回復後・70番開始）で、既存Aマーカーは一致度0.980153／閾値0.800で検出。これは68番のA入力直前を直接記録した画像ではなく、実機の通過確認でもない。関連72件は成功。必須全体878件は既知19 failures／8 errors／1 skipが残り、前回から追加診断0。Origin・stock・配布ZIP・clean DevStudio文書・共通断片を同期済み。</p>
+<p>反映にはCommands停止後のF5 Reloadが必要。現在の壁際でStepだけを67番へ変えず、ゲームの保存を読み直した地点から <code>1_STORY_OUT_HOTEL_Z_67</code> を再開する。今回、実機入力・Stop／Reload・再起動は行っていない。<a href="fix_20261026.json">修正と検証の記録</a></p>
+<p>以下は修正前の録画を比較した調査記録。</p>
+<h2>正常例と今回の違い</h2><p>同じ70番開始地点でも、正常例は主人公の顔側から通路を見ている。今回は主人公の背中側から壁を見ている。70番の移動角度・時間はZIP旧ソースと現ソースでAST一致。異なる画角で同じ操作を行い、71番では回復NPC近くの壁際へ到着した。</p><img src="comparison.jpg" alt="70番開始と71番到着の比較">
+<table><tr><th>確認点</th><th>ZIP正常例</th><th>今回</th></tr>
+<tr><td>68番の最後</td><td>LなしでA入力</td><td>02:06:09.221の実行位置に追加L。動画1:27:26で反転後の画角を確認</td></tr>
+<tr><td>70番開始</td><td><a href="https://www.youtube.com/watch?v=22Lc8za8OfQ&t=3511s">58:31</a>、通路側</td><td><a href="https://www.youtube.com/watch?v=Jk4nNEJtym0&t=5256s">1:27:36</a>、壁側</td></tr>
+<tr><td>71番</td><td>59:14.006から59:17.645まで約3.64秒で72番へ</td><td>02:07:02.762から少なくとも05:38:38.106まで継続。72番への遷移なし</td></tr>
+<tr><td>探す対象</td><td colspan="2"><code>ZA_markerdir("PIN")</code>。A表示確認は72番。71番のPIN未検知には、この経路で期限付きの復帰先がない</td></tr></table>
+<h2>リセット後の再開位置</h2><p>ZIPの67番保存画像には「レポート中…」があり、2勝・700/1000ポイントの戦闘後の広場が写っている。今回の2回の再開も同じ広場・NPC・花壇・ベンチの位置であり、67番からPINへ方向合わせをやり直す復帰先は整合している。</p>
+<table><tr><th>時刻</th><th>復帰理由</th><th>戻った地点</th></tr><tr><td>01:58:01台 → 01:58:46</td><td>68番の初回ResetDebug。20秒待機後の確認用リセット</td><td>67番。2勝・700/1000の戦闘後保存地点</td></tr><tr><td>02:03:16台 → 02:04:00</td><td>69番が進行しないためのcheckpoint復旧。既定120秒の停滞判定</td><td>同じ67番。敗戦復帰の呼出しではない</td></tr></table>
+<p>現在の壁際でStep番号だけ67へ変更することと、保存を読み直して67から再開することは別。今回確認した正しい再開地点は後者。</p>
+<h2>調整対象と確認の範囲</h2><p>復帰先67を変更する根拠はない。修正対象は68番のLによる画角変更と、70番の移動開始時に必要な画角との整合。A確認自体の撤去や、移動角度の推測変更はこの調査では行っていない。71番の未検知が無期限になる点も確認した。</p><p>ゲーム制御コードの変更、実機入力、Stop／Reload／再起動は未実施。修正後の完走確認ではない。保存画像と参照動画の該当場面を確認し、全フレームの視聴ではない。実行位置のサンプル数をボタン入力回数として数えていない。調査対象は今回の67～72番と直前の2回の復帰で、全ストーリーの再開位置監査ではない。</p>
+<h2>保存画像</h2><div class="grid"><figure><img src="images/normal_z67.jpg" alt="ZIP正常例・67番：戦闘後、保存表示あり"><figcaption>ZIP正常例・67番：戦闘後、保存表示あり · <a href="https://www.youtube.com/watch?v=22Lc8za8OfQ&t=3327s">対応動画</a> </figcaption></figure>
+<figure><img src="images/restart1_z67.jpg" alt="今回・01:58:46：初回ResetDebug後の67番"><figcaption>今回・01:58:46：初回ResetDebug後の67番 · <a href="https://www.youtube.com/watch?v=Jk4nNEJtym0&t=4805s">対応動画</a> </figcaption></figure>
+<figure><img src="images/restart2_z67.jpg" alt="今回・02:04:00：69番の停滞復旧後の67番"><figcaption>今回・02:04:00：69番の停滞復旧後の67番 · <a href="https://www.youtube.com/watch?v=Jk4nNEJtym0&t=5117s">対応動画</a> </figcaption></figure>
+<figure><img src="images/normal_z70.jpg" alt="ZIP正常例・70番開始：主人公の顔側から通路を見る"><figcaption>ZIP正常例・70番開始：主人公の顔側から通路を見る · <a href="https://www.youtube.com/watch?v=22Lc8za8OfQ&t=3511s">対応動画</a> </figcaption></figure>
+<figure><img src="images/current_z70.jpg" alt="今回・02:06:19：主人公の背中側から壁を見る"><figcaption>今回・02:06:19：主人公の背中側から壁を見る · <a href="https://www.youtube.com/watch?v=Jk4nNEJtym0&t=5256s">対応動画</a> </figcaption></figure>
+<figure><img src="images/normal_z71.jpg" alt="ZIP正常例・71番：通路上、緑PINが見える"><figcaption>ZIP正常例・71番：通路上、緑PINが見える · <a href="https://www.youtube.com/watch?v=22Lc8za8OfQ&t=3554s">対応動画</a> </figcaption></figure>
+<figure><img src="images/current_z71.jpg" alt="今回・02:07:02：回復NPC付近の壁際に到着"><figcaption>今回・02:07:02：回復NPC付近の壁際に到着 · <a href="https://www.youtube.com/watch?v=Jk4nNEJtym0&t=5298s">対応動画</a> </figcaption></figure>
+<figure><img src="images/latest_z71.jpg" alt="今回・05:38:08：同じ壁際で71番を継続"><figcaption>今回・05:38:08：同じ壁際で71番を継続 </figcaption></figure></div><p><a href="findings.json">時刻・原ファイル・SHA256・ソース比較・実行位置の証跡</a></p></html>

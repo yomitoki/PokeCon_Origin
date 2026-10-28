@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import configparser
 import copy
 import difflib
 import hashlib
@@ -137,6 +138,9 @@ from OperationGamepadMap import (OperationGamepadMapDialog,
 from AutomationTriggers import (StableRuleEvaluator, discover_state_values,
                                 discover_state_variables, resolve_command_value)
 from CommandStartOverride import apply_command_start_override
+from CommandQuickRun import CommandQuickRun
+from AiAssistPanel import AiAssistPanel
+from CommandImageCollection import build_native_image_collection_controls
 from CommandRunOptions import (apply_command_run_options,
                                discover_command_run_options,
                                discover_runtime_debug_options,
@@ -183,6 +187,7 @@ from ProcessShutdown import (active_recording_finalize_worker_pid,
 from ResourceControl import (SystemCpuSampler, clamp_cpu_target,
                              resource_throttle_level,
                              set_main_runtime_priority, throttle_multiplier)
+from CommandRunDialog import single_command_run_dialog
 from UiResponsiveness import (dialog_owner_attachment_allowed,
                               foreground_process_id,
                               foreground_process_matches,
@@ -213,6 +218,8 @@ from Commands.Keys import (KeyPress, Button, Hat, Stick, Direction,
                            normalize_serial_data_format_name)
 from Commands.ProController import ProController
 from Commands.CommandBase import Command
+from CaptureGeometry import capture_frame_size
+from PreviewSizing import PreviewSizing
 
 # OpenCV defaults to all logical CPUs.  Several PokeCon processes then each
 # create a full machine-sized worker pool and starve Tk.  Two workers retain
@@ -423,6 +430,7 @@ class PokeControllerApp:
             name="CommandRecordingStepFrameWriter")
         self._command_step_frame_writer.start()
         self.record_trigger_rules = []
+        self.event_clip_rule = {}
         self.record_cleanup_rules = []
         self.record_variable_rules = []
         self._record_variable_evaluator = StableRuleEvaluator()
@@ -1506,7 +1514,7 @@ class PokeControllerApp:
         self.shortcut2_f.configure(padding="2")
         self.shortcut2_f.pack(side="top", expand="true", fill="both")
         self.command_nb.add(self.shortcut_f, padding="5", text="Shortcut")
-        self.command_nb.configure(padding="0", width="580")
+        self.command_nb.configure(padding="0", width="520")
         self.command_nb.pack(padx="5", pady="5", side="left")
         self.command_nb.pack(fill="both", expand=True, padx="5", pady="5", side="left")
         self.command_nb.bind("<<NotebookTabChanged>>", self.controllButtons, add="")
@@ -1569,18 +1577,36 @@ class PokeControllerApp:
             column="4", columnspan="6", padx="5", pady=(0, 5),
             row="2", sticky="w")
         self.action_commands_f.configure(height="200", width="200")
-        self.action_commands_f.grid(column="0", row="1", sticky="e")
+        self.action_commands_f.grid(column="0", row="1", sticky="ew")
+        # Two compact rows leave room for embedded Step and operation pickers.
+        self.image_match_debug_button.grid_configure(column=0, row=1, columnspan=2, padx=3)
+        self.pause_button.grid_configure(column=6, row=0, padx=3)
+        self.force_stop_button.grid_configure(column=2, row=1, columnspan=2, padx=3)
+        self.command_recovery_button.configure(text="復旧操作", command=self.open_command_recovery_window)
+        self.command_recovery_button.grid_configure(column=4, row=1, padx=3)
+        for child in self.action_commands_f.grid_slaves(row=1):
+            if isinstance(child, ttk.Label):
+                child.configure(width=28, wraplength=220)
+                child.grid_configure(column=5, columnspan=2)
+        self.command_recovery_auto_pause_checkbox.configure(text="従来の自動一時停止を無効")
+        self.command_recovery_auto_pause_checkbox.grid_configure(column=0, columnspan=7)
+
+        self.ai_assist_tab, self.ai_assist_f = self._create_scrollable_tab()
+        self.controller_nb.add(self.ai_assist_tab, padding="0", text="AIアシスト")
 
         self.command_debug_panel = CommandDebugPanel(
-            self.commands_f, on_pulse=self._command_debug_pulse,
+            self.ai_assist_f, on_pulse=self._command_debug_pulse,
             on_capture=self.capture_command_debug_evidence,
             on_retest=self.retest_current_command_step,
             on_maximize=self._command_debug_save_maximize,
             on_stop=self.stop_command_debug_tools,
             on_restart=self.restart_pokecon_same_settings,
             on_fresh_start=self.fresh_start_current_command)
-        # Keep the tools BESIDE Commands selection, not below the tall preview.
-        self.command_debug_panel.grid(column=1, row=0, rowspan=2, sticky="new", padx=5, pady=3)
+        self.command_debug_panel.pack(fill="x", padx=5, pady=3)
+        self.command_quick_run = CommandQuickRun(self.commands_f, self)
+        self.command_quick_run.grid(column=0, row=2, sticky="ew", padx=5, pady=3)
+        self.ai_assist_panel = AiAssistPanel(self.ai_assist_f, self, self.commands_f)
+        self.ai_assist_panel.pack(fill="x")
         self.commands_f.columnconfigure(0, weight=1)
 
         self.commands_f.configure(height="200", width="500")
@@ -1663,6 +1689,10 @@ class PokeControllerApp:
             self.others_preset_lf, text="Open PokeConStudio",
             command=self.open_pokecon_studio).grid(
                 column=6, row=0, padx=(2, 5), pady=4)
+        ttk.Button(
+            self.others_preset_lf, text="動画解析GUI",
+            command=self.open_video_analysis_studio).grid(
+                column=5, columnspan=2, row=1, padx=5, pady=4, sticky="ew")
         self.others_preset_lf.grid(column=0, row=0, padx=5, pady=(3, 0), sticky="ew")
         self.othres_outputs_lf = ttk.Labelframe(self.others_f)
         self.outputs_size_adjuster_lf = ttk.Labelframe(self.othres_outputs_lf)
@@ -2452,6 +2482,12 @@ class PokeControllerApp:
         self.record_mode.set(self.settings.record_mode)
         self._select_recording_mode_page()
         self.record_output_dir.set(self.settings.record_output_dir)
+        try:
+            self.event_clip_rule = json.loads(getattr(self.settings, "event_clip_rule", "{}"))
+            if not isinstance(self.event_clip_rule, dict):
+                self.event_clip_rule = {}
+        except (TypeError, ValueError):
+            self.event_clip_rule = {}
         self._apply_record_output_dir()
         self.operation_capture_output_dir.set(
             getattr(self.settings, "operation_capture_output_dir", ""))
@@ -2561,7 +2597,9 @@ class PokeControllerApp:
                 preset = self._read_recording_presets().get(
                     self._startup_combined_item.get("recording_set", ""))
                 if isinstance(preset, dict):
-                    self._startup_legacy_recording_preset = copy.deepcopy(preset)
+                    self._startup_legacy_recording_preset = (
+                        self._legacy_recording_preset_data(
+                            self._startup_input_item, preset))
                 self._startup_effective_snapshot = legacy_combined_snapshot(
                     self._startup_input_item, self._startup_combined_item)
             self._apply_all_tabs_snapshot(
@@ -2746,6 +2784,13 @@ class PokeControllerApp:
         Command.image_detection_event = self.receive_image_detection_event
 
         self.show_size_tmp = self.show_size_cb["values"].index(self.show_size_cb.get())
+        self.preview_sizing = PreviewSizing(self)
+        from CompanionPane import open_companion
+        ttk.Button(self.preview_status_f, text="2画面",
+                   command=lambda: open_companion(self)).pack(side="left", padx=3)
+        from EventClipUI import open_event_clips
+        ttk.Button(self.preview_status_f, text="条件クリップ",
+                   command=lambda: open_event_clips(self)).pack(side="left", padx=3)
         self.root.bind("<Key-F5>", self.ReloadCommandWithF5)
         self._logger.debug("Bind F5 key to reload commands")
         self.root.bind("<Key-F6>", self.StartCommandWithF6)
@@ -4484,6 +4529,7 @@ class PokeControllerApp:
              (self.audio_tab, "Audio"), (self.recording_tab, "Recording"),
              (self.serial_tab, "Serial"), (self.manual_control_tab, "Manual Control"),
              (self.area_capture_tab, "Area Capture"), (self.commands_tab, "Commands"),
+             (self.ai_assist_tab, "AIアシスト"),
              (self.commands_assist_tab, "CommandsAssist"),
              (self.operation_capture_tab, "操作記録→Commands"),
              (self.image_detection_monitor_tab, "Image Detection"),
@@ -4518,6 +4564,7 @@ class PokeControllerApp:
             tab for tab in (
                 getattr(self, "area_capture_tab", None),
                 getattr(self, "commands_tab", None),
+                getattr(self, "ai_assist_tab", None),
                 getattr(self, "commands_assist_tab", None),
                 getattr(self, "operation_capture_tab", None),
                 getattr(self, "image_detection_monitor_tab", None),
@@ -7273,9 +7320,13 @@ class PokeControllerApp:
         dialog.wait_window()
         return result["action"]
 
+    @single_command_run_dialog
     def _prompt_command_run_settings(self, command_instance,
                                      initial_config=None):
         """Show the Commands-owned Step selector after Start was requested."""
+        inline = getattr(self, "command_quick_run", None)
+        if inline is not None:
+            return inline.prepare(command_instance, initial_config)
         command_name = str(getattr(command_instance, "NAME", "") or "")
         options = self._command_run_options(command_name)
         locations = list(options.get("locations", []))
@@ -7326,11 +7377,10 @@ class PokeControllerApp:
             initial_config if isinstance(initial_config, dict)
             else self.command_start_overrides.get(command_name, {}))
         dialog = tk.Toplevel(self.root)
+        self._command_run_dialog.attach(dialog)
         dialog.title("{} - Step実行設定".format(command_name))
         dialog.geometry("1020x720")
-        dialog.minsize(820, 580)
-        dialog.transient(self.root)
-        dialog.grab_set()
+        dialog.minsize(820, 620)
 
         search = tk.StringVar()
         group = tk.StringVar(value="すべて")
@@ -7402,6 +7452,12 @@ class PokeControllerApp:
             favorite_box, state="readonly", width=48,
             textvariable=favorite_value)
         favorite_cb.grid(column=0, row=0, padx=5, pady=5, sticky="ew")
+
+        # Native-only, one-run options. Deliberately outside current_config /
+        # apply_config so old dialogs, saved InputSets and favorites cannot
+        # enable collection or supplemental operation checks on another run.
+        activate_image_collection = build_native_image_collection_controls(
+            dialog, command_instance, os.path.dirname(os.path.abspath(__file__)))
 
         option_box = ttk.Labelframe(dialog, text="デバッグ・失敗時再実行")
         option_box.pack(fill="both", expand=True, padx=10, pady=5)
@@ -7612,6 +7668,13 @@ class PokeControllerApp:
                     tkmsg.showwarning(
                         "Step実行設定", "開始場所を選択してください。", parent=dialog)
                     return
+            if mode in ("apply", "default"):
+                try:
+                    activate_image_collection()
+                except (OSError, ValueError) as error:
+                    tkmsg.showerror("画像収集・補足チェック", str(error), parent=dialog)
+                    return
+            if mode == "apply":
                 self.command_start_overrides[command_name] = config
                 self._sync_command_start_overrides_to_active_input_set()
                 result["start"] = True
@@ -7637,11 +7700,13 @@ class PokeControllerApp:
         refresh_filter()
         apply_config(saved if saved else {"start": locations[0]})
         refresh_favorites()
+        self._command_run_dialog.present()
         self.root.wait_window(dialog)
         self._refresh_command_start_status()
         return bool(result["start"])
 
     def _selected_command_run_changed(self, _event=None):
+        self._update_command_start_state()
         self._refresh_command_start_status()
         self._refresh_inline_command_run_panel()
 
@@ -7839,6 +7904,9 @@ class PokeControllerApp:
         self._refresh_inline_command_run_panel()
 
     def _refresh_command_start_status(self):
+        inline = getattr(self, "command_quick_run", None)
+        if inline is not None:
+            inline.refresh()
         panel = getattr(self, "command_debug_panel", None)
         if panel is not None and hasattr(panel, "set_fresh_start_supported"):
             classes = self._command_classes(self._selected_command_name())
@@ -8391,6 +8459,9 @@ class PokeControllerApp:
         return result["value"]
 
     def _prepare_command_start_override(self, command):
+        inline = getattr(self, "command_quick_run", None)
+        if inline is not None:
+            return inline.apply(command)
         command_name = str(getattr(command, "NAME", "") or "")
         config = self.command_start_overrides.get(command_name)
         if not isinstance(config, dict):
@@ -9757,6 +9828,27 @@ class PokeControllerApp:
             except tk.TclError:
                 pass
 
+    def open_video_analysis_studio(self):
+        """Launch offline review in a separate, lower-priority process."""
+        project_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        launcher = os.path.join(project_dir, "VideoAnalysisStudio.pyw")
+        python = sys.executable
+        options = {"cwd": project_dir, "close_fds": True}
+        if platform.system() == "Windows":
+            candidate = os.path.join(os.path.dirname(python), "pythonw.exe")
+            if os.path.isfile(candidate):
+                python = candidate
+            options["creationflags"] = (
+                getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200)
+                | getattr(subprocess, "DETACHED_PROCESS", 0x8)
+                | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x4000))
+        try:
+            subprocess.Popen([python, launcher, "--settings",
+                              os.path.abspath(Settings.GuiSettings.SETTING_PATH)], **options)
+            self.show_output("Analysis", text="動画解析GUIを別プロセスで起動しました。")
+        except OSError as error:
+            tkmsg.showerror("動画解析GUI", "起動できませんでした。\n" + str(error))
+
     def open_dev_studio(self, operation_session=None, command_recording=None,
                         focus_repair=False):
         """Launch the dependency-free PokeCon code search/merge helper."""
@@ -10267,6 +10359,11 @@ class PokeControllerApp:
 
     def applyWindowSize(self, event=None):
         width, height = map(int, self.show_size.get().split("x"))
+        sizing = getattr(self, "preview_sizing", None)
+        if sizing is not None:
+            sizing.manual_size(width, height)
+            self.show_size_tmp = self.show_size_cb["values"].index(self.show_size_cb.get())
+            return
         self.preview.setShowsize(height, width)
         self.changeAreaSize()
 
@@ -10769,6 +10866,9 @@ class PokeControllerApp:
         worker = getattr(command, "thread", None) if command is not None else None
         if worker is not None and worker.is_alive():
             return True
+        pane = getattr(self, "companion_pane", None)
+        if pane is not None and (pane.command_running() or pane.recorder.active):
+            return True
         return bool(
             getattr(self.recorder, "active", False)
             or getattr(self, "record_armed", False)
@@ -10938,7 +11038,12 @@ class PokeControllerApp:
         return bool(isinstance(output, dict) and output.get("key"))
 
     def _device_conflicts(self, kind, key):
-        return device_usage_conflicts(self._other_device_usage_entries(), kind, key)
+        entries = self._other_device_usage_entries()
+        pane = getattr(self, "companion_pane", None)
+        if pane is not None and pane.device_keys.get(kind) == key:
+            entries = list(entries) + [{"pid": os.getpid(), "input_set": pane.name.get(),
+                "devices": {kind: {"key": key, "label": "副画面"}}}]
+        return device_usage_conflicts(entries, kind, key)
 
     @staticmethod
     def _device_conflict_owner_text(entries):
@@ -11822,10 +11927,9 @@ class PokeControllerApp:
             tag for tag in self.mcu_tags if tag.startswith("@"))
         self.command_filter_mcu_cb.configure(values=["-"] + self.mcu_tags_values)
         self.setCommandItems()
-        if self.py_classes and self.mcu_classes:
-            self.assignCommand()
-            if hasattr(self, "menu"):
-                self.menu.cur_command = self.cur_command
+        self.assignCommand()
+        if hasattr(self, "menu"):
+            self.menu.cur_command = self.cur_command
         self.refresh_command_watch_commands()
         self.refresh_commands_assist_commands()
         self._commands_loaded = True
@@ -11873,6 +11977,7 @@ class PokeControllerApp:
         else:
             self.sample_py_cb["values"] = [c.NAME for c in self.sample_py_classes if self.command_filter_sample_py_cb.get() in c.TAGS]
         if self.sample_py_cb["values"]: self.sample_py_cb.current(0)
+        else: self.sample_py_cb.set("")
 
         # McuCommands
         self.mcu_cb_all = [c.NAME for c in self.mcu_classes]
@@ -11880,10 +11985,13 @@ class PokeControllerApp:
             self.mcu_cb["values"] = self.mcu_cb_all
         else:
             self.mcu_cb["values"] = [c.NAME for c in self.mcu_classes if self.command_filter_mcu_cb.get() in c.TAGS]
-        if self.mcu_cb_all: self.mcu_cb.current(0)
+        if self.mcu_cb["values"]: self.mcu_cb.current(0)
+        else: self.mcu_cb.set("")
 
     def assignShortcutButton(self):
         self.assignCommand()
+        if self.cur_command is None:
+            return
         if self.set_shortcut_num.get() == "(select)":
             print("not select num.")
         else:
@@ -11929,42 +12037,48 @@ class PokeControllerApp:
                 self.shortcut_button_10_tooltip.text = self.shortcut_command_name[num]
 
     def assignCommand(self):
-        # 選択されているコマンド名を取得する
-        mcu_i = [i for i, name in enumerate([c.NAME for c in self.mcu_classes]) if name == self.mcu_cb.get()]
-        self.mcu_cur_command = self.mcu_classes[mcu_i[0]]()  # MCUコマンドについて
-
-        # pythonコマンドは画像認識を使うかどうかで分岐している
-        py_i = [i for i, name in enumerate([c.NAME for c in self.py_classes]) if name == self.py_cb.get()]
-        cmd_class = self.py_classes[py_i[0]]
-        if issubclass(cmd_class, PythonCommandBase.ImageProcPythonCommand):
-            try:  # 画像認識の際に認識位置を表示する引数追加。互換性のため従来のはexceptに。
-                self.py_cur_command = cmd_class(self.camera, self.preview)
-            except TypeError:
-                self.py_cur_command = cmd_class(self.camera)
-            except Exception:
-                self.py_cur_command = cmd_class(self.camera)
-
-        else:
-            self.py_cur_command = cmd_class()
-
-        sample_i = [i for i, name in enumerate([c.NAME for c in self.sample_py_classes]) if name == self.sample_py_cb.get()]
-        self.sample_py_cur_command = None
-        if sample_i:
-            sample_class = self.sample_py_classes[sample_i[0]]
-            try:
-                self.sample_py_cur_command = sample_class(self.camera, self.preview)
-            except TypeError:
-                self.sample_py_cur_command = sample_class()
-                self.sample_py_cur_command.camera = self.camera
-                self.sample_py_cur_command.gui = self.preview
-
+        # Only the selected tab participates in Start. A missing/filtered-out
+        # command or a broken constructor in another tab must not prevent its
+        # confirmation dialog from opening.
         selected_tab = self.command_nb.tab(self.command_nb.select(), "text")
+        choices = {
+            "Python Command": (self.py_classes, self.py_cb, "py_cur_command"),
+            "Python Sample Command": (
+                self.sample_py_classes, self.sample_py_cb, "sample_py_cur_command"),
+            "Mcu Command": (self.mcu_classes, self.mcu_cb, "mcu_cur_command"),
+        }
+        self.cur_command = None
+        selection = choices.get(selected_tab)
+        if selection is None:
+            return
+        classes, command_box, attribute = selection
+        setattr(self, attribute, None)
+        selected_name = command_box.get()
+        if not selected_name or selected_name not in command_box["values"]:
+            return
+        cmd_class = next((item for item in classes if item.NAME == selected_name), None)
+        if cmd_class is None:
+            return
+
         if selected_tab == "Python Command":
-            self.cur_command = self.py_cur_command
+            if issubclass(cmd_class, PythonCommandBase.ImageProcPythonCommand):
+                try:  # Preserve compatibility with camera-only Commands.
+                    command = cmd_class(self.camera, self.preview)
+                except TypeError:
+                    command = cmd_class(self.camera)
+            else:
+                command = cmd_class()
         elif selected_tab == "Python Sample Command":
-            self.cur_command = self.sample_py_cur_command
-        elif selected_tab == "Mcu Command":
-            self.cur_command = self.mcu_cur_command
+            try:
+                command = cmd_class(self.camera, self.preview)
+            except TypeError:
+                command = cmd_class()
+                command.camera = self.camera
+                command.gui = self.preview
+        else:
+            command = cmd_class()
+        setattr(self, attribute, command)
+        self.cur_command = command
 
     def assignShortcutCommand(self, num):
         commandtype = self.shortcut_command_class[num]
@@ -12074,12 +12188,21 @@ class PokeControllerApp:
             "Mcu Command": self.mcu_cb,
         }
         command_box = command_boxes.get(selected_tab)
-        enabled = command_box is not None and bool(command_box["values"]) and bool(command_box.get())
+        enabled = (command_box is not None and bool(command_box.get())
+                   and command_box.get() in command_box["values"])
         state = "normal" if enabled else "disabled"
         self.start_button["state"] = state
         self.start_top_button["state"] = state
 
     def reloadCommands(self):
+        pending_dialog = getattr(self, "_command_run_dialog", None)
+        if pending_dialog is not None:
+            pending_dialog.activate()
+            return
+        pane = getattr(self, "companion_pane", None)
+        if pane is not None and pane.command_running():
+            self.show_output("Analysis", text="副画面のCommandsを停止してからReloadしてください。")
+            return
         self._cancel_command_debug_pulse()
         self._state_value_cache.clear()
         if not self._commands_loaded:
@@ -12130,6 +12253,9 @@ class PokeControllerApp:
         self._update_command_start_state()
         print("Finished reloading command modules.")
         self._logger.info("Reloaded commands.")
+        inline = getattr(self, "command_quick_run", None)
+        if inline is not None:
+            inline.refresh(force=True)
 
     def applyFilterPy(self, event=None):
         if not self._commands_loaded:
@@ -12174,7 +12300,10 @@ class PokeControllerApp:
             self.mcu_cb["values"] = self.mcu_cb_all
         else:
             self.mcu_cb["values"] = [c.NAME for c in self.mcu_classes if self.command_filter_mcu_cb.get() in c.TAGS]
+        if self.mcu_cb["values"]:
             self.mcu_cb.current(0)
+        else:
+            self.mcu_cb.set("")
         self._update_command_start_state()
 
     def applyFilterSamplePy(self, event=None):
@@ -12187,6 +12316,7 @@ class PokeControllerApp:
         else:
             self.sample_py_cb["values"] = [c.NAME for c in self.sample_py_classes if self.command_filter_sample_py_cb.get() in c.TAGS]
         if self.sample_py_cb["values"]: self.sample_py_cb.current(0)
+        else: self.sample_py_cb.set("")
         self._update_command_start_state()
 
     def pausePlay(self, *event):
@@ -12219,7 +12349,42 @@ class PokeControllerApp:
         except tk.TclError:
             pass
 
+    def _confirm_command_start_preview(self, command):
+        """Optional Commands-owned preview, before any worker/recording starts.
+
+        Only opt-in commands (currently SSR3 v2) get this additional dialog.
+        No camera/frame or controller operation belongs in this hook.
+        """
+        callback = getattr(command, "prompt_start_preview", None)
+        if not callable(callback):
+            return True
+        if getattr(self, "_command_start_preview_pending", False):
+            return False
+        self._command_start_preview_pending = True
+        inline = getattr(self, "command_quick_run", None)
+        if inline is not None:
+            self.root._pokecon_embedded_start_preview = inline.show_start_preview
+        try:
+            confirmed = callback(self.root)
+            return confirmed is True and self.cur_command is command
+        except Exception as error:
+            if inline is not None:
+                inline.status.set("開始画面を確認できないため開始しません: " + str(error))
+            else:
+                tkmsg.showerror("Commands 開始想定画面", "開始画面を確認できないため開始しません。\n" + str(error), parent=self.root)
+            return False
+        finally:
+            if inline is not None:
+                self.root.__dict__.pop("_pokecon_embedded_start_preview", None)
+            self._command_start_preview_pending = False
+
     def startPlay(self, *event, _fresh_start_request=None):
+        pending_dialog = getattr(self, "_command_run_dialog", None)
+        if pending_dialog is not None:
+            pending_dialog.activate()
+            return
+        if getattr(self, "_command_start_preview_pending", False):
+            return
         fresh_launch = getattr(self, "_command_debug_fresh_start_launch", None)
         if (getattr(self, "_command_debug_pulse_job", None) is not None
                 or getattr(self, "_command_debug_retest_request", None) is not None
@@ -12234,6 +12399,10 @@ class PokeControllerApp:
         if not PokeControllerApp._confirm_start_after_app_restart(self):
             return
         # set and init selected command
+        inline = getattr(self, "command_quick_run", None)
+        if _fresh_start_request is None and inline is not None:
+            if not inline.capture_before_start():
+                return
         self.assignCommand()
         if self.cur_command is None:
             print("No commands have been assigned yet.")
@@ -12246,6 +12415,9 @@ class PokeControllerApp:
                 return
         elif not self._command_debug_prepare_fresh_start(self.cur_command, _fresh_start_request):
             return
+        if callable(getattr(self.cur_command, "prompt_start_preview", None)):
+            if not PokeControllerApp._confirm_command_start_preview(self, self.cur_command):
+                return
         self._mark_active_input_set_commands_used()
 
         print(self.start_button["text"] + " " + self.cur_command.NAME)
@@ -12285,6 +12457,12 @@ class PokeControllerApp:
         self._start_command_start_monitor(self.cur_command)
 
     def startShortcutPlay(self, *event, num=0):
+        pending_dialog = getattr(self, "_command_run_dialog", None)
+        if pending_dialog is not None:
+            pending_dialog.activate()
+            return
+        if getattr(self, "_command_start_preview_pending", False):
+            return
         if (getattr(self, "_command_debug_fresh_start_request", None) is not None
                 or getattr(self, "_command_debug_fresh_start_launch", None) is not None):
             self._command_debug_status("はじめから準備中は別のShortcutを実行できません", error=True)
@@ -12299,12 +12477,18 @@ class PokeControllerApp:
             self._logger.info("No commands have been assigned yet.")
 
         # set and init selected command
+        inline = getattr(self, "command_quick_run", None)
+        if inline is not None:
+            inline.prepared = (inline.name, copy.deepcopy(inline.current()))
         flag = self.assignShortcutCommand(num)
         if flag:
             if not self._prompt_command_run_settings(self.cur_command):
                 return
             if not self._prepare_command_start_override(self.cur_command):
                 return
+            if callable(getattr(self.cur_command, "prompt_start_preview", None)):
+                if not PokeControllerApp._confirm_command_start_preview(self, self.cur_command):
+                    return
             self._mark_active_input_set_commands_used()
             print(self.start_button["text"] + " " + self.cur_command.NAME)
             self._logger.info(self.start_button["text"] + " " + self.cur_command.NAME)
@@ -12568,6 +12752,39 @@ class PokeControllerApp:
 
     def exit(self):
         """Avoid destroying the window while the background MP4 encoder runs."""
+        clips = getattr(self, "event_clip_window", None)
+        if clips is not None and clips.worker is not None and clips.worker.is_alive():
+            clips.cancel.set()
+            clips.status.set("終了前にクリップ解析の停止を待っています。")
+            self.root.after(250, self.exit)
+            return
+        pane = getattr(self, "companion_pane", None)
+        if pane is not None:
+            command_thread = getattr(getattr(self, "cur_command", None), "thread", None)
+            if (command_thread is not None and command_thread.is_alive()
+                    and not getattr(self, "_companion_exit_pending", False)):
+                self.stopPlay()
+            # Stop the primary capture now as well: waiting for the secondary
+            # MP4 must not extend the primary recording for several minutes.
+            if ((getattr(self.recorder, "active", False) or getattr(self, "record_armed", False))
+                    and not getattr(self, "_template_recording_stop_in_progress", False)
+                    and not getattr(self, "_command_monitor_stop_in_progress", False)):
+                self.toggle_recording()
+            pane.close()
+            if not getattr(self, "_companion_exit_pending", False):
+                self._companion_exit_pending = True
+                def wait_companion():
+                    current = getattr(self, "companion_pane", None)
+                    if current is not None:
+                        if not current.closing:
+                            self._companion_exit_pending = False
+                            return
+                        self.root.after(250, wait_companion)
+                        return
+                    self._companion_exit_pending = False
+                    self.exit()
+                self.root.after(250, wait_companion)
+            return
         if PokeControllerApp._command_debug_wait_for_release(self, lambda: self.exit()):
             return
         PokeControllerApp._cancel_command_debug_pulse(self)
@@ -12724,6 +12941,8 @@ class PokeControllerApp:
             self.settings.is_use_keyboard.set(self.is_use_keyboard.get())
             self.settings.fps.set(self.fps.get())
             self.settings.show_size.set(self.show_size.get())
+            if getattr(self, "preview_sizing", None) is not None:
+                self.settings.preview_auto_fit = self.preview_sizing.enabled.get()
             self.settings.last_active_preview_full_fps = \
                 self.last_active_preview_full_fps.get()
             self.settings.resource_control_enabled = \
@@ -12815,6 +13034,7 @@ class PokeControllerApp:
             self.settings.record_roi = self.record_roi.get()
             self.settings.record_debug = self.record_debug.get()
             self.settings.record_trigger_rules = json.dumps(self.record_trigger_rules)
+            self.settings.event_clip_rule = json.dumps(getattr(self, "event_clip_rule", {}), ensure_ascii=False)
             self.settings.record_cleanup_rules = json.dumps(self.record_cleanup_rules)
             self.settings.record_minimum_duration = self.record_minimum_duration.get()
             self.settings.record_min_free_gb = self.record_min_free_gb.get()
@@ -14113,8 +14333,8 @@ class PokeControllerApp:
                    and str(rule.get("id", "")) in self.analysis_rule_results]
         rows = ["[Analysis rules]"]
         self.preview.delete("AnalysisRules")
-        ratio_x = self.preview.show_size[0] / self.camera.capture_size[0]
-        ratio_y = self.preview.show_size[1] / self.camera.capture_size[1]
+        ratio_x = self.preview.show_size[0] / capture_frame_size(self.camera)[0]
+        ratio_y = self.preview.show_size[1] / capture_frame_size(self.camera)[1]
         for item in ordered:
             state = "実行" if item.get("passed") else "待機"
             rows.append("{} [{}] {}".format(item.get("name", "解析"), state, item.get("summary", "")))
@@ -14300,8 +14520,8 @@ class PokeControllerApp:
         if not self.image_assist_enabled.get():
             return
         self.preview.delete("ImageAnalysisAssist")
-        ratio_x = self.preview.show_size[0] / self.camera.capture_size[0]
-        ratio_y = self.preview.show_size[1] / self.camera.capture_size[1]
+        ratio_x = self.preview.show_size[0] / capture_frame_size(self.camera)[0]
+        ratio_y = self.preview.show_size[1] / capture_frame_size(self.camera)[1]
         rows = []
         for index, item in enumerate(results, 1):
             x, y, width, height = item["rect"]
@@ -14995,6 +15215,16 @@ class PokeControllerApp:
         legacy["youtube_commands_allow_low_presentations"] = True
         legacy["monitor_retention_mode"] = COMMAND_MONITOR_RETENTION_SMART
         return legacy
+
+    @staticmethod
+    def _legacy_recording_preset_data(input_item, preset):
+        """Keep a legacy shared preset but honor an explicitly saved folder."""
+        result = copy.deepcopy(preset)
+        override = input_item.get("record_output_dir_override") \
+            if isinstance(input_item, dict) else None
+        if isinstance(override, str):
+            result["output_dir"] = override
+        return result
 
     def _current_serial_data(self):
         selected = self._selected_serial_device_label() \
@@ -15722,11 +15952,12 @@ class PokeControllerApp:
         for name, value in values.items():
             if not commands_enabled and name in COMMAND_INPUT_SET_VARIABLES:
                 continue
-            if (not apply_recording
-                    and name == "record_monitor_retention_mode"):
-                # The top-level ``recording`` object was already applied and
-                # is authoritative. A stale all_tabs.values copy must not
-                # switch the retention mode afterwards.
+            if (name.startswith("record_")
+                    and (not apply_recording
+                         or isinstance(snapshot.get("recording"), dict))):
+                # Recording has one authoritative snapshot. Stale copies in
+                # values must not undo its path/mode/policy, including during
+                # the delayed Commands restoration after startup.
                 continue
             variable = getattr(self, name, None)
             if hasattr(variable, "set"):
@@ -16288,8 +16519,11 @@ class PokeControllerApp:
         self._apply_input_set_data(input_item, apply_serial=not isinstance(serial_override, dict))
         if not has_complete_snapshot(input_item):
             self.recording_preset_name.set(item.get("recording_set", ""))
-            self.load_recording_preset()
             self._apply_all_tabs_snapshot(snapshot, runtime=True)
+            # As at startup, the linked Recording preset wins over old
+            # combined values; a folder explicitly saved for this InputSet
+            # overrides only that field, without editing the shared preset.
+            self.load_recording_preset(input_item=input_item)
         if isinstance(serial_override, dict):
             self._apply_serial_input_set(serial_override)
         self._select_input_recording_set()
@@ -18652,9 +18886,12 @@ class PokeControllerApp:
                     sticky="w")
         ttk.Label(frame, text="保存フォルダ:").grid(
             column=0, row=1, padx=(6, 2), pady=5, sticky="w")
-        ttk.Entry(
-            frame, textvariable=self.record_output_dir, width=56).grid(
-                column=1, columnspan=3, row=1, padx=2, pady=5, sticky="ew")
+        output_entry = ttk.Entry(
+            frame, textvariable=self.record_output_dir, width=36)
+        output_entry.grid(
+            column=1, columnspan=3, row=1, padx=2, pady=5, sticky="ew")
+        output_entry.bind("<Return>", self._commit_record_output_dir)
+        output_entry.bind("<FocusOut>", self._commit_record_output_dir)
         ttk.Button(
             frame, text="参照…", command=self.choose_record_output_dir).grid(
                 column=4, row=1, padx=2, pady=5)
@@ -18666,7 +18903,10 @@ class PokeControllerApp:
                 column=6, row=1, padx=(2, 6), pady=5)
         ttk.Label(
             frame,
-            text="空欄の場合は従来どおり Recordings フォルダへ保存します。",
+            text=("参照・既定は自動保存。直接入力はEnterで保存"
+                  "（次の録画から反映）。\n"
+                  "使用中のInputSetにも保存します。空欄は Recordings です。"),
+            wraplength=520,
             foreground="#555555").grid(
                 column=1, columnspan=6, row=2, padx=2, pady=(0, 5),
                 sticky="w")
@@ -21349,6 +21589,12 @@ class PokeControllerApp:
         if pause_command and command is not None and getattr(command, "alive", False):
             self._claim_command_recovery_pause(command)
         context = self._command_recovery_context_text(command)
+        inline = getattr(self, "ai_assist_panel", None)
+        if inline is not None:
+            inline.status.set(str(reason) + " / " + context)
+            if not automatic:
+                self.controller_nb.select(self.ai_assist_tab)
+            return True
         if self._command_recovery_window_exists():
             self._command_recovery_window.set_context(reason, context)
             return True
@@ -21400,6 +21646,9 @@ class PokeControllerApp:
         return shown
 
     def _append_command_recovery_output(self, text):
+        inline = getattr(self, "ai_assist_panel", None)
+        if inline is not None:
+            inline.status.set(str(text))
         if self._command_recovery_window_exists():
             self._command_recovery_window.append_output(text)
 
@@ -21893,6 +22142,9 @@ class PokeControllerApp:
 
     def _record_command_key_activity(self, _payload, priority=False):
         """Sender callback: update a timestamp only; never touch Tk here."""
+        inline = getattr(self, "ai_assist_panel", None)
+        if inline is not None:
+            inline.detector.activity()
         if priority:
             return
         tracker = getattr(self, "_command_monitor_input_tracker", None)
@@ -25638,6 +25890,7 @@ class PokeControllerApp:
             self._record_output_reload_after_id = None
 
     def _record_output_dir_changed(self, *_):
+        self._record_output_dir_committed = None
         self._recording_disk_config_generation = int(getattr(
             self, "_recording_disk_config_generation", 0) or 0) + 1
         self._apply_record_output_dir()
@@ -25653,15 +25906,80 @@ class PokeControllerApp:
     def choose_record_output_dir(self):
         from tkinter import filedialog
         current = self.record_output_dir.get().strip()
-        initial = current if current and os.path.isdir(current) else os.path.abspath("Recordings")
-        path = filedialog.askdirectory(title="録画の保存先を選択", initialdir=initial)
+        initial = os.path.abspath(current or "Recordings")
+        # A new/deleted destination is valid for the next recording. Start the
+        # picker at its nearest existing parent instead of an invalid folder.
+        while not os.path.isdir(initial):
+            parent = os.path.dirname(initial)
+            if parent == initial:
+                initial = os.path.abspath(os.curdir)
+                break
+            initial = parent
+        self._record_output_dir_picking = True
+        try:
+            path = filedialog.askdirectory(
+                title="録画の保存先を選択", initialdir=initial, parent=self.root)
+        finally:
+            self._record_output_dir_picking = False
         if path:
             self.record_output_dir.set(os.path.abspath(path))
-            self._apply_record_output_dir()
+            self._commit_record_output_dir()
 
     def clear_record_output_dir(self):
         self.record_output_dir.set("")
-        self._apply_record_output_dir()
+        self._commit_record_output_dir()
+
+    def _commit_record_output_dir(self, event=None):
+        """Persist an explicit edit without saving programmatic InputSet loads."""
+        if (bool(getattr(self, "_record_output_reload_suspended", False))
+                or bool(getattr(self, "_record_output_dir_committing", False))
+                or bool(getattr(self, "_record_output_dir_picking", False))):
+            return False
+        value = self.record_output_dir.get().strip()
+        name = str(getattr(self, "_active_input_set_name", "") or "").strip()
+        key = (name, value)
+        if getattr(self, "_record_output_dir_committed", None) == key:
+            return True
+        self._record_output_dir_committing = True
+        try:
+            if value and os.path.isfile(value):
+                raise ValueError("ファイルではなく、保存先フォルダを指定してください。")
+            if name:
+                data = self._read_input_sets()
+                item = data.get("input_sets", {}).get(name)
+                if not isinstance(item, dict):
+                    raise ValueError(
+                        "使用中のInputSet「{}」が見つかりません。".format(name))
+                recording = self._input_set_recording_data(item)
+                recording["output_dir"] = value
+                item["recording"] = recording
+                if not isinstance(item.get("all_tabs"), dict):
+                    item["record_output_dir_override"] = value
+                snapshot = item.get("all_tabs")
+                if isinstance(snapshot, dict):
+                    nested = snapshot.get("recording")
+                    if not isinstance(nested, dict):
+                        nested = copy.deepcopy(recording)
+                        snapshot["recording"] = nested
+                    nested["output_dir"] = value
+                    values = snapshot.get("values")
+                    if not isinstance(values, dict):
+                        values = {}
+                        snapshot["values"] = values
+                    values["record_output_dir"] = value
+                self._write_input_sets(data)
+            self.settings.save_record_output_dir(value)
+            self._apply_record_output_dir()
+            self._record_output_dir_committed = key
+            return True
+        except (OSError, ValueError, configparser.Error, tk.TclError) as error:
+            tkmsg.showerror(
+                "録画の保存先",
+                "保存先の設定を保存できませんでした。\n" + str(error),
+                parent=self.root)
+            return False
+        finally:
+            self._record_output_dir_committing = False
 
     def open_record_output_dir(self):
         directory = self._effective_record_output_dir()
@@ -25717,6 +26035,7 @@ class PokeControllerApp:
             "roi": self.record_roi.get(),
             "debug": self.record_debug.get(),
             "trigger_rules": self.record_trigger_rules,
+            "event_clip_rule": copy.deepcopy(getattr(self, "event_clip_rule", {})),
             "cleanup_rules": self.record_cleanup_rules,
             "minimum_duration": self.record_minimum_duration.get(),
             "min_free_gb": self.record_min_free_gb.get(),
@@ -25764,14 +26083,15 @@ class PokeControllerApp:
         self._write_recording_presets(data)
         self.refresh_recording_presets()
 
-    def load_recording_preset(self):
+    def load_recording_preset(self, input_item=None):
         name = self.recording_preset_name.get().strip()
         data = self._read_recording_presets().get(name)
         if not data:
             tkmsg.showwarning("Recording set", "Select a saved recording set.")
             return
         self._apply_recording_preset_data(
-            data, show_limited_warning=True)
+            PokeControllerApp._legacy_recording_preset_data(input_item, data),
+            show_limited_warning=True)
 
     def _apply_recording_preset_data(
             self, data, show_limited_warning=False):
@@ -25822,6 +26142,7 @@ class PokeControllerApp:
         self.record_roi.set(data.get("roi", "0,0,0,0"))
         self.record_debug.set(data.get("debug", False))
         self.record_trigger_rules = data.get("trigger_rules", [])
+        self.event_clip_rule = copy.deepcopy(data.get("event_clip_rule", {}))
         self.record_cleanup_rules = data.get("cleanup_rules", [])
         self.record_minimum_duration.set(data.get("minimum_duration", 0))
         self.record_min_free_gb.set(data.get("min_free_gb", 5.0))
@@ -27581,6 +27902,7 @@ class PokeControllerApp:
             "input_set": str(
                 getattr(self, "_active_input_set_name", "") or ""),
             "record_mode": self.record_mode.get(),
+            "event_clip_rule": copy.deepcopy(getattr(self, "event_clip_rule", {})),
         }
 
     def _launch_youtube_upload_worker(self, config, job_path=""):
@@ -27630,6 +27952,7 @@ class PokeControllerApp:
                   channel_profile_resolved=config.get(
                       "channel_profile_resolved", ""),
                   channel_id_resolved=config.get("channel_id_resolved", ""),
+                  event_clip_rule=config.get("event_clip_rule"),
                   hold_for_local_commit=hold_for_local_commit)
         except (OSError, RuntimeError, TypeError, ValueError) as error:
             self._logger.warning("YouTube upload queue failed: %s", error)
@@ -28341,6 +28664,8 @@ class PokeControllerApp:
 
     def changeAreaSize(self, *event):
         _, height = map(int, self.show_size.get().split("x"))
+        if getattr(self, "preview_sizing", None) is not None:
+            height = self.preview.show_height
         max_size = 0.075 * height
         mode = self.right_frame_widget_mode.get()
         flag = False
@@ -28749,10 +29074,17 @@ class PokeControllerApp:
                       retry_on_failure=False, save_delete_user_number=0, debug={}, max_retries=1)
         self.command_start_overrides[request["name"]] = config
         self._refresh_command_start_status()
+        inline = getattr(self, "command_quick_run", None)
+        if inline is not None:
+            inline.use_config(config)
         version = getattr(getattr(self, "cur_command", None), "VISION_RUNTIME_VERSION", "")
         self._command_debug_status("Reload完了 {}。同Stepだけの開始確認を開きます".format(version), busy=False)
-        # The normal range-confirmation dialog is mandatory. It can be cancelled;
-        # no Pause hot-swap, save deletion, title reset or hidden auto-Start.
+        # Preserve the explicit range confirmation inside Commands.
+        if inline is not None:
+            self.controller_nb.select(self.commands_tab)
+            inline.confirm("{} から同じStepの終了まで再試験します。入力映像を確認してください。".format(
+                location.get("label", location.get("value", ""))), self.startPlay)
+            return True
         self.startPlay()
 
     def _command_debug_fresh_start_location(self, owner, locations):
@@ -28768,7 +29100,7 @@ class PokeControllerApp:
                      and all(item.get(key) == capability.get(key)
                              for key in ("mode", "variable", "value"))), None)
 
-    def fresh_start_current_command(self):
+    def fresh_start_current_command(self, _inline_confirmation=None):
         """Explicit reset/new-game run, guarded by the Commands' image runtime."""
         if any(getattr(self, field, None) is not None for field in (
                 "_command_debug_fresh_start_request", "_command_debug_fresh_start_launch",
@@ -28802,7 +29134,15 @@ class PokeControllerApp:
                    "started": time.monotonic(), "source_file": os.path.abspath(source_file),
                    "capability": copy.deepcopy(owner.POKECON_FRESH_START),
                    "location": copy.deepcopy(location), "end": copy.deepcopy(end)}
-        if not tkmsg.askyesno("タイトル→はじめから実行",
+        inline = getattr(self, "command_quick_run", None)
+        confirmation_key = (binding, name, source_file, location.get("id"), end.get("id"))
+        if inline is not None and _inline_confirmation != confirmation_key:
+            inline.confirm(
+                "入力先: {} / {}\nデータ1を『はじめから』で実行し、既存オートセーブを上書きします。\n"
+                "録画を保護して停止・Reload後に実行します。".format(binding[4], name),
+                lambda: self.fresh_start_current_command(_inline_confirmation=confirmation_key))
+            return False
+        if inline is None and not tkmsg.askyesno("タイトル→はじめから実行",
                 "入力先: {}\nCommands: {}\n\n停止・録画保護・Reloadの後、ゲーム内タイトルへ戻り、"
                 "データ1を『はじめから』で実行します。既存オートセーブは上書きされます。\n"
                 "開始: {}\n終了: {}\n\nHOMEは使用せず、画像判定できなければ停止します。実行しますか？".format(
@@ -28890,6 +29230,13 @@ class PokeControllerApp:
         # This is session-only; saved run options/InputSet remain unchanged.
         if not getattr(self, "_restart_needs_start_confirmation", False):
             return True
+        inline = getattr(self, "command_quick_run", None)
+        if inline is not None:
+            def confirmed():
+                self._restart_needs_start_confirmation = False
+                self.startPlay()
+            inline.confirm("再起動後の現在選択中Commandsを実行します。入力先と開始位置を確認してください。", confirmed)
+            return False
         if not tkmsg.askyesno("再起動後のCommands実行確認",
                              "再起動後はCommandsを停止したままにしています。\n"
                              "現在選択中のCommandsを実行してよいですか？", parent=self.root):

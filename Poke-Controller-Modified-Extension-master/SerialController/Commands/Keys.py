@@ -480,6 +480,10 @@ class KeyPress:
 
         self.q = queue.Queue()
         self.ser = ser
+        # Extra panes can use another protocol without changing the primary
+        # window's process-wide legacy default.
+        if getattr(ser, "serial_data_format_name", None) is not None:
+            self.serial_data_format_name = ser.serial_data_format_name
         self.priority = bool(priority)
         self.format = SendFormat()
         self.holdButton = []

@@ -2,13 +2,13 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import configparser
 import os
 import tkinter as tk
 import tkinter.ttk as ttk
 from logging import getLogger, DEBUG, NullHandler
 
 from pynput.keyboard import Listener
+from Settings import KEYMAP_SECTIONS, create_settings_parser, write_settings_file
 
 
 class PokeKeycon:
@@ -19,8 +19,7 @@ class PokeKeycon:
         self.kc = tk.Toplevel(master)
         self.kc.title("Key Config")
         self.listener = None
-        self.setting = configparser.ConfigParser()
-        self.setting.optionxform = str
+        self.setting = create_settings_parser()
 
         self._logger = getLogger(__name__)
         self._logger.addHandler(NullHandler())
@@ -352,13 +351,29 @@ class PokeKeycon:
         self.setting["KeyMap-Hat"]["Hat.BTM"] = self.HAT_DOWN.get()
         self.setting["KeyMap-Hat"]["Hat.LEFT"] = self.HAT_LEFT.get()
 
-        with open(self.SETTING_PATH, "w", encoding="utf-8") as file:
-            self.setting.write(file)
+        self._persist_keymaps()
+
+    def _persist_keymaps(self):
+        # The main window may have saved new recording/output settings since
+        # this dialog opened. Only the key mappings belong to this dialog.
+        latest = create_settings_parser()
+        if os.path.isfile(self.SETTING_PATH):
+            with open(self.SETTING_PATH, encoding="utf-8") as file:
+                latest.read_file(file)
+        else:
+            latest.read_dict({
+                section: dict(self.setting.items(section))
+                for section in self.setting.sections()
+            })
+        for section in KEYMAP_SECTIONS:
+            if self.setting.has_section(section):
+                latest[section] = dict(self.setting.items(section))
+        write_settings_file(latest, self.SETTING_PATH)
+        self.setting = latest
 
     def apply_setting(self):
-        with open(self.SETTING_PATH, "w", encoding="utf-8") as file:
-            self._logger.debug("Apply key setting")
-            self.setting.write(file)
+        self._logger.debug("Apply key setting")
+        self._persist_keymaps()
         if self.listener is not None:
             self.listener.stop()
 

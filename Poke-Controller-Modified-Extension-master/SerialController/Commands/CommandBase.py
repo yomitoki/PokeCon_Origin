@@ -80,8 +80,9 @@ class Command:
         physical slot name: ``left_top``, ``left_bottom``, ``right_top``,
         ``right_bottom``.  ``image`` is an OpenCV BGR image.
         """
-        if Command.output is not None:
-            Command.output(panel, text=text, image=image, html_path=html_path)
+        dispatch = self.__dict__.get("output", Command.output)
+        if dispatch is not None:
+            dispatch(panel, text=text, image=image, html_path=html_path)
 
     def print_t1(self, *objects: object, sep: str = " ", end: str = "\n"):
         """
@@ -89,8 +90,9 @@ class Command:
         """
         try:
             txt = sep.join([str(obj) for obj in objects]) + end
-            if Command.text_output is not None:
-                Command.text_output("Output#1", "a", txt)
+            dispatch = self.__dict__.get("text_output", Command.text_output)
+            if dispatch is not None:
+                dispatch("Output#1", "a", txt)
                 return
             self.text_area_1.config(state="normal")
             self.text_area_1.insert("end", txt)
@@ -105,8 +107,9 @@ class Command:
         """
         try:
             txt = sep.join([str(obj) for obj in objects]) + end
-            if Command.text_output is not None:
-                Command.text_output("Output#2", "a", txt)
+            dispatch = self.__dict__.get("text_output", Command.text_output)
+            if dispatch is not None:
+                dispatch("Output#2", "a", txt)
                 return
             self.text_area_2.config(state="normal")
             self.text_area_2.insert("end", txt)
@@ -140,8 +143,9 @@ class Command:
         """
         try:
             txt = sep.join([str(obj) for obj in objects]) + end
-            if Command.text_output is not None:
-                Command.text_output("Output#1", mode, txt)
+            dispatch = self.__dict__.get("text_output", Command.text_output)
+            if dispatch is not None:
+                dispatch("Output#1", mode, txt)
                 return
             self.text_area_1.config(state="normal")
             if mode in ["w", "d"]:
@@ -162,8 +166,9 @@ class Command:
         """
         try:
             txt = sep.join([str(obj) for obj in objects]) + end
-            if Command.text_output is not None:
-                Command.text_output("Output#2", mode, txt)
+            dispatch = self.__dict__.get("text_output", Command.text_output)
+            if dispatch is not None:
+                dispatch("Output#2", mode, txt)
                 return
             self.text_area_2.config(state="normal")
             if mode in ["w", "d"]:

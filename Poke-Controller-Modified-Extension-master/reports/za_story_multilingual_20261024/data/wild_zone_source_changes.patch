@@ -1,0 +1,136 @@
+--- before/ZA_story.py
++++ after/ZA_story.py
+@@ -46218,9 +46218,132 @@
+     # POKECON_IMAGE_CHECK_GENERATED_END
+ 
+     # POKECON_IMAGE_CHECK_USER_BEGIN
++    def ZA_wild_zone_number_detail_check(self, targetimage, frame=None):
++        """Confirm 10/18 from equal-size digit crops after the whole-card check."""
++        import cv2
++        import os
++        import LocalFunction.ImageDetection as image_detection
++
++        targets = (
++            "POKEMON_ZA_MOVEPOINT_PIC_W_ZONE10",
++            "POKEMON_ZA_MOVEPOINT_PIC_W_ZONE18",
++        )
++        # The source PNGs have different top margins. Both cutouts are 39x39
++        # and contain only the two digits, with one pixel of white padding.
++        digit_crops = ((169, 4, 208, 43), (168, 0, 207, 39))
++        template_shapes = ((45, 208), (40, 208))
++        self.last_wild_zone_number_detection = {"matched": False}
++        if str(targetimage) not in targets:
++            return False
++        expected = targets.index(str(targetimage))
++        if frame is None:
++            try:
++                frame = image_detection.read_command_frame(self)
++            except RuntimeError:
++                return False
++        if (frame is None or getattr(frame, "size", 0) == 0
++                or len(frame.shape) != 3 or frame.shape[2] not in (3, 4)):
++            return False
++        gray = cv2.cvtColor(frame[:, :, :3], cv2.COLOR_BGR2GRAY)
++        serial_root = os.path.abspath(os.path.join(
++            os.path.dirname(image_detection.__file__), "..", "..", ".."))
++        cache = getattr(self, "_za_wild_zone_number_templates", {})
++        templates, settings = [], []
++        for index, target in enumerate(targets):
++            variants = self.IMAGE_DETECTION_TARGETS.get(target, [])
++            if not variants and index != expected:
++                # A composed sample may register only its requested zone.
++                # The competing PNG is shipped beside it in the same bundle.
++                own = self.IMAGE_DETECTION_TARGETS.get(targets[expected], [])
++                if len(own) == 1:
++                    peer = dict(own[0])
++                    peer["template_path"] = os.path.join(
++                        os.path.dirname(str(peer.get("template_path", ""))),
++                        "W_ZONE{}_pic.png".format(10 if index == 0 else 18))
++                    variants = [peer]
++            if len(variants) != 1:
++                return False
++            config = variants[0]
++            # These calibrated crops belong to the original grayscale PNGs.
++            if (not config.get("use_gray", True)
++                    or any(config.get("template_crop") or [])
++                    or config.get("exclude_regions")):
++                return False
++            path = str(config.get("template_path", ""))
++            if not os.path.isabs(path):
++                path = os.path.join(serial_root, path)
++            try:
++                stat = os.stat(path)
++            except OSError:
++                return False
++            signature = (path, stat.st_mtime_ns, stat.st_size)
++            cached = cache.get(target)
++            if cached is None or cached[0] != signature:
++                template = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
++                if template is None or template.shape != template_shapes[index]:
++                    return False
++                x1, y1, x2, y2 = digit_crops[index]
++                digits = template[y1:y2, x1:x2]
++                if float(cv2.meanStdDev(digits)[1][0, 0]) < 1.0:
++                    return False
++                cached = (signature, template, digits)
++                cache[target] = cached
++            templates.append(cached)
++            settings.append(config)
++        self._za_wild_zone_number_templates = cache
++
++        config = settings[expected]
++        x1, y1, x2, y2 = config.get("crop", (0, 0, 0, 0))
++        height, width = gray.shape
++        x1, y1 = max(0, int(x1)), max(0, int(y1))
++        x2 = width if int(x2) <= 0 else min(width, int(x2))
++        y2 = height if int(y2) <= 0 else min(height, int(y2))
++        region = gray[y1:y2, x1:x2]
++        template = templates[expected][1]
++        if (region.shape[0] < template.shape[0]
++                or region.shape[1] < template.shape[1]):
++            return False
++        _, whole_score, _, position = cv2.minMaxLoc(cv2.matchTemplate(
++            region, template, cv2.TM_CCOEFF_NORMED))
++        # Recheck the original card on this fresh frame too: a menu change
++        # between image_check() and this confirmation cannot reuse old proof.
++        if whole_score < float(config.get("threshold", 0.9)):
++            return False
++        dx1, dy1, dx2, dy2 = digit_crops[expected]
++        left = x1 + position[0] + dx1 - 2
++        top = y1 + position[1] + dy1 - 2
++        right = x1 + position[0] + dx2 + 2
++        bottom = y1 + position[1] + dy2 + 2
++        if left < 0 or top < 0 or right > width or bottom > height:
++            return False
++        digits = gray[top:bottom, left:right]
++        # Both candidates search the SAME 43x43 pixels, allowing only +/-2px.
++        scores = [float(cv2.minMaxLoc(cv2.matchTemplate(
++            digits, cached[2], cv2.TM_CCOEFF_NORMED))[1])
++            for cached in templates]
++        margin = scores[expected] - scores[1 - expected]
++        matched = scores[expected] >= 0.90 and margin >= 0.03
++        self.last_wild_zone_number_detection = {
++            "matched": bool(matched), "target": str(targetimage),
++            "whole_score": float(whole_score),
++            "scores": {"10": scores[0], "18": scores[1]},
++            "score": scores[expected], "margin": margin,
++            "threshold": 0.90, "margin_threshold": 0.03,
++            "crop": (left, top, right, bottom),
++        }
++        if config.get("show_value", False) or getattr(self, "show_value_bool", False):
++            print("[WILD_ZONE_DIGITS] {} 10={:.6f} 18={:.6f} gap={:.6f} {}".format(
++                str(targetimage), scores[0], scores[1], margin,
++                "MATCH" if matched else "NO MATCH"))
++        return bool(matched)
++
+     def image_check_confirmation(self, targetimage, first_match=False):
+-        """Reject numbered SELECT matches on FIELD, battle-level, or RPush screens."""
++        """Disambiguate zone digits and reject SELECT matches on field/battle UI."""
+         del first_match  # image_check hook compatibility
++        if str(targetimage) in (
++                "POKEMON_ZA_MOVEPOINT_PIC_W_ZONE10",
++                "POKEMON_ZA_MOVEPOINT_PIC_W_ZONE18"):
++            return self.ZA_wild_zone_number_detail_check(targetimage)
+         select_targets = {
+             "POKEMON_ZA_1_SELECT",
+             "POKEMON_ZA_2_SELECT",

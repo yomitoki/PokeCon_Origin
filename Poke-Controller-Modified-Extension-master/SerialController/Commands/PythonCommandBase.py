@@ -625,7 +625,7 @@ class PythonCommand(CommandBase.Command):
                 self.keys.init_hat()
             print("Interrupt:cmd(黒い画面)を確認してください。")
             print(e)
-            self._logger.warning("Command stopped unexpectedly")
+            self._logger.warning("Command stopped unexpectedly", exc_info=True)
             import traceback
 
             traceback.print_exc()
@@ -647,6 +647,11 @@ class PythonCommand(CommandBase.Command):
             except Exception as error:
                 self._logger.warning("Command key release failed: %s", error)
             self.keys = None
+            collection = getattr(self, "_native_image_collection", None)
+            if collection is not None:
+                # PNGs drain on their own bounded writer; never hold command
+                # cleanup, recording finalization, or the Tk thread on disk.
+                collection.close()
             if self.thread is threading.current_thread():
                 self.thread = None
             post_process = self.postProcess
@@ -664,7 +669,7 @@ class PythonCommand(CommandBase.Command):
         self.socket0.alive = True
         self.mqtt0.alive = True
         self.postProcess = postProcess
-        ImageProcPythonCommand.template_path_name = "./Template/"
+        self.template_path_name = "./Template/"
         if not self.thread:
             self.thread = threading.Thread(target=self.do_safe, args=(ser,))
             self.thread.start()
@@ -1081,7 +1086,7 @@ class ImageProcPythonCommand(PythonCommand):
             return filename
 
     def setTemplateDir(self, path):
-        ImageProcPythonCommand.template_path_name = path
+        self.template_path_name = path
 
     def getCameraImage(self, crop_fmt: int | str = "", crop: List[int] = []) -> ImageProcessing.image_type:
         """

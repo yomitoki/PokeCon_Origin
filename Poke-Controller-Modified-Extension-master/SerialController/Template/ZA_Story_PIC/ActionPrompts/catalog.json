@@ -1,0 +1,694 @@
+{
+  "schema_version": 1,
+  "created": "2026-10-27",
+  "candidates": [
+    {
+      "id": "enter_ja",
+      "language": "ja",
+      "text": "A はいる",
+      "picture": "POKEMON_ZA_IN_MARKER",
+      "pictures": [
+        "POKEMON_ZA_IN_MARKER"
+      ],
+      "template_path": "Template/ZA_Story_PIC/ActionPrompts/enter_ja.png",
+      "mask_path": "Template/ZA_Story_PIC/ActionPrompts/enter_ja_mask.png",
+      "template_crop": null,
+      "crop": [
+        550,
+        250,
+        900,
+        550
+      ],
+      "threshold": 0.9,
+      "use_gray": true,
+      "match_mode": "zncc",
+      "source": {
+        "kind": "zip_step_frame",
+        "archive": "D:/Recording/Switch_No3.zip",
+        "member": "Switch_No3/20261014_080237_376139_Commands_merged/step_frames/029_step_000001.jpg",
+        "sha256": "45a3181025f185e0fb007e94d02105cdd482631c761f8fd90cf6f543f7febafb",
+        "frame_shape": [
+          720,
+          1280,
+          3
+        ],
+        "crop": [
+          689,
+          414,
+          770,
+          439
+        ],
+        "frame_index": 51,
+        "youtube_remote_member": "Switch_No3/20261014_080237_376139_Commands_merged/youtube_remote.json",
+        "youtube_remote_sha256": "7e9339ff7ec9e07acdb17f2675e514c959660772bbacacdc2975a765eb823337",
+        "video_id": "22Lc8za8OfQ",
+        "video_time_seconds": 841.766667,
+        "video_url": "https://www.youtube.com/watch?v=22Lc8za8OfQ&t=841s",
+        "local_evidence": "C:\\PokeCon\\PokeCon_Origin\\Poke-Controller-Modified-Extension-master\\.codex_tmp\\absol_move21_20261027\\catalog_source_frames\\enter_00051.jpg",
+        "active_state": "1_STORY_HOTEL_Z_MOVE1",
+        "encoded_file_sha256": "45a3181025f185e0fb007e94d02105cdd482631c761f8fd90cf6f543f7febafb",
+        "bgr_pixels_sha256": "6c78ecef3df8b27a9015fc1662e49b34c71b2768d79fb02fec4529dae60cea55",
+        "crop_bgr_pixels_sha256": "47953205685980e93e372b27ca00b47128edbba0c59c827391c97a0cc5fbc04e"
+      },
+      "mask_method": "source gray >= 180, 1px dilation for text; full A disc radius 12 at (11,11)",
+      "template_sha256": "7e46677d145113892b52b46bfc7d8a37c0933950d780cb54671658c6ddfd2d24",
+      "mask_sha256": "93865a8675982385945563132464d512a8efddbe33362b569f8e6bf49f3ed9c2",
+      "status": "verified_zip_pixels_and_offline_crosscheck",
+      "mask_pixels": 1056
+    },
+    {
+      "id": "talk_ja",
+      "language": "ja",
+      "text": "A 話しかける",
+      "picture": "POKEMON_ZA_CHAT_MARKER",
+      "pictures": [
+        "POKEMON_ZA_CHAT_MARKER"
+      ],
+      "template_path": "Template/ZA_Story_PIC/ActionPrompts/talk_ja.png",
+      "mask_path": "Template/ZA_Story_PIC/ActionPrompts/talk_ja_mask.png",
+      "template_crop": null,
+      "crop": [
+        550,
+        250,
+        900,
+        550
+      ],
+      "threshold": 0.9,
+      "use_gray": true,
+      "match_mode": "zncc",
+      "source": {
+        "kind": "zip_step_frame",
+        "archive": "D:/Recording/Switch_No3.zip",
+        "member": "Switch_No3/20261014_080237_376139_Commands_merged/step_frames/109_step_000002.jpg",
+        "sha256": "c4e4b6dee05b438d8128bb2fa2a80326b09c0bb110982635c18a26688c7664ec",
+        "frame_shape": [
+          720,
+          1280,
+          3
+        ],
+        "crop": [
+          689,
+          414,
+          802,
+          439
+        ],
+        "frame_index": 291,
+        "youtube_remote_member": "Switch_No3/20261014_080237_376139_Commands_merged/youtube_remote.json",
+        "youtube_remote_sha256": "7e9339ff7ec9e07acdb17f2675e514c959660772bbacacdc2975a765eb823337",
+        "video_id": "22Lc8za8OfQ",
+        "video_time_seconds": 3260.940375,
+        "video_url": "https://www.youtube.com/watch?v=22Lc8za8OfQ&t=3260s",
+        "local_evidence": "C:\\PokeCon\\PokeCon_Origin\\Poke-Controller-Modified-Extension-master\\.codex_tmp\\absol_move21_20261027\\catalog_source_frames\\talk_00291.jpg",
+        "active_state": "1_STORY_OUT_HOTEL_Z_64",
+        "encoded_file_sha256": "c4e4b6dee05b438d8128bb2fa2a80326b09c0bb110982635c18a26688c7664ec",
+        "bgr_pixels_sha256": "33260390dacaa3fe53a7afb243240d8accf6303d2f84646cdba00dc4cbc85591",
+        "crop_bgr_pixels_sha256": "c2f14273b733961f34b51b3996d5b9f1b2fb47a5ddba3b9720378244c797b63d"
+      },
+      "mask_method": "source gray >= 180, 1px dilation for text; full A disc radius 12 at (11,11)",
+      "template_sha256": "3e38ec2f9b5389af2bed9ef87dc8a489caf7390f0523b27133ffe27ad0d187aa",
+      "mask_sha256": "2737f76fed20e4c553d01e32c13c8c4d212a95048b148bdc45fcf88859c93857",
+      "status": "verified_zip_pixels_and_offline_crosscheck",
+      "mask_pixels": 1481
+    },
+    {
+      "id": "investigate_ja",
+      "language": "ja",
+      "text": "A 調べる",
+      "picture": "POKEMON_ZA_INVESTIGATE_MARKER",
+      "pictures": [
+        "POKEMON_ZA_INVESTIGATE_MARKER",
+        "ZA_RESEARCH_A"
+      ],
+      "template_path": "Template/ZA_Story_PIC/ActionPrompts/investigate_ja.png",
+      "mask_path": "Template/ZA_Story_PIC/ActionPrompts/investigate_ja_mask.png",
+      "template_crop": null,
+      "crop": [
+        550,
+        250,
+        900,
+        550
+      ],
+      "threshold": 0.9,
+      "use_gray": true,
+      "match_mode": "zncc",
+      "source": {
+        "kind": "zip_step_frame",
+        "archive": "D:/Recording/Switch_No3.zip",
+        "member": "Switch_No3/20261016_140837_124907_Commands_merged/step_frames/083_step_000001.jpg",
+        "sha256": "f29a44c65193a9e8877d93f62337d9e8f61ae04ab929b1de3de152264e5069af",
+        "frame_shape": [
+          720,
+          1280,
+          3
+        ],
+        "crop": [
+          689,
+          417,
+          770,
+          442
+        ],
+        "frame_index": 5210,
+        "youtube_remote_member": "Switch_No3/20261016_140837_124907_Commands_merged/youtube_remote.json",
+        "youtube_remote_sha256": "a3a016540adb82ec543bc17b9086b3b608d5ef5c2a861af82e18716fd3e48a70",
+        "video_id": "l_MzEJK1KeM",
+        "video_time_seconds": 2470.2,
+        "video_url": "https://www.youtube.com/watch?v=l_MzEJK1KeM&t=2470s",
+        "local_evidence": "C:\\PokeCon\\PokeCon_Origin\\Poke-Controller-Modified-Extension-master\\.codex_tmp\\absol_move21_20261027\\catalog_source_frames\\investigate_05210.jpg",
+        "active_state": "7_STORY_GURI_102",
+        "encoded_file_sha256": "f29a44c65193a9e8877d93f62337d9e8f61ae04ab929b1de3de152264e5069af",
+        "bgr_pixels_sha256": "8d43d6035e76668a938ff152d3a7b7783e892a3497505bfe4a82347845738c7b",
+        "crop_bgr_pixels_sha256": "e6ae07812b8137eb6753de3ebe52ae181a716e4b54183c4829fd4662e72fc6f6"
+      },
+      "mask_method": "source gray >= 180, 1px dilation for text; full A disc radius 12 at (11,11)",
+      "template_sha256": "2a600b0ee06b94a63d3487ede39a57b5219b6b1582d3c305aa33908bc296c013",
+      "mask_sha256": "49bea1617aad401faafd58be41b2cf0f058a3de8d0b7b815cc1b068ff9e085d3",
+      "status": "verified_zip_pixels_and_offline_crosscheck",
+      "mask_pixels": 1090
+    },
+    {
+      "id": "pickup_ja",
+      "language": "ja",
+      "text": "A 拾う",
+      "picture": "POKEMON_ZA_PICKUP_MARKER",
+      "pictures": [
+        "POKEMON_ZA_PICKUP_MARKER"
+      ],
+      "template_path": "Template/ZA_Story_PIC/ActionPrompts/pickup_ja.png",
+      "mask_path": "Template/ZA_Story_PIC/ActionPrompts/pickup_ja_mask.png",
+      "template_crop": null,
+      "crop": [
+        550,
+        250,
+        900,
+        550
+      ],
+      "threshold": 0.9,
+      "use_gray": true,
+      "match_mode": "zncc",
+      "source": {
+        "kind": "zip_step_frame",
+        "archive": "D:/Recording/Switch_No3.zip",
+        "member": "Switch_No3/20261014_080237_376139_Commands_merged/step_frames/067_step_000003.jpg",
+        "sha256": "e8eecd5bd8ba00c8699fa96a2e1f375d4eed9b4f9f52965fc739da705f4ebf73",
+        "frame_shape": [
+          720,
+          1280,
+          3
+        ],
+        "crop": [
+          689,
+          414,
+          754,
+          439
+        ],
+        "frame_index": 140,
+        "youtube_remote_member": "Switch_No3/20261014_080237_376139_Commands_merged/youtube_remote.json",
+        "youtube_remote_sha256": "7e9339ff7ec9e07acdb17f2675e514c959660772bbacacdc2975a765eb823337",
+        "video_id": "22Lc8za8OfQ",
+        "video_time_seconds": 2007.503153,
+        "video_url": "https://www.youtube.com/watch?v=22Lc8za8OfQ&t=2007s",
+        "local_evidence": "C:\\PokeCon\\PokeCon_Origin\\Poke-Controller-Modified-Extension-master\\.codex_tmp\\absol_move21_20261027\\catalog_source_frames\\pickup_00140.jpg",
+        "active_state": "1_STORY_OUT_HOTEL_Z_18",
+        "encoded_file_sha256": "e8eecd5bd8ba00c8699fa96a2e1f375d4eed9b4f9f52965fc739da705f4ebf73",
+        "bgr_pixels_sha256": "88aa24a3dd27a7d05e2da7eddaf069942ac1895f1a248c193e8af286861dd923",
+        "crop_bgr_pixels_sha256": "6c0b28639a2093ca7337bb1e35eda6a2ecf0e519141009f4e7e77295dd1d8580"
+      },
+      "mask_method": "source gray >= 180, 1px dilation for text; full A disc radius 12 at (11,11)",
+      "template_sha256": "eb9815ad0e1ee444b55a926ab05d7789194dcef8b808770c917aaab813e39ae4",
+      "mask_sha256": "2777826023ef4937966c73c5187e9bd403688a0dde32b9708f65f87eb5a6c3c0",
+      "status": "verified_zip_pixels_and_offline_crosscheck",
+      "mask_pixels": 1023
+    },
+    {
+      "id": "pet_ja",
+      "language": "ja",
+      "text": "A ふれあう",
+      "picture": "POKEMON_ZA_INTERACT_MARKER",
+      "pictures": [
+        "POKEMON_ZA_INTERACT_MARKER"
+      ],
+      "template_path": "Template/ZA_Story_PIC/ActionPrompts/pet_ja.png",
+      "mask_path": "Template/ZA_Story_PIC/ActionPrompts/pet_ja_mask.png",
+      "template_crop": null,
+      "crop": [
+        550,
+        250,
+        900,
+        550
+      ],
+      "threshold": 0.9,
+      "use_gray": true,
+      "match_mode": "zncc",
+      "source": {
+        "kind": "zip_step_frame",
+        "archive": "D:/Recording/Switch_No3.zip",
+        "member": "Switch_No3/20261014_100536_992718_Commands_merged/step_frames/116_step_000002.jpg",
+        "sha256": "25d9fdf64ae9bb3c2659f0ec04141afa8c2a321914d2805080d3a75175d4da90",
+        "frame_shape": [
+          720,
+          1280,
+          3
+        ],
+        "crop": [
+          689,
+          433,
+          786,
+          458
+        ],
+        "frame_index": 1553,
+        "youtube_remote_member": "Switch_No3/20261014_100536_992718_Commands_merged/youtube_remote.json",
+        "youtube_remote_sha256": "e03891caf110f5dc197ab640ab8aeb71dbd9e11e5b150e69cf1a6b7217620ce2",
+        "video_id": "BLM81UP9V5I",
+        "video_time_seconds": 3475.585241,
+        "video_url": "https://www.youtube.com/watch?v=BLM81UP9V5I&t=3475s",
+        "local_evidence": "C:\\PokeCon\\PokeCon_Origin\\Poke-Controller-Modified-Extension-master\\.codex_tmp\\absol_move21_20261027\\catalog_source_frames\\pet_01553.jpg",
+        "active_state": "2_STORY_Y_LANK_BATTLE_ZONE",
+        "encoded_file_sha256": "25d9fdf64ae9bb3c2659f0ec04141afa8c2a321914d2805080d3a75175d4da90",
+        "bgr_pixels_sha256": "020c37af4a40a75f44e7e0910e8867221009f2d216d9f14d41b6f87d76f192e4",
+        "crop_bgr_pixels_sha256": "c5cea6fe9eb2b5f992878216bf15a53dd4a496126db4c33e4264477a68ff71f9"
+      },
+      "mask_method": "source gray >= 180, 1px dilation for text; full A disc radius 12 at (11,11)",
+      "template_sha256": "c123bdc8d470de193df49d31cad96bc10e8b4ab14a769a54a0179784e9851f6e",
+      "mask_sha256": "2344359d35477431fd265a0b3d3443019e7b2f7cac80ab734e33e656084ca60e",
+      "status": "verified_zip_pixels_and_offline_crosscheck",
+      "mask_pixels": 1325
+    },
+    {
+      "id": "sit_ja",
+      "language": "ja",
+      "text": "A 座る",
+      "picture": "POKEMON_ZA_SIT_MARKER",
+      "pictures": [
+        "POKEMON_ZA_SIT_MARKER"
+      ],
+      "template_path": "Template/ZA_Story_PIC/ActionPrompts/sit_ja.png",
+      "mask_path": "Template/ZA_Story_PIC/ActionPrompts/sit_ja_mask.png",
+      "template_crop": null,
+      "crop": [
+        550,
+        250,
+        900,
+        550
+      ],
+      "threshold": 0.9,
+      "use_gray": true,
+      "match_mode": "zncc",
+      "source": {
+        "kind": "zip_step_frame",
+        "archive": "D:/Recording/Switch_No3.zip",
+        "member": "Switch_No3/20261016_033721_470767_Commands_merged/step_frames/111_step_000002.jpg",
+        "sha256": "57e6def1e3333e8c3ddcf22c2b7b829e2a3f814065a2197c45ab6e9329d18aff",
+        "frame_shape": [
+          720,
+          1280,
+          3
+        ],
+        "crop": [
+          689,
+          514,
+          754,
+          539
+        ],
+        "frame_index": 2303,
+        "youtube_remote_member": "Switch_No3/20261016_033721_470767_Commands_merged/youtube_remote.json",
+        "youtube_remote_sha256": "7b88ff388b69140c7104130f4b5c038dc6b7cc57cb7b0e2615b3a81e2ab8ac8e",
+        "video_id": "DHVY6rsajPM",
+        "video_time_seconds": 3313.776667,
+        "video_url": "https://www.youtube.com/watch?v=DHVY6rsajPM&t=3313s",
+        "local_evidence": "C:\\PokeCon\\PokeCon_Origin\\Poke-Controller-Modified-Extension-master\\.codex_tmp\\absol_move21_20261027\\catalog_source_frames\\sit_02303.jpg",
+        "active_state": "5_STORY_KARASUBA_111",
+        "encoded_file_sha256": "57e6def1e3333e8c3ddcf22c2b7b829e2a3f814065a2197c45ab6e9329d18aff",
+        "bgr_pixels_sha256": "c23dc20e8ca1b9356b70a47c478d35d9665bd36741e729dbf93f8a54e7e12f0e",
+        "crop_bgr_pixels_sha256": "f34cab1d4527385e57e90ac71751dee23c85ee59f5acf377bdfb1936387b0304"
+      },
+      "mask_method": "source gray >= 180, 1px dilation for text; full A disc radius 12 at (11,11)",
+      "template_sha256": "f661cf168d7482e90fad2c70d5c9329b46d8e589af8accfb1b6dd62fb24e7cdc",
+      "mask_sha256": "f84919fe0f7fc6377ac096493a0e3dbd0b6b77528baa05e10430531fe09a6c1c",
+      "status": "verified_zip_pixels_and_offline_crosscheck",
+      "mask_pixels": 979
+    },
+    {
+      "id": "exit_ja",
+      "language": "ja",
+      "text": "A でる",
+      "picture": "POKEMON_ZA_OUT_MARKER",
+      "pictures": [
+        "POKEMON_ZA_OUT_MARKER"
+      ],
+      "template_path": "Template/ZA_Story_PIC/ActionPrompts/exit_ja.png",
+      "mask_path": "Template/ZA_Story_PIC/ActionPrompts/exit_ja_mask.png",
+      "template_crop": null,
+      "crop": [
+        550,
+        250,
+        900,
+        550
+      ],
+      "threshold": 0.9,
+      "use_gray": true,
+      "match_mode": "zncc",
+      "source": {
+        "kind": "zip_step_frame",
+        "archive": "D:/Recording/Switch_No3.zip",
+        "member": "Switch_No3/20261016_140837_124907_Commands_merged/step_frames/108_step_000002.jpg",
+        "sha256": "ed783b7e9301aa4e2f8517d20ff47531657d49723a25748e3869e5cc8220778b",
+        "frame_shape": [
+          720,
+          1280,
+          3
+        ],
+        "crop": [
+          689,
+          414,
+          754,
+          439
+        ],
+        "frame_index": 5290,
+        "youtube_remote_member": "Switch_No3/20261016_140837_124907_Commands_merged/youtube_remote.json",
+        "youtube_remote_sha256": "a3a016540adb82ec543bc17b9086b3b608d5ef5c2a861af82e18716fd3e48a70",
+        "video_id": "l_MzEJK1KeM",
+        "video_time_seconds": 3226.309127,
+        "video_url": "https://www.youtube.com/watch?v=l_MzEJK1KeM&t=3226s",
+        "local_evidence": "C:\\PokeCon\\PokeCon_Origin\\Poke-Controller-Modified-Extension-master\\.codex_tmp\\absol_move21_20261027\\catalog_source_frames\\exit_05290.jpg",
+        "active_state": "7_STORY_GURI_126",
+        "encoded_file_sha256": "ed783b7e9301aa4e2f8517d20ff47531657d49723a25748e3869e5cc8220778b",
+        "bgr_pixels_sha256": "56a3d053a3a4b20552578308336fde84f47d1b453a1e410935af5cd51079e186",
+        "crop_bgr_pixels_sha256": "02c76ed465b8c1e4a8b687fcce0bbce91f5b91792b564b52bb1953c0f6e2d4ab"
+      },
+      "mask_method": "source gray >= 180, 1px dilation for text; full A disc radius 12 at (11,11)",
+      "template_sha256": "721313ae9d93bc2d2ed8632ac63d69881312200c9dc27bce28bc4b91f12523ac",
+      "mask_sha256": "b54555d3521237bbf0c0908c332270cf9c2825f66b7bdf6320465f54fc37c6d6",
+      "status": "verified_zip_pixels_and_offline_crosscheck",
+      "mask_pixels": 798
+    },
+    {
+      "id": "climb_ja",
+      "language": "ja",
+      "text": "A のぼる",
+      "picture": "POKEMON_ZA_HASHIGO_ICON",
+      "pictures": [
+        "POKEMON_ZA_HASHIGO_ICON"
+      ],
+      "template_path": "Template/ZA_Story_PIC/ActionPrompts/climb_ja.png",
+      "mask_path": "Template/ZA_Story_PIC/ActionPrompts/climb_ja_mask.png",
+      "template_crop": null,
+      "crop": [
+        550,
+        250,
+        900,
+        550
+      ],
+      "threshold": 0.9,
+      "use_gray": true,
+      "match_mode": "zncc",
+      "source": {
+        "kind": "zip_step_frame",
+        "archive": "D:/Recording/Switch_No3.zip",
+        "member": "Switch_No3/20261015_170734_180260_Commands_merged/step_frames/034_step_000001.jpg",
+        "sha256": "e0b668e597246fc217df0a00241b29643f90758776e3cc34924a597f841cffbe",
+        "frame_shape": [
+          720,
+          1280,
+          3
+        ],
+        "crop": [
+          689,
+          412,
+          770,
+          437
+        ],
+        "frame_index": 9403,
+        "youtube_remote_member": "Switch_No3/20261015_170734_180260_Commands_merged/youtube_remote.json",
+        "youtube_remote_sha256": "8c633a401fd7d8c2545611c7111fbe1d4fa9c109c7f843d9c58f0bfe244f30a9",
+        "video_id": "snVCacRDGNY",
+        "video_time_seconds": 993.566667,
+        "video_url": "https://www.youtube.com/watch?v=snVCacRDGNY&t=993s",
+        "local_evidence": "C:\\PokeCon\\PokeCon_Origin\\Poke-Controller-Modified-Extension-master\\.codex_tmp\\absol_move21_20261027\\catalog_source_frames\\climb_09403.jpg",
+        "active_state": "2_STORY_MEGA_MOVE13",
+        "encoded_file_sha256": "e0b668e597246fc217df0a00241b29643f90758776e3cc34924a597f841cffbe",
+        "bgr_pixels_sha256": "587c3bd6d01332ddea8ffb342d1f1b05068ea20b6c101596da849469177e1556",
+        "crop_bgr_pixels_sha256": "844853188ec98cf095e708ee3a5f48dc4dc9ac7aea3023fd5e84aa80853ff8f2"
+      },
+      "mask_method": "source gray >= 180, 1px dilation for text; full A disc radius 12 at (11,11)",
+      "template_sha256": "8fbf59fdfdba6def62a48a062f4e73e7759ef44f0b0fddeb29407bc982e1add8",
+      "mask_sha256": "b60f7c0c5942835d0342a5bc895fafb917854ac32ef15ffedcbf194f06db3e64",
+      "status": "verified_zip_pixels_and_offline_crosscheck",
+      "mask_pixels": 1207
+    },
+    {
+      "id": "elevator_ja",
+      "language": "ja",
+      "text": "A エレベータ",
+      "picture": "POKEMON_ZA_ELEVATOR_MARKER",
+      "pictures": [
+        "POKEMON_ZA_ELEVATOR_MARKER"
+      ],
+      "template_path": "Template/ZA_Story_PIC/ActionPrompts/elevator_ja.png",
+      "mask_path": "Template/ZA_Story_PIC/ActionPrompts/elevator_ja_mask.png",
+      "template_crop": null,
+      "crop": [
+        550,
+        250,
+        900,
+        550
+      ],
+      "threshold": 0.9,
+      "use_gray": true,
+      "match_mode": "zncc",
+      "source": {
+        "kind": "zip_step_frame",
+        "archive": "D:/Recording/Switch_No3.zip",
+        "member": "Switch_No3/20261016_140837_124907_Commands_merged/step_frames/076_step_000003.jpg",
+        "sha256": "b25190dadba80eeb1a683305b78891b746eac5f6e859dca0aeff699ee7d321e6",
+        "frame_shape": [
+          720,
+          1280,
+          3
+        ],
+        "crop": [
+          689,
+          414,
+          802,
+          439
+        ],
+        "frame_index": 5176,
+        "youtube_remote_member": "Switch_No3/20261016_140837_124907_Commands_merged/youtube_remote.json",
+        "youtube_remote_sha256": "a3a016540adb82ec543bc17b9086b3b608d5ef5c2a861af82e18716fd3e48a70",
+        "video_id": "l_MzEJK1KeM",
+        "video_time_seconds": 2263.283865,
+        "video_url": "https://www.youtube.com/watch?v=l_MzEJK1KeM&t=2263s",
+        "local_evidence": "C:\\PokeCon\\PokeCon_Origin\\Poke-Controller-Modified-Extension-master\\.codex_tmp\\absol_move21_20261027\\catalog_source_frames\\elevator_05176.jpg",
+        "active_state": "7_STORY_GURI_86",
+        "encoded_file_sha256": "b25190dadba80eeb1a683305b78891b746eac5f6e859dca0aeff699ee7d321e6",
+        "bgr_pixels_sha256": "00163a010c224b27d9925a52ece966767f080fcd7c053b77df89a1a59f282b58",
+        "crop_bgr_pixels_sha256": "f96ca961305abee4fab85a81a9c49a820c19a55df32e9a6b8a3b5f2d5f3976a5"
+      },
+      "mask_method": "source gray >= 180, 1px dilation for text; full A disc radius 12 at (11,11)",
+      "template_sha256": "fa2a5b77e0bbdafbea60131e64393b49070dd4373cd2b3e1605a2fe855eadeed",
+      "mask_sha256": "6b65c96c2a27951de5d5b6ed5d7f4d5efc009224f6f9230fe47d82317597a720",
+      "status": "verified_zip_pixels_and_offline_crosscheck",
+      "mask_pixels": 1119
+    }
+  ],
+  "notes": [
+    "Images are literal crops of ZIP saved game pixels; masks select existing pixels.",
+    "DOOR_A is a glyph-only legacy check; no action word is invented for it.",
+    "The existing HASHIGO label reads A のぼる, not A はしご.",
+    "ZIP scan: 13,173 indexed saved game frames inspected in memory, 803 A-glyph >=0.90 candidates; six initial word classes plus all nine outliers reviewed.",
+    "The glyph scan is a candidate retrieval pass, not a guarantee that every possible prompt was visible or retrieved.",
+    "ZIP enter reference does not pass the bright 2026-10-27 ABSOL21 frame; that known limitation is retained for explicit fallback collection."
+  ],
+  "audit": {
+    "archive": "D:/Recording/Switch_No3.zip",
+    "indexed_saved_frames": 13173,
+    "candidate_retrieval": {
+      "glyph": "existing Other_A inner17x17",
+      "search_crop": [
+        550,
+        250,
+        900,
+        550
+      ],
+      "minimum_score": 0.9,
+      "candidate_count": 803,
+      "note": "Only candidate retrieval, not a claimed recall measurement. Six initial classes and nine low-confidence outliers were visually reviewed."
+    },
+    "confirmed_words": [
+      "はいる",
+      "でる",
+      "話しかける",
+      "調べる",
+      "のぼる",
+      "拾う",
+      "ふれあう",
+      "座る",
+      "エレベータ"
+    ],
+    "legacy_glyph_only": [
+      {
+        "picture": "POKEMON_ZA_DOOR_A",
+        "template_path": "Template/ZA_Story_PIC/ZA_infi/doorA.png",
+        "shape": [
+          14,
+          15,
+          3
+        ],
+        "encoded_file_sha256": "c21f5e49644154fc843303e15c02242219401ca182e8c32130f0800eaa1d9c20",
+        "note": "Existing glyph only, no action word. Existing source image kept unchanged; not a new word reference."
+      },
+      {
+        "picture": "POKEMON_ZA_OTHER_A_MARKER",
+        "template_path": "Template/ZA_Story_PIC/Common/other_a_marker.png",
+        "shape": [
+          23,
+          23,
+          3
+        ],
+        "encoded_file_sha256": "a30ac3f6c1e991b777bce81f183ff12d383952ef0f3dfe384a95a237eb0e760f",
+        "note": "Existing glyph only, no action word. Existing source image kept unchanged; not a new word reference."
+      }
+    ],
+    "unverified_words": [
+      "はなす",
+      "しらべる",
+      "はしご"
+    ],
+    "unverified_words_note": "These spellings are not asserted; visible Japanese labels use 話しかける / 調べる / のぼる."
+  },
+  "validation": {
+    "method": "existing MaskedTemplate.masked_template_scores with grayscale and per-candidate mask; fixed saved images only",
+    "source_crop_roundtrip_and_hash": true,
+    "cross_label_source_pairs": 72,
+    "cross_label_source_max_score": 0.7020555138587952,
+    "known_negative_frames": 9,
+    "known_negative_max_score": 0.40521153807640076,
+    "heldout_frames": 19,
+    "heldout": [
+      {
+        "expected": "enter_ja",
+        "index": 52,
+        "score": 0.9953800439834595,
+        "matched": true
+      },
+      {
+        "expected": "enter_ja",
+        "index": 256,
+        "score": 0.8992504477500916,
+        "matched": false
+      },
+      {
+        "expected": "enter_ja",
+        "index": 517,
+        "score": 0.973120927810669,
+        "matched": true
+      },
+      {
+        "expected": "enter_ja",
+        "index": 3580,
+        "score": 0.9715374112129211,
+        "matched": true
+      },
+      {
+        "expected": "talk_ja",
+        "index": 21,
+        "score": 0.8744423389434814,
+        "matched": false
+      },
+      {
+        "expected": "talk_ja",
+        "index": 55,
+        "score": 0.9615505933761597,
+        "matched": true
+      },
+      {
+        "expected": "talk_ja",
+        "index": 139,
+        "score": 0.9666997194290161,
+        "matched": true
+      },
+      {
+        "expected": "talk_ja",
+        "index": 170,
+        "score": 0.8912732601165771,
+        "matched": false
+      },
+      {
+        "expected": "talk_ja",
+        "index": 305,
+        "score": 0.9753901362419128,
+        "matched": true
+      },
+      {
+        "expected": "pickup_ja",
+        "index": 143,
+        "score": 0.786767840385437,
+        "matched": false
+      },
+      {
+        "expected": "pickup_ja",
+        "index": 2411,
+        "score": 0.8078513741493225,
+        "matched": false
+      },
+      {
+        "expected": "pickup_ja",
+        "index": 2689,
+        "score": 0.8286682367324829,
+        "matched": false
+      },
+      {
+        "expected": "pet_ja",
+        "index": 2570,
+        "score": 0.8915255665779114,
+        "matched": false
+      },
+      {
+        "expected": "pet_ja",
+        "index": 2605,
+        "score": 0.9079746603965759,
+        "matched": true
+      },
+      {
+        "expected": "sit_ja",
+        "index": 3504,
+        "score": 0.8790355324745178,
+        "matched": false
+      },
+      {
+        "expected": "sit_ja",
+        "index": 9570,
+        "score": 0.7875449657440186,
+        "matched": false
+      },
+      {
+        "expected": "exit_ja",
+        "index": 10413,
+        "score": 0.9875911474227905,
+        "matched": true
+      },
+      {
+        "expected": "exit_ja",
+        "index": 11877,
+        "score": 0.978755533695221,
+        "matched": true
+      },
+      {
+        "expected": "exit_ja",
+        "index": 13168,
+        "score": 0.9619045257568359,
+        "matched": true
+      }
+    ],
+    "latest_absol21": {
+      "source": "D:/Recording/Switch_No3_sub/20261027_201043_763492/step_frames/step_000001.jpg",
+      "enter_score": 0.6865254640579224,
+      "matched": false,
+      "note": "Known bright-background miss retained for explicit debug fallback collection. No non-ZIP image added to this static catalog."
+    },
+    "limits": [
+      "Source-crop self matches validate extraction only; independent held-out frames are reported separately.",
+      "Climb/elevator/investigate each have one selected source scene in this catalog; source matches alone do not establish scene-wide recall.",
+      "Candidate retrieval can omit unseen action words or low-quality prompts; this is not an exhaustive dictionary guarantee."
+    ]
+  }
+}

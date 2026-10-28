@@ -796,7 +796,9 @@ class Camera:
         else:
             filename = filename + ".png"
 
-        if crop is None:
+        if img is not None:
+            image = img
+        elif crop is None:
             image = self.image_bgr
         elif crop == 1 or crop == "1":
             image = self.image_bgr[crop_ax[1] : crop_ax[3], crop_ax[0] : crop_ax[2]]

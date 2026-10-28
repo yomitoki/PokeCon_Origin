@@ -384,6 +384,21 @@ def ZA_common_box_change_box_target1(self,target1,target1_high=0):
         return "COMMON_BOX_CHANGE_BOX_TARGET1_SELECT"        
     return "COMMON_BOX_CHANGE_BOX_TARGET1"
 def ZA_common_box_change_box_target1_select(self):
+    if getattr(getattr(getattr(self, "_native_image_collection", None), "options", None), "supplemental", False):
+        session = self._native_image_collection
+        menu = session.choice_observation(self, read_command_frame, "box")
+        if menu and menu["rows"] in (7, 8):
+            if menu["selected"] != 0:
+                self.etc_sendCommand("Lbutton_up")
+                self.wait(0.2)
+            elif self.image_check("POKEMON_ZA_BOX_MENU"):
+                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+                return "COMMON_BOX_CHANGE_BOX_TARGET2"
+        elif menu and menu["rows"] == 0:
+            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+        else:
+            self.wait(0.1)
+        return "COMMON_BOX_CHANGE_BOX_TARGET1_SELECT"
     if self.image_check("POKEMON_ZA_BOX_WINDOW"):
         self.wait(1.0)
         if self.image_check("POKEMON_ZA_BOX_MENU"):
@@ -529,13 +544,21 @@ def ZA_common_evolution_function(self,selectnum):
 
     return self.common_evolution_current_state
 def ZA_common_evolution_exec(self):
+    session = getattr(self, "_native_image_collection", None)
+    supplemental_mode = getattr(getattr(session, "options", None), "supplemental", False)
+    if supplemental_mode:
+        menu = session.choice_observation(self, read_command_frame, "evolution")
+        if menu and menu["rows"] == 2 and menu["selected"] != 0:
+            self.etc_sendCommand("Lbutton_up")
+            self.wait(0.2)
+            return "COMMON_EVOLUTION_EXEC"
     # 3_SELECTはステータス／Xメニューの白枠を拾う場合がある。
     # 専用画面を先に処理し、誤検知したAでメニューへ入り直さない。
     def evolution_confirm_visible():
         return (
             self.image_check("POKEMON_ZA_EVOLUTION_CONFIRM")
             or self.image_check("POKEMON_ZA_X_MENU_EVO_MENU")
-            or self.image_check("POKEMON_ZA_2_SELECT"))
+            or (not supplemental_mode and self.image_check("POKEMON_ZA_2_SELECT")))
 
     def close_target_visible():
         return (

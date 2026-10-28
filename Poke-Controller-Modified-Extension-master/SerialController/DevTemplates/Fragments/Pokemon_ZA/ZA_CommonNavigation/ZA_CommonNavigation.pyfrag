@@ -31,6 +31,10 @@ def ZA_Common_map_open(
 
     return "COMMON_MAP_OPEN"
 def ZA_Common_goto_select1(self,position,othermap="POKEMON_ZA_FALSE_RETURN",select_position0_direct=0):
+    if getattr(getattr(getattr(self, "_native_image_collection", None), "options", None), "supplemental", False):
+        result = self.ZA_story_supplemental_filter(position, "COMMON_GOTO_SELECT1", "COMMON_GOTO_SELECT2", othermap)
+        if result is not None:
+            return result
     # position:0 すべて
     # position:1 施設
     # position:2 ポケセン
@@ -205,9 +209,9 @@ def _ZA_furadari_screen_is_dark(self, log_detection=True):
 
 def ZA_Common_goto_jump(
         self, othermap="POKEMON_ZA_FALSE_RETURN",
-        battle_recovery_mode=0):
+        battle_recovery_mode=0, require_confirmation=False):
     self.wait(0.1)#self.wait(self.SLEEPLIST[7][2])
- 
+
     self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.1, interval=0.1)
     furadari_battle_recovery = (
         battle_recovery_mode == 1
@@ -236,7 +240,15 @@ def ZA_Common_goto_jump(
                 reason, recovery_kind))
         return "COMMON_FURADARI_MAP_BATTLE_RECOVERY"
 
-    for i in range(1,10):
+    supplemental_mode = getattr(getattr(getattr(self, "_native_image_collection", None), "options", None), "supplemental", False)
+    if supplemental_mode:
+        if self.ZA_story_map_confirmation_ready():
+            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.1, interval=0.1)
+            self.sleepcount = 0
+            self._za_common_goto_retry_pending = False
+            return "COMMON_CHANGE_TIME"
+        require_confirmation = True
+    for i in ([] if supplemental_mode else range(1,10)):
         self.wait(0.1)#self.wait(self.SLEEPLIST[10][2])
         # バトル警告は通常の移動確認と似ているため、補助モード1では
         # 先に判定しないと通常移動成功として次Stepへ進む場合がある。
@@ -245,22 +257,39 @@ def ZA_Common_goto_jump(
             return start_furadari_battle_recovery(
                 "battle warning detected")
 
+        # 通常gotoも警告を先に確認する。通常確認との重複一致で
+        # 移動成功にしない。Bは復帰処理で画面を見ながら1回ずつ送る。
+        if (not furadari_battle_recovery
+                and self.image_check("POKEMON_ZA_MOVE_COMMENT_BATTLE")):
+            self.inactioncount += 1
+            self.battle_step_return = 1
+            # movepoint確認後の直接呼出しは従来のB回数を維持する。
+            # 復帰処理の上限にも、この入力回数を含める。
+            direct_b_count = (
+                10 if getattr(self, "Common_current_state", None)
+                == "COMMON_START" else 0)
+            if direct_b_count:
+                self.pressRep(
+                    Button.B, repeat=direct_b_count, duration=0.15,
+                    wait=0.1, interval=0.1)
+            self._za_common_goto_retry_pending = True
+            self._za_common_goto_recovery = {
+                "b_count": direct_b_count, "clear_count": 0}
+            return "COMMON_BATTLE_RETURN"
+
         if self.image_check("POKEMON_ZA_MOVE_COMMENT"): 
             self.pressRep(Button.A, repeat=15, duration=0.15, wait=0.1, interval=0.1)
             self.sleepcount=0
+            if not furadari_battle_recovery:
+                self._za_common_goto_retry_pending = False
             return "COMMON_CHANGE_TIME"
-        
-        elif (not furadari_battle_recovery
-                and self.image_check("POKEMON_ZA_MOVE_COMMENT_BATTLE")):
-            self.inactioncount+=1
-            self.pressRep(Button.B, repeat=10, duration=0.15, wait=0.1, interval=0.1)
-            self.battle_step_return=1
-            return "COMMON_BATTLE_RETURN"
-        
+
         elif i == 1:
             if self.image_check("POKEMON_ZA_MOVE_COMMENT"): 
                 self.pressRep(Button.A, repeat=15, duration=0.15, wait=0.1, interval=0.1)
                 self.sleepcount=0
+                if not furadari_battle_recovery:
+                    self._za_common_goto_retry_pending = False
                 return "COMMON_CHANGE_TIME"
             self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.2, interval=0.1)
     print("MOVE_COM_ELSE")
@@ -274,10 +303,21 @@ def ZA_Common_goto_jump(
                 recovery_kind="dark")
         return start_furadari_battle_recovery(
             "move confirmation timed out")
-    if self.battlecheck == 1:
+    if (self.battlecheck == 1 or require_confirmation
+            or getattr(self, "_za_common_goto_retry_pending", False)):
         self.inactioncount+=1
-        self.pressRep(Button.B, repeat=20, duration=0.15, wait=0.1, interval=0.1)
         self.battle_step_return=1
+        direct_b_count = (
+            20 if (self.battlecheck == 1
+                   and getattr(self, "Common_current_state", None)
+                   == "COMMON_START") else 0)
+        if direct_b_count:
+            self.pressRep(
+                Button.B, repeat=direct_b_count, duration=0.15,
+                wait=0.1, interval=0.1)
+        self._za_common_goto_retry_pending = True
+        self._za_common_goto_recovery = {
+            "b_count": direct_b_count, "clear_count": 0}
         return "COMMON_BATTLE_RETURN"
     self.sleepcount=0
     self.pressRep(Button.A, repeat=5, duration=0.15, wait=0.1, interval=0.1)
@@ -333,7 +373,8 @@ def ZA_Common_furadari_map_dark_recovery(self):
 
     if phase == "WAIT_ENTRY_ICON":
         if (self.image_check(field_picture)
-                and self.image_check("POKEMON_ZA_IN_ICON")):
+                and self.image_check("POKEMON_ZA_IN_ICON")
+                and self.ZA_story_wait_movement_a(("POKEMON_ZA_IN_MARKER",), timeout=3.0)):
             self.pressRep(
                 Button.A, repeat=1, duration=0.15,
                 wait=0.5, interval=0.1)
@@ -363,7 +404,8 @@ def ZA_Common_furadari_map_dark_recovery(self):
             and self.image_check("POKEMON_ZA_IN_ICON")):
         entry_a_count = int(getattr(
             self, "_za_furadari_dark_entry_a_count", 0))
-        if entry_a_count < 10:
+        if (entry_a_count < 10
+                and self.ZA_story_wait_movement_a(("POKEMON_ZA_IN_MARKER",), timeout=3.0)):
             self.pressRep(
                 Button.A, repeat=1, duration=0.15,
                 wait=0.5, interval=0.1)
@@ -526,12 +568,22 @@ def ZA_Common_furadari_map_battle_recovery(self):
         "POKEMON_ZA_FURADARI_MAP".format(completion_reason))
     return "COMMON_MAP_OPEN"
 def ZA_Common_change_time(self):
-    
+    recover=getattr(self,"ZA_story_movement_a_local_recovery",None)
+    if callable(recover):
+        recovered=recover(('ZA_Benchi',),'COMMON_MAP_OPEN')
+        if recovered is not None:
+            return recovered
+
+    if self.ZA_story_movement_a_pending("ZA_Benchi"):
+        if self.ZA_Benchi() is False:
+            return "COMMON_CHANGE_TIME"
+        return "COMMON_CHECK_TIME"
+
     #マップコメントの捕捉失敗用
     #if self.image_check("ESCAPE"):
     #    self.battlecheck=1
     #    return "GOTO_SELECT1"
-           
+
     #ポケモンセンター用
     #elif self.image_check("DEAD"):
     #    self.press(Direction(Stick.LEFT, 90), duration=2.0, wait=0.1)
@@ -544,7 +596,8 @@ def ZA_Common_change_time(self):
     #        return "BENCH_MAP_OPEN"
     #el
     if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"): #FIELDから変更
-        self.ZA_Benchi()
+        if self.ZA_Benchi() is False:
+            return "COMMON_CHANGE_TIME"
         return "COMMON_CHECK_TIME"
 
     else:
@@ -645,6 +698,178 @@ def ZA_Common_event_marker_check(self,othermap="POKEMON_ZA_FALSE_RETURN",markert
     return "COMMON_FALSE_RETURN"
 def ZA_Common_false_return(self,othermap="POKEMON_ZA_FALSE_RETURN"):#dummy
     return "COMMON_FALSE_RETURN"
+def ZA_Common_goto_defeat_recovery(self, recovery):
+    """Handle the two defeat comments before allowing a goto retry."""
+    phase = recovery.get("defeat_phase")
+    black_comment = self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT")
+    if phase is None:
+        # 黒背景／通常会話だけでは敗北としない。専用文言を一度確認
+        # した後は、文言が消えても黒Commentが続く間ラッチを保持する。
+        if not black_comment:
+            recovery.pop("defeat_started", None)
+            return False
+        if "defeat_started" not in recovery:
+            if not self.image_check("POKEMON_ZA_FURADARI_EYES_DARK_COMMENT"):
+                return False
+            recovery["defeat_started"] = time.monotonic()
+            self.ZA_MOVE_SEE("END")
+            self.ZA_ZL_ACTION("END")
+        recovery["clear_count"] = 0
+        # 既存フラダリ専用復帰と同じ30秒確認。通常Stepは進めない。
+        if time.monotonic() - recovery["defeat_started"] < 30.0:
+            self.wait(0.1)
+            return True
+        self.checkIfAlive()
+        self.pressRep(
+            Button.B, repeat=1, duration=0.15, wait=0.1, interval=0.1)
+        recovery["defeat_phase"] = "WAIT_INITIAL_BLACK_CLEAR"
+        print("[COMMON_GOTO_DEFEAT] initial B; wait for load")
+        return True
+
+    recovery["clear_count"] = 0
+    if phase == "WAIT_INITIAL_BLACK_CLEAR":
+        if not black_comment:
+            recovery["defeat_phase"] = "WAIT_POST_LOAD_BLACK_COMMENT"
+        self.wait(0.1)
+        return True
+    if phase == "WAIT_POST_LOAD_BLACK_COMMENT":
+        if not black_comment:
+            self.wait(0.1)
+            return True
+        recovery["defeat_phase"] = "CLOSE_POST_LOAD_COMMENT"
+        recovery["defeat_b_count"] = 0
+        phase = "CLOSE_POST_LOAD_COMMENT"
+        print("[COMMON_GOTO_DEFEAT] post-load comment detected")
+
+    if phase == "CLOSE_POST_LOAD_COMMENT":
+        def restored_field():
+            return (
+                not self.image_check("POKEMON_ZA_TEXT_BLACK_COMMENT")
+                and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK_0"))
+
+        # 2回目のComment検知後だけ、最大70回・1秒間隔のBでFIELDへ。
+        # 1周期1入力とし、毎回FIELDを再確認してから次の入力を判断する。
+        field_visible = restored_field()
+        if not field_visible and recovery["defeat_b_count"] < 70:
+            self.checkIfAlive()
+            self.pressRep(
+                Button.B, repeat=1, duration=0.15,
+                wait=0.85, interval=1.0)
+            recovery["defeat_b_count"] += 1
+            field_visible = restored_field()
+        if field_visible:
+            for key in ("defeat_phase", "defeat_started", "defeat_b_count"):
+                recovery.pop(key, None)
+            print("[COMMON_GOTO_DEFEAT] FIELD restored; verify before retry")
+            return False
+    self.wait(0.1)
+    return True
+
+def ZA_Common_battle_return(self):
+    """Clear a blocked ordinary goto, then retry the same destination."""
+    recovery_state = "COMMON_BATTLE_RETURN"
+    self.checkIfAlive()
+    recovery = getattr(self, "_za_common_goto_recovery", None)
+    if not isinstance(recovery, dict):
+        recovery = {"b_count": 0, "clear_count": 0}
+        self._za_common_goto_recovery = recovery
+    self._za_common_goto_retry_pending = True
+
+    if self.ZA_Common_goto_defeat_recovery(recovery):
+        return recovery_state
+
+    # 通常goto専用。FURADARIの復旧状態やその移動先は変更しない。
+    # 警告／マップが残る場合だけBを最大30回、毎周期1回ずつ送る。
+    if any(self.image_check(picture) for picture in (
+            "POKEMON_ZA_MOVE_COMMENT_BATTLE", "POKEMON_ZA_MAP",
+            "POKEMON_ZA_MAP2", "POKEMON_ZA_MOVE_COMMENT")):
+        recovery["clear_count"] = 0
+        if recovery["b_count"] < 30:
+            self.pressRep(
+                Button.B, repeat=1, duration=0.15,
+                wait=0.1, interval=0.1)
+            recovery["b_count"] += 1
+        self.wait(0.1)
+        return recovery_state
+
+    def field_ready():
+        # 背景にFIELDが見える会話・選択肢では攻撃しない。
+        return (
+            not any(self.image_check(picture) for picture in (
+                "POKEMON_ZA_X_MENU_OPEN", "POKEMON_ZA_HELP_MARKER",
+                "POKEMON_ZA_TEXT_BLACK_COMMENT",
+                "POKEMON_ZA_TEXT_WHITE_COMMENT",
+                "POKEMON_ZA_TEXT_GREEN_COMMENT",
+                "POKEMON_ZA_1_SELECT", "POKEMON_ZA_2_SELECT",
+                "POKEMON_ZA_3_SELECT", "POKEMON_ZA_4_SELECT"))
+            and self.image_check("POKEMON_ZA_FILED_HARD_CHECK_0"))
+
+    def threat_visible():
+        return any(self.image_check(picture) for picture in (
+            "POKEMON_ZA_EYE_CHECK_HIGH", "POKEMON_ZA_EYE_CHECK",
+            "POKEMON_ZA_EYE_CHECK_HIGH_POKE",
+            "POKEMON_ZA_BATTLE_BALL_CHECK", "POKEMON_ZA_ESCAPE"))
+
+    if not field_ready():
+        recovery["clear_count"] = 0
+        self.wait(0.1)
+        return recovery_state
+
+    if not threat_visible():
+        if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"):
+            recovery["clear_count"] += 1
+        else:
+            recovery["clear_count"] = 0
+        if recovery["clear_count"] >= 3:
+            self.ZA_MOVE_SEE("END")
+            self.ZA_ZL_ACTION("END")
+            self.battlecheck = 0
+            self.battle_step_return = 0
+            self.inactioncount = 0
+            self.map_cursor_reset = 0
+            self.sleepcount = 0
+            self._za_common_goto_recovery = None
+            print(
+                "[COMMON_GOTO_RECOVERY] threat cleared; "
+                "retry the same destination")
+            # 移動成功ではない。呼出元は同じStepに留まり、再度gotoする。
+            return "COMMON_MAP_OPEN"
+        self.wait(0.1)
+        return recovery_state
+
+    recovery["clear_count"] = 0
+    # 既存の警告復旧と同じ視点方向・ロックオン先・X/A/Bを使用する。
+    # 通常gotoでは各周期で必ず保持を解放し、未知画面へ持ち越さない。
+    self.ZA_MOVE_SEE("END")
+    self.ZA_ZL_ACTION("END")
+    if self.image_check("POKEMON_ZA_FIELD_W"):
+        self.etc_sendCommand("Lbutton_up")
+    self.press(
+        Direction(Stick.RIGHT, 180, 0.6), duration=0.2, wait=0.1)
+    marker_direction = None
+    try:
+        if not field_ready() or not threat_visible():
+            return recovery_state
+        self.ZA_ZL_ACTION("")
+        self.wait(0.1)
+        marker_direction = self.ZA_infi_target_marker_direction()
+        if marker_direction:
+            self.hold(marker_direction)
+        for button in (Button.X, Button.A, Button.B):
+            self.checkIfAlive()
+            if (not field_ready() or not threat_visible()
+                    or not self.ZA_infi_attack_ready()):
+                break
+            self.pressRep(
+                button, repeat=1, duration=0.04,
+                wait=0.0, interval=0.1)
+        self.wait(0.1)
+    finally:
+        if marker_direction:
+            self.holdEnd(marker_direction)
+        self.ZA_ZL_ACTION("END")
+    return recovery_state
+
 def ZA_Common_goto(
         self, position1, position2left, position2down,
         movepoint_check=0,
@@ -657,7 +882,8 @@ def ZA_Common_goto(
     #type=0:ポケセンブルーにて実施(バトルゾーンに影響あり)
     mapping_goto_black_recovery = getattr(
         self, "ZA_Common_mapping_goto_black_recovery", None)
-    if (callable(mapping_goto_black_recovery)
+    if (self.Common_current_state != "COMMON_BATTLE_RETURN"
+            and callable(mapping_goto_black_recovery)
             and mapping_goto_black_recovery(
                 movepoint_check=movepoint_check)):
         return "EXEC"
@@ -678,7 +904,7 @@ def ZA_Common_goto(
         self.Common_current_state = self.ZA_Common_furadari_map_battle_recovery()
     else:
         self.Common_current_state = self.STATE_COMMON_FUNCTION[self.Common_current_state]()
-        
+
     if movepoint_check==1 and self.Common_current_state == "COMMON_GOTO_JUMP":#移動先画像チェック用
         self.Common_current_state = "COMMON_START"#画像位置で停止するが、移動するかは確定出ないためstartに戻す。(移動の際は移動関数を直接叩く)
         return "MOVEPOINT_PIC"
@@ -688,6 +914,9 @@ def ZA_Common_goto(
     else:
         return "EXEC"
 def ZA_Common_pokemon_recovery(self,timeout_seconds=0.0,require_entry_picture=False):  
+    # A待ちの再入場では、済んだ方向移動を繰り返さない。
+    if self.ZA_story_movement_a_pending('ZA_Common_pokemon_recovery'):
+        return self.ZA_story_resume_movement_a('ZA_Common_pokemon_recovery')
     renda_options = {}
     if float(timeout_seconds) > 0.0:
         renda_options["timeout_seconds"] = float(timeout_seconds)
@@ -695,14 +924,231 @@ def ZA_Common_pokemon_recovery(self,timeout_seconds=0.0,require_entry_picture=Fa
         renda_options["require_entry_picture"] = True
     if self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"): #FIELDから変更
         self.press(Direction(Stick.LEFT, 90), duration=2.0, wait=0.1)
-        self.pressRep(Button.A, repeat=10, duration=0.15, wait=0.2, interval=0.1)
-        if self.ZA_renda_button(rendabutton="B",endpicture="POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",sub_button="A",sub_picture="POKEMON_ZA_TEXT_BLACK_COMMENT",sub2_button="A",sub2_picture="POKEMON_ZA_HELP_MARKER",**renda_options): #FIELDから変更
-            return True
-        if renda_options:
+        def _after_checked_a_1():
+            self.pressRep(Button.A, repeat=10, duration=0.15, wait=0.2, interval=0.1)
+            if self.ZA_renda_button(rendabutton="B",endpicture="POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",sub_button="A",sub_picture="POKEMON_ZA_TEXT_BLACK_COMMENT",sub2_button="A",sub2_picture="POKEMON_ZA_HELP_MARKER",**renda_options): #FIELDから変更
+                return True
+            if renda_options:
+                return False
             return False
+        return self.ZA_story_checked_movement_action(
+            'ZA_Common_pokemon_recovery', ('POKEMON_ZA_CHAT_MARKER',),
+            _after_checked_a_1, False, allow_recenter=False)
     else:
         return False
+def ZA_story_wait_movement_a(self, pictures=("POKEMON_ZA_IN_MARKER",), timeout=3.0):
+    """Fixed endpoints may wait; timeout=0 performs exactly one immediate check."""
+    timeout=max(0.0,float(timeout))
+    self.checkIfAlive()
+    if timeout == 0.0:
+        if bool(getattr(self, "Debug_A_Check", False)):
+            try:
+                from Commands.PythonCommands.LocalFunction import ActionPromptCheck as action_prompt
+            except ModuleNotFoundError as error:
+                if error.name not in ("Commands", "Commands.PythonCommands",
+                                      "Commands.PythonCommands.LocalFunction",
+                                      "Commands.PythonCommands.LocalFunction.ActionPromptCheck"):
+                    raise
+                from LocalFunction import ActionPromptCheck as action_prompt
+            return action_prompt.check_action_prompt(self, pictures, count_attempt=True)
+        return self.ZA_story_movement_a_check(pictures)
+    context_getter=getattr(self,"ZA_story_movement_a_context",None)
+    context=(context_getter() if callable(context_getter) else
+             (getattr(self,"_za_story_pre_step_gate_last_dispatch_state",None),))
+    key=(context,tuple(pictures))
+    timers=getattr(self,"_za_movement_a_wait_timers",{})
+    # A previous Step/endpoint must never supply the next endpoint's timeout.
+    timers={k:v for k,v in timers.items() if k[0]==context}
+    self._za_movement_a_wait_timers=timers
+    started=timers.setdefault(key,time.monotonic())
+    deadline=time.monotonic()+timeout
+    while True:
+        self.checkIfAlive()
+        if self.ZA_story_movement_a_check(pictures):
+            self.checkIfAlive()
+            if time.monotonic() <= deadline:
+                timers.pop(key,None)
+                self._za_movement_a_failure=None
+                return True
+        remaining=deadline-time.monotonic()
+        if remaining<=0.0:
+            break
+        self.wait(min(.1,remaining))
+    debug_ready = True
+    if bool(getattr(self, "Debug_A_Check", False)):
+        try:
+            from Commands.PythonCommands.LocalFunction import ActionPromptCheck as action_prompt
+        except ModuleNotFoundError as error:
+            if error.name not in ("Commands", "Commands.PythonCommands",
+                                  "Commands.PythonCommands.LocalFunction",
+                                  "Commands.PythonCommands.LocalFunction.ActionPromptCheck"):
+                raise
+            from LocalFunction import ActionPromptCheck as action_prompt
+        if action_prompt.check_action_prompt(self, pictures, count_attempt=True):
+            timers.pop(key, None)
+            self._za_movement_a_failure = None
+            return True
+        # Finish the third logical trial before scheduling ordinary recovery.
+        detail = getattr(self, "last_action_prompt_detection", {})
+        debug_ready = detail.get("attempt", 0) >= 3
+    if (time.monotonic()-started>=12.0 and debug_ready
+            and not getattr(self,"_za_movement_a_failure",None)):
+        self._za_movement_a_failure={
+            "dispatch":getattr(self,"_za_story_pre_step_gate_last_dispatch_state",None),
+            "context":context,"pictures":tuple(pictures)}
+    return False
+
+def ZA_story_movement_a_check(self, pictures):
+    """Compare A+word references on one fresh frame without glyph substitution."""
+    try:
+        from Commands.PythonCommands.LocalFunction import ActionPromptCheck as action_prompt
+    except ModuleNotFoundError as error:
+        if error.name not in ("Commands", "Commands.PythonCommands",
+                              "Commands.PythonCommands.LocalFunction",
+                              "Commands.PythonCommands.LocalFunction.ActionPromptCheck"):
+            raise
+        from LocalFunction import ActionPromptCheck as action_prompt
+    return action_prompt.check_action_prompt(self, pictures, count_attempt=False)
+
+def ZA_story_note_mapping_a(self, state, pic1, pic2):
+    """Record one verified A route for its matching registration check only."""
+    session = getattr(self, "_native_image_collection", None)
+    options = getattr(session, "options", None)
+    if not getattr(options, "supplemental", False):
+        self._za_mapping_a_proof = None
+        return
+    self._za_mapping_a_proof = {
+        "state": str(state), "pictures": (str(pic1), str(pic2)),
+        "session": session, "expires": time.monotonic() + 180.0,
+    }
+
+def ZA_story_mapping_a_succeeded(self, pic1, pic2):
+    """A proof does not bypass map opening, travel confirmation, or battle guards."""
+    proof = getattr(self, "_za_mapping_a_proof", None)
+    session = getattr(self, "_native_image_collection", None)
+    if (not isinstance(proof, dict)
+            or not getattr(getattr(session, "options", None), "supplemental", False)):
+        return False
+    state = getattr(self, "_za_story_pre_step_gate_last_dispatch_state", None)
+    if (proof.get("session") is not session
+            or time.monotonic() > proof.get("expires", 0.0)
+            or proof.get("state") != state):
+        self._za_mapping_a_proof = None
+        return False
+    if proof.get("pictures") != (str(pic1), str(pic2)):
+        return False
+    print("[MAPPING_A_CONFIRMED] {}: 日本語の場所名・プレビュー確認を代用".format(state))
+    return True
+
+def ZA_story_movement_a_context(self):
+    return tuple(getattr(self, name, None) for name in (
+        "_za_story_pre_step_gate_last_dispatch_state", "Common_current_state",
+        "za_infi_main_current_state", "bench_current_state", "quasar_current_state"))
+
+def ZA_story_movement_a_pending(self, key):
+    """Only resume the action belonging to this movement endpoint."""
+    pending = getattr(self, "_za_movement_a_pending", None)
+    if not isinstance(pending, dict) or pending.get("key") != key:
+        return False
+    if pending.get("context") != self.ZA_story_movement_a_context():
+        self._za_movement_a_pending = None
+        return False
+    return True
+
+def ZA_story_resume_movement_a(self, key):
+    """Recheck at the endpoint; do not replay the movement or earlier A inputs."""
+    if not self.ZA_story_movement_a_pending(key):
+        raise RuntimeError("Movement A continuation is no longer valid: " + key)
+    pending = self._za_movement_a_pending
+    if not self.ZA_story_wait_movement_a(pending["pictures"], timeout=3.0):
+        # Only callers whose existing next step handles this white dialogue opt
+        # in. This is not an A success and never creates map registration proof.
+        if (pending.get("dialogue_state")
+                and self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT")):
+            self._za_movement_a_pending = None
+            print("[MOVEMENT_A_DIALOGUE] {}: 会話開始済み。入口Aを省略".format(key))
+            return pending["dialogue_state"]
+        # The ZIP videos also show a wall/player obscuring a ladder or doorway.
+        # Recenter only once, only on a confirmed non-battle field. Never move,
+        # reset the game, or recenter during a dialogue/battle while awaiting A.
+        if (pending.get("allow_recenter", True) and not pending.get("recentered")
+                and self.image_check("POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK")):
+            self.checkIfAlive()
+            pending["recentered"] = True
+            self.pressRep(Button.L, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+        if not pending.get("reported"):
+            print("[MOVEMENT_A_WAIT] {}: A表示未検知。移動を繰り返さず到着位置で再確認".format(key))
+            pending["reported"] = True
+        return pending["waiting_result"]
+    self.checkIfAlive()
+    # Clear before invoking: the continuation may reach another guarded endpoint.
+    self._za_movement_a_pending = None
+    return pending["action"]()
+
+def ZA_story_checked_movement_action(self, key, pictures, action, waiting_result,
+                                    dialogue_state=None, allow_recenter=True):
+    """Guard an explicit fixed-movement action, never a dialogue/search loop."""
+    try:
+        from Commands.PythonCommands.LocalFunction import ActionPromptCheck as action_prompt
+    except ModuleNotFoundError as error:
+        if error.name not in ("Commands", "Commands.PythonCommands",
+                              "Commands.PythonCommands.LocalFunction",
+                              "Commands.PythonCommands.LocalFunction.ActionPromptCheck"):
+            raise
+        from LocalFunction import ActionPromptCheck as action_prompt
+    source = action_prompt.capture_action_prompt_source(self, pictures, key, action)
+    self._za_movement_a_wait_timers = {}
+    self._za_movement_a_failure = None
+    self._za_movement_a_pending = {
+        "_action_prompt_source": source,
+        "key": key, "pictures": tuple(pictures), "action": action,
+        "waiting_result": waiting_result,
+        "dispatch": getattr(self, "_za_story_pre_step_gate_last_dispatch_state", None),
+        "context": self.ZA_story_movement_a_context(),
+        "dialogue_state": dialogue_state,
+        "allow_recenter": allow_recenter,
+    }
+    return self.ZA_story_resume_movement_a(key)
+
+def ZA_story_map_confirmation_ready(self):
+    session = getattr(self, "_native_image_collection", None)
+    if not getattr(getattr(session, "options", None), "supplemental", False):
+        return self.image_check("POKEMON_ZA_MOVE_COMMENT")
+    self._za_supplemental_map_confirmation = "UNKNOWN"
+    warning = getattr(session, "map_warning_observation", None)
+    deadline = time.monotonic() + 3.0
+    while time.monotonic() < deadline:
+        self.checkIfAlive()
+        menu = session.choice_observation(self, read_command_frame, "map")
+        if menu and menu["rows"] == 2:
+            if menu["selected"] == 0:
+                # Go through image_check for same-frame capture/diagnostics.
+                if self.image_check("POKEMON_ZA_MOVE_COMMENT"):
+                    self._za_supplemental_map_confirmation = "CONFIRM"
+                    return True
+            else:
+                self.etc_sendCommand("Lbutton_up")
+                self.wait(0.2)
+        if callable(warning):
+            warning(self, read_command_frame)
+        self.wait(0.1)
+    if callable(warning) and warning(self, read_command_frame):
+        self._za_supplemental_map_confirmation = "BLOCKED"
+        print("[SUPPLEMENTAL_MAP] map comment without 2_SELECT for 3s; blocked travel")
+    return False
+
 def ZA_Common_mappic_check(self,pic1="NULL",pic2="NULL"):
+    supplemental = getattr(self, "_native_image_collection", None)
+    if getattr(getattr(supplemental, "options", None), "supplemental", False):
+        # 指定goto直後・歩行なしで15番内にいることを呼出し側で保証。
+        if (pic1, pic2) == ("POKEMON_ZA_MOVEPOINT_TARGET_W_ZONE15", "POKEMON_ZA_MOVEPOINT_PIC_W_ZONE15"):
+            return True
+        # Cafe Batailleは場所名を使わず、引き続きプレビューで確認する。
+        if pic1 == "POKEMON_ZA_MOVEPOINT_TARGET_CAFE_BATAILLE":
+            pic1 = "NULL"
+    substitute = getattr(self, "ZA_story_mapping_a_succeeded", None)
+    if callable(substitute) and substitute(pic1, pic2):
+        return True
     for i in range(1,10):
         if ((pic1=="NULL" or self.image_check(pic1)) and (pic2=="NULL" or self.image_check(pic2))):
             return True
@@ -734,3 +1180,294 @@ def ZA_Common_Event_check(self,othermap="POKEMON_ZA_FALSE_RETURN",markertype=0):
 ######################################################
 # BENCH FUNCTION
 ######################################################
+
+def ZA_story_supplemental_filter(self, position, current_state, next_state, othermap="POKEMON_ZA_FALSE_RETURN"):
+    """MAP_6_SELECT: observe, move one row, re-observe, then confirm."""
+    session = self._native_image_collection
+    if not (self.image_check("POKEMON_ZA_MAP2") or self.image_check(othermap)):
+        return None
+    menu = session.choice_observation(self, read_command_frame, "filter")
+    if menu is not None and menu["rows"] == 6:
+        if menu["selected"] == 0:
+            self.image_check("POKEMON_ZA_SELECT_ALL")
+        if menu["selected"] != position:
+            self.etc_sendCommand("Lbutton_up" if menu["selected"] > position else "Lbutton_down")
+            self.wait(0.2)
+            return current_state
+        self.checkIfAlive()
+        fresh = session.choice_observation(self, read_command_frame, "filter")
+        if fresh and fresh["rows"] == 6 and fresh["selected"] == position:
+            self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+            return next_state
+        return current_state
+    if self.image_check("POKEMON_ZA_MOVESPOT_TAB"):
+        self.pressRep(Button.MINUS, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+    else:
+        self.pressRep(Button.Y, repeat=1, duration=0.15, wait=0.3, interval=0.1)
+    return current_state
+
+
+def ZA_story_movement_a_timeout_recovery(self,current_state,normal_return):
+    """Use reviewed recovery origins after A expiry, never execute the A action."""
+    failure=getattr(self,"_za_movement_a_failure",None)
+    if not isinstance(failure,dict):
+        return None
+    if (failure.get("dispatch")!=current_state or normal_return!=current_state
+            or (failure.get("context") is not None
+                and failure["context"] != self.ZA_story_movement_a_context())):
+        self._za_movement_a_failure=None
+        self._za_movement_a_wait_timers={}
+        return None
+    # Filled from existing validated checkpoints / adjacent teleport routes.
+    route=self.ZA_story_movement_a_recovery_route(current_state)
+    if route is None:
+        if not failure.get("reported"):
+            print("[MOVEMENT_A_RECOVERY_UNRESOLVED] {}: 復旧位置未検証。Aを送らず再確認".format(current_state))
+            failure["reported"]=True
+        return None
+    target,action,reset_common,_checkpoint=route
+    self._za_movement_a_pending=None
+    self._za_movement_a_failure=None
+    self._za_movement_a_wait_timers={}
+    self._za_mapping_a_proof=None
+    self._ZA_story_release_recovery_controls("movement_a:"+str(current_state))
+    if reset_common:
+        self._ZA_story_reset_common_navigation_state("movement_a:"+str(current_state))
+    print("[MOVEMENT_A_RECOVERY] {} -> {} action={}".format(current_state,target,action))
+    self._ZA_story_schedule_event_entry_recovery(
+        current_state=current_state,recovery_target=target,
+        recovery_kind="movement_a",recovery_action=action)
+    return self._ZA_story_event_entry_pending_recovery_step(current_state)
+
+def ZA_story_movement_a_local_recovery(self, keys, retry_state):
+    """Restart local map navigation without mistaking it for time-change success."""
+    pending=getattr(self,"_za_movement_a_pending",None)
+    failure=getattr(self,"_za_movement_a_failure",None)
+    if not isinstance(pending,dict) or not isinstance(failure,dict):
+        return None
+    if (pending.get("key") not in keys
+            or pending.get("context") != self.ZA_story_movement_a_context()
+            or failure.get("context") != pending.get("context")):
+        return None
+    self.checkIfAlive()
+    self._za_movement_a_pending=None
+    self._za_movement_a_failure=None
+    self._za_movement_a_wait_timers={}
+    self._za_mapping_a_proof=None
+    release=getattr(self,"_ZA_story_release_recovery_controls",None)
+    if callable(release):
+        release("movement_a_local")
+    reset=getattr(self,"_ZA_story_reset_common_navigation_state",None)
+    if callable(reset):
+        reset("movement_a_local")
+    else:
+        # Portable bench fragments do not contain the Story recovery helpers.
+        # The fixed press movements have already released their controls.
+        self.Common_current_state="COMMON_START"
+        self.map_cursor_reset=0
+        self.timecount=0
+        self.changetimecount=0
+        self.sleepcount=0
+        self.battlecheck=0
+        self.battle_step_return=0
+        self.inactioncount=0
+    print("[MOVEMENT_A_RECOVERY] {} -> {}".format(pending["key"],retry_state))
+    return retry_state
+
+
+def ZA_story_movement_a_recovery_route(self, current_state):
+    """Reviewed save/bench/goto origins shared by A expiry and first ResetDebug."""
+    # The fourth value identifies the existing checkpoint, not the nearest Step.
+    # YUKARI64/68/72/76/80/84/88/92 temporarily use battle recovery, without an A guard.
+    routes = {'1_STORY_FARST_POKEMON_SELECT': ('1_STORY_FARST_POKEMON_SELECT', 4, True, '1_STORY_FARST_POKEMON_SELECT'),
+     '1_STORY_HOTEL_Z_MOVE11': ('1_STORY_HOTEL_Z_MOVE11', 4, False, '1_STORY_HOTEL_Z_MOVE12'),
+     '1_STORY_HOTEL_Z_MOVE12': ('1_STORY_HOTEL_Z_MOVE11', 4, False, '1_STORY_HOTEL_Z_MOVE12'),
+     '1_STORY_HOTEL_Z_MOVE13': ('1_STORY_HOTEL_Z_MOVE13', 4, False, '1_STORY_HOTEL_Z_MOVE15'),
+     '1_STORY_HOTEL_Z_MOVE14': ('1_STORY_HOTEL_Z_MOVE13', 4, False, '1_STORY_HOTEL_Z_MOVE15'),
+     '1_STORY_HOTEL_Z_MOVE3': ('1_STORY_HOTEL_Z_MOVE3', 4, False, '1_STORY_AZ_CHAT'),
+     '1_STORY_HOTEL_Z_MOVE4': ('1_STORY_HOTEL_Z_MOVE4', 4, False, '1_STORY_FAST_ELEVATOR'),
+     '1_STORY_HOTEL_Z_MOVE5': ('1_STORY_HOTEL_Z_MOVE4', 4, True, '1_STORY_FAST_ELEVATOR'),
+     '1_STORY_HOTEL_Z_MOVE7': ('1_STORY_HOTEL_Z_MOVE7', 4, False, '1_STORY_HOTEL_Z_MOVE8'),
+     '1_STORY_HOTEL_Z_MOVE9': ('1_STORY_HOTEL_Z_MOVE9', 4, False, '1_STORY_HOTEL_Z_MOVE10'),
+     '1_STORY_OUT_HOTEL_Z_10': ('1_STORY_WANINOKO_SKILL_CHANGE1', 4, False, '1_STORY_OUT_HOTEL_Z_11'),
+     '1_STORY_OUT_HOTEL_Z_25': ('1_STORY_OUT_HOTEL_Z_20_1', 4, True, '1_STORY_OUT_HOTEL_Z_20_1'),
+     '1_STORY_OUT_HOTEL_Z_27': ('1_STORY_OUT_HOTEL_Z_27', 4, False, '1_STORY_OUT_HOTEL_Z_28'),
+     '1_STORY_OUT_HOTEL_Z_35': ('1_STORY_OUT_HOTEL_Z_35', 4, False, '1_STORY_OUT_HOTEL_Z_37'),
+     '1_STORY_OUT_HOTEL_Z_37': ('1_STORY_OUT_HOTEL_Z_35', 4, False, '1_STORY_OUT_HOTEL_Z_37'),
+     '1_STORY_OUT_HOTEL_Z_39': ('1_STORY_WANINOKO_SKILL_CHANGE3', 4, True, '1_STORY_WANINOKO_SKILL_CHANGE3'),
+     '1_STORY_OUT_HOTEL_Z_40': ('1_STORY_WANINOKO_SKILL_CHANGE3', 4, True, '1_STORY_WANINOKO_SKILL_CHANGE3'),
+     '1_STORY_OUT_HOTEL_Z_48': ('1_STORY_OUT_HOTEL_Z_48', 4, False, '1_STORY_OUT_HOTEL_Z_50'),
+     '1_STORY_OUT_HOTEL_Z_49': ('1_STORY_OUT_HOTEL_Z_48', 4, False, '1_STORY_OUT_HOTEL_Z_50'),
+     '1_STORY_OUT_HOTEL_Z_51': ('1_STORY_OUT_HOTEL_Z_51', 4, False, '1_STORY_OUT_HOTEL_Z_52'),
+     '1_STORY_OUT_HOTEL_Z_6': ('1_STORY_OUT_HOTEL_Z_6', 4, False, '1_STORY_OUT_HOTEL_Z_7'),
+     '1_STORY_OUT_HOTEL_Z_62': ('1_STORY_OUT_HOTEL_Z_61', 0, False, '1_STORY_OUT_HOTEL_Z_63'),
+     '1_STORY_OUT_HOTEL_Z_68': ('1_STORY_OUT_HOTEL_Z_67', 4, False, '1_STORY_OUT_HOTEL_Z_69'),
+     '1_STORY_OUT_HOTEL_Z_72': ('1_STORY_OUT_HOTEL_Z_67', 4, False, '1_STORY_OUT_HOTEL_Z_73'),
+     '1_STORY_OUT_HOTEL_Z_78': ('1_STORY_OUT_HOTEL_Z_77', 0, True, '1_STORY_OUT_HOTEL_Z_78'),
+     '1_STORY_OUT_HOTEL_Z_80': ('1_STORY_OUT_HOTEL_Z_79', 0, True, '1_STORY_OUT_HOTEL_Z_81'),
+     '1_STORY_OUT_HOTEL_Z_82': ('1_STORY_OUT_HOTEL_Z_82', 4, False, '1_STORY_OUT_HOTEL_Z_83'),
+     '2_STORY_ABSOL_MOVE16': ('2_STORY_ABSOL_MOVE14', 0, True, '2_STORY_ABSOL_MOVE17'),
+     '2_STORY_ABSOL_MOVE21': ('2_STORY_ABSOL_MOVE21', 4, False, '2_STORY_ABSOL_MOVE22'),
+     '2_STORY_ABSOL_MOVE22': ('2_STORY_ABSOL_MOVE21', 4, False, '2_STORY_ABSOL_MOVE22'),
+     '2_STORY_ABSOL_MOVE23': ('2_STORY_ABSOL_MOVE23', 4, False, '2_STORY_ABSOL_MOVE24'),
+     '2_STORY_ABSOL_MOVE25': ('2_STORY_ABSOL_MOVE23', 4, False, '2_STORY_ABSOL_MOVE24'),
+     '2_STORY_ABSOL_MOVE27': ('2_STORY_ABSOL_MOVE23', 4, False, '2_STORY_ABSOL_MOVE24'),
+     '2_STORY_ABSOL_MOVE33': ('2_STORY_ABSOL_MOVE32', 0, True, None),
+     '2_STORY_ABSOL_MOVE34': ('2_STORY_ABSOL_MOVE32', 0, True, '2_STORY_ABSOL_MOVE35'),
+     '2_STORY_ABSOL_MOVE37': ('2_STORY_ABSOL_MOVE36', 0, True, '2_STORY_ABSOL_MOVE38'),
+     '2_STORY_ABSOL_MOVE38': ('2_STORY_ABSOL_MOVE36', 0, True, '2_STORY_ABSOL_MOVE38'),
+     '2_STORY_ABSOL_MOVE4': ('2_STORY_ABSOL_MOVE4', 4, True, '2_STORY_ABSOL_MOVE6'),
+     '2_STORY_ABSOL_MOVE5': ('2_STORY_ABSOL_MOVE4', 4, True, '2_STORY_ABSOL_MOVE6'),
+     '2_STORY_MAPPING_105': ('2_STORY_MAPPING_104', 0, True, None),
+     '2_STORY_MAPPING_112': ('2_STORY_MAPPING_111', 0, True, None),
+     '2_STORY_MAPPING_114_1': ('2_STORY_MAPPING_114', 0, True, None),
+     '2_STORY_MAPPING_116_1': ('2_STORY_MAPPING_116', 0, True, None),
+     '2_STORY_MAPPING_2': ('2_STORY_MAPPING_1', 0, True, None),
+     '2_STORY_MAPPING_38': ('2_STORY_MAPPING_37', 0, True, None),
+     '2_STORY_MAPPING_41': ('2_STORY_MAPPING_40', 0, True, None),
+     '2_STORY_MAPPING_44': ('2_STORY_MAPPING_43', 0, True, None),
+     '2_STORY_MAPPING_77': ('2_STORY_MAPPING_76', 0, True, None),
+     '2_STORY_MAPPING_8': ('2_STORY_MAPPING_7', 0, True, None),
+     '2_STORY_MAPPING_80': ('2_STORY_MAPPING_79', 0, True, None),
+     '2_STORY_MAPPING_81_0': ('2_STORY_MAPPING_79', 4, True, '2_STORY_MAPPING_81_0'),
+     '2_STORY_MAPPING_92': ('2_STORY_MAPPING_91', 0, True, None),
+     '2_STORY_MAPPING_96': ('2_STORY_MAPPING_95', 0, True, None),
+     '2_STORY_MEGA_MOVE13': ('2_STORY_MEGA_MOVE13', 4, False, '2_STORY_MEGA_MOVE14'),
+     '2_STORY_TOWER_1': ('2_STORY_TOWER_1', 4, True, '2_STORY_TOWER_1'),
+     '2_STORY_TOWER_11': ('2_STORY_TOWER_11', 4, False, '2_STORY_TOWER_12'),
+     '2_STORY_TOWER_3': ('2_STORY_TOWER_2', 0, False, '2_STORY_TOWER_4'),
+     '2_STORY_TOWER_31': ('2_STORY_TOWER_30', 0, True, '2_STORY_TOWER_31'),
+     '2_STORY_TOWER_33': ('2_STORY_TOWER_32', 0, True, '2_STORY_TOWER_34'),
+     '2_STORY_TOWER_42': ('2_STORY_TOWER_42', 4, False, '2_STORY_TOWER_43'),
+     '2_STORY_TOWER_44': ('2_STORY_TOWER_44', 4, True, '2_STORY_TOWER_44'),
+     '2_STORY_TOWER_46': ('2_STORY_TOWER_44', 4, True, '2_STORY_TOWER_44'),
+     '2_STORY_TOWER_48': ('2_STORY_TOWER_47', 0, True, '2_STORY_TOWER_49'),
+     '2_STORY_TOWER_5': ('2_STORY_TOWER_5', 4, False, '2_STORY_TOWER_6'),
+     '2_STORY_TOWER_50': ('2_STORY_TOWER_50', 4, True, '2_STORY_TOWER_50'),
+     '2_STORY_TOWER_53': ('2_STORY_TOWER_52', 0, True, None),
+     '2_STORY_TOWER_56': ('2_STORY_TOWER_55', 0, True, None),
+     '2_STORY_TOWER_57': ('2_STORY_TOWER_58_RECOVERY', 0, False, '2_STORY_TOWER_58'),
+     '2_STORY_TOWER_59': ('2_STORY_TOWER_55', 4, True, '2_STORY_TOWER_59'),
+     '2_STORY_TOWER_62': ('2_STORY_TOWER_61', 0, True, '2_STORY_TOWER_63'),
+     '2_STORY_TOWER_65': ('2_STORY_TOWER_64', 0, True, '2_STORY_TOWER_65'),
+     '2_STORY_TOWER_67': ('2_STORY_TOWER_66', 0, True, '2_STORY_TOWER_68'),
+     '2_STORY_TOWER_70': ('2_STORY_TOWER_74', 0, True, '2_STORY_TOWER_71'),
+     '2_STORY_TOWER_75': ('2_STORY_TOWER_74', 0, True, '2_STORY_TOWER_75'),
+     '2_STORY_TOWER_77': ('2_STORY_TOWER_76', 0, True, '2_STORY_TOWER_78'),
+     '2_STORY_TOWER_78': ('2_STORY_TOWER_76', 0, True, '2_STORY_TOWER_78'),
+     '2_STORY_TOWER_79': ('2_STORY_TOWER_79', 4, False, '2_STORY_TOWER_81'),
+     '2_STORY_TOWER_80': ('2_STORY_TOWER_79', 4, False, '2_STORY_TOWER_81'),
+     '2_STORY_W_LANK_MOVE10': ('2_STORY_W_LANK_MOVE8', 0, True, '2_STORY_W_LANK_MOVE11'),
+     '2_STORY_W_LANK_MOVE7': ('2_STORY_W_LANK_MOVE6', 0, True, '2_STORY_W_LANK_MOVE7'),
+     '2_STORY_W_LANK_MOVE9': ('2_STORY_W_LANK_MOVE8', 0, True, None),
+     '2_STORY_X_LANK_MOVE1': ('2_STORY_X_LANK_MOVE1', 4, False, '2_STORY_X_LANK_MOVE3'),
+     '2_STORY_X_LANK_MOVE10': ('2_STORY_X_LANK_MOVE9', 0, True, '2_STORY_X_LANK_MOVE11'),
+     '2_STORY_X_LANK_MOVE2': ('2_STORY_X_LANK_MOVE1', 4, False, '2_STORY_X_LANK_MOVE3'),
+     '2_STORY_Y_LANK_MOVE2': ('2_STORY_Y_LANK_MOVE0', 0, True, '2_STORY_Y_LANK_MOVE3'),
+     '3_STORY_CANARI_1': ('3_STORY_CANARI_2_RECOVERY1', 0, True, '3_STORY_CANARI_2'),
+     '3_STORY_CANARI_13': ('3_STORY_CANARI_12', 0, True, None),
+     '3_STORY_CANARI_15': ('3_STORY_CANARI_15', 4, True, '3_STORY_CANARI_16'),
+     '3_STORY_CANARI_2': ('3_STORY_CANARI_2_RECOVERY1', 0, True, '3_STORY_CANARI_3'),
+     '3_STORY_CANARI_23': ('3_STORY_CANARI_23', 4, True, '3_STORY_CANARI_24'),
+     '3_STORY_CANARI_25': ('3_STORY_CANARI_23', 4, True, '3_STORY_CANARI_23'),
+     '3_STORY_CANARI_27': ('3_STORY_CANARI_27', 4, True, '3_STORY_CANARI_28'),
+     '3_STORY_CANARI_2_RECOVERY3': ('3_STORY_CANARI_2_RECOVERY1', 0, True, '3_STORY_CANARI_3'),
+     '3_STORY_CANARI_42': ('3_STORY_CANARI_41', 0, True, '3_STORY_CANARI_44'),
+     '3_STORY_CANARI_43': ('3_STORY_CANARI_41', 0, True, '3_STORY_CANARI_44'),
+     '3_STORY_CANARI_8': ('3_STORY_CANARI_7', 0, True, None),
+     '3_STORY_CANARI_9': ('3_STORY_CANARI_2_RECOVERY1', 0, True, '3_STORY_CANARI_10'),
+     '3_STORY_MEGA_MOVE1': ('3_STORY_MEGA_MOVE2_RECOVERY', 4, True, '3_STORY_MEGA_MOVE2_PHASE_SELECTOR'),
+     '3_STORY_MEGA_MOVE21': ('3_STORY_MEGA_MOVE20', 0, True, None),
+     '3_STORY_MEGA_MOVE22': ('3_STORY_MEGA_MOVE20', 1, False, '3_STORY_MEGA_MOVE23'),
+     '3_STORY_MEGA_MOVE29': ('3_STORY_MEGA_MOVE28', 0, True, '3_STORY_MEGA_MOVE30'),
+     '3_STORY_MEGA_MOVE5': ('3_STORY_MEGA_MOVE4', 0, True, None),
+     '4_STORY_SHIRO_11': ('4_STORY_SHIRO_10', 0, True, '4_STORY_SHIRO_12'),
+     '4_STORY_SHIRO_16': ('4_STORY_SHIRO_16', 4, True, '4_STORY_SHIRO_17'),
+     '4_STORY_SHIRO_21_2': ('4_STORY_SHIRO_21_1', 0, True, '4_STORY_SHIRO_21_2'),
+     '4_STORY_SHIRO_23': ('4_STORY_SHIRO_21', 0, True, '4_STORY_SHIRO_24'),
+     '4_STORY_SHIRO_33': ('4_STORY_SHIRO_31', 4, True, '4_STORY_SHIRO_33'),
+     '4_STORY_SHIRO_45': ('4_STORY_SHIRO_44_1', 4, True, '4_STORY_SHIRO_46'),
+     '4_STORY_SHIRO_49': ('4_STORY_SHIRO_49', 4, True, '4_STORY_SHIRO_50'),
+     '4_STORY_SHIRO_63': ('4_STORY_SHIRO_63', 4, True, '4_STORY_SHIRO_64'),
+     '4_STORY_SHIRO_66': ('4_STORY_SHIRO_63', 4, True, '4_STORY_SHIRO_67'),
+     '4_STORY_SHIRO_69': ('4_STORY_SHIRO_63', 4, True, '4_STORY_SHIRO_70'),
+     '4_STORY_SHIRO_72': ('4_STORY_SHIRO_63', 4, True, '4_STORY_SHIRO_73'),
+     '4_STORY_SHIRO_85': ('4_STORY_SHIRO_84', 0, True, '4_STORY_SHIRO_86'),
+     '4_STORY_SHIRO_9': ('4_STORY_SHIRO_8', 0, True, '4_STORY_SHIRO_9'),
+     '5_STORY_KARASUBA_101': ('5_STORY_KARASUBA_100', 0, True, '5_STORY_KARASUBA_101'),
+     '5_STORY_KARASUBA_11': ('5_STORY_KARASUBA_11', 4, True, '5_STORY_KARASUBA_12'),
+     '5_STORY_KARASUBA_113': ('5_STORY_KARASUBA_112', 0, True, '5_STORY_KARASUBA_113'),
+     '5_STORY_KARASUBA_115': ('5_STORY_KARASUBA_112', 2, True, '5_STORY_KARASUBA_116'),
+     '5_STORY_KARASUBA_118': ('5_STORY_KARASUBA_117', 0, True, None),
+     '5_STORY_KARASUBA_119': ('5_STORY_KARASUBA_117', 0, True, '5_STORY_KARASUBA_120'),
+     '5_STORY_KARASUBA_13': ('5_STORY_KARASUBA_11', 4, True, '5_STORY_KARASUBA_14'),
+     '5_STORY_KARASUBA_17': ('5_STORY_KARASUBA_16', 1, True, '5_STORY_KARASUBA_18'),
+     '5_STORY_KARASUBA_19': ('5_STORY_KARASUBA_19', 4, True, '5_STORY_KARASUBA_20'),
+     '5_STORY_KARASUBA_23': ('5_STORY_KARASUBA_22', 1, True, '5_STORY_KARASUBA_24'),
+     '5_STORY_KARASUBA_38': ('5_STORY_KARASUBA_38', 4, True, '5_STORY_KARASUBA_39'),
+     '5_STORY_KARASUBA_42': ('5_STORY_KARASUBA_46_RECOVERY', 0, True, '5_STORY_KARASUBA_46'),
+     '5_STORY_KARASUBA_43': ('5_STORY_KARASUBA_42', 4, True, '5_STORY_KARASUBA_42'),
+     '5_STORY_KARASUBA_44': ('5_STORY_KARASUBA_42', 4, True, '5_STORY_KARASUBA_42'),
+     '5_STORY_KARASUBA_45': ('5_STORY_KARASUBA_42', 4, True, '5_STORY_KARASUBA_42'),
+     '5_STORY_KARASUBA_51': ('5_STORY_KARASUBA_50', 0, True, '5_STORY_KARASUBA_52'),
+     '5_STORY_KARASUBA_56': ('5_STORY_KARASUBA_56', 4, True, '5_STORY_KARASUBA_57'),
+     '5_STORY_KARASUBA_61': ('5_STORY_KARASUBA_58', 4, True, '5_STORY_KARASUBA_62'),
+     '5_STORY_KARASUBA_65': ('5_STORY_KARASUBA_64', 1, True, '5_STORY_KARASUBA_66'),
+     '5_STORY_KARASUBA_67': ('5_STORY_KARASUBA_64', 4, True, '5_STORY_KARASUBA_67'),
+     '5_STORY_KARASUBA_7': ('5_STORY_KARASUBA_7', 4, True, '5_STORY_KARASUBA_8'),
+     '5_STORY_KARASUBA_71': ('5_STORY_KARASUBA_69', 0, True, None),
+     '5_STORY_KARASUBA_97': ('5_STORY_KARASUBA_96', 0, True, '5_STORY_KARASUBA_98'),
+     '6_STORY_MAPPING_3': ('6_STORY_MAPPING_2', 0, True, None),
+     '6_STORY_YUKARI_19': ('6_STORY_YUKARI_18', 1, True, '6_STORY_YUKARI_20'),
+     '6_STORY_YUKARI_21': ('6_STORY_YUKARI_21', 0, True, '6_STORY_YUKARI_22'),
+     '6_STORY_YUKARI_25': ('6_STORY_YUKARI_24', 1, True, '6_STORY_YUKARI_26'),
+     '6_STORY_YUKARI_27': ('6_STORY_YUKARI_27', 4, True, '6_STORY_YUKARI_28'),
+     '6_STORY_YUKARI_3': ('6_STORY_YUKARI_2', 1, True, '6_STORY_YUKARI_4'),
+     '6_STORY_YUKARI_37': ('6_STORY_YUKARI_36', 1, True, '6_STORY_YUKARI_39'),
+     '6_STORY_YUKARI_38': ('6_STORY_YUKARI_36', 1, True, '6_STORY_YUKARI_39'),
+     '6_STORY_YUKARI_44': ('6_STORY_YUKARI_43', 1, True, '6_STORY_YUKARI_45'),
+     '6_STORY_YUKARI_46': ('6_STORY_YUKARI_46', 4, True, '6_STORY_YUKARI_47'),
+     '6_STORY_YUKARI_50': ('6_STORY_YUKARI_52_RECOVERY', 0, True, '6_STORY_YUKARI_52'),
+     '6_STORY_YUKARI_51': ('6_STORY_YUKARI_52_RECOVERY', 0, True, '6_STORY_YUKARI_52'),
+     '6_STORY_YUKARI_57': ('6_STORY_YUKARI_56', 1, True, '6_STORY_YUKARI_58'),
+     '6_STORY_YUKARI_63': ('6_STORY_YUKARI_62', 1, True, '6_STORY_YUKARI_65'),
+     '6_STORY_YUKARI_7': ('6_STORY_YUKARI_7', 4, True, '6_STORY_YUKARI_8'),
+     '7_STORY_GURI_10': ('7_STORY_GURI_9', 1, True, '7_STORY_GURI_11'),
+     '7_STORY_GURI_102': ('7_STORY_GURI_101', 0, True, '7_STORY_GURI_102'),
+     '7_STORY_GURI_106': ('7_STORY_GURI_105', 0, True, '7_STORY_GURI_106'),
+     '7_STORY_GURI_111': ('7_STORY_GURI_108', 0, True, '7_STORY_GURI_111'),
+     '7_STORY_GURI_119': ('7_STORY_GURI_118', 0, True, '7_STORY_GURI_119'),
+     '7_STORY_GURI_12': ('7_STORY_GURI_12', 0, True, '7_STORY_GURI_13'),
+     '7_STORY_GURI_125': ('7_STORY_GURI_123', 4, True, '7_STORY_GURI_124'),
+     '7_STORY_GURI_126': ('7_STORY_GURI_123', 4, True, '7_STORY_GURI_124'),
+     '7_STORY_GURI_127': ('7_STORY_GURI_123', 4, True, '7_STORY_GURI_124'),
+     '7_STORY_GURI_131': ('7_STORY_GURI_130', 1, True, '7_STORY_GURI_133'),
+     '7_STORY_GURI_132': ('7_STORY_GURI_130', 1, True, '7_STORY_GURI_133'),
+     '7_STORY_GURI_135': ('7_STORY_GURI_134', 0, True, '7_STORY_GURI_135'),
+     '7_STORY_GURI_138': ('7_STORY_GURI_137', 1, True, '7_STORY_GURI_139'),
+     '7_STORY_GURI_28': ('7_STORY_GURI_28', 4, True, '7_STORY_GURI_30'),
+     '7_STORY_GURI_42': ('7_STORY_GURI_38', 1, True, '7_STORY_GURI_43'),
+     '7_STORY_GURI_43': ('7_STORY_GURI_38', 1, True, '7_STORY_GURI_44'),
+     '7_STORY_GURI_49': ('7_STORY_GURI_48', 1, True, '7_STORY_GURI_50'),
+     '7_STORY_GURI_5': ('7_STORY_GURI_5', 4, True, '7_STORY_GURI_6'),
+     '7_STORY_GURI_53': ('7_STORY_GURI_52', 1, True, '7_STORY_GURI_54'),
+     '7_STORY_GURI_54': ('7_STORY_GURI_52', 1, True, '7_STORY_GURI_54'),
+     '7_STORY_GURI_57': ('7_STORY_GURI_56', 1, True, '7_STORY_GURI_58'),
+     '7_STORY_GURI_62': ('7_STORY_GURI_61', 0, True, '7_STORY_GURI_62'),
+     '7_STORY_GURI_65': ('7_STORY_GURI_64', 1, True, '7_STORY_GURI_68'),
+     '7_STORY_GURI_66': ('7_STORY_GURI_64', 4, True, '7_STORY_GURI_66'),
+     '7_STORY_GURI_73': ('7_STORY_GURI_72', 1, True, '7_STORY_GURI_74'),
+     '7_STORY_GURI_81': ('7_STORY_GURI_81', 4, True, '7_STORY_GURI_82'),
+     '7_STORY_GURI_83': ('7_STORY_GURI_83', 4, True, '7_STORY_GURI_84'),
+     '7_STORY_GURI_92': ('7_STORY_GURI_91', 0, True, '7_STORY_GURI_92'),
+     '7_STORY_GURI_95': ('7_STORY_GURI_94', 0, True, '7_STORY_GURI_95'),
+     '7_STORY_MAPPING_3': ('7_STORY_MAPPING_2', 0, True, None),
+     '8_STORY_STORY_LAST_1': ('8_STORY_STORY_LAST_1', 4, True, '8_STORY_STORY_LAST_2'),
+     '8_STORY_STORY_LAST_26': ('8_STORY_STORY_LAST_26_0', 0, True, '8_STORY_STORY_LAST_27'),
+     '8_STORY_STORY_LAST_38': ('8_STORY_STORY_LAST_38_0', 0, True, '8_STORY_STORY_LAST_39'),
+     '8_STORY_STORY_LAST_4': ('8_STORY_STORY_LAST_3', 0, True, '8_STORY_STORY_LAST_5'),
+     '8_STORY_STORY_LAST_4_2': ('8_STORY_STORY_LAST_3', 0, True, '8_STORY_STORY_LAST_5'),
+     '8_STORY_STORY_LAST_52': ('8_STORY_STORY_LAST_52', 4, True, '8_STORY_STORY_LAST_53'),
+     '8_STORY_STORY_LAST_54': ('8_STORY_STORY_LAST_52', 4, True, '8_STORY_STORY_LAST_52'),
+     '8_STORY_STORY_LAST_8': ('8_STORY_STORY_LAST_8_0', 0, False, '8_STORY_STORY_LAST_9')}
+    return routes.get(str(current_state))

@@ -4,10 +4,56 @@ from __future__ import annotations
 
 import configparser
 import os
+import tempfile
 import tkinter as tk
 from logging import getLogger  # , DEBUG, NullHandler
 
 from AudioLevelControl import sanitize_audio_level_settings
+
+
+class _LiteralSettingsInterpolation(configparser.Interpolation):
+    """Keep user text literal while reading the existing INI percent escapes."""
+
+    def before_get(self, parser, section, option, value, defaults):
+        # Older settings escaped literal percent signs for BasicInterpolation.
+        # Paths and command text must never expand %(other_setting)s.
+        return value.replace("%%", "%")
+
+    def before_set(self, parser, section, option, value):
+        return value.replace("%", "%%")
+
+
+KEYMAP_SECTIONS = ("KeyMap-Button", "KeyMap-Direction", "KeyMap-Hat")
+
+
+def create_settings_parser():
+    parser = configparser.ConfigParser(
+        interpolation=_LiteralSettingsInterpolation())
+    parser.optionxform = str
+    return parser
+
+
+def write_settings_file(setting, path):
+    target_path = os.path.abspath(os.fspath(path))
+    directory = os.path.dirname(target_path)
+    os.makedirs(directory, exist_ok=True)
+    temporary_path = None
+    try:
+        # Keep the previous complete settings if writing fails (for
+        # example, because the settings drive has exhausted free space).
+        with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", dir=directory,
+                prefix="." + os.path.basename(target_path) + ".",
+                suffix=".tmp", delete=False) as file:
+            temporary_path = file.name
+            setting.write(file)
+            file.flush()
+            os.fsync(file.fileno())
+        os.chmod(path=temporary_path, mode=0o777)
+        os.replace(temporary_path, target_path)
+    finally:
+        if temporary_path is not None and os.path.exists(temporary_path):
+            os.unlink(temporary_path)
 
 
 class GuiSettings:
@@ -15,8 +61,7 @@ class GuiSettings:
 
     def __init__(self):
         self._logger = getLogger(__name__)
-        self.setting = configparser.ConfigParser()
-        self.setting.optionxform = str
+        self.setting = create_settings_parser()
         # print("isExistConfig =", os.path.exists(self.SETTING_PATH))
 
         if not os.path.exists(self.SETTING_PATH):
@@ -41,6 +86,8 @@ class GuiSettings:
         self.baud_rate = tk.IntVar(value=self.setting["General Setting"].getint("baud_rate"))
         self.fps = tk.StringVar(value=self.setting["General Setting"]["fps"])
         self.show_size = tk.StringVar(value=self.setting["General Setting"].get("show_size"))
+        self.preview_auto_fit = self.setting.getboolean(
+            "General Setting", "preview_auto_fit", fallback=True)
         self.last_active_preview_full_fps = self.setting.getboolean(
             "General Setting", "last_active_preview_full_fps", fallback=False)
         self.resource_control_enabled = self.setting.getboolean(
@@ -161,11 +208,11 @@ class GuiSettings:
         self.audio_auto_start = self.setting.getboolean("Audio", "auto_start", fallback=False)
         self.audio_auto_level = self.setting.getboolean(
             "Audio", "auto_level", fallback=False)
-        self.audio_target_dbfs = self.setting.getfloat(
+        self.audio_target_dbfs = self.setting.get(
             "Audio", "target_dbfs", fallback=-6.0)
-        self.audio_max_auto_gain = self.setting.getint(
+        self.audio_max_auto_gain = self.setting.get(
             "Audio", "max_auto_gain", fallback=800)
-        self.audio_limiter_ceiling_dbfs = self.setting.getfloat(
+        self.audio_limiter_ceiling_dbfs = self.setting.get(
             "Audio", "limiter_ceiling_dbfs", fallback=-1.0)
         safe_audio = sanitize_audio_level_settings(
             self.audio_gain, self.audio_target_dbfs,
@@ -196,6 +243,7 @@ class GuiSettings:
         self.record_roi = self.setting.get("Recording", "roi", fallback="0,0,0,0")
         self.record_debug = self.setting.getboolean("Recording", "debug", fallback=False)
         self.record_trigger_rules = self.setting.get("Recording", "trigger_rules", fallback="[]")
+        self.event_clip_rule = self.setting.get("Recording", "event_clip_rule", fallback="{}")
         self.record_cleanup_rules = self.setting.get("Recording", "cleanup_rules", fallback="[]")
         self.record_minimum_duration = self.setting.get("Recording", "minimum_duration", fallback="0")
         self.record_min_free_gb = self.setting.getfloat("Recording", "min_free_gb", fallback=5.0)
@@ -246,6 +294,47 @@ class GuiSettings:
     def load(self):
         if os.path.isfile(self.SETTING_PATH):
             self.setting.read(self.SETTING_PATH, encoding="utf-8")
+
+    def _write_settings_file(self, path):
+        write_settings_file(self.setting, path)
+
+    def save_record_output_dir(self, value):
+        """Commit only the recording folder without overwriting newer settings."""
+        value = str(value or "")
+        latest = create_settings_parser()
+        if os.path.isfile(self.SETTING_PATH):
+            with open(self.SETTING_PATH, encoding="utf-8") as file:
+                latest.read_file(file)
+        else:
+            latest.read_dict({
+                section: dict(self.setting.items(section))
+                for section in self.setting.sections()
+            })
+        if not latest.has_section("Recording"):
+            latest.add_section("Recording")
+        latest["Recording"]["output_dir"] = value
+        write_settings_file(latest, self.SETTING_PATH)
+        self.record_output_dir = value
+        if not self.setting.has_section("Recording"):
+            self.setting.add_section("Recording")
+        self.setting["Recording"]["output_dir"] = value
+
+    def save_event_clip_rule(self, value):
+        """Persist clip settings without replacing unrelated live settings."""
+        latest = create_settings_parser()
+        if os.path.isfile(self.SETTING_PATH):
+            with open(self.SETTING_PATH, encoding="utf-8") as file:
+                latest.read_file(file)
+        else:
+            latest.read_dict({s: dict(self.setting.items(s)) for s in self.setting.sections()})
+        if not latest.has_section("Recording"):
+            latest.add_section("Recording")
+        latest["Recording"]["event_clip_rule"] = value
+        write_settings_file(latest, self.SETTING_PATH)
+        self.event_clip_rule = value
+        if not self.setting.has_section("Recording"):
+            self.setting.add_section("Recording")
+        self.setting["Recording"]["event_clip_rule"] = value
 
     def generate(self):
         # logger.info('Create Default setting file.')
@@ -407,12 +496,20 @@ class GuiSettings:
         }
         self.setting["Command Watch"] = {"enabled": False, "command": "", "target": "Output#1", "variables": ""}
         self.setting["Commands Assist"] = {"enabled": False, "recovery_command": "", "rules": "[]"}
-        with open(self.SETTING_PATH, "w", encoding="utf-8") as file:
-            self.setting.write(file)
-        os.chmod(path=self.SETTING_PATH, mode=0o777)
+        self._write_settings_file(self.SETTING_PATH)
 
     def save(self, path=None):
         # Some preparations are needed because tkinter related objects are not serializable.
+
+        # Key Config saves independently while this object remains open.
+        # Do not restore its startup key mappings on a later GUI save/export.
+        latest = create_settings_parser()
+        if os.path.isfile(self.SETTING_PATH):
+            with open(self.SETTING_PATH, encoding="utf-8") as file:
+                latest.read_file(file)
+        for section in KEYMAP_SECTIONS:
+            if latest.has_section(section):
+                self.setting[section] = dict(latest.items(section))
 
         self.setting["General Setting"] = {
             "camera_id": self.camera_id.get(),
@@ -425,6 +522,7 @@ class GuiSettings:
             "baud_rate": self.baud_rate.get(),
             "fps": self.fps.get(),
             "show_size": self.show_size.get(),
+            "preview_auto_fit": getattr(self, "preview_auto_fit", True),
             "last_active_preview_full_fps": self.last_active_preview_full_fps,
             "is_show_realtime": self.is_show_realtime.get(),
             "is_show_value": self.is_show_value.get(),
@@ -519,7 +617,7 @@ class GuiSettings:
             "image_assist_filter_mode": self.image_assist_filter_mode,
             "image_assist_max_candidates": self.image_assist_max_candidates,
             "rules_enabled": self.analysis_rules_enabled,
-            "rules": str(self.analysis_rules).replace("%", "%%"),
+            "rules": str(self.analysis_rules),
             "pc_gamepad_input_enabled": self.pc_gamepad_input_enabled,
         }
         self.setting["Recording"] = {
@@ -532,6 +630,7 @@ class GuiSettings:
             "roi": self.record_roi,
             "debug": self.record_debug,
             "trigger_rules": self.record_trigger_rules,
+            "event_clip_rule": getattr(self, "event_clip_rule", "{}"),
             "cleanup_rules": self.record_cleanup_rules,
             "minimum_duration": self.record_minimum_duration,
             "min_free_gb": self.record_min_free_gb,
@@ -568,9 +667,5 @@ class GuiSettings:
             "rules": self.commands_assist_rules,
         }
 
-        target_path = path or self.SETTING_PATH
-        os.makedirs(os.path.dirname(target_path), exist_ok=True)
-        with open(target_path, "w", encoding="utf-8") as file:
-            self.setting.write(file)
-        os.chmod(path=target_path, mode=0o777)
+        self._write_settings_file(path or self.SETTING_PATH)
         self._logger.debug("Settings file has been saved.")

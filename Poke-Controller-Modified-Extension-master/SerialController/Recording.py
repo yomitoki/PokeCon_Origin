@@ -518,14 +518,9 @@ class CaptureRecorder:
         self.wav_path = os.path.join(self.session_dir, "recording.wav")
         self.mp4_path = os.path.join(self.session_dir, "recording.mp4")
         height, width = frame.shape[:2]
-        self.video, self.video_codec = self._open_video_writer(
-            self.video_path, fps, (width, height))
-        if self.video is None:
-            raise RuntimeError("動画ファイルを作成できませんでした。")
         self.frames_written = 0
         # Presentation timestamps decide which configured-CFR slots are
         # written.  Wall-clock frames/elapsed remains diagnostic only.
-        self.started_at = time.monotonic()
         self.timeline_active = not bool(defer_timeline_activation)
         self.requested_fps = max(1.0, float(fps))
         initial_frame = frame.copy()
@@ -605,12 +600,34 @@ class CaptureRecorder:
         # discard this recording under the new InputSet's cleanup policy.
         self._capture_cleanup_rules = list(self.cleanup_rules)
         self._capture_minimum_duration = float(self.minimum_duration)
+        # Validate/copy the initial state before acquiring the AVI handle.
+        # Otherwise an invalid setting or allocation failure leaves video
+        # open while active is false: Stop cannot close it and every later
+        # Start is rejected as if an earlier recording were still draining.
+        self.video, self.video_codec = self._open_video_writer(
+            self.video_path, fps, (width, height))
+        if self.video is None:
+            raise RuntimeError("動画ファイルを作成できませんでした。")
+        self.started_at = time.monotonic()
         self.active = True
         # MJPEG encoding stays outside Tk.  The worker advances the CFR file
         # from preview presentation timestamps, not from the later time at
         # which an asynchronously composed frame happens to arrive here.
-        self.writer_thread = threading.Thread(target=self._video_writer_loop, daemon=True)
-        self.writer_thread.start()
+        try:
+            self.writer_thread = threading.Thread(
+                target=self._video_writer_loop, daemon=True)
+            self.writer_thread.start()
+        except Exception:
+            self.active = False
+            writer, self.video = self.video, None
+            self.writer_thread = None
+            self.writer_stop = None
+            try:
+                writer.release()
+            except Exception as error:
+                print("[RECORDING] Failed-start AVI release failed: {}".format(
+                    error))
+            raise
         if self.defer_finalization or self.durable_finalization:
             # Publish a recovery journal while capture is still live, rather
             # than waiting until Stop.  A power loss or hard process kill can

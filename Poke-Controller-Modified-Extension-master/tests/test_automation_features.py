@@ -23,6 +23,24 @@ from collections import deque, namedtuple
 from unittest import mock
 
 
+class _ConfirmedMovementAFixture:
+    """A is already visible in tests of unrelated story/recovery behavior.
+
+    Deadline, absence, pending input and proof scope are exercised with the
+    production helpers in test_za_movement_a_guards/continuations instead.
+    """
+    def ZA_story_movement_a_pending(self, _key):
+        return False
+
+    def ZA_story_checked_movement_action(
+            self, _key, _pictures, action, _waiting_result,
+            dialogue_state=None, allow_recenter=True):
+        return action()
+
+    def ZA_story_wait_movement_a(self, *_args, **_kwargs):
+        return True
+
+
 def normalized_function_ast_dump(function_node):
     """Compare class and top-level sample functions without docstring indent."""
     normalized = copy.deepcopy(function_node)
@@ -42,7 +60,8 @@ def normalized_function_ast_dump(function_node):
 SERIAL_CONTROLLER = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "SerialController"))
 if SERIAL_CONTROLLER not in sys.path:
     sys.path.insert(0, SERIAL_CONTROLLER)
-LOCAL_FUNCTION = os.path.join(SERIAL_CONTROLLER, "LocalFunction")
+LOCAL_FUNCTION = os.path.join(
+    SERIAL_CONTROLLER, "Commands", "PythonCommands", "LocalFunction")
 if LOCAL_FUNCTION not in sys.path:
     sys.path.insert(0, LOCAL_FUNCTION)
 DEV_STUDIO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "DevStudio"))
@@ -130,7 +149,7 @@ from InputSetData import (INPUT_SET_VARIABLES, SCHEMA_VERSION,
                           sync_quick_actions,
                           sync_step_debug_rules)
 from SoftwareControllerState import SoftwareControllerState
-from SwitchUpdatePrompt import (START_WITHOUT_UPDATE,
+from SwitchUpdatePrompt import (PROMPT_WAIT, START_WITHOUT_UPDATE,
                                 UPDATE_SELECTED,
                                 detect_switch_update_prompt_selection)
 from InputSetRuntimeRegistry import (ActiveInputSetRegistry,
@@ -175,7 +194,7 @@ from Camera import (Camera, camera_fourcc_name,
                     camera_frame_freshness_timeout, camera_reader_backoff)
 from Commands.PythonCommandBase import (ImageProcPythonCommand,
                                         PythonCommand)
-from LocalFunction.ImageDetection import (SimilarityHistory, _command_frame,
+from Commands.PythonCommands.LocalFunction.ImageDetection import (SimilarityHistory, _command_frame,
                                            detect_image)
 from AudioMonitor import (AudioMonitor, StreamingAudioRateConverter,
                           fit_audio_block, plan_audio_buffer_consume)
@@ -1371,11 +1390,10 @@ class SwitchUpdatePromptTests(unittest.TestCase):
                           color, thickness=5)
         return frame
 
-    def test_detects_only_the_selected_safe_update_prompt_option(self):
-        self.assertEqual(detect_switch_update_prompt_selection(
-            self._prompt_frame(START_WITHOUT_UPDATE)), START_WITHOUT_UPDATE)
-        self.assertEqual(detect_switch_update_prompt_selection(
-            self._prompt_frame(UPDATE_SELECTED)), UPDATE_SELECTED)
+    def test_textless_colored_boxes_are_not_startup_dialogs(self):
+        for selection in (START_WITHOUT_UPDATE, UPDATE_SELECTED):
+            self.assertIsNone(detect_switch_update_prompt_selection(
+                self._prompt_frame(selection)))
         self.assertIsNone(detect_switch_update_prompt_selection(
             numpy.zeros((720, 1280, 3), dtype=numpy.uint8)))
 
@@ -1399,6 +1417,7 @@ class SwitchUpdatePromptTests(unittest.TestCase):
             "START_WITHOUT_UPDATE": START_WITHOUT_UPDATE,
             "UPDATE_SELECTED": UPDATE_SELECTED,
             "time": time,
+            "PROMPT_WAIT": PROMPT_WAIT,
         }
         exec(compile(function_module, source_path, "exec"), namespace)
 
@@ -1478,8 +1497,10 @@ class ZaMapping52RecoveryTests(unittest.TestCase):
             def ZA_Common_mappic_check(self, **_kwargs):
                 return mappic_result
 
-            def ZA_Common_goto_jump(self):
+            def ZA_Common_goto_jump(self, require_confirmation=False):
+                assert require_confirmation is True
                 self.jump_count += 1
+                return "COMMON_CHANGE_TIME"
 
             def image_check(self, _name):
                 return False
@@ -2746,7 +2767,7 @@ class ZaOutHotelZ40RecoveryTests(unittest.TestCase):
             ],
             type_ignores=[]))
         namespace = {
-            "Button": types.SimpleNamespace(A="A"),
+            "Button": types.SimpleNamespace(A="A", L="L"),
             "Direction": lambda stick, angle: (stick, angle),
             "Stick": types.SimpleNamespace(LEFT="LEFT"),
             "time": fake_time,
@@ -2756,7 +2777,7 @@ class ZaOutHotelZ40RecoveryTests(unittest.TestCase):
 
     @staticmethod
     def _command(namespace, image_check):
-        class Command:
+        class Command(_ConfirmedMovementAFixture):
             ZA_OUT_HOTEL_Z_40_STALL_TIMEOUT_SECONDS = 120.0
             _1_story_out_hotel_z_40_restart = namespace[
                 "_1_story_out_hotel_z_40_restart"]
@@ -4001,7 +4022,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         namespace = {"Button": Button}
         exec(compile(module, source_path, "exec"), namespace)
 
-        class Command:
+        class Command(_ConfirmedMovementAFixture):
             STATE_2_STORY_FUNCTION = {
                 "2_STORY_TOWER_54": None,
                 "2_STORY_TOWER_55": None,
@@ -5499,7 +5520,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             type_ignores=[]))
         exec(compile(module, source_path, "exec"), namespace)
 
-        class Command:
+        class Command(_ConfirmedMovementAFixture):
             ZA_STORY_YUKARI_48_ITEM_WINDOW_TIMEOUT_SECONDS = 60.0
             ZA_STORY_YUKARI_48_FIELD_TIMEOUT_SECONDS = 10.0
             _6_story_yukari_48 = namespace["_6_story_yukari_48"]
@@ -7428,7 +7449,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         self.assertEqual(
             recovery_menu_command.press_events,
             [(Button.X, 1), (Button.B, 1)])
-        self.assertEqual(recovery_menu_command.alive_checks, 1)
+        self.assertEqual(recovery_menu_command.alive_checks, 2)
         self.assertFalse(recovery_menu_command.x_menu_open)
 
         help_command = RecoveryCommand(
@@ -7465,7 +7486,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             command.press_events,
             [(Button.X, 1), (Button.B, 1),
              (Button.B, 1), (Button.B, 1)])
-        self.assertEqual(command.alive_checks, 3)
+        self.assertEqual(command.alive_checks, 4)
         self.assertEqual(command._za_battle_missing_field_count_cocp, 0)
         self.assertFalse(command.stuck)
 
@@ -7485,7 +7506,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         for _ in range(10):
             battle_once(capped_command)
         self.assertEqual(capped_command.b_count, 20)
-        self.assertEqual(capped_command.alive_checks, 20)
+        self.assertEqual(capped_command.alive_checks, 21)
         self.assertTrue(capped_command.stuck)
         self.assertEqual(
             capped_command._za_battle_missing_field_count_cocp, 0)
@@ -8158,23 +8179,22 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             normalized_function_ast_dump(source_function),
             normalized_function_ast_dump(fragment_function))
 
-        polling_loops = [
-            node for node in ast.walk(source_function)
-            if isinstance(node, ast.While)
-            and node.body
-            and isinstance(node.body[0], ast.If)
-            and any(
-                isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Attribute)
-                and call.func.attr == "image_check"
-                and call.args
-                and isinstance(call.args[0], ast.Constant)
-                and call.args[0].value == "POKEMON_ZA_HELP_MARKER"
-                for call in ast.walk(node.body[0].test))
-        ]
+        def help_branches(loop):
+            return [branch for branch in loop.body
+                    if isinstance(branch, ast.If) and any(
+                        isinstance(call, ast.Call)
+                        and isinstance(call.func, ast.Attribute)
+                        and call.func.attr == "image_check"
+                        and call.args
+                        and isinstance(call.args[0], ast.Constant)
+                        and call.args[0].value == "POKEMON_ZA_HELP_MARKER"
+                        for call in ast.walk(branch.test))]
+
+        polling_loops = [node for node in ast.walk(source_function)
+                         if isinstance(node, ast.While) and help_branches(node)]
         self.assertEqual(len(polling_loops), 1)
         polling_loop = polling_loops[0]
-        help_branch = polling_loop.body[0]
+        help_branch = help_branches(polling_loop)[0]
         self.assertIsInstance(help_branch, ast.If)
         help_checks = [
             node for node in ast.walk(help_branch.test)
@@ -18024,7 +18044,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         step = namespace["_2_story_absol_move17"]
         move16 = namespace["_2_story_absol_move16"]
 
-        class Command:
+        class Command(_ConfirmedMovementAFixture):
             def __init__(self, matched=()):
                 self.matched = set(matched)
                 self.buttons = []
@@ -19558,7 +19578,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         namespace = {"Button": Button, "time": time}
         exec(compile(module, source_path, "exec"), namespace)
 
-        class Command:
+        class Command(_ConfirmedMovementAFixture):
             ZA_STORY_GURI_SELECT_DEFEAT_PICTURES = frozenset({
                 "POKEMON_ZA_2_SELECT",
                 "POKEMON_ZA_3_SELECT",
@@ -19794,7 +19814,7 @@ class ImageDetectionMonitorTests(unittest.TestCase):
         namespace = {"Button": Button, "time": FakeTime}
         exec(compile(module, source_path, "exec"), namespace)
 
-        class Command:
+        class Command(_ConfirmedMovementAFixture):
             ZA_STORY_FURADARI_BLACK_RECOVERY_STATES = frozenset({
                 "7_STORY_GURI_114", "7_STORY_GURI_116"})
             ZA_STORY_FURADARI_BLACK_RECOVERY_FALLBACK = (
@@ -20836,6 +20856,53 @@ class ImageDetectionMonitorTests(unittest.TestCase):
 
 
 class ImageDetectionDetailTests(unittest.TestCase):
+    def test_wild_zone_confirmation_uses_nested_package_without_flat_alias(self):
+        source_path = os.path.join(
+            SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA",
+            "ZA_story", "ZA_story.py")
+        with open(source_path, encoding="utf-8-sig") as stream:
+            base = next(n for n in ast.parse(stream.read()).body
+                        if isinstance(n, ast.ClassDef) and n.name == "ZA_story_Base")
+        names = {"_image_check_target", "image_check", "image_check_confirmation",
+                 "ZA_wild_zone_number_detail_check",
+                 "ZA_wild_zone_preview_competition_check"}
+        namespace = {"detect_image": detect_image, "SimilarityHistory": SimilarityHistory}
+        module = ast.fix_missing_locations(ast.Module(
+            body=[copy.deepcopy(n) for n in base.body
+                  if isinstance(n, ast.FunctionDef) and n.name in names],
+            type_ignores=[]))
+        exec(compile(module, source_path, "exec"), namespace)
+        settings = next(ast.literal_eval(n.value) for n in base.body
+                        if isinstance(n, ast.Assign) and any(
+                            isinstance(t, ast.Name) and t.id == "IMAGE_DETECTION_TARGETS"
+                            for t in n.targets))
+        import builtins
+        original_import = builtins.__import__
+
+        def without_flat_alias(name, *args, **kwargs):
+            if name == "LocalFunction" or name.startswith("LocalFunction."):
+                raise ModuleNotFoundError("No module named 'LocalFunction'", name="LocalFunction")
+            return original_import(name, *args, **kwargs)
+
+        for number in (8, 10, 18):
+            with self.subTest(zone=number):
+                frame = cv2.imread(os.path.join(
+                    os.path.dirname(__file__), "fixtures", "za_preview_competition",
+                    "W_ZONE{}_pic.jpg".format(number)))
+                self.assertIsNotNone(frame)
+                command = types.SimpleNamespace(
+                    camera=types.SimpleNamespace(readFreshFrame=lambda timeout=0.75: frame),
+                    gui=None, IMAGE_DETECTION_TARGETS=copy.deepcopy(settings),
+                    IMAGE_DETECTION_OPERATORS={}, IMAGE_DETECTION_OUTPUT_PANEL=None)
+                for name in names:
+                    setattr(command, name, types.MethodType(namespace[name], command))
+                with mock.patch("builtins.__import__", side_effect=without_flat_alias):
+                    self.assertTrue(command.image_check(
+                        "POKEMON_ZA_MOVEPOINT_PIC_W_ZONE{}".format(number)))
+                    for other in {8, 10, 18} - {number}:
+                        self.assertFalse(command.image_check(
+                            "POKEMON_ZA_MOVEPOINT_PIC_W_ZONE{}".format(other)))
+
     def test_template_crop_matches_only_the_requested_letter_region(self):
         template = numpy.array(
             [[[10 + x * 19, 30 + y * 17, 40 + (x + y) * 13]
@@ -32530,7 +32597,7 @@ class PythonSourceSafetyTests(unittest.TestCase):
             indoor.renda_options["endpicture4"],
             "POKEMON_ZA_FILED_HARD_CHECK_1")
 
-        class Guri54:
+        class Guri54(_ConfirmedMovementAFixture):
             def __init__(self, comment_complete, field_visible):
                 self.comment_complete = comment_complete
                 self.field_visible = field_visible
@@ -33227,7 +33294,7 @@ class PythonSourceSafetyTests(unittest.TestCase):
         event_entry_recovery_step = namespace[
             "ZA_story_event_entry_recovery_step"]
 
-        class Command:
+        class Command(_ConfirmedMovementAFixture):
             _ZA_furadari_eyes_dark_comment_visible = eyes_dark_check
             _ZA_story_furadari_release_held_recovery_controls = namespace[
                 "_ZA_story_furadari_release_held_recovery_controls"]
@@ -44415,6 +44482,236 @@ class OperationStepPlanTests(unittest.TestCase):
                 self.assertEqual(
                     studio._tree_meta[loaded_pages[0]].get("start"), 400)
                 studio.destroy()
+        finally:
+            root.destroy()
+
+
+class CommandStartSelectionTests(unittest.TestCase):
+    """Exercise the Start callback without camera, serial or game input."""
+
+    @classmethod
+    def setUpClass(cls):
+        path = os.path.join(SERIAL_CONTROLLER, "Window.py")
+        with tokenize.open(path) as stream:
+            tree = ast.parse(stream.read())
+        owner = next(node for node in tree.body
+                     if isinstance(node, ast.ClassDef)
+                     and node.name == "PokeControllerApp")
+        names = {"assignCommand", "_update_command_start_state", "startPlay",
+                 "applyFilterMcu", "applyFilterSamplePy", "setCommandItems"}
+        methods = [node for node in owner.body
+                   if isinstance(node, ast.FunctionDef) and node.name in names]
+        cls.image_base = type("ImageCommand", (), {})
+        namespace = {
+            "PythonCommandBase": types.SimpleNamespace(
+                ImageProcPythonCommand=cls.image_base),
+            "print": lambda *args, **kwargs: None,
+        }
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=methods, type_ignores=[])), path, "exec"), namespace)
+        cls.runtime = type("SelectedCommandWindow", (), {
+            name: namespace[name] for name in names})
+        cls.runtime._confirm_start_after_app_restart = lambda self: True
+        namespace["PokeControllerApp"] = cls.runtime
+
+    class Box(dict):
+        def __init__(self, value="", values=()):
+            super().__init__(values=tuple(values))
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+        def current(self, index):
+            self.value = self["values"][index]
+
+        def configure(self, **values):
+            self.update(values)
+
+    def app(self, tab="Python Command"):
+        app = self.runtime()
+        app.command_nb = types.SimpleNamespace(
+            select=lambda: "selected", tab=lambda *_args: tab)
+        app.py_classes = []
+        app.mcu_classes = []
+        app.sample_py_classes = []
+        app.py_cb = self.Box()
+        app.mcu_cb = self.Box()
+        app.sample_py_cb = self.Box()
+        app.command_filter_py_cb = self.Box("-")
+        app.command_filter_mcu_cb = self.Box("-")
+        app.command_filter_sample_py_cb = self.Box("-")
+        app._visible_python_classes = lambda: app.py_classes
+        app._commands_loaded = True
+        app.start_button = {"text": "Start", "state": "normal"}
+        app.start_top_button = dict(app.start_button)
+        app.cur_command = object()  # Previous selection must not be reused.
+        app.camera = object()
+        app.preview = object()
+        return app
+
+    def test_start_constructs_only_the_selected_tab(self):
+        for tab, classes_attr, box_attr in (
+                ("Python Command", "py_classes", "py_cb"),
+                ("Python Sample Command", "sample_py_classes", "sample_py_cb"),
+                ("Mcu Command", "mcu_classes", "mcu_cb")):
+            with self.subTest(tab=tab):
+                app = self.app(tab)
+                constructed = []
+
+                class Selected:
+                    NAME = "selected"
+
+                    def __init__(self, *args):
+                        constructed.append(args)
+
+                setattr(app, classes_attr, [Selected])
+                setattr(app, box_attr, self.Box("selected", ["selected"]))
+                app.assignCommand()
+                self.assertIsInstance(app.cur_command, Selected)
+                self.assertEqual(len(constructed), 1)
+
+    def test_broken_hidden_command_cannot_block_start(self):
+        app = self.app()
+
+        class Hidden:
+            NAME = "broken hidden command"
+
+            def __init__(self, *args):
+                raise RuntimeError("hidden constructor must not run")
+
+        class Selected:
+            NAME = "selected"
+
+        app.py_classes = [Selected]
+        app.py_cb = self.Box(Selected.NAME, [Selected.NAME])
+        app.mcu_classes = app.sample_py_classes = [Hidden]
+        app.mcu_cb = self.Box(Hidden.NAME, [Hidden.NAME])
+        app.sample_py_cb = self.Box(Hidden.NAME, [Hidden.NAME])
+        app.assignCommand()
+        self.assertIsInstance(app.cur_command, Selected)
+
+    def test_missing_or_shortcut_selection_never_reuses_previous_command(self):
+        for tab in ("Python Command", "Python Sample Command", "Mcu Command", "Shortcut"):
+            with self.subTest(tab=tab):
+                app = self.app(tab)
+                app.assignCommand()
+                self.assertIsNone(app.cur_command)
+
+    def test_selected_constructor_error_preserves_the_error_and_clears_old_instance(self):
+        app = self.app()
+        attempts = []
+
+        class Broken(self.image_base):
+            NAME = "broken selected command"
+
+            def __init__(self, *args):
+                attempts.append(args)
+                raise RuntimeError("selected command initialization failed")
+
+        app.py_classes = [Broken]
+        app.py_cb = self.Box(Broken.NAME, [Broken.NAME])
+        with self.assertRaisesRegex(RuntimeError, "initialization failed"):
+            app.assignCommand()
+        self.assertEqual(len(attempts), 1)
+        self.assertIsNone(app.cur_command)
+        self.assertIsNone(app.py_cur_command)
+
+    def test_image_and_legacy_sample_constructor_arguments_are_preserved(self):
+        class Image(self.image_base):
+            NAME = "image"
+
+            def __init__(self, camera, gui=None):
+                self.camera, self.gui = camera, gui
+
+        class LegacyImage(self.image_base):
+            NAME = "legacy image"
+
+            def __init__(self, camera):
+                self.camera = camera
+
+        class LegacySample:
+            NAME = "legacy sample"
+
+        for command, tab, field in (
+                (Image, "Python Command", "py"),
+                (LegacyImage, "Python Command", "py"),
+                (LegacySample, "Python Sample Command", "sample_py")):
+            with self.subTest(command=command.NAME):
+                app = self.app(tab)
+                setattr(app, field + "_classes", [command])
+                setattr(app, field + "_cb", self.Box(command.NAME, [command.NAME]))
+                app.assignCommand()
+                self.assertIs(app.cur_command.camera, app.camera)
+                if command is not LegacyImage:
+                    self.assertIs(app.cur_command.gui, app.preview)
+
+    def test_start_is_disabled_for_a_stale_selection_and_recovers(self):
+        app = self.app()
+        app.py_cb = self.Box("removed command", ["available command"])
+        app._update_command_start_state()
+        self.assertEqual(app.start_button["state"], "disabled")
+        self.assertEqual(app.start_top_button["state"], "disabled")
+        app.py_cb.set("available command")
+        app._update_command_start_state()
+        self.assertEqual(app.start_button["state"], "normal")
+        app.start_button["text"] = "Stopping..."
+        app.start_button["state"] = "disabled"
+        app._update_command_start_state()
+        self.assertEqual(app.start_button["state"], "disabled")
+
+    def test_empty_filters_clear_old_selections_without_indexing_empty_values(self):
+        for field, tab, method in (
+                ("mcu", "Mcu Command", "applyFilterMcu"),
+                ("sample_py", "Python Sample Command", "applyFilterSamplePy")):
+            with self.subTest(field=field):
+                app = self.app(tab)
+                setattr(app, field + "_cb_all", [])
+                getattr(app, field + "_cb").set("previous command")
+                getattr(app, "command_filter_" + field + "_cb").set("missing tag")
+                getattr(app, method)()
+                self.assertEqual(getattr(app, field + "_cb").get(), "")
+                self.assertEqual(app.start_button["state"], "disabled")
+
+    def test_reload_items_tolerate_a_filter_with_no_remaining_commands(self):
+        app = self.app()
+        command = type("Loaded", (), {"NAME": "loaded", "TAGS": []})
+        app.mcu_classes = app.sample_py_classes = [command]
+        for field in ("mcu", "sample_py"):
+            getattr(app, field + "_cb").set("previous command")
+            getattr(app, "command_filter_" + field + "_cb").set("removed tag")
+        app.setCommandItems()
+        self.assertEqual(app.mcu_cb.get(), "")
+        self.assertEqual(app.sample_py_cb.get(), "")
+
+    def test_real_tk_start_button_reaches_confirmation_with_other_tabs_empty(self):
+        import tkinter as tk
+        from tkinter import ttk
+        root = tk.Tk()
+        root.withdraw()
+        try:
+            app = self.app()
+            command = type("Selected", (), {"NAME": "selected"})
+            app.py_classes = [command]
+            app.py_cb = ttk.Combobox(root, values=[command.NAME], state="readonly")
+            app.py_cb.set(command.NAME)
+            app.mcu_cb = ttk.Combobox(root, values=(), state="readonly")
+            app.sample_py_cb = ttk.Combobox(root, values=(), state="readonly")
+            app._prompt_command_run_settings = mock.Mock(return_value=False)
+            app._logger = mock.Mock()
+            app.start_button = ttk.Button(root, text="Start", command=app.startPlay)
+            app.start_top_button = ttk.Button(root, text="Start", command=app.startPlay)
+            callback_errors = []
+            root.report_callback_exception = lambda *args: callback_errors.append(args)
+            app._update_command_start_state()
+            app.start_button.invoke()
+            self.assertEqual(callback_errors, [])
+            app._prompt_command_run_settings.assert_called_once_with(app.cur_command)
+            self.assertIsInstance(app.cur_command, command)
+            self.assertEqual(str(app.start_button["state"]), "normal")
         finally:
             root.destroy()
 

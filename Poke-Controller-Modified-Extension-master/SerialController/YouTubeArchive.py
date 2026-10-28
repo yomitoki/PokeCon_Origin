@@ -1050,7 +1050,7 @@ def enqueue_upload_job(queue_dir, media_path, session_dir, input_set="",
                        command="", delete_local=True, commands_video_mode="",
                        segment_seconds=DEFAULT_SEGMENT_SECONDS,
                        channel_profile_resolved="", channel_id_resolved="",
-                       hold_for_local_commit=False):
+                       hold_for_local_commit=False, event_clip_rule=None):
     queue_dir = os.path.abspath(queue_dir)
     media_path = os.path.abspath(media_path)
     session_dir = os.path.abspath(session_dir or os.path.dirname(media_path))
@@ -1164,6 +1164,9 @@ def enqueue_upload_job(queue_dir, media_path, session_dir, input_set="",
             "segments": [],
             "attempts": 0,
         }
+        if isinstance(event_clip_rule, dict) and event_clip_rule.get("enabled"):
+            # A plain JSON snapshot belongs to this recording's durable intent.
+            payload["event_clip_rule"] = json.loads(json.dumps(event_clip_rule))
         session_identity = _session_directory_identity_snapshot(session_dir)
         if session_identity is not None:
             # Cleanup can happen hours after enqueue.  Pin the directory object
@@ -3022,6 +3025,24 @@ def _mark_source_upload_blocked(path, job, message):
     return SOURCE_VERIFICATION_REQUIRED
 
 
+def prepare_event_clips_for_upload(job):
+    """Keep highlights locally; the full recording keeps its normal upload."""
+    from EventClips import export_event_clips
+    try:
+        result = export_event_clips(job["media_path"], job["event_clip_rule"])
+        job["event_clips_result"] = {
+            "manifest": result.get("manifest", ""),
+            "saved_count": len(result.get("clips", [])),
+            "skipped_capacity_count": len(result.get("skipped_capacity", [])),
+        }
+    except Exception as error:
+        # An unavailable highlight drive must not cancel the full upload.
+        # Keep its source for a manual retry from the conditions dialog.
+        job["event_clips_result"] = {"error": str(error)}
+        job["delete_local_after_processing"] = False
+    return job["event_clips_result"]
+
+
 def process_upload_job(path, store_path):
     path = os.path.abspath(path)
     with _upload_job_state_lock(path):
@@ -3207,6 +3228,23 @@ def process_upload_job(path, store_path):
             job["updated_at"] = datetime.datetime.now().isoformat(
                 timespec="seconds")
             _atomic_json(path, job)
+    if job.get("event_clip_rule", {}).get("enabled") and not job.get("event_clips_result"):
+        prepare_event_clips_for_upload(job)
+        with _upload_job_state_lock(path):
+            current = _read_json(path, {})
+            if not isinstance(current, dict) or not current:
+                return INVALID_JOB
+            if str(current.get("status")) != "uploading":
+                return str(current.get("status", INVALID_JOB))
+            if (_upload_job_schema_error(current)
+                    or _upload_job_identity_error(current, expected_id)
+                    or current.get("media_path") != job.get("media_path")):
+                return _quarantine_invalid_upload_job(path, "条件解析中にupload jobが変更されました。")
+            current["event_clips_result"] = job["event_clips_result"]
+            if job["event_clips_result"].get("error"):
+                current["delete_local_after_processing"] = False
+            _atomic_json(path, current)
+            job = current
     profile_name, profile = _resolve_profile(
         store_path, job.get("channel_profile_resolved", "")
         or job.get("channel_profile", ""))

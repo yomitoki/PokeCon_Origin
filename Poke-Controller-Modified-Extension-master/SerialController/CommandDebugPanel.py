@@ -132,9 +132,7 @@ class CommandDebugPanel(ttk.Frame):
         self._register(ttk.Button(
             session_actions, text="このPokeConを同じ設定で再起動", command=self._dispatch_restart),
             "restart").pack(side="left", fill="x", expand=True, padx=(0, 3), pady=2)
-        self._register(ttk.Button(
-            session_actions, text="タイトル→はじめから実行", command=self._dispatch_fresh_start),
-            "fresh_start").pack(side="left", fill="x", expand=True, pady=2)
+        # Game-specific fresh start is an entry in Commands' start dropdown.
         self._status_label = ttk.Label(
             # A positive character width keeps the panel's requested width
             # stable when a saved path replaces a short status message.

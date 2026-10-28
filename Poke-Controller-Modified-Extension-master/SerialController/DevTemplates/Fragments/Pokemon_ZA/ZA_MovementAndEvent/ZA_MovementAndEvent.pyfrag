@@ -791,6 +791,18 @@ def ZA_mega_target_marker_direction(self, include_upper=False):
         self._za_mega_last_target_frame=frame
         detection_details = []
         for target, variant in marker_variants:
+            if str(variant.get("match_mode", "")).startswith("lockon_"):
+                try:
+                    from Commands.PythonCommands.LocalFunction.LockOnDetection import detect_lockon
+                except ImportError:
+                    from LocalFunction.LockOnDetection import detect_lockon
+                detail = detect_lockon(
+                    frame, mode="mega", side=variant["match_mode"].split("_")[1],
+                    threshold=float(variant.get("threshold", .8)),
+                    include_upper=include_upper)
+                detail["name"] = target
+                detection_details.append(detail)
+                continue
             template_path = str(variant.get("template_path", ""))
             normalized_path = template_path.replace("\\", "/")
             if (not os.path.isabs(template_path)
@@ -2420,12 +2432,20 @@ def ZA_mega_mode5_defeat_background_confirmed(
         return False
     template=getattr(self, "_za_mega_mode5_defeat_black_template", None)
     if template is None:
-        serial_root=os.path.dirname(os.path.dirname(
-            os.path.abspath(_image_detection.__file__)))
+        # LocalFunction may live directly under SerialController (stock)
+        # or under Commands/PythonCommands (portable Commands). Locate the
+        # owning Template directory instead of assuming a parent depth.
+        serial_root=os.path.dirname(os.path.abspath(_image_detection.__file__))
+        while not os.path.isdir(os.path.join(serial_root, "Template")):
+            parent=os.path.dirname(serial_root)
+            if parent == serial_root:
+                break
+            serial_root=parent
         template_path=os.path.join(
             serial_root, "Template", "ZA_Story_PIC", "Common",
             "za_black_back.png")
-        template=cv2.imread(template_path, cv2.IMREAD_COLOR)
+        template=(cv2.imread(template_path, cv2.IMREAD_COLOR)
+                  if os.path.isfile(template_path) else None)
         if template is None:
             if not getattr(
                     self, "_za_mega_mode5_defeat_template_error_logged",
@@ -2706,9 +2726,30 @@ def ZA_mega_mode5_defeat_background_prompt_confirmed(
 
 def ZA_mega_mode5_defeat_prompt_advance(self, retry_seconds=0.80):
     """SELECT描画前の敗戦質問をAで送り、再戦選択肢を表示する。"""
+    supplemental = getattr(self, "_native_image_collection", None)
+    if supplemental is not None and supplemental.options.supplemental:
+        # The position-based retry handler owns all black-dialogue A input.
+        return False
     if not self.ZA_mega_mode5_defeat_background_prompt_confirmed(
             stable_seconds=0.0):
         return False
+    # A partly drawn HP confirmation must not fall through to the generic
+    # black-question A input while the geometry handler waits for its rows.
+    observer = getattr(self, "ZA_mega_retry_menu_observe", None)
+    classifier = getattr(self, "ZA_mega_retry_menu_kind", None)
+    if callable(observer) and callable(classifier):
+        try:
+            frame = read_command_frame(self)
+        except RuntimeError:
+            return False
+        if frame is None:
+            return False
+        if observer(frame=frame) is not None:
+            return False
+        pending = classifier(frame, {
+            "rows": 0, "bounds": (900, 280, 320, 270)})
+        if pending.get("kind") in {"hp_carryover_dialogue", "retry_dialogue"}:
+            return False
     now=time.monotonic()
     if now < float(getattr(
             self, "_za_mega_mode5_defeat_prompt_a_retry_at", 0.0)):
@@ -3293,7 +3334,7 @@ def ZA_mega_red_edge_y_renda(
         self, seconds, endpicture="", end2picture="",
         repeat_count=0, interrupt_pictures=(),
         interrupt_check_interval=0.3,
-        continuous_wait_seconds=0.1):
+        continuous_wait_seconds=0.1, warning_deadline=None):
     """赤い画面端を避けるためYを送り、停止理由を返す。"""
     endpictures = tuple(
         picture for picture in (endpicture, end2picture) if picture)
@@ -3318,6 +3359,8 @@ def ZA_mega_red_edge_y_renda(
         return ""
 
     repeat_count=max(0, int(repeat_count))
+    if warning_deadline is not None and (repeat_count or continuous_wait_seconds <= 0.0):
+        raise ValueError("Warning window requires the timed Y loop")
     if continuous_wait_seconds <= 0.0:
         # 明示待機なしの赤枠／FIELD復帰後ローリングでは、画像検知を
         # 同期実行すると各Yの間に検知時間がそのまま入る。Y送信だけを
@@ -3431,7 +3474,7 @@ def ZA_mega_red_edge_y_renda(
                 self.wait(continuous_wait_seconds)
         return "complete"
     deadline = time.monotonic() + max(0.0, float(seconds))
-    while time.monotonic() < deadline:
+    while warning_deadline is not None or time.monotonic() < deadline:
         self.checkIfAlive()
         if any(self.image_check(picture) for picture in endpictures):
             return "endpicture"
@@ -3442,6 +3485,15 @@ def ZA_mega_red_edge_y_renda(
             return "guard"
         if self.ZA_mega_field_attack_only_suppress_y_dodge():
             return "attack_only"
+        if warning_deadline is not None:
+            if self.ZA_mega_mode5_event_attack_blocked():
+                return "guard"
+            updated_deadline = warning_deadline()
+            if updated_deadline is None:
+                return "guard"
+            deadline = float(updated_deadline)
+            if time.monotonic() >= deadline:
+                return "complete"
         self.pressRep(
             Button.Y, repeat=1, duration=0.04,
             wait=0.0, interval=0.05)
@@ -3473,8 +3525,17 @@ def ZA_mega_last_battle_charge_dodge(
         "no reachable green floor; non-lockon Y for {:.1f}s".format(
             seconds),
         force=True)
+    warning_options = {}
+    supplemental = getattr(self, "_native_image_collection", None)
+    if (reason == "supplemental_icon" and supplemental is not None
+            and supplemental.options.supplemental):
+        warning_options["warning_deadline"] = lambda: supplemental.final_warning_deadline(
+            self, read_command_frame)
     result=self.ZA_mega_red_edge_y_renda(
-        seconds, endpicture=endpicture, end2picture=end2picture)
+        seconds, endpicture=endpicture, end2picture=end2picture,
+        **warning_options)
+    if warning_options and result != "complete":
+        supplemental._icons.scenes.reset_final_warning()
     if result == "complete":
         # 旧移動方向は再送しない。ZLだけ戻し、次周期のmode 5探索で
         # 新しい敵方向を取得する。
@@ -3503,6 +3564,33 @@ def ZA_mega_last_battle_charge_update(
             self._za_mega_last_charge_state="IDLE"
             self._za_mega_last_charge_search_deadline=0.0
         return "none"
+
+    supplemental = getattr(self, "_native_image_collection", None)
+    if supplemental is not None and supplemental.options.supplemental:
+        warning = supplemental.final_warning_observation(self, read_command_frame)
+        if not warning["valid"]:
+            return "guard"
+        if not warning["active"]:
+            if getattr(self,"_za_mega_last_charge_attack_suspended",False):
+                self.ZA_mega_mode5_marker_search_view_stop(relock=False)
+                self.ZA_MOVE_LStick(dir1,dir2,dir3,dir4,1,"END")
+                self.ZA_MOVE_SEE(action="END",in_see_r=see_r)
+                return "guard"
+            return "none"
+        # 補完では文言／1個目・2個目を区別しない。既存の呼出側が
+        # 許可したフリーランだけ、初回アイコンから期限延長式Yへ入る。
+        # 障害物内はside_transition側の既存方向付きYを維持する。
+        self._za_mega_last_charge_attack_suspended=True
+        if (getattr(self, "_za_mega_testmode1_enabled", False)
+                and not getattr(self, "_za_mega_testmode1_legacy_until_reset", False)):
+            self._za_mega_testmode1_phase_before_charge=str(getattr(
+                self, "_za_mega_testmode1_phase", "FREE_RUN"))
+            self._za_mega_testmode1_existing_charge_latched=True
+            self._za_mega_testmode1_phase="EXISTING_CHARGE"
+        return self.ZA_mega_last_battle_charge_dodge(
+            dir1,dir2,dir3,dir4,see_r,
+            endpicture=endpicture, end2picture=end2picture,
+            seconds=7.0, reason="supplemental_icon")
 
     now=time.monotonic()
 
@@ -3950,6 +4038,304 @@ def ZA_mega_red_edge_dodge_if_needed(
             in_see_r=see_r)
     return result
 
+def ZA_mega_retry_menu_kind(self, frame, menu):
+    """Identify retry meaning and its HP-preserving row on the same frame."""
+    import numpy as np
+    if (frame is None or getattr(frame, "size", 0) == 0
+            or len(frame.shape) != 3 or frame.shape[2] not in (3, 4)):
+        return {}
+    templates = getattr(self, "_za_mega_retry_prompt_templates", None)
+    names = (
+        "mega_retry_retry_question_prefix.png",
+        "mega_retry_hp_question_hp_prefix.png",
+        "mega_retry_hp_question_choice_suffix.png",
+        "mega_retry_hp_carryover_label_unselected.png",
+        "mega_retry_hp_carryover_label_selected.png",
+        "2_select_tutorial.png", "3_select_tutorial.png", "arrow.png")
+    if templates is None:
+        root = os.path.dirname(os.path.abspath(_image_detection.__file__))
+        while not os.path.isdir(os.path.join(root, "Template")):
+            parent = os.path.dirname(root)
+            if parent == root:
+                return {}
+            root = parent
+        templates = {}
+        for name in names:
+            path = os.path.join(root, "Template", "ZA_Story_PIC", "Common", name)
+            template = (cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                        if os.path.isfile(path) else None)
+            if template is None:
+                if name == "arrow.png":
+                    # The question remains owned, but cannot advance when
+                    # its required dialogue marker is unavailable.
+                    continue
+                if not getattr(self, "_za_mega_retry_template_error_logged", False):
+                    print("[MEGA_RETRY_MENU] required template missing: " + path)
+                    self._za_mega_retry_template_error_logged = True
+                return {}
+            templates[name] = template
+        self._za_mega_retry_prompt_templates = templates
+    source = frame[:, :, :3]
+    if source.shape[:2] != (720, 1280):
+        source = cv2.resize(source, (1280, 720))
+    gray = cv2.cvtColor(source, cv2.COLOR_BGR2GRAY)
+
+    def match(template, roi, invert=False):
+        x1, y1, x2, y2 = roi
+        region = gray[y1:y2, x1:x2]
+        if (not template.size or region.shape[0] < template.shape[0]
+                or region.shape[1] < template.shape[1]):
+            return 0.0, (0, 0)
+        result = cv2.matchTemplate(region, template, cv2.TM_CCOEFF_NORMED)
+        if invert:
+            # Existing no-HP option lettering changes polarity with the
+            # selection band. Both polarities must still match its glyphs.
+            result = np.abs(result)
+        _, score, _, position = cv2.minMaxLoc(result)
+        return score, (x1 + position[0], y1 + position[1])
+
+    question_roi = (340, 570, 760, 630)
+    scores = {name: match(templates[name], question_roi)[0] for name in names[:3]}
+    self._za_mega_retry_question_scores = scores
+    retry = scores[names[0]] >= 0.90
+    carry = scores[names[1]] >= 0.90 and scores[names[2]] >= 0.90
+    if retry and carry:
+        return {}
+    rows = menu["rows"]
+    x, y, width, height = menu["bounds"]
+    if rows == 0:
+        kind = ("hp_carryover_dialogue" if carry else
+                "retry_dialogue" if retry else "")
+        if not kind:
+            return {}
+        # The dialogue box starts below y=550. Any nonblack pixel in the
+        # whole choice area blocks A, including incomplete panel edges.
+        choice_area = source[280:550, 900:1220]
+        empty = bool(np.all(np.max(choice_area, axis=2) <= 24))
+        arrow = templates.get("arrow.png")
+        marker = (arrow is not None
+                  and match(arrow, (900, 620, 990, 680))[0] >= 0.90)
+        return {"kind": kind, "target": 0,
+                "dialogue_ready": empty and bool(marker)}
+    if carry:
+        return ({"kind": "hp_carryover_prompt", "target": 0}
+                if rows == 3 else {})
+
+    def matching_rows(template, invert=False):
+        found = set()
+        # Search each row separately so two HP labels are rejected rather
+        # than silently accepting the global best match.
+        for row in range(rows):
+            top = y + int(row * height / rows)
+            bottom = y + int((row + 1) * height / rows)
+            score, position = match(template, (x, top, x + width, bottom), invert)
+            center = position[1] + template.shape[0] / 2.0
+            if score >= 0.90 and top <= center < bottom:
+                found.add(row)
+        return found
+
+    hp_rows = set()
+    for name in names[3:5]:
+        hp_rows.update(matching_rows(templates[name]))
+    if hp_rows:
+        if retry and len(hp_rows) == 1:
+            return {"kind": "retry_prompt", "target": next(iter(hp_rows))}
+        return {}
+    # These existing assets explicitly show menus without HP carry-over.
+    # Require every label in its expected row; row count alone is not proof.
+    if rows == 2:
+        template = templates["2_select_tutorial.png"]
+        labels = (template[0:42, 0:150], template[61:103, 0:145])
+        kind = "retry_without_hp"
+    elif rows == 3 and getattr(self, "_za_mega_last_battle_mode", False):
+        template = templates["3_select_tutorial.png"]
+        labels = (template[0:36, 0:150], template[48:92, 0:175],
+                  template[112:145, 0:125])
+        kind = "final_retry_without_hp"
+    else:
+        return {}
+    if all(matching_rows(label, invert=True) == {row}
+           for row, label in enumerate(labels)):
+        return {"kind": kind, "target": 0}
+    return {}
+
+
+def ZA_mega_retry_menu_observe(self, frame=None):
+    """Read the retry panel and highlight geometry without matching its text."""
+    import numpy as np
+    if frame is None:
+        try:
+            frame = read_command_frame(self)
+        except RuntimeError:
+            return None
+    if (frame is None or getattr(frame, "size", 0) == 0
+            or len(frame.shape) != 3 or frame.shape[2] not in (3, 4)):
+        return None
+    height, width = frame.shape[:2]
+    if height < 360 or width < 640:
+        return None
+    panel = frame[int(height * 280 / 720):int(height * 580 / 720),
+                  int(width * 900 / 1280):int(width * 1220 / 1280), :3]
+    if panel.shape[:2] != (300, 320):
+        panel = cv2.resize(panel, (320, 300))
+    blue, green, red = cv2.split(panel)
+    high = np.max(panel, axis=2).astype(np.int16)
+    low = np.min(panel, axis=2).astype(np.int16)
+    white = (low >= 160) & ((high - low) <= 45)
+    navy = ((blue.astype(np.int16) - red.astype(np.int16) >= 12)
+            & (blue >= 35) & (blue <= 160) & (green < 135))
+    mask = ((white | navy).astype(np.uint8) * 255)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE,
+                          np.ones((5, 5), dtype=np.uint8))
+    contours = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[-2]
+    candidates = []
+    for contour in contours:
+        x, y, w, h = cv2.boundingRect(contour)
+        rows = int(round(h / 52.0))
+        if (not 140 <= w <= 310 or rows not in (2, 3, 4)
+                or abs(h - rows * 52) > 12
+                or x <= 0 or y <= 0 or x + w >= 320 or y + h >= 300
+                or cv2.contourArea(contour) < w * h * 0.85):
+            continue
+        selected = []
+        for row in range(rows):
+            top = y + int(row * h / rows) + 7
+            bottom = y + int((row + 1) * h / rows) - 7
+            stripe = white[top:bottom, x + 12:x + w - 12]
+            if stripe.size and float(np.mean(stripe)) >= 0.62:
+                selected.append(row)
+        if len(selected) == 1:
+            candidates.append({
+                "rows": rows, "selected": selected[0],
+                "bounds": (900 + x, 280 + y, w, h),
+            })
+    menu = candidates[0] if len(candidates) == 1 else None
+    if menu is not None:
+        # The retry options and HP carry-over confirmation both have three
+        # rows, but require different choices. Read their question from
+        # this same frame; cursor geometry alone cannot tell them apart.
+        menu.update(self.ZA_mega_retry_menu_kind(frame, menu))
+    return menu
+
+
+def ZA_mega_retry_menu_step(self, dir1, dir2, dir3, dir4, see_r):
+    """Move one verified row, then confirm retry from a fresh observation."""
+    supplemental = getattr(self, "_native_image_collection", None)
+    if supplemental is not None and supplemental.options.supplemental:
+        return supplemental.retry_menu_step(
+            self, (dir1, dir2, dir3, dir4, see_r), read_command_frame, Button.A)
+    self.checkIfAlive()
+    last = bool(getattr(self, "_za_mega_last_battle_mode", False))
+
+    def dialogue_observation(frame):
+        pending = self.ZA_mega_retry_menu_kind(frame, {
+            "rows": 0, "bounds": (900, 280, 320, 270)})
+        if pending.get("kind") not in {"hp_carryover_dialogue", "retry_dialogue"}:
+            return None
+        observed = {"rows": 0, "selected": 0,
+                    "bounds": (900, 280, 320, 270)}
+        observed.update(pending)
+        return observed
+
+    menu = self.ZA_mega_retry_menu_observe()
+    if menu is None:
+        # A completed question needs one A before its choice panel opens.
+        # Partial panels remain owned here and cannot reach generic A.
+        try:
+            frame = read_command_frame(self)
+        except RuntimeError:
+            frame = None
+        menu = dialogue_observation(frame)
+    if menu is None:
+        if (not last and getattr(
+                self, "_za_mega_normal_choice_black_background_state", "none")
+                in {"confirming", "ready"}):
+            # A caller may disable the legacy choice guard. The semantic
+            # menu path still owns its latch and clears it on battle/field
+            # return so the next defeat must confirm black for five seconds.
+            self.ZA_mega_normal_choice_black_background_state(force=True)
+        self._za_mega_retry_menu_ack = None
+        return ""
+
+    def ui_clear():
+        return not any(self.image_check(picture) for picture in (
+            "POKEMON_ZA_FIELD_W", "POKEMON_ZA_FIELD_BACK_W",
+            "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK",
+            "POKEMON_ZA_BATTLE_ACTIVE_LEVEL", "POKEMON_ZA_ESCAPE"))
+
+    if not ui_clear():
+        self._za_mega_retry_menu_ack = None
+        return ""
+    self.ZA_MOVE_LStick(dir1, dir2, dir3, dir4, 1, "END")
+    self.ZA_MOVE_SEE(action="END", in_see_r=see_r)
+    self.ZA_ZL_ACTION("END")
+    ready = (self.ZA_mega_mode5_defeat_background_prompt_confirmed()
+             if last else
+             self.ZA_mega_normal_choice_black_background_state(force=True) == "ready")
+    if not ready:
+        self.wait(0.1)
+        return "waiting"
+    kind = menu.get("kind", "")
+    target = menu.get("target")
+    dialogue = menu["rows"] == 0
+    if (kind not in {"retry_prompt", "hp_carryover_prompt", "retry_without_hp",
+                     "final_retry_without_hp", "retry_dialogue",
+                     "hp_carryover_dialogue"}
+            or not isinstance(target, int)
+            or (not dialogue and not 0 <= target < menu["rows"])
+            or (dialogue and not menu.get("dialogue_ready", False))):
+        # A visible but unrecognized three-choice menu remains owned here;
+        # do not let a generic Comment/SELECT fallback press A.
+        self.wait(0.1)
+        return "waiting"
+    self.wait(0.08)
+    if dialogue:
+        try:
+            frame = read_command_frame(self)
+        except RuntimeError:
+            frame = None
+        fresh = (dialogue_observation(frame)
+                 if frame is not None and
+                 self.ZA_mega_retry_menu_observe(frame=frame) is None else None)
+    else:
+        fresh = self.ZA_mega_retry_menu_observe()
+    if not fresh or not ui_clear():
+        return "waiting"
+    if (fresh["rows"] != menu["rows"]
+            or fresh["selected"] != menu["selected"]
+            or fresh.get("kind", "") != kind or fresh.get("target") != target
+            or (dialogue and not fresh.get("dialogue_ready", False))
+            or any(abs(a - b) > 3 for a, b in
+                   zip(fresh["bounds"], menu["bounds"]))):
+        return "waiting"
+    now = time.monotonic()
+    # Small capture jitter must not reset the A cooldown/attempt limit.
+    key = (last, menu["rows"], kind, target)
+    ack = getattr(self, "_za_mega_retry_menu_ack", None)
+    if not isinstance(ack, dict) or ack.get("key") != key:
+        ack = {"key": key, "attempts": 0, "retry_at": 0.0}
+        self._za_mega_retry_menu_ack = ack
+    if now < ack["retry_at"]:
+        self.wait(0.1)
+        return "waiting"
+    if menu["selected"] != target:
+        self.etc_sendCommand(
+            "Lbutton_up" if menu["selected"] > target else "Lbutton_down")
+        self.wait(0.2)
+        print("[MEGA_RETRY_MENU] kind={} rows={} selected={} target={} move".format(
+            kind, menu["rows"], menu["selected"], target))
+        return "moved"
+    if ack["attempts"] >= 3:
+        raise RuntimeError("MEGA retry menu did not close after 3 confirmed A inputs")
+    ack["attempts"] += 1
+    ack["retry_at"] = now + 0.8
+    self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.2, interval=0.1)
+    print("[MEGA_RETRY_MENU] kind={} rows={} selected={} retry A {}/3".format(
+        kind, menu["rows"], target, ack["attempts"]))
+    return "confirmed"
+
+
 def ZA_mega_normal_choice_black_background_reset(self):
     """通常MEGA戦の黒背景確認状態を破棄する。"""
     self._za_mega_normal_choice_black_background_since=0.0
@@ -3958,9 +4344,9 @@ def ZA_mega_normal_choice_black_background_reset(self):
     self._za_mega_normal_choice_black_background_logged=False
 
 def ZA_mega_normal_choice_black_background_state(
-        self, stable_seconds=5.0):
+        self, stable_seconds=5.0, force=False):
     """通常MEGA戦で黒背景を5秒確認してComment／SELECTを許可する。"""
-    if not getattr(
+    if not force and not getattr(
             self, "_za_mega_normal_choice_black_background_required",
             False):
         return "disabled"
@@ -4729,6 +5115,9 @@ def ZA_battle_missing_field_recovery(
     if hasattr(self, "ZA_MOVE_SEE"):
         self.ZA_MOVE_SEE("END")
     self.ZA_ZL_ACTION("END")
+    print("[BATTLE_FIELD_RECOVERY] {} missing=10 -> unlock + X".format(
+        counter_key))
+    self.checkIfAlive()
     self.pressRep(
         Button.X, repeat=1, duration=0.15,
         wait=0.5, interval=0.1)
@@ -4746,12 +5135,15 @@ def ZA_battle_missing_field_recovery(
                 self.ZA_mega_mode5_x_menu_b_recovery(
                     max_attempts=20,
                     before_recovery=before_recovery)
-            else:
-                self.checkIfAlive()
-                self.pressRep(
-                    Button.B, repeat=1, duration=0.15,
-                    wait=0.5, interval=0.1)
-            return True
+                return True
+            self.checkIfAlive()
+            self.pressRep(
+                Button.B, repeat=1, duration=0.15,
+                wait=0.5, interval=0.1)
+            b_press_count += 1
+            # メニューを1回閉じただけでは復帰完了としない。
+            # 次のfresh判定でHELP/FIELDを確認し、同じ上限内でBを続ける。
+            continue
         if self.image_check("POKEMON_ZA_HELP_MARKER"):
             if help_press_count >= 10:
                 return True
@@ -4764,6 +5156,8 @@ def ZA_battle_missing_field_recovery(
             help_press_count += 1
             continue
         if bool(self.ZA_story_Template_Field_HardGaurd()):
+            print("[BATTLE_FIELD_RECOVERY] {} field restored; B={}".format(
+                counter_key, b_press_count))
             break
         self.checkIfAlive()
         self.pressRep(
@@ -4859,6 +5253,10 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
     self._za_mega_roll_only_logged=False
     self._za_mega_lockon_unchecked_ay_logged=False
     self._za_mega_last_battle_mode=bool(last_battle_mode)
+    self._za_mega_retry_menu_ack=None
+    supplemental = getattr(self, "_native_image_collection", None)
+    if supplemental is not None and supplemental.options.supplemental:
+        supplemental.reset_retry()
     self._za_mega_normal_choice_black_background_required=bool(
         choice_black_background_guard and not last_battle_mode)
     self.ZA_mega_normal_choice_black_background_reset()
@@ -5041,8 +5439,36 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
     # MEGAの外側ループでは毎周必ず照合して、成立時にAを1回送る。
     if mode4_view_nudge:
         self.ZA_mega_mode4_view_nudge()
-    
+
     while True:
+        retry_menu_step = self.ZA_mega_retry_menu_step(
+            dir1, dir2, dir3, dir4, see_r)
+        if retry_menu_step:
+            nofiled = 1
+            self._za_mega_field_dir5_until = 0.0
+            self._za_mega_field_dir4_until = 0.0
+            if retry_menu_step in {"moved", "confirmed"}:
+                self.ZA_mega_field_post_attack_roll_reset()
+            if last_battle_mode and retry_menu_step in {"moved", "confirmed"}:
+                # This early menu path must prepare the same new battle
+                # state as the existing choice/comment guard below.
+                self.ZA_mega_mode5_transition(
+                    "RETRY_SELECTION", "retry menu geometry confirmed")
+                self._za_mega_mode5_battle_active = False
+                self._za_mega_mode5_post_move_wait_until = 0.0
+                self._za_mega_mode5_lockon_confirmed_until = 0.0
+                self._za_mega_mode5_visual_lockon_until = 0.0
+                self._za_mega_colored_enemy_track_position = None
+                self._za_mega_colored_enemy_track_seen_at = 0.0
+                if self._za_mega_testmode1_enabled:
+                    self.ZA_mega_mode5_testmode1_reset_for_selection(
+                        "RETRY_MENU_GEOMETRY")
+                self._za_mega_field_w_up_attempts = 0
+                self._za_mega_field_w_up_retry_at = 0.0
+                self._za_mega_field_w_up_latched = False
+                self.ZA_mega_mode5_set_start_flag(
+                    0, "RETRY_MENU_GEOMETRY", "restart FIELD check after retry selection")
+            continue
         if self.image_check("POKEMON_ZA_HELP_MARKER"):
             self.pressRep(
                 Button.A, repeat=1, duration=0.04,
@@ -7157,48 +7583,13 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
             self.ZA_MOVE_LStick(dir1,dir2,dir3,dir4,1,"END")
             self.ZA_MOVE_SEE(action = "END",in_see_r=see_r)
             self.wait(1.0)
-            if (last_battle_mode
-                    and self.ZA_mega_mode5_defeat_select_check(
-                        "POKEMON_ZA_3_SELECT_TUTORIAL")):
-                # 最終戦の「準備して再挑戦」は専用画像を優先し、
-                # 汎用3_SELECTの下入力処理へ入れず、そのまま決定する。
-                if self.ZA_mega_last_battle_tutorial_confirmed():
-                    self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-            elif (last_battle_mode
-                    and self.ZA_mega_mode5_defeat_select_check(
-                        select2_picture)):
-                # 描画途中では専用画像だけ外れることがある。
-                # 下入力へフォールバックせず、この場で再確認する。
-                if self.ZA_mega_last_battle_tutorial_confirmed():
-                    self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-            elif self.image_check(select2_picture):
-                self.wait(1.0)
-                if (not last_battle_mode
-                        and self.image_check(
-                            "POKEMON_ZA_2_SELECT_TUTORIAL")):
-                    self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1) 
-                else:
-                    # 2_SELECT相当は1項目下へ移動してから決定する。
-                    self.etc_sendCommand("Lbutton_down")
-                    self.wait(1.0)
-                    self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)  
-            elif ((last_battle_mode
-                   and self.ZA_mega_mode5_defeat_select_check(
-                       select3_picture))
-                  or (not last_battle_mode
-                      and self.image_check(select3_picture))):
-                self.wait(1.0)
-                if (not last_battle_mode
-                        and self.image_check(
-                            "POKEMON_ZA_3_SELECT_SELECT")):
-                    self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-                else:
-                    # 3_SELECT相当は1項目下へ移動してから決定する。
-                    self.etc_sendCommand("Lbutton_down")
-                    self.wait(1.0)
-                    self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-            else:
-                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
+            # The early geometry handler owns retry menus. A plain black
+            # question still needs A to reveal its options.
+            if (self.ZA_mega_retry_menu_observe() is None
+                    and not any(self.image_check(picture) for picture in (
+                        select2_picture, select3_picture))):
+                self.pressRep(Button.A, repeat=1, duration=0.15,
+                              wait=0.5, interval=0.1)
             if last_battle_mode:
                 self.ZA_mega_mode5_set_start_flag(
                     0, "BLACK_COMMENT_SELECT_HANDLED",
@@ -7274,91 +7665,21 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
                     dir1,dir2,dir3,dir4,see_r)
                 continue
 
-        elif (
-                last_battle_mode
-                and not field_active
-                and self.ZA_mega_mode5_defeat_select_confirmed(
-                    "POKEMON_ZA_3_SELECT_TUTORIAL")):
-            nofiled=1
-            self._za_mega_field_dir5_until=0.0
-            self._za_mega_field_dir4_until=0.0
-            self.ZA_MOVE_LStick(dir1,dir2,dir3,dir4,1,"END")
-            self.ZA_MOVE_SEE(action = "END",in_see_r=see_r)
-            # 専用3_SELECT_TUTORIALは現在選択中の
-            # 「準備して再挑戦」を下入力なしで決定する。
-            if self.ZA_mega_last_battle_tutorial_confirmed():
-                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-                self.ZA_mega_mode5_set_start_flag(
-                    0, "POKEMON_ZA_3_SELECT_TUTORIAL",
-                    "A complete; restart FIELD check")
-        elif (
-                last_battle_mode
-                and not field_active
-                and self.ZA_mega_mode5_defeat_select_confirmed(
-                    select2_picture)):
-            nofiled=1
-            self._za_mega_field_dir5_until=0.0
-            self._za_mega_field_dir4_until=0.0
-            self.ZA_MOVE_LStick(dir1,dir2,dir3,dir4,1,"END")
-            self.ZA_MOVE_SEE(action = "END",in_see_r=see_r)
-            # 汎用3_SELECTだけ先に一致しても入力せず、専用画像を再確認する。
-            if self.ZA_mega_last_battle_tutorial_confirmed():
-                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-                self.ZA_mega_mode5_set_start_flag(
-                    0, select2_picture,
-                    "A complete; restart FIELD check")
-        elif (
-                not last_battle_mode
-                and not field_active
-                and normal_choice_black_background_ready
-                and self.image_check(select2_picture)
-                and self.ZA_mega_nonfield_picture_confirmed(
-                    "POKEMON_ZA_2_SELECT")):
-            nofiled=1
-            self._za_mega_field_dir5_until=0.0
-            self._za_mega_field_dir4_until=0.0
-            self.ZA_MOVE_LStick(dir1,dir2,dir3,dir4,1,"END")
-            self.ZA_MOVE_SEE(action = "END",in_see_r=see_r)
-            self.wait(1.0)
-            if (not last_battle_mode
-                    and self.image_check(
-                        "POKEMON_ZA_2_SELECT_TUTORIAL")):
-                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1) 
-            else:
-                self.wait(1.0)
-                # 2_SELECT相当は1項目下へ移動してから決定する。
-                self.etc_sendCommand("Lbutton_down")
-                self.wait(1.0)
-                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)  
-        elif (
-                not field_active
+        elif (not field_active
                 and ((last_battle_mode
-                      and self.ZA_mega_mode5_defeat_select_confirmed(
-                          select3_picture))
+                      and any(self.ZA_mega_mode5_defeat_select_confirmed(picture)
+                              for picture in (select2_picture, select3_picture)))
                      or (not last_battle_mode
                          and normal_choice_black_background_ready
-                         and self.image_check(select3_picture)
-                         and self.ZA_mega_nonfield_picture_confirmed(
-                             "POKEMON_ZA_3_SELECT")))):
+                         and any(self.image_check(picture) for picture in (
+                             select2_picture, select3_picture))))):
             nofiled=1
-            self._za_mega_field_dir5_until=0.0
-            self._za_mega_field_dir4_until=0.0
             self.ZA_MOVE_LStick(dir1,dir2,dir3,dir4,1,"END")
-            self.ZA_MOVE_SEE(action = "END",in_see_r=see_r)
-            self.wait(1.0)
-            if (not last_battle_mode
-                    and self.image_check(
-                        "POKEMON_ZA_3_SELECT_SELECT")):
-                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-            else:
-                # 3_SELECT相当は1項目下へ移動してから決定する。
-                self.etc_sendCommand("Lbutton_down")
-                self.wait(1.0)
-                self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.5, interval=0.1)
-            if last_battle_mode:
-                self.ZA_mega_mode5_set_start_flag(
-                    0, select3_picture,
-                    "selection input complete; restart FIELD check")
+            self.ZA_MOVE_SEE(action="END",in_see_r=see_r)
+            self.ZA_ZL_ACTION("END")
+            # Every mode, including a legacy guard opt-out, waits for the
+            # semantic retry handler. A generic edge cannot select HP.
+            self.wait(0.1)
         elif (
                 last_battle_mode
                 and not field_active
@@ -7618,14 +7939,74 @@ def ZA_no_battle_filed_check_HardGaurd(self,mode=0):
 ######################################################
 # story_Template
 ######################################################
-def ZA_get_pokemon(self):
+def ZA_get_pokemon(self, expected_name=None):
+    # In the default Story mode these three catches must identify the
+    # currently locked target. Chapter selection prevents stale state
+    # values from applying a chapter-1 guard to a later chapter's capture.
+    if expected_name is None:
+        chapter = getattr(self, "main_current_state", "")
+        if chapter == "MAIN_1_Z_LANK":
+            expected_name = {
+                "1_STORY_OUT_HOTEL_Z_18": "scatterbug",
+                "1_STORY_OUT_HOTEL_Z_18_2": "scatterbug",
+                "1_STORY_OUT_HOTEL_Z_20": "mareep",
+            }.get(getattr(self, "_1_story_current_state", ""))
+        elif (chapter == "MAIN_2_Y_V_LANK"
+              and getattr(self, "_2_story_current_state", "") == "2_STORY_TOWER_36"):
+            expected_name = "pikachu"
+    supplemental = bool(getattr(getattr(getattr(
+        self, "_native_image_collection", None), "options", None), "supplemental", False))
+    guarded = bool(expected_name and not supplemental)
+    if guarded:
+        # The displayed name fades during a long ZL hold. Reacquire, then
+        # identify the resulting target instead of reusing the old name.
+        self.ZA_ZL_ACTION("END")
+        self.wait(0.05)
     self.ZA_ZL_ACTION("")
-    self.wait(0.1)
+    self.wait(0.15 if guarded else 0.1)
+    if guarded:
+        for confirmation in range(2):
+            if not self.ZA_capture_name_check(expected_name):
+                self.ZA_ZL_ACTION("END")
+                return False
+            if confirmation == 0:
+                self.wait(0.05)
+        # Nothing that can move/relock/attack intervenes between the fresh
+        # second observation and the actual ZR input.
     self.keys.input(Button.ZR)
     self.wait(0.15)
     self.keys.inputEnd(Button.ZR)
     self.wait(0.1)
     self.ZA_ZL_ACTION("END")
+    return True
+
+def ZA_capture_name_check(self, expected_name):
+    try:
+        from Commands.PythonCommands.LocalFunction.ImageDetection import read_command_frame
+        from Commands.PythonCommands.LocalFunction.LockOnDetection import detect_capture_name
+    except ImportError:
+        from LocalFunction.ImageDetection import read_command_frame
+        from LocalFunction.LockOnDetection import detect_capture_name
+    try:
+        frame = read_command_frame(self)
+        if frame is None:
+            detail = {"matched": False, "target": expected_name,
+                      "reason": "fresh_frame_unavailable"}
+        else:
+            detail = detect_capture_name(frame, expected_name,
+                self.get_filespec("ZA_Story_PIC/LockOnNames", mode="t"))
+    except (OSError, ValueError, RuntimeError) as error:
+        detail = {"matched": False, "target": expected_name,
+                  "reason": str(error)}
+    self.last_capture_target_detection = detail
+    if not detail["matched"]:
+        now = time.monotonic()
+        if now >= getattr(self, "_za_capture_name_log_after", 0.0):
+            print("[CAPTURE_TARGET] skip GET: {} score={:.3f} reason={}".format(
+                expected_name, detail.get("score", -2.),
+                detail.get("reason", "unconfirmed")))
+            self._za_capture_name_log_after = now + 2.0
+    return bool(detail["matched"])
 def ZA_ball_change(self,type=0):
 
     for i in range(20):
@@ -9134,6 +9515,11 @@ def ZA_mega_mode5_testmode1_side_transition_update(
                     False)
                 block_seconds=max(0.0, float(settings.get(
                     "RED_ATTACK_PREMOVE_BLOCK_SECONDS", 7.0)))
+                supplemental = getattr(self, "_native_image_collection", None)
+                if supplemental is not None and supplemental.options.supplemental:
+                    # 非文字判定がすでに最終検出後7秒を含む。ここで
+                    # さらに7秒を加算しない。既存の障害物向きYを継続。
+                    block_seconds=0.0
                 self._za_mega_testmode1_red_premove_block_until=max(
                     float(getattr(
                         self,
