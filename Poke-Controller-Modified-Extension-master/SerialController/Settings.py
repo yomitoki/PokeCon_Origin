@@ -290,6 +290,9 @@ class GuiSettings:
         self.commands_assist_recovery_command = self.setting.get(
             "Commands Assist", "recovery_command", fallback="")
         self.commands_assist_rules = self.setting.get("Commands Assist", "rules", fallback="[]")
+        # Commands の開始位置・その他の操作: "tab"=Commandsタブに常時表示（AI操作向け）/
+        # "dialog"=Start を押した時に表示（従来の PokeCon と同じ）
+        self.command_start_panel = self.setting.get("Commands Start", "panel", fallback="tab")
 
     def load(self):
         if os.path.isfile(self.SETTING_PATH):
@@ -496,6 +499,7 @@ class GuiSettings:
         }
         self.setting["Command Watch"] = {"enabled": False, "command": "", "target": "Output#1", "variables": ""}
         self.setting["Commands Assist"] = {"enabled": False, "recovery_command": "", "rules": "[]"}
+        self.setting["Commands Start"] = {"panel": "tab"}
         self._write_settings_file(self.SETTING_PATH)
 
     def save(self, path=None):
@@ -666,6 +670,7 @@ class GuiSettings:
             "recovery_command": self.commands_assist_recovery_command,
             "rules": self.commands_assist_rules,
         }
+        self.setting["Commands Start"] = {"panel": getattr(self, "command_start_panel", "tab")}
 
         self._write_settings_file(path or self.SETTING_PATH)
         self._logger.debug("Settings file has been saved.")

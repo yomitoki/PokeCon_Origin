@@ -138,7 +138,7 @@ from OperationGamepadMap import (OperationGamepadMapDialog,
 from AutomationTriggers import (StableRuleEvaluator, discover_state_values,
                                 discover_state_variables, resolve_command_value)
 from CommandStartOverride import apply_command_start_override
-from CommandQuickRun import CommandQuickRun
+from CommandQuickRun import CommandQuickRun, CommandStartPanelHost
 from AiAssistPanel import AiAssistPanel
 from CommandImageCollection import build_native_image_collection_controls
 from CommandRunOptions import (apply_command_run_options,
@@ -1603,8 +1603,10 @@ class PokeControllerApp:
             on_restart=self.restart_pokecon_same_settings,
             on_fresh_start=self.fresh_start_current_command)
         self.command_debug_panel.pack(fill="x", padx=5, pady=3)
-        self.command_quick_run = CommandQuickRun(self.commands_f, self)
-        self.command_quick_run.grid(column=0, row=2, sticky="ew", padx=5, pady=3)
+        # 開始位置・その他の操作。置き場所（Commandsタブ／Start時の画面）は host が切り替え、
+        # self.command_quick_run には現在の欄が入る
+        self.command_quick_run_host = CommandStartPanelHost(self.commands_f, self)
+        self.command_quick_run_host.grid(column=0, row=2, sticky="ew", padx=5, pady=3)
         self.ai_assist_panel = AiAssistPanel(self.ai_assist_f, self, self.commands_f)
         self.ai_assist_panel.pack(fill="x")
         self.commands_f.columnconfigure(0, weight=1)
@@ -2360,6 +2362,8 @@ class PokeControllerApp:
 
         # load settings file
         self.loadSettings()
+        if getattr(self, "command_quick_run_host", None) is not None:
+            self.command_quick_run_host.apply_saved_mode()
         # 各tk変数に設定値をセット(コピペ簡単のため)
         self.is_show_realtime.set(self.settings.is_show_realtime.get())
         self.is_show_value.set(self.settings.is_show_value.get())

@@ -384,8 +384,8 @@ def ZA_common_box_change_box_target1(self,target1,target1_high=0):
         return "COMMON_BOX_CHANGE_BOX_TARGET1_SELECT"        
     return "COMMON_BOX_CHANGE_BOX_TARGET1"
 def ZA_common_box_change_box_target1_select(self):
-    if getattr(getattr(getattr(self, "_native_image_collection", None), "options", None), "supplemental", False):
-        session = self._native_image_collection
+    if getattr(getattr(getattr(self, "_command_supplemental_session", None), "options", None), "supplemental", False):
+        session = self._command_supplemental_session
         menu = session.choice_observation(self, read_command_frame, "box")
         if menu and menu["rows"] in (7, 8):
             if menu["selected"] != 0:
@@ -544,7 +544,7 @@ def ZA_common_evolution_function(self,selectnum):
 
     return self.common_evolution_current_state
 def ZA_common_evolution_exec(self):
-    session = getattr(self, "_native_image_collection", None)
+    session = getattr(self, "_command_supplemental_session", None)
     supplemental_mode = getattr(getattr(session, "options", None), "supplemental", False)
     if supplemental_mode:
         menu = session.choice_observation(self, read_command_frame, "evolution")

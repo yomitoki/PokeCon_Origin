@@ -41,9 +41,15 @@ def observed_location(command, locations):
                  if str(item.get("value")) == value), None)
 
 
+PANEL_PLACES = (("tab", "Commandsタブに表示（AI操作向け）"),
+                ("dialog", "Startを押した時に表示（従来のPokeCon）"))
+
+
 class CommandQuickRun(ttk.LabelFrame):
-    def __init__(self, parent, app):
+    def __init__(self, parent, app, host=None):
         super().__init__(parent, text="開始位置・その他の操作")
+        # host: CommandStartPanelHost。"dialog" の時はこの欄は Start を押した時の画面に入る
+        self.host, self._dialog_accepted = host, False
         self.app, self.name, self.locations = app, "", []
         self.options, self.last_location, self.prepared = {}, {}, None
         self._display_current_id = None
@@ -63,7 +69,15 @@ class CommandQuickRun(ttk.LabelFrame):
         self.collect = tk.BooleanVar(self, False)
         self.supplemental = tk.BooleanVar(self, False)
         self.language = tk.StringVar(self)
-        row = ttk.Frame(self)
+        # Commands may declare extra start modes (COMMAND_RUN_MODES). Each mode is
+        # a tab next to the normal Story start; Start follows the selected tab.
+        self.mode = tk.StringVar(self, "")
+        self.mode_panels, self.mode_specs = {}, {}
+        self.prepared_mode, self.mode_authorization = None, None
+        self.mode_bar = ttk.Frame(self)
+        self.story_frame = ttk.Frame(self)
+        self.story_frame.pack(fill="x")
+        row = ttk.Frame(self.story_frame)
         row.pack(fill="x", padx=5, pady=3)
         ttk.Label(row, text="開始").pack(side="left")
         self.start_cb = ttk.Combobox(row, textvariable=self.choice, state="readonly", width=38)
@@ -74,7 +88,7 @@ class CommandQuickRun(ttk.LabelFrame):
         scope.pack(side="left", padx=3)
         scope.bind("<<ComboboxSelected>>", lambda *_: self.refresh_choices())
         ttk.Button(row, text="オプション", width=10, command=self.toggle_options).pack(side="left")
-        self.option_frame = ttk.Frame(self)
+        self.option_frame = ttk.Frame(self.story_frame)
         filters = ttk.Frame(self.option_frame)
         filters.pack(fill="x")
         ttk.Label(filters, text="Step検索").pack(side="left")
@@ -108,7 +122,8 @@ class CommandQuickRun(ttk.LabelFrame):
         ttk.Label(native, text="言語").pack(side="left")
         ttk.Entry(native, textvariable=self.language, width=12).pack(side="left")
         ttk.Button(self.option_frame, text="オプションをInputSetへ保存", command=self.save_options).pack(anchor="w")
-        ttk.Label(self, textvariable=self.status, width=65, wraplength=650).pack(fill="x", padx=5, pady=3)
+        self.status_label = ttk.Label(self, textvariable=self.status, width=65, wraplength=650)
+        self.status_label.pack(fill="x", padx=5, pady=3)
         self.confirmation = ttk.Frame(self)
         self.confirm_text = tk.StringVar(self)
         ttk.Label(self.confirmation, textvariable=self.confirm_text, wraplength=620).pack(fill="x")
@@ -123,13 +138,53 @@ class CommandQuickRun(ttk.LabelFrame):
         else:
             self.option_frame.pack(fill="x", padx=5, pady=3)
 
+    def reveal(self, box, focus=None):
+        """Scroll the Commands page so an embedded prompt is visible.
+
+        These prompts are packed at the bottom of a scrolling page; when they
+        were off-screen, Start looked unresponsive while waiting for them.
+        """
+        try:
+            canvas = box.master
+            while canvas is not None and not isinstance(canvas, tk.Canvas):
+                canvas = canvas.master
+            if canvas is not None:
+                canvas.update_idletasks()
+                content = canvas.nametowidget(canvas.itemcget(canvas.find_all()[0], "window"))
+                total = max(1, content.winfo_height())
+                # Prefer the action button: a tall preview image can push it out of view.
+                target = focus if focus is not None else box
+                top = target.winfo_rooty() - content.winfo_rooty() - max(0, canvas.winfo_height() - target.winfo_height() - 8)
+                canvas.yview_moveto(max(0.0, min(1.0, top / float(total))))
+            if focus is not None:
+                focus.focus_set()
+        except (tk.TclError, IndexError, KeyError):
+            pass
+
+    def _in_dialog(self):
+        return self.host is not None and self.host.dialog_mode()
+
+    def _problem(self, text):
+        """開始できない理由を表示する（Start時の画面なら画面を出して見せる）。"""
+        self.status.set(text)
+        if self._in_dialog():
+            self.host.show_dialog()
+        return False
+
     def confirm(self, message, action):
         self.confirm_text.set(message)
         def accepted():
             self.confirmation.pack_forget()
+            # 確認済みの Start では、Start時の画面を出し直さない
+            self._dialog_accepted = True
+            if self._in_dialog():
+                self.host.hide_dialog()
             action()
         self.confirm_button.configure(command=accepted)
         self.confirmation.pack(fill="x", padx=5, pady=4)
+        if self._in_dialog():
+            self.host.show_dialog()
+        self.after_idle(lambda: self.reveal(self.confirmation, self.confirm_button))
 
     def refresh(self, force=False):
         name = self.app._selected_command_name()
@@ -162,7 +217,44 @@ class CommandQuickRun(ttk.LabelFrame):
             ttk.Checkbutton(self.debug_frame, text=item.get("label", key), variable=var).pack(side="left", padx=3)
         self.end.set(next((self.display(item) for item in self.locations
                            if item.get("id") == (saved.get("end") or {}).get("id")), "終了指定なし"))
+        self.refresh_modes()
         self.refresh_choices()
+
+    def refresh_modes(self):
+        """Rebuild the tabs for the selected command's COMMAND_RUN_MODES."""
+        for widget in list(self.mode_bar.winfo_children()) + list(self.mode_panels.values()):
+            widget.destroy()
+        self.mode_panels, self.mode_specs = {}, {}
+        self.prepared_mode, self.mode_authorization = None, None
+        owners = self.app._command_classes(self.name) if self.name else []
+        modes = next((getattr(owner, "COMMAND_RUN_MODES", ()) for owner in owners
+                      if getattr(owner, "COMMAND_RUN_MODES", ())), ())
+        for spec in modes:
+            try:
+                panel = spec["builder"](self, self)
+            except Exception as error:
+                self.status.set("開始タブ「{}」を表示できません: {}".format(spec.get("label", ""), error))
+                continue
+            self.mode_panels[spec["key"]], self.mode_specs[spec["key"]] = panel, spec
+        self.mode.set("")
+        if self.mode_panels:
+            for key, label in [("", "ストーリー")] + [(k, s.get("label", k)) for k, s in self.mode_specs.items()]:
+                ttk.Radiobutton(self.mode_bar, text=label, value=key, variable=self.mode,
+                                style="Toolbutton", command=self.show_mode).pack(side="left", padx=2)
+        self.show_mode()
+
+    def show_mode(self):
+        # Re-pack in a fixed order above the status line. Packing relative to
+        # a hidden sibling raises "isn't packed" (Reload while a tab was open).
+        key = self.mode.get()
+        for widget in [self.mode_bar, self.story_frame] + list(self.mode_panels.values()):
+            widget.pack_forget()
+        if self.mode_panels:
+            self.mode_bar.pack(fill="x", padx=5, pady=(3, 0), before=self.status_label)
+        if key in self.mode_panels:
+            self.mode_panels[key].pack(fill="x", padx=5, pady=3, before=self.status_label)
+        else:
+            self.story_frame.pack(fill="x", before=self.status_label)
 
     @staticmethod
     def display(item):
@@ -220,6 +312,17 @@ class CommandQuickRun(ttk.LabelFrame):
 
     def capture_before_start(self):
         self.refresh()
+        if self._in_dialog() and not self._dialog_accepted:
+            # 従来の PokeCon と同じく、Start を押した時に開始位置・タブを選ぶ画面を出す。
+            # 「この内容で開始」で Start をやり直す（CommandStartPanelHost.accept_dialog）
+            self.refresh_choices()
+            self.host.show_dialog()
+            return False
+        self._dialog_accepted = False
+        key = self.mode.get()
+        if key in self.mode_panels:
+            return self.capture_mode_before_start(key)
+        self.prepared_mode = None
         selected = self.choice.get()
         if selected == FRESH:
             self.app.fresh_start_current_command()
@@ -230,8 +333,7 @@ class CommandQuickRun(ttk.LabelFrame):
         try:
             config = self.config(location)
         except ValueError as error:
-            self.status.set(str(error))
-            return False
+            return self._problem(str(error))
         authorization = (self.profile, self.name, repr(config))
         if config["save_delete_user_number"] and self.delete_authorization != authorization:
             def confirmed():
@@ -241,6 +343,24 @@ class CommandQuickRun(ttk.LabelFrame):
                 config["save_delete_user_number"]), confirmed)
             return False
         self.prepared = (self.name, copy.deepcopy(location))
+        return True
+
+    def capture_mode_before_start(self, key):
+        """Start on an extra tab: the panel validates and returns its settings."""
+        try:
+            values, message = self.mode_panels[key].prepare_start()
+        except ValueError as error:
+            return self._problem(str(error))
+        authorization = (self.profile, self.name, key, repr(values))
+        if message and self.mode_authorization != authorization:
+            def confirmed():
+                self.mode_authorization = authorization
+                self.app.startPlay()
+            self.confirm(message, confirmed)
+            return False
+        self.mode_authorization = None
+        self.prepared_mode = (self.name, key, copy.deepcopy(values))
+        self.prepared = (self.name, None)
         return True
 
     def config(self, location):
@@ -333,6 +453,11 @@ class CommandQuickRun(ttk.LabelFrame):
                     self.status.set(str(error))
                     return False
         self.prepared = None
+        if self.prepared_mode and self.prepared_mode[0] == name:
+            # An extra tab starts at the command default and never uses the
+            # Story tab's save-delete recovery.
+            config["start"], config["end"] = {}, {}
+            config["save_delete_user_number"] = 0
         authorization = (self.profile, name, repr(config))
         if config.get("save_delete_user_number") and (
                 name != self.name or self.delete_authorization != authorization):
@@ -362,6 +487,13 @@ class CommandQuickRun(ttk.LabelFrame):
         finally:
             self.collect.set(False)
             self.supplemental.set(False)
+        mode, self.prepared_mode = self.prepared_mode, None
+        hook = getattr(command, "apply_command_run_mode", None)
+        if callable(hook):
+            if mode and mode[0] == getattr(command, "NAME", ""):
+                hook(mode[1], copy.deepcopy(mode[2]))
+            else:
+                hook(None, None)
         start = config.get("start") or {}
         command._command_start_override_context = {
             "variable": start.get("variable", ""), "state": str(start.get("value", "")),
@@ -372,7 +504,10 @@ class CommandQuickRun(ttk.LabelFrame):
         """Show an opt-in Commands reference image inside Commands, with no grab."""
         box = ttk.LabelFrame(self, text="開始画面の確認")
         box.pack(fill="x", padx=5, pady=4)
-        self.app.controller_nb.select(self.app.commands_tab)
+        if self._in_dialog():
+            self.host.show_dialog()
+        else:
+            self.app.controller_nb.select(self.app.commands_tab)
         done = tk.BooleanVar(self, False)
         status = tk.StringVar(self, "開始画像を読み込み中…")
         state = {"accepted": False, "closed": False, "photo": None, "poll": None}
@@ -411,6 +546,8 @@ class CommandQuickRun(ttk.LabelFrame):
         confirm.pack(side="left", padx=3)
         ttk.Button(actions, text="キャンセル", command=finish).pack(side="left")
 
+        self.after_idle(lambda: self.reveal(box))
+
         def poll():
             if state["closed"]:
                 return
@@ -423,6 +560,7 @@ class CommandQuickRun(ttk.LabelFrame):
                 if error:
                     status.set("参考画像を読み込めません: " + error)
                     confirm.configure(text="画像なしで実行", state="normal")
+                    self.after_idle(lambda: self.reveal(box, confirm))
                 else:
                     from PIL import ImageTk
                     pixels = value.image.copy()
@@ -431,6 +569,7 @@ class CommandQuickRun(ttk.LabelFrame):
                     image_label.configure(image=state["photo"])
                     status.set("元録画の参考画像です。現在の入力映像と開始位置を確認してください")
                     confirm.configure(state="normal")
+                    self.after_idle(lambda: self.reveal(box, confirm))
             elif error:
                 status.set("開始しません: " + error)
                 confirm.configure(state="normal")
@@ -454,5 +593,118 @@ class CommandQuickRun(ttk.LabelFrame):
                     self.after_cancel(state["poll"])
                 self.unbind("<Destroy>", destroy_binding)
                 box.destroy()
+                if self._in_dialog():
+                    self.host.hide_dialog()
             except tk.TclError:
                 pass
+
+
+class CommandStartPanelHost(ttk.Frame):
+    """Commands タブの「開始位置・その他の操作」の置き場所を切り替える。
+
+    - "tab": Commands タブに常時表示（生成AIの操作では常に見えている方が扱いやすい）
+    - "dialog": 従来の PokeCon と同じく Start を押した時に画面を出す
+    設定は settings.ini の [Commands Start] panel に保存する。Tk のウィジェットは親を
+    変えられないため、切り替え時は欄を作り直す（選択中の Commands の設定は読み直す）。
+    """
+
+    def __init__(self, parent, app):
+        super().__init__(parent)
+        self.app = app
+        self.window, self.panel = None, None
+        self.place = tk.StringVar(self, "tab")
+        bar = ttk.Frame(self)
+        bar.pack(fill="x")
+        ttk.Label(bar, text="開始位置・その他の操作:").pack(side="left")
+        for key, label in PANEL_PLACES:
+            ttk.Radiobutton(bar, text=label, value=key, variable=self.place,
+                            command=self.switch).pack(side="left", padx=4)
+        self._build()
+
+    def dialog_mode(self):
+        return self.place.get() == "dialog"
+
+    def apply_saved_mode(self):
+        """settings.ini の読込後に呼ぶ（画面を作る時点ではまだ読み込まれていない）。"""
+        saved = str(getattr(getattr(self.app, "settings", None), "command_start_panel", "tab") or "tab")
+        if saved in dict(PANEL_PLACES) and saved != self.place.get():
+            self.place.set(saved)
+            self._rebuild()
+
+    def switch(self):
+        settings = getattr(self.app, "settings", None)
+        if settings is not None:
+            settings.command_start_panel = self.place.get()
+            try:
+                settings.save()
+            except Exception:
+                pass
+        self._rebuild()
+        try:
+            self.panel.refresh(force=True)
+        except Exception:
+            pass
+
+    def _rebuild(self):
+        old, window = self.panel, self.window
+        self.window = None
+        self._build()
+        for widget in (old, window):
+            if widget is not None:
+                try:
+                    widget.destroy()
+                except tk.TclError:
+                    pass
+
+    def _build(self):
+        if self.dialog_mode():
+            window = tk.Toplevel(self)
+            window.title("Commands - 開始位置・その他の操作")
+            window.withdraw()
+            window.protocol("WM_DELETE_WINDOW", self.cancel_dialog)
+            ttk.Label(window, text="Startが押されました。開始位置・タブを選んで開始してください。",
+                      foreground="#174a7e").pack(anchor="w", padx=10, pady=(8, 2))
+            panel = CommandQuickRun(window, self.app, host=self)
+            panel.pack(fill="both", expand=True, padx=8, pady=4)
+            buttons = ttk.Frame(window)
+            buttons.pack(fill="x", padx=8, pady=(0, 8))
+            ttk.Button(buttons, text="開始をやめる", command=self.cancel_dialog).pack(side="right", padx=4)
+            ttk.Button(buttons, text="この内容で開始", command=self.accept_dialog).pack(side="right", padx=4)
+            self.window = window
+        else:
+            panel = CommandQuickRun(self, self.app, host=self)
+            panel.pack(fill="x", pady=(3, 0))
+        self.panel = panel
+        self.app.command_quick_run = panel
+
+    def show_dialog(self):
+        if self.window is None:
+            return
+        try:
+            self.window.transient(self.winfo_toplevel())
+            self.window.deiconify()
+            self.window.lift()
+            self.window.grab_set()
+            self.window.focus_set()
+        except tk.TclError:
+            pass
+
+    def hide_dialog(self):
+        if self.window is None:
+            return
+        try:
+            self.window.grab_release()
+            self.window.withdraw()
+        except tk.TclError:
+            pass
+
+    def accept_dialog(self):
+        self.panel._dialog_accepted = True
+        self.hide_dialog()
+        self.app.startPlay()
+
+    def cancel_dialog(self):
+        self.panel._dialog_accepted = False
+        self.panel.confirmation.pack_forget()
+        self.hide_dialog()
+        self.panel.status.set("開始をやめました")

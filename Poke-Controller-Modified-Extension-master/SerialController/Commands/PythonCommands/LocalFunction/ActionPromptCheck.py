@@ -143,6 +143,30 @@ def _field(command, root, frame):
         "HELP_MARKER", "1_SELECT", "2_SELECT", "3_SELECT", "4_SELECT")))
 
 
+def _supplemental(command):
+    # 補完モードのセッション（LocalFunction/ZA/SupplementalSession.py）が付いている間
+    return getattr(command, "_command_supplemental_session", None) is not None
+
+
+def _check_supplemental(command, pictures):
+    """補完モード: 日本語の文字は出ないので、登録済みの判定（A の字だけに置き換わる）に任せる。"""
+    registry = getattr(command, "IMAGE_DETECTION_TARGETS", {})
+    targets = []
+    for value in pictures:
+        target = "ZA_STORY_COMMON_ZA_RESEARCH_A" if value == "ZA_RESEARCH_A" else value
+        if target not in registry:
+            # ZA_ACTION_PROMPT_* などの単語だけの参照は、汎用の A で確かめる。
+            target = "POKEMON_ZA_OTHER_A_MARKER"
+        if target not in targets:
+            targets.append(target)
+    matched = next((target for target in targets if command._image_check_target(target)), None)
+    command.last_action_prompt_detection = {
+        "matched": bool(matched), "status": "supplemental_A",
+        "pictures": list(pictures), "targets": targets, "target": matched,
+    }
+    return bool(matched)
+
+
 def check_action_prompt(command, pictures, count_attempt=False):
     """One fresh frame; count_attempt means one failed logical wait/search.
 
@@ -157,6 +181,8 @@ def check_action_prompt(command, pictures, count_attempt=False):
         raise ValueError("Unsupported action prompt: " + repr(pictures))
     alive = getattr(command, "checkIfAlive", lambda: None)
     alive()
+    if _supplemental(command):
+        return _check_supplemental(command, pictures)
     frame = read_command_frame(command)
     if frame is None:
         command.last_action_prompt_detection = {"matched": False, "status": "no_frame"}

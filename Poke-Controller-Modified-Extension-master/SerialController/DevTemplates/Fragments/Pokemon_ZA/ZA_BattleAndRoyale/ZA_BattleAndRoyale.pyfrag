@@ -174,7 +174,7 @@ def ZA_battle_missing_field_recovery(
         b_press_count += 1
     return True
 
-def ZA_battle_coCp_noloop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endskip=0,battle_mode=0,selection_up_handled=False):
+def ZA_battle_coCp_noloop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_endskip=0,battle_mode=0,selection_up_handled=False,keep_lockon=False):
     select_pictures = (
         "POKEMON_ZA_1_SELECT",
         "POKEMON_ZA_2_SELECT",
@@ -212,9 +212,13 @@ def ZA_battle_coCp_noloop(self,Xaction=0,Aaction=0,Yaction=0,Baction=0,lockon_en
     if self.ZA_battle_missing_field_recovery(
             "cocp", enabled=recovery_enabled):
         return
-    self.ZA_ZL_ACTION("")
-    # ロックオンがゲーム側へ反映されてから攻撃を開始する。
-    self.wait(0.1)
+
+    # keep_lockon: 呼出元がHPバーを確認したロック相手のまま攻撃する
+    # （ZLを押し直すと別の相手・岩へ移ることがある）。
+    if not (keep_lockon and getattr(self, "ZL_state", 0) == 1):
+        self.ZA_ZL_ACTION("")
+        # ロックオンがゲーム側へ反映されてから攻撃を開始する。
+        self.wait(0.1)
     for i in range(3):
         # 攻撃中に選択肢へ切り替わった場合も、以降のX/A/Y/Bを
         # 中断してA決定へ切り替える。
@@ -787,7 +791,7 @@ def ZA_bench_map_open(self):
         
     return "BENCH_MAP_OPEN"
 def ZA_bench_goto_pokecenter1(self):        
-    if getattr(getattr(getattr(self, "_native_image_collection", None), "options", None), "supplemental", False):
+    if getattr(getattr(getattr(self, "_command_supplemental_session", None), "options", None), "supplemental", False):
         result = self.ZA_story_supplemental_filter(2, "BENCH_POKECENTER_SELECT1", "BENCH_POKECENTER_SELECT2", "POKEMON_ZA_FALSE_RETURN")
         if result is not None:
             return result
@@ -833,7 +837,7 @@ def ZA_bench_goto_pokecenter2(self):
                 self.etc_sendCommand("Lbutton_down")
                 self.etc_sendCommand("Lbutton_down")
                 self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.1, interval=0.1)
-                session = getattr(self, "_native_image_collection", None)
+                session = getattr(self, "_command_supplemental_session", None)
                 if getattr(getattr(session, "options", None), "supplemental", False):
                     if self.ZA_story_map_confirmation_ready():
                         self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.1, interval=0.1)
@@ -995,7 +999,7 @@ def ZA_quasar_map_open(self):
     else:
         return "QUASAR_MAP_OPEN"
 def ZA_goto_quasar1(self):
-    if getattr(getattr(getattr(self, "_native_image_collection", None), "options", None), "supplemental", False):
+    if getattr(getattr(getattr(self, "_command_supplemental_session", None), "options", None), "supplemental", False):
         result = self.ZA_story_supplemental_filter(1, "QUASAR_SELECT1", "QUASAR_SELECT2", "POKEMON_ZA_FALSE_RETURN")
         if result is not None:
             return result
@@ -1029,7 +1033,7 @@ def ZA_goto_quasar2(self):
                 self.wait(self.SLEEPLIST[1][2])
                 self.etc_sendCommand("Lbutton_down")
                 self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.2, interval=0.1)
-                session = getattr(self, "_native_image_collection", None)
+                session = getattr(self, "_command_supplemental_session", None)
                 if getattr(getattr(session, "options", None), "supplemental", False):
                     if self.ZA_story_map_confirmation_ready():
                         self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.1, interval=0.1)
@@ -1141,7 +1145,7 @@ def ZA_battle_map_open(self):
         self.wait(self.SLEEPLIST[0][2])
     return "BATTLE_MAP_OPEN"
 def ZA_battle_goto_battle_zone1(self):
-    if getattr(getattr(getattr(self, "_native_image_collection", None), "options", None), "supplemental", False):
+    if getattr(getattr(getattr(self, "_command_supplemental_session", None), "options", None), "supplemental", False):
         result = self.ZA_story_supplemental_filter(4, "BATTLE_GOTO_BATTLE_ZONE1", "BATTLE_GOTO_BATTLE_ZONE2", "POKEMON_ZA_FALSE_RETURN")
         if result is not None:
             return result
@@ -1213,7 +1217,7 @@ def ZA_battle_goto_battle_zone2(self):
                 self.infi_previous_targetzone = self.targetzone
                 self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.1, interval=0.1)
 
-                session = getattr(self, "_native_image_collection", None)
+                session = getattr(self, "_command_supplemental_session", None)
                 if getattr(getattr(session, "options", None), "supplemental", False):
                     if self.ZA_story_map_confirmation_ready():
                         self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.1, interval=0.1)
@@ -1578,7 +1582,7 @@ def ZA_battle_move_test(self,fast=0):
 
         self.battleescapecount+=1
         self.pressRep(Button.MINUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
-        if getattr(getattr(getattr(self, "_native_image_collection", None), "options", None), "supplemental", False):
+        if getattr(getattr(getattr(self, "_command_supplemental_session", None), "options", None), "supplemental", False):
             return self.ZA_story_supplemental_surrender()
         for loop in range(100):
             if self.image_check("POKEMON_ZA_ESCAPE_SELECT"):
@@ -1771,7 +1775,7 @@ def ZA_battle_move_test(self,fast=0):
 
         if self.battle_step==0 and self.battle_current_state=="BATTLE_MOVE":
             self.etc_sendCommand("Lbutton_up")
-        if getattr(getattr(getattr(self, "_native_image_collection", None), "options", None), "supplemental", False) and self.quasar_current_state == "QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT"):
+        if getattr(getattr(getattr(self, "_command_supplemental_session", None), "options", None), "supplemental", False) and self.quasar_current_state == "QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT"):
             self.ZA_MOVE_SEE("END")
             self.ZA_ZL_ACTION("END")
             self.pressRep(Button.B, repeat=5, duration=0.15, wait=0.1, interval=0.1)
@@ -2202,7 +2206,7 @@ def ZA_battle_move_test(self,fast=0):
                         self.battleescapecount+=1
                         self.battle_nofiled_count=0
                         self.pressRep(Button.MINUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
-                        if getattr(getattr(getattr(self, "_native_image_collection", None), "options", None), "supplemental", False):
+                        if getattr(getattr(getattr(self, "_command_supplemental_session", None), "options", None), "supplemental", False):
                             return self.ZA_story_supplemental_surrender()
                         for i in range(100):#無限ループ抜け
                             if self.image_check("POKEMON_ZA_ESCAPE_SELECT"):
@@ -2335,7 +2339,7 @@ def ZA_battle_move_test(self,fast=0):
                                 self.battleescapecount+=1
                                 self.battle_nofiled_count=0
                                 self.pressRep(Button.MINUS, repeat=1, duration=0.15, wait=0.3, interval=0.1)
-                                if getattr(getattr(getattr(self, "_native_image_collection", None), "options", None), "supplemental", False):
+                                if getattr(getattr(getattr(self, "_command_supplemental_session", None), "options", None), "supplemental", False):
                                     return self.ZA_story_supplemental_surrender()
                                 for i in range(100):
                                     if self.image_check("POKEMON_ZA_ESCAPE_SELECT"):
@@ -2472,7 +2476,7 @@ def ZA_battle_lockon_test(self):
     self.notargetcount=0
     start = time.perf_counter()  # 計測開始
     while True:
-        if getattr(getattr(getattr(self, "_native_image_collection", None), "options", None), "supplemental", False) and self.quasar_current_state == "QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT"):
+        if getattr(getattr(getattr(self, "_command_supplemental_session", None), "options", None), "supplemental", False) and self.quasar_current_state == "QUASAR_BATTLE_LOOP" and self.image_check("POKEMON_ZA_TEXT_WHITE_COMMENT"):
             self.ZA_MOVE_SEE("END")
             self.ZA_ZL_ACTION("END")
             return
@@ -2802,7 +2806,7 @@ def ZA_image_guarded_a_repeat(
 
 def ZA_story_supplemental_surrender(self):
     """Called only immediately after the surrender MINUS. No persistent flag."""
-    session = self._native_image_collection
+    session = self._command_supplemental_session
     deadline = time.monotonic() + 30.0
     confirmed = False
     choice_closed = False

@@ -31,7 +31,7 @@ def ZA_Common_map_open(
 
     return "COMMON_MAP_OPEN"
 def ZA_Common_goto_select1(self,position,othermap="POKEMON_ZA_FALSE_RETURN",select_position0_direct=0):
-    if getattr(getattr(getattr(self, "_native_image_collection", None), "options", None), "supplemental", False):
+    if getattr(getattr(getattr(self, "_command_supplemental_session", None), "options", None), "supplemental", False):
         result = self.ZA_story_supplemental_filter(position, "COMMON_GOTO_SELECT1", "COMMON_GOTO_SELECT2", othermap)
         if result is not None:
             return result
@@ -240,7 +240,7 @@ def ZA_Common_goto_jump(
                 reason, recovery_kind))
         return "COMMON_FURADARI_MAP_BATTLE_RECOVERY"
 
-    supplemental_mode = getattr(getattr(getattr(self, "_native_image_collection", None), "options", None), "supplemental", False)
+    supplemental_mode = getattr(getattr(getattr(self, "_command_supplemental_session", None), "options", None), "supplemental", False)
     if supplemental_mode:
         if self.ZA_story_map_confirmation_ready():
             self.pressRep(Button.A, repeat=1, duration=0.15, wait=0.1, interval=0.1)
@@ -1012,7 +1012,7 @@ def ZA_story_movement_a_check(self, pictures):
 
 def ZA_story_note_mapping_a(self, state, pic1, pic2):
     """Record one verified A route for its matching registration check only."""
-    session = getattr(self, "_native_image_collection", None)
+    session = getattr(self, "_command_supplemental_session", None)
     options = getattr(session, "options", None)
     if not getattr(options, "supplemental", False):
         self._za_mapping_a_proof = None
@@ -1025,7 +1025,7 @@ def ZA_story_note_mapping_a(self, state, pic1, pic2):
 def ZA_story_mapping_a_succeeded(self, pic1, pic2):
     """A proof does not bypass map opening, travel confirmation, or battle guards."""
     proof = getattr(self, "_za_mapping_a_proof", None)
-    session = getattr(self, "_native_image_collection", None)
+    session = getattr(self, "_command_supplemental_session", None)
     if (not isinstance(proof, dict)
             or not getattr(getattr(session, "options", None), "supplemental", False)):
         return False
@@ -1111,7 +1111,7 @@ def ZA_story_checked_movement_action(self, key, pictures, action, waiting_result
     return self.ZA_story_resume_movement_a(key)
 
 def ZA_story_map_confirmation_ready(self):
-    session = getattr(self, "_native_image_collection", None)
+    session = getattr(self, "_command_supplemental_session", None)
     if not getattr(getattr(session, "options", None), "supplemental", False):
         return self.image_check("POKEMON_ZA_MOVE_COMMENT")
     self._za_supplemental_map_confirmation = "UNKNOWN"
@@ -1138,7 +1138,7 @@ def ZA_story_map_confirmation_ready(self):
     return False
 
 def ZA_Common_mappic_check(self,pic1="NULL",pic2="NULL"):
-    supplemental = getattr(self, "_native_image_collection", None)
+    supplemental = getattr(self, "_command_supplemental_session", None)
     if getattr(getattr(supplemental, "options", None), "supplemental", False):
         # 指定goto直後・歩行なしで15番内にいることを呼出し側で保証。
         if (pic1, pic2) == ("POKEMON_ZA_MOVEPOINT_TARGET_W_ZONE15", "POKEMON_ZA_MOVEPOINT_PIC_W_ZONE15"):
@@ -1183,7 +1183,7 @@ def ZA_Common_Event_check(self,othermap="POKEMON_ZA_FALSE_RETURN",markertype=0):
 
 def ZA_story_supplemental_filter(self, position, current_state, next_state, othermap="POKEMON_ZA_FALSE_RETURN"):
     """MAP_6_SELECT: observe, move one row, re-observe, then confirm."""
-    session = self._native_image_collection
+    session = self._command_supplemental_session
     if not (self.image_check("POKEMON_ZA_MAP2") or self.image_check(othermap)):
         return None
     menu = session.choice_observation(self, read_command_frame, "filter")

@@ -2726,7 +2726,7 @@ def ZA_mega_mode5_defeat_background_prompt_confirmed(
 
 def ZA_mega_mode5_defeat_prompt_advance(self, retry_seconds=0.80):
     """SELECT描画前の敗戦質問をAで送り、再戦選択肢を表示する。"""
-    supplemental = getattr(self, "_native_image_collection", None)
+    supplemental = getattr(self, "_command_supplemental_session", None)
     if supplemental is not None and supplemental.options.supplemental:
         # The position-based retry handler owns all black-dialogue A input.
         return False
@@ -3526,7 +3526,7 @@ def ZA_mega_last_battle_charge_dodge(
             seconds),
         force=True)
     warning_options = {}
-    supplemental = getattr(self, "_native_image_collection", None)
+    supplemental = getattr(self, "_command_supplemental_session", None)
     if (reason == "supplemental_icon" and supplemental is not None
             and supplemental.options.supplemental):
         warning_options["warning_deadline"] = lambda: supplemental.final_warning_deadline(
@@ -3565,7 +3565,7 @@ def ZA_mega_last_battle_charge_update(
             self._za_mega_last_charge_search_deadline=0.0
         return "none"
 
-    supplemental = getattr(self, "_native_image_collection", None)
+    supplemental = getattr(self, "_command_supplemental_session", None)
     if supplemental is not None and supplemental.options.supplemental:
         warning = supplemental.final_warning_observation(self, read_command_frame)
         if not warning["valid"]:
@@ -4221,7 +4221,7 @@ def ZA_mega_retry_menu_observe(self, frame=None):
 
 def ZA_mega_retry_menu_step(self, dir1, dir2, dir3, dir4, see_r):
     """Move one verified row, then confirm retry from a fresh observation."""
-    supplemental = getattr(self, "_native_image_collection", None)
+    supplemental = getattr(self, "_command_supplemental_session", None)
     if supplemental is not None and supplemental.options.supplemental:
         return supplemental.retry_menu_step(
             self, (dir1, dir2, dir3, dir4, see_r), read_command_frame, Button.A)
@@ -5254,7 +5254,7 @@ def ZA_mega_evolution_battle(self,usenum=1,Xaction=0,Aaction=0,Yaction=0,Baction
     self._za_mega_lockon_unchecked_ay_logged=False
     self._za_mega_last_battle_mode=bool(last_battle_mode)
     self._za_mega_retry_menu_ack=None
-    supplemental = getattr(self, "_native_image_collection", None)
+    supplemental = getattr(self, "_command_supplemental_session", None)
     if supplemental is not None and supplemental.options.supplemental:
         supplemental.reset_retry()
     self._za_mega_normal_choice_black_background_required=bool(
@@ -7955,7 +7955,7 @@ def ZA_get_pokemon(self, expected_name=None):
               and getattr(self, "_2_story_current_state", "") == "2_STORY_TOWER_36"):
             expected_name = "pikachu"
     supplemental = bool(getattr(getattr(getattr(
-        self, "_native_image_collection", None), "options", None), "supplemental", False))
+        self, "_command_supplemental_session", None), "options", None), "supplemental", False))
     guarded = bool(expected_name and not supplemental)
     if guarded:
         # The displayed name fades during a long ZL hold. Reacquire, then
@@ -9515,7 +9515,7 @@ def ZA_mega_mode5_testmode1_side_transition_update(
                     False)
                 block_seconds=max(0.0, float(settings.get(
                     "RED_ATTACK_PREMOVE_BLOCK_SECONDS", 7.0)))
-                supplemental = getattr(self, "_native_image_collection", None)
+                supplemental = getattr(self, "_command_supplemental_session", None)
                 if supplemental is not None and supplemental.options.supplemental:
                     # 非文字判定がすでに最終検出後7秒を含む。ここで
                     # さらに7秒を加算しない。既存の障害物向きYを継続。

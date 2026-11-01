@@ -1,6 +1,8 @@
 import datetime
 import ast
 import copy
+import contextlib
+import io
 import inspect
 import math
 import os
@@ -2260,9 +2262,23 @@ class ZaOutHotelZ17To22BlackRecoveryTests(unittest.TestCase):
             "_1_story_out_hotel_z_17_22_black_comment_recovery")
         namespace = {"time": fake_time}
         exec(compile(ast.fix_missing_locations(ast.Module(
-            body=[functions[helper_name]], type_ignores=[])),
+            body=[functions[name] for name in (
+                helper_name, "_za_merip_caught",
+                "_1_story_out_hotel_z_after_reset_state",
+                "_1_story_out_hotel_z_kohuki_caught_state",
+                "_za_beedle_route", "_za_beedle_caught", "_za_capture_party_slot",
+                "_za_gift_loop_second_kohuki")],
+            type_ignores=[])),
             source_path, "exec"), namespace)
-        return source_class, functions, namespace[helper_name]
+        helper = namespace[helper_name]
+        helper.caught_helpers = {
+            name: namespace[name] for name in (
+                "_za_merip_caught",
+                "_1_story_out_hotel_z_after_reset_state",
+                "_1_story_out_hotel_z_kohuki_caught_state",
+                "_za_beedle_route", "_za_beedle_caught", "_za_capture_party_slot",
+                "_za_gift_loop_second_kohuki")}
+        return source_class, functions, helper
 
     def test_all_z17_to_z22_steps_use_black_comment_recovery(self):
         _, functions, _ = self._load_helper(
@@ -2299,6 +2315,14 @@ class ZaOutHotelZ17To22BlackRecoveryTests(unittest.TestCase):
         class Command:
             ZA_OUT_HOTEL_Z_17_22_BLACK_RESTART_SECONDS = 5.0
             ZA_OUT_HOTEL_Z_17_22_BLACK_GAP_SECONDS = 2.0
+            _za_merip_caught = helper.caught_helpers["_za_merip_caught"]
+            _za_beedle_route = staticmethod(lambda: False)   # ビードルルートは別テスト
+            _1_story_out_hotel_z_after_reset_state = helper.caught_helpers[
+                "_1_story_out_hotel_z_after_reset_state"]
+            _1_story_out_hotel_z_kohuki_caught_state = helper.caught_helpers[
+                "_1_story_out_hotel_z_kohuki_caught_state"]
+            _za_gift_loop_second_kohuki = helper.caught_helpers[
+                "_za_gift_loop_second_kohuki"]
 
             def __init__(self, caught=()):
                 self.black_visible = True
@@ -2353,6 +2377,58 @@ class ZaOutHotelZ17To22BlackRecoveryTests(unittest.TestCase):
                 self.assertIsNone(
                     command._1_story_out_hotel_z_17_22_black_last_seen_at)
 
+    def test_gift_loop_catches_second_kohuki_and_reads_mareep_slot6(self):
+        _, _, helper = self._load_helper(
+            types.SimpleNamespace(monotonic=lambda: 0.0))
+        caught_state = helper.caught_helpers[
+            "_1_story_out_hotel_z_kohuki_caught_state"]
+        merip_caught = helper.caught_helpers["_za_merip_caught"]
+
+        class Command:
+            _za_beedle_route = helper.caught_helpers["_za_beedle_route"]
+            _za_beedle_caught = helper.caught_helpers["_za_beedle_caught"]
+            _za_capture_party_slot = helper.caught_helpers["_za_capture_party_slot"]
+            _za_gift_loop_second_kohuki = helper.caught_helpers["_za_gift_loop_second_kohuki"]
+
+            def __init__(self, gift_loop, caught, route="merip", debug_beedle=False,
+                         second_kohuki=False):
+                self.GIFT_LOOP_MODE = gift_loop
+                self.ZA_GIFT_LOOP_SECOND_KOHUKI = second_kohuki
+                self.caught = set(caught)
+                self._za_gift_loop_settings = {"capture_route": route}
+                self.BEEDLE_ROUTE = debug_beedle
+
+            def image_check(self, target):
+                return target in self.caught
+
+        kohuki4 = {"POKEMON_ZA_KOHUKI_ICON_GET4"}
+        kohuki45 = kohuki4 | {"POKEMON_ZA_KOHUKI_ICON_GET5"}
+        self.assertEqual(caught_state(Command(False, kohuki4)),
+                         "1_STORY_OUT_HOTEL_Z_19")
+        # 既定はおくりものループでもコフキムシ1匹（受け取り後に手持ち6番目をボックスへ）
+        self.assertEqual(caught_state(Command(True, kohuki4)),
+                         "1_STORY_OUT_HOTEL_Z_19")
+        # 従来の2匹（ZA_GIFT_LOOP_SECOND_KOHUKI=True）
+        self.assertEqual(caught_state(Command(True, kohuki4, second_kohuki=True)),
+                         "1_STORY_OUT_HOTEL_Z_18_1")
+        self.assertEqual(caught_state(Command(True, kohuki45, second_kohuki=True)),
+                         "1_STORY_OUT_HOTEL_Z_19")
+        slot6 = {"POKEMON_ZA_MERIP_ICON_GET6"}
+        self.assertFalse(merip_caught(Command(False, slot6)))
+        self.assertTrue(merip_caught(Command(True, slot6)))
+        self.assertTrue(merip_caught(
+            Command(False, {"POKEMON_ZA_MERIP_ICON_GET5"})))
+        # ビードルルート: 既定は5番目。コフキムシ2匹の時は6番目（どちらの番号も見る）
+        self.assertEqual(Command(True, set())._za_capture_party_slot(), 5)
+        self.assertEqual(Command(True, set(), second_kohuki=True)._za_capture_party_slot(), 6)
+        beedle6 = {"POKEMON_ZA_BEEDLE_ICON_GET6"}
+        self.assertTrue(merip_caught(Command(True, beedle6, route="beedle")))
+        self.assertFalse(merip_caught(Command(True, slot6, route="beedle")))
+        self.assertFalse(merip_caught(Command(True, beedle6)))
+        self.assertTrue(merip_caught(Command(
+            False, {"POKEMON_ZA_BEEDLE_ICON_GET5"}, debug_beedle=True)))
+        self.assertFalse(merip_caught(Command(False, {"POKEMON_ZA_BEEDLE_ICON_GET5"}, route="beedle")))
+
     def test_short_black_or_long_detection_gap_does_not_restart(self):
         clock = types.SimpleNamespace(now=0.0)
         _, _, helper = self._load_helper(
@@ -2361,6 +2437,14 @@ class ZaOutHotelZ17To22BlackRecoveryTests(unittest.TestCase):
         class Command:
             ZA_OUT_HOTEL_Z_17_22_BLACK_RESTART_SECONDS = 5.0
             ZA_OUT_HOTEL_Z_17_22_BLACK_GAP_SECONDS = 2.0
+            _za_merip_caught = helper.caught_helpers["_za_merip_caught"]
+            _za_beedle_route = staticmethod(lambda: False)   # ビードルルートは別テスト
+            _1_story_out_hotel_z_after_reset_state = helper.caught_helpers[
+                "_1_story_out_hotel_z_after_reset_state"]
+            _1_story_out_hotel_z_kohuki_caught_state = helper.caught_helpers[
+                "_1_story_out_hotel_z_kohuki_caught_state"]
+            _za_gift_loop_second_kohuki = helper.caught_helpers[
+                "_za_gift_loop_second_kohuki"]
 
             def __init__(self):
                 self.black_visible = True
@@ -2420,6 +2504,11 @@ class ZaPartyDeadRecoveryTests(unittest.TestCase):
         _source_class, functions = cls._source_class_and_functions()
         method_names = (
             "ZA_count_dead_party_icons",
+            "_za_merip_caught",
+            "_za_capture_dead",
+            "_1_story_out_hotel_z_17_18_target_caught",
+            "_1_story_out_hotel_z_kohuki_caught_state",
+            "_za_gift_loop_second_kohuki",
             "_1_story_out_hotel_z_17_18_dead_recovery",
             "_1_story_out_hotel_z_20_dead_recovery",
             "_1_story_out_hotel_z_20_lockon_recheck",
@@ -2511,6 +2600,12 @@ class ZaPartyDeadRecoveryTests(unittest.TestCase):
                 for index in range(1, 7))
             ZA_count_dead_party_icons = namespace[
                 "ZA_count_dead_party_icons"]
+            _za_capture_dead = namespace["_za_capture_dead"]
+            _1_story_out_hotel_z_17_18_target_caught = namespace[
+                "_1_story_out_hotel_z_17_18_target_caught"]
+            _1_story_out_hotel_z_kohuki_caught_state = namespace[
+                "_1_story_out_hotel_z_kohuki_caught_state"]
+            _za_gift_loop_second_kohuki = namespace["_za_gift_loop_second_kohuki"]
             recover = namespace[
                 "_1_story_out_hotel_z_17_18_dead_recovery"]
 
@@ -2576,6 +2671,24 @@ class ZaPartyDeadRecoveryTests(unittest.TestCase):
                 self.assertEqual(skipped.waits, [])
                 self.assertEqual(skipped.events, [])
 
+        # 通常モードのコフキムシは1体目（ワニノコ）のDEADだけ。2体目（ホルビー）ではリセットしない。
+        clock.now = 0.0
+        holbie = Command()
+        holbie.image_check = lambda target: target in (
+            "POKEMON_ZA_FIELD_W", "POKEMON_ZA_DEAD2")
+        self.assertIsNone(holbie.recover("1_STORY_OUT_HOTEL_Z_18"))
+
+        # 2匹目探し中は1匹目（GET4）が居ても、DEADならリセットして2匹目探しへ戻る。
+        clock.now = 0.0
+        second = Command(kohuki=True)
+        second.GIFT_LOOP_MODE = True
+        second.ZA_GIFT_LOOP_SECOND_KOHUKI = True   # 従来の2匹の時
+        self.assertEqual(
+            second.recover("1_STORY_OUT_HOTEL_Z_18_2"),
+            "1_STORY_OUT_HOTEL_Z_18_1")
+        self.assertEqual(second.events, [
+            ("view", "END"), ("zl", "END"), ("reset",)])
+
     def test_all_z17_to_z18_2_steps_call_dead_recovery(self):
         _source_class, functions = self._source_class_and_functions()
         helper_name = "_1_story_out_hotel_z_17_18_dead_recovery"
@@ -2605,7 +2718,7 @@ class ZaPartyDeadRecoveryTests(unittest.TestCase):
                 and node.func.attr == helper_name]),
             3)
 
-    def test_z20_recovers_at_four_or_more_dead_without_mareep(self):
+    def test_z20_recovers_when_slot1_or_2_dead_without_mareep(self):
         fake_time = types.SimpleNamespace(monotonic=lambda: 0.0)
         _functions, namespace = self._load_dead_methods(fake_time)
 
@@ -2615,11 +2728,17 @@ class ZaPartyDeadRecoveryTests(unittest.TestCase):
                 for index in range(1, 7))
             ZA_count_dead_party_icons = namespace[
                 "ZA_count_dead_party_icons"]
+            _za_merip_caught = namespace["_za_merip_caught"]
+            _za_beedle_route = staticmethod(lambda: False)   # ビードルルートは別テスト
+            _za_capture_dead = namespace["_za_capture_dead"]
             recover = namespace[
                 "_1_story_out_hotel_z_20_dead_recovery"]
 
-            def __init__(self, dead_count, mareep=False):
-                self.dead = set(self.ZA_PARTY_DEAD_TARGETS[:dead_count])
+            def __init__(self, dead_count, mareep=False, lead=True):
+                slots = self.ZA_PARTY_DEAD_TARGETS
+                if not lead:
+                    slots = slots[1:]
+                self.dead = set(slots[:dead_count])
                 self.mareep = mareep
                 self._1_story_out_hotel_z_20_not_eyecheck_count = 7
                 self.events = []
@@ -2638,9 +2757,10 @@ class ZaPartyDeadRecoveryTests(unittest.TestCase):
             def ZA_gamereset(self):
                 self.events.append(("reset",))
 
-        for dead_count in (4, 5, 6):
-            with self.subTest(dead_count=dead_count):
-                command = Command(dead_count)
+        # 通常モード: 1体目か2体目のDEAD
+        for dead_count, lead in ((1, True), (4, True), (6, True), (1, False)):
+            with self.subTest(dead_count=dead_count, lead=lead):
+                command = Command(dead_count, lead=lead)
                 self.assertEqual(
                     command.recover(), "1_STORY_OUT_HOTEL_Z_19")
                 self.assertEqual(
@@ -2648,7 +2768,18 @@ class ZaPartyDeadRecoveryTests(unittest.TestCase):
                 self.assertEqual(command.events, [
                     ("view", "END"), ("zl", "END"), ("reset",)])
 
-        for command in (Command(3), Command(4, mareep=True)):
+        # おくりものループ: 以前の条件（4体以上のDEAD）。ホルビーのひんしは関係しない
+        for dead_count, lead, expected in ((1, True, None), (3, True, None),
+                                           (4, False, "1_STORY_OUT_HOTEL_Z_19")):
+            with self.subTest(gift=dead_count, lead=lead):
+                command = Command(dead_count, lead=lead)
+                command.GIFT_LOOP_MODE = True
+                self.assertEqual(command.recover(), expected)
+
+        third = Command(1, lead=False)
+        third.dead = {"POKEMON_ZA_DEAD3"}
+        for command in (Command(0), third,
+                        Command(1, mareep=True)):
             self.assertIsNone(command.recover())
             self.assertEqual(command.events, [])
             self.assertEqual(
@@ -2712,6 +2843,9 @@ class ZaPartyDeadRecoveryTests(unittest.TestCase):
         self.assertEqual(len(mid_route.moves), 2)
 
         class Caller:
+            _za_merip_caught = namespace["_za_merip_caught"]
+            _za_beedle_route = staticmethod(lambda: False)   # ビードルルートは別テスト
+
             def __init__(self):
                 self._1_story_out_hotel_z_20_not_eyecheck_count = 9
                 self.recheck_calls = 0
@@ -2723,6 +2857,14 @@ class ZaPartyDeadRecoveryTests(unittest.TestCase):
             @staticmethod
             def _1_story_out_hotel_z_20_dead_recovery():
                 return None
+
+            @staticmethod
+            def _1_story_out_hotel_z_20_stall_reset():
+                return None
+
+            @staticmethod
+            def _za_capture_getchance():
+                return False
 
             @staticmethod
             def image_check(target):
@@ -17708,6 +17850,9 @@ class ImageDetectionMonitorTests(unittest.TestCase):
             "ZA_story", "ZA_story.py")
         with open(source_path, "r", encoding="utf-8-sig") as stream:
             source = stream.read()
+        # 補完モード用の文字なし画像の登録（IMAGE_DETECTION_SUPPLEMENTAL_TARGETS）は数えない
+        import re
+        source = re.sub(r"IMAGE_DETECTION_SUPPLEMENTAL_TARGETS = \{.*?\n    \}\n", "", source, flags=re.S)
         target_marker = "'POKEMON_ZA_BATTLE_ACTIVE_LEVEL': ["
         target_blocks = source.split(target_marker)[1:]
         self.assertEqual(len(target_blocks), 2)
@@ -34365,6 +34510,7 @@ class PythonSourceSafetyTests(unittest.TestCase):
             "Stick": types.SimpleNamespace(RIGHT="RIGHT", LEFT="LEFT"),
         }
         for function_name in (
+                "_za_merip_caught",
                 "_1_story_out_hotel_z_20_lockon_recheck",
                 "_1_story_out_hotel_z_20"):
             exec(compile(
@@ -34374,6 +34520,9 @@ class PythonSourceSafetyTests(unittest.TestCase):
         step20 = namespace["_1_story_out_hotel_z_20"]
 
         class Command:
+            _za_merip_caught = namespace["_za_merip_caught"]
+            _za_beedle_route = staticmethod(lambda: False)   # ビードルルートは別テスト
+
             def __init__(self, lockon_after=None, get_chance=False):
                 self._1_story_out_hotel_z_20_not_eyecheck_count = 0
                 self.lockon_after = lockon_after
@@ -34435,6 +34584,18 @@ class PythonSourceSafetyTests(unittest.TestCase):
 
             def ZA_get_pokemon(self):
                 return None
+
+            @staticmethod
+            def _1_story_out_hotel_z_20_stall_reset():
+                return None
+
+            def _za_capture_getchance(self):
+                return self.get_chance
+
+            def _1_story_capture_lockon_attack(self, _state):
+                self.attack_calls += 1
+                self.events.append(("attack",))
+                return "attacked"
 
         success = Command(lockon_after=1)
         self.assertTrue(recheck(success))
@@ -34523,9 +34684,11 @@ class PythonSourceSafetyTests(unittest.TestCase):
                 for item in source_function_records(stream.read())
             }
 
+        clock = types.SimpleNamespace(now=0.0)
         namespace = {
             "Direction": lambda stick, angle: (stick, angle),
             "Stick": types.SimpleNamespace(LEFT="LEFT"),
+            "time": types.SimpleNamespace(monotonic=lambda: clock.now),
         }
         exec(compile(
             records["_1_story_out_hotel_z_23"],
@@ -34533,6 +34696,8 @@ class PythonSourceSafetyTests(unittest.TestCase):
         step = namespace["_1_story_out_hotel_z_23"]
 
         class Command:
+            ZA_OUT_HOTEL_Z_23_STALL_SECONDS = 120.0
+
             def __init__(self, marker_result=True,
                          white_comment=False, field=True):
                 self.moves = []
@@ -34540,6 +34705,11 @@ class PythonSourceSafetyTests(unittest.TestCase):
                 self.marker_result = marker_result
                 self.white_comment = white_comment
                 self.field = field
+                self.resets = []
+
+            def _1_story_out_hotel_z_23_reset(self, reason):
+                self.resets.append(reason)
+                return "1_STORY_OUT_HOTEL_Z_20_BEEDLE_RETURN"
 
             def image_check(self, target):
                 if target == "POKEMON_ZA_TEXT_WHITE_COMMENT":
@@ -34573,6 +34743,55 @@ class PythonSourceSafetyTests(unittest.TestCase):
             step(actual_comment), "1_STORY_OUT_HOTEL_Z_24")
         self.assertEqual(actual_comment.marker_calls, [])
         self.assertEqual(actual_comment.moves, [])
+
+        # Z_22 から来た最初の1回: 横へずらすだけ。EVENT に合わせられた次の回で長めに直進
+        first = Command()
+        first.ZA_LAB_SIDESTEP = (160, 1.5)
+        first.ZA_LAB_FIRST_FORWARD = (90, 8.0)
+        first._1_story_out_hotel_z_23_sidestep_done = False
+        self.assertEqual(step(first), "1_STORY_OUT_HOTEL_Z_23")
+        self.assertEqual(first.marker_calls, [("EVENT", 0)])
+        self.assertEqual(first.moves, [
+            (("LEFT", 160), {"duration": 1.5, "wait": 0.5}),
+        ])
+        self.assertTrue(first._1_story_out_hotel_z_23_sidestep_done)
+        # 横移動の直後は合わせが1回で終わらないことがある。合うまで直進しない
+        first.moves, first.marker_calls = [], []
+        first.marker_result = False
+        step(first)
+        self.assertEqual(first.marker_calls, [("EVENT", 2)])
+        self.assertEqual(first.moves, [])
+        first.marker_result = True
+        first.marker_calls = []
+        step(first)
+        self.assertEqual(first.marker_calls, [("EVENT", 2)])
+        self.assertEqual(first.moves, [
+            (("LEFT", 90), {"duration": 8.0, "wait": 1.0}),
+        ])
+        first.moves, first.marker_calls = [], []
+        step(first)
+        self.assertEqual(first.moves, [
+            (("LEFT", 90), {"duration": 2.0, "wait": 1.0}),
+        ])
+
+        # 研究所のイベントが始まらないまま120秒たったら、ゲームを再起動して再開先へ
+        stuck = Command()
+        clock.now = 1000.0
+        self.assertEqual(step(stuck), "1_STORY_OUT_HOTEL_Z_23")
+        clock.now = 1119.0
+        self.assertEqual(step(stuck), "1_STORY_OUT_HOTEL_Z_23")
+        self.assertEqual(stuck.resets, [])
+        clock.now = 1120.0
+        stuck.moves = []
+        self.assertEqual(step(stuck), "1_STORY_OUT_HOTEL_Z_20_BEEDLE_RETURN")
+        self.assertEqual(len(stuck.resets), 1)
+        self.assertEqual(stuck.moves, [])
+        # イベントが始まれば計時をやめる
+        started = Command(white_comment=True)
+        started._1_story_out_hotel_z_23_started_at = 0.0
+        self.assertEqual(step(started), "1_STORY_OUT_HOTEL_Z_24")
+        self.assertIsNone(started._1_story_out_hotel_z_23_started_at)
+        self.assertEqual(started.resets, [])
 
     def test_za_karasuba121_talks_only_when_chat_marker_is_visible(self):
         source_path = os.path.join(
@@ -44714,6 +44933,2102 @@ class CommandStartSelectionTests(unittest.TestCase):
             self.assertEqual(str(app.start_button["state"]), "normal")
         finally:
             root.destroy()
+
+
+class ZaCaptureTargetTests(unittest.TestCase):
+    """Z_18/Z_18_2/Z_20: attack only HP-bar targets, throw on 4 lime marks."""
+
+    TEMPLATE = os.path.join(
+        SERIAL_CONTROLLER, "Template", "ZA_Story_PIC", "Common",
+        "getmerker4.png")
+
+    @staticmethod
+    def _frame(bar=True, marks=True):
+        frame = numpy.zeros((720, 1280, 3), numpy.uint8)
+        frame[:] = (60, 110, 70)  # dull grass
+        if bar:
+            frame[300:312, 600:630] = (20, 210, 250)  # yellow fill
+            frame[300:312, 632:672] = (75, 55, 40)   # navy empty part
+        if marks:
+            template = cv2.imread(ZaCaptureTargetTests.TEMPLATE)
+            frame[325:325 + template.shape[0],
+                  690:690 + template.shape[1]] = template
+        return frame
+
+    def test_target_bar_and_four_marks(self):
+        import LockOnDetection as detection
+        bars = detection.target_hp_bars(self._frame())
+        self.assertEqual(len(bars), 1)
+        left, top, width, _height = bars[0]["bar"]
+        self.assertEqual((left, top), (600, 300))
+        self.assertTrue(66 <= width <= 76, width)
+        self.assertLess(bars[0]["fill_ratio"], .5)
+        marks = detection.getchance_marks(self._frame(), bars)
+        self.assertEqual(marks["count"], 4)
+        self.assertTrue(marks["matched"])
+
+    def test_four_marks_template_is_limited_to_bar_area(self):
+        import LockOnDetection as detection
+        template = cv2.imread(self.TEMPLATE)
+        frame = self._frame()
+        # チェック数は崩れても（点滅中など）テンプレートで一致する
+        frame[325:325 + template.shape[0], 690:690 + template.shape[1]] = cv2.GaussianBlur(template, (3, 3), 0)
+        marks = detection.getchance_marks(frame, template=template)
+        self.assertTrue(marks["matched"])
+        # バーの近く以外（左上など）に同じ画像があっても一致しない
+        far = self._frame(marks=False)
+        far[100:100 + template.shape[0], 250:250 + template.shape[1]] = template
+        self.assertFalse(detection.getchance_marks(far, template=template)["matched"])
+
+    def test_mareep_bar_over_grass_and_merged_marks(self):
+        import LockOnDetection as detection
+        frame = numpy.zeros((720, 1280, 3), numpy.uint8)
+        frame[:] = (70, 160, 110)  # bright grass
+        # メリープ: 減った部分は半透明で、草の上では暗い灰緑（H~80, S~60, V~60）
+        frame[355:367, 649:697] = (110, 255, 60)   # green fill
+        frame[355:367, 697:721] = (48, 63, 58)     # dark grey-green empty part
+        bars = detection.target_hp_bars(frame)
+        self.assertEqual(len(bars), 1)
+        self.assertTrue(66 <= bars[0]["bar"][2] <= 76, bars[0])
+        # 近いとマーク4つが1本の塊（13x32）になる
+        for k in range(4):
+            y = 400 + k * 8
+            for row in range(9):
+                half = 6 - abs(row - 4)
+                frame[y + row, 760 - half - 1:760 + half + 2] = (60, 255, 200)
+        marks = detection.getchance_marks(frame, bars)
+        self.assertEqual(marks["count"], 4)
+        self.assertTrue(marks["matched"])
+
+    def test_capture_dead_condition_depends_on_mode(self):
+        functions = ZaPartyDeadRecoveryTests._source_class_and_functions()[1]
+        namespace = {}
+        module = ast.fix_missing_locations(ast.Module(
+            body=[functions["_za_capture_dead"], functions["ZA_count_dead_party_icons"]],
+            type_ignores=[]))
+        exec(compile(module, "za", "exec"), namespace)
+
+        class Command:
+            ZA_PARTY_DEAD_TARGETS = tuple("POKEMON_ZA_DEAD{}".format(i) for i in range(1, 7))
+            _za_capture_dead = namespace["_za_capture_dead"]
+            ZA_count_dead_party_icons = namespace["ZA_count_dead_party_icons"]
+
+            def __init__(self, dead, gift=False):
+                self.dead = {"POKEMON_ZA_DEAD{}".format(i) for i in dead}
+                self.GIFT_LOOP_MODE = gift
+
+            def image_check(self, target):
+                return target in self.dead
+
+        for dead, target, expected in (([1], "KOHUKI", True), ([2], "KOHUKI", False),
+                                       ([2], "MERIP", True),
+                                       ([3, 4, 5], "MERIP", False), ([], "KOHUKI", False)):
+            self.assertEqual(Command(dead)._za_capture_dead(target), expected, (dead, target))
+        for dead, target, expected in (([2], "KOHUKI", True), ([1, 2], "MERIP", False),
+                                       ([2, 3, 4, 5], "MERIP", True), ([], "KOHUKI", False)):
+            self.assertEqual(Command(dead, gift=True)._za_capture_dead(target), expected,
+                             ("gift", dead, target))
+
+    def test_second_scatterbug_does_not_move_and_aligns_to_event(self):
+        functions = ZaPartyDeadRecoveryTests._source_class_and_functions()[1]
+        step = functions["_1_story_out_hotel_z_18_1"]
+        calls = [node.func.attr for node in ast.walk(step)
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)]
+        self.assertNotIn("press", calls)
+        self.assertIn("_1_story_out_hotel_z_18_align", calls)
+        align = [node.func.attr for node in ast.walk(functions["_1_story_out_hotel_z_18_align"])
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)]
+        self.assertIn("ZA_markerdir", align)
+        # L はカメラをキャラの向きへ戻して向き合わせを打ち消すため押さない
+        self.assertNotIn("pressRep", align)
+        for name in ("_1_story_out_hotel_z_18", "_1_story_out_hotel_z_18_2"):
+            names = [node.func.attr for node in ast.walk(functions[name])
+                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)]
+            self.assertIn("_1_story_out_hotel_z_18_align", names, name)
+
+    def test_marks_without_target_bar_do_not_match(self):
+        import LockOnDetection as detection
+        frame = self._frame(bar=False)
+        self.assertEqual(detection.target_hp_bars(frame), [])
+        self.assertFalse(detection.getchance_marks(frame)["matched"])
+        # A bar alone (rock has none; a normal target without marks).
+        frame = self._frame(marks=False)
+        self.assertFalse(detection.getchance_marks(frame)["matched"])
+
+    def _attack_command(self, views):
+        _source_class, functions = (
+            ZaPartyDeadRecoveryTests._source_class_and_functions())
+        clock = types.SimpleNamespace(now=0.0)
+        namespace = {"time": types.SimpleNamespace(monotonic=lambda: clock.now)}
+        module = ast.fix_missing_locations(ast.Module(
+            body=[functions["_1_story_capture_lockon_attack"],
+                  functions["_za_capture_wait_view"],
+                  functions["_za_capture_getchance_recent"]],
+            type_ignores=[]))
+        exec(compile(module, "<capture_attack>", "exec"), namespace)
+
+        class Command:
+            attack = namespace["_1_story_capture_lockon_attack"]
+            _za_capture_wait_view = namespace["_za_capture_wait_view"]
+            _za_capture_getchance_recent = namespace["_za_capture_getchance_recent"]
+            clock_ref = clock
+
+            def __init__(self):
+                self.ZL_state = 1
+                self.events = []
+                self.views = list(views)
+                self.view_calls = 0
+
+            def ZA_capture_target_view(self):
+                self.view_calls += 1
+                # 最後の表示がそのまま続く（HPバーが出るまで待つ間も同じ画面）
+                return self.views.pop(0) if len(self.views) > 1 else self.views[0]
+
+            def ZA_ZL_ACTION(self, action):
+                self.events.append(("zl", action))
+                self.ZL_state = 0 if action == "END" else 1
+
+            def wait(self, seconds):
+                clock.now += seconds
+
+            def ZA_battle_coCp_noloop(self, **kwargs):
+                self.events.append(("attack", kwargs.get("keep_lockon")))
+
+        return Command()
+
+    def test_rock_lock_is_not_attacked(self):
+        empty = {"bars": [], "getchance": False, "marks": 0}
+        command = self._attack_command([empty, empty])
+        self.assertEqual(command.attack("1_STORY_OUT_HOTEL_Z_20"), "no_target")
+        self.assertNotIn("attack", [e[0] for e in command.events])
+        # HPバーが見えなくなった直後は猶予中なのでロックを押し直さない（ロックオンミス対策）
+        self.assertEqual(command.events, [])
+        self.assertGreater(command.view_calls, 3)
+        self.assertEqual(command._za_capture_no_target_count, 1)
+        # 見えない状態が猶予（2.5秒）続いたらロックは取り直すが離さない
+        command._za_capture_no_bar_since = -10.0
+        self.assertEqual(command.attack("1_STORY_OUT_HOTEL_Z_20"), "no_target")
+        self.assertNotIn(("zl", "END"), command.events)
+        self.assertEqual(command.events, [("zl", "")])
+        self.assertEqual(command._za_capture_no_target_count, 2)
+
+    def test_hp_bar_target_is_attacked_with_same_lock(self):
+        bar = {"bars": [{"bar": (600, 300, 72, 12), "fill_ratio": 1.}],
+               "getchance": False, "marks": 0}
+        command = self._attack_command([bar])
+        self.assertEqual(command.attack("1_STORY_OUT_HOTEL_Z_18"), "attacked")
+        self.assertEqual(command.events, [("attack", True)])
+
+    def test_four_marks_skip_attack(self):
+        chance = {"bars": [{"bar": (600, 300, 72, 12), "fill_ratio": 1.}],
+                  "getchance": True, "marks": 4}
+        command = self._attack_command([chance])
+        self.assertEqual(command.attack("1_STORY_OUT_HOTEL_Z_18"), "getchance")
+        self.assertEqual(command.events, [])
+
+    def test_relock_waits_for_marks_after_the_bar(self):
+        # 掛け直した直後は前のロックの HP バーだけが見え、マークは遅れて出る（2026-11-01 実機で
+        # ここで攻撃してマーク4つのコフキムシを倒した）。HP バーだけで攻撃を決めない
+        bar = {"bars": [{"bar": (600, 300, 72, 12), "fill_ratio": 1.}],
+               "getchance": False, "marks": 0}
+        chance = dict(bar, getchance=True, marks=4)
+        command = self._attack_command([bar, bar, bar, chance])
+        command.ZL_state = 0
+        self.assertEqual(command.attack("1_STORY_OUT_HOTEL_Z_18"), "getchance")
+        self.assertNotIn("attack", [e[0] for e in command.events])
+        self.assertTrue(command._za_capture_getchance_pending)
+        # マークが最後まで出なければ待ち切ってから攻撃する
+        command = self._attack_command([bar])
+        command.ZL_state = 0
+        start = command.clock_ref.now
+        self.assertEqual(command.attack("1_STORY_OUT_HOTEL_Z_18"), "attacked")
+        self.assertGreaterEqual(command.clock_ref.now - start, 0.8)
+
+    def test_recent_four_marks_keep_holding_fire(self):
+        # 少し前にマーク4つが見えた相手は、マークが一瞬見えなくても攻撃しない（倒すと次の出現待ち）
+        bar = {"bars": [{"bar": (600, 300, 72, 12), "fill_ratio": 1.}],
+               "getchance": False, "marks": 0}
+        command = self._attack_command([bar])
+        command._za_capture_getchance_seen_at = command.clock_ref.now - 3.0
+        self.assertEqual(command.attack("1_STORY_OUT_HOTEL_Z_18"), "getchance")
+        self.assertEqual(command.events, [])
+        # 時間が経てば（ZA_CAPTURE_GETCHANCE_HOLD_SECONDS）通常どおり攻撃する
+        command._za_capture_getchance_seen_at = command.clock_ref.now - 30.0
+        self.assertEqual(command.attack("1_STORY_OUT_HOTEL_Z_18"), "attacked")
+
+    def _get_pokemon_command(self, reads, zl_state=1):
+        """ZA_get_pokemon（名前確認つき）の模擬。reads は名前判定の結果を順に返す。"""
+        _source_class, functions = (
+            ZaPartyDeadRecoveryTests._source_class_and_functions())
+        clock = types.SimpleNamespace(now=0.0)
+        namespace = {"time": types.SimpleNamespace(monotonic=lambda: clock.now),
+                     "Button": types.SimpleNamespace(ZR="ZR")}
+        module = ast.fix_missing_locations(ast.Module(
+            body=[functions["ZA_get_pokemon"], functions["_za_capture_lock_and_confirm_name"],
+                  functions["_za_capture_confirm_name"]],
+            type_ignores=[]))
+        exec(compile(module, "<get_pokemon>", "exec"), namespace)
+
+        class Command:
+            ZA_get_pokemon = namespace["ZA_get_pokemon"]
+            _za_capture_lock_and_confirm_name = namespace["_za_capture_lock_and_confirm_name"]
+            _za_capture_confirm_name = namespace["_za_capture_confirm_name"]
+            main_current_state = "MAIN_1_Z_LANK"
+            _1_story_current_state = "1_STORY_OUT_HOTEL_Z_18"
+
+            def __init__(self):
+                self.ZL_state = zl_state
+                self.events = []
+                self.reads = list(reads)
+                test = self
+
+                class Keys:
+                    def input(self, button):
+                        test.events.append(("press", button))
+
+                    def inputEnd(self, button):
+                        test.events.append(("release", button))
+                self.keys = Keys()
+
+            def ZA_capture_name_check(self, expected, quiet=False):
+                self.events.append(("name", expected))
+                result = self.reads.pop(0) if self.reads else False
+                if isinstance(result, dict):
+                    self.last_capture_target_detection = result
+                    return bool(result.get("matched"))
+                self.last_capture_target_detection = {"matched": result}
+                return result
+
+            def ZA_ZL_ACTION(self, action="RELOAD"):
+                self.events.append(("zl", action))
+                self.ZL_state = 0 if action == "END" else 1
+
+            def wait(self, seconds):
+                self.events.append(("wait", seconds))
+                clock.now += seconds
+
+        return Command()
+
+    def test_get_uses_the_current_lock_when_the_name_is_visible(self):
+        command = self._get_pokemon_command([True, True])
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(command.ZA_get_pokemon())
+        zl = [e for e in command.events if e[0] == "zl"]
+        # 名前を2回確かめたら、ロックを外さずに投げる（投げた後にだけ外す）
+        self.assertEqual(zl, [("zl", "END")])
+        self.assertLess(command.events.index(("press", "ZR")), command.events.index(("zl", "END")))
+
+    def test_get_relocks_with_a_gap_and_waits_for_the_name(self):
+        # 長く押したままで名前が薄れている → 間を空けて掛け直し、表示が出るまで待って確かめる
+        reads = [False] * 9 + [False, False, False, True, True]
+        command = self._get_pokemon_command(reads)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertTrue(command.ZA_get_pokemon())
+        end = command.events.index(("zl", "END"))
+        self.assertEqual(command.events[end + 1][0], "wait")
+        self.assertGreaterEqual(command.events[end + 1][1], 0.15)
+        self.assertEqual(command.events[end + 2], ("zl", ""))
+        self.assertIn(("press", "ZR"), command.events)
+
+    def test_get_keeps_the_lock_when_the_name_stays_unconfirmed(self):
+        command = self._get_pokemon_command([False] * 100)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(command.ZA_get_pokemon())
+        self.assertNotIn(("press", "ZR"), command.events)
+        # 掛け直しの1回だけ外し、最後は押したまま（以前は失敗のたびに外してロックが外れていた）
+        self.assertEqual([e for e in command.events if e[0] == "zl"], [("zl", "END"), ("zl", "")])
+        self.assertEqual(command.ZL_state, 1)
+        # 別の種族と確認できた時は外す
+        other = {"matched": False, "winner": "mareep", "winner_confirmed": True}
+        command = self._get_pokemon_command([False] * 9 + [other] * 100)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(command.ZA_get_pokemon())
+        self.assertEqual(command.ZL_state, 0)
+
+    def test_supplemental_get_keeps_the_lock_without_names(self):
+        # 補完モード（名前は日本語の画像なので見ない）: 投げる直前に ZL を押し直してロックが
+        # 掛からず、メリープへの投げが空振りした（2026-11-01 英語）
+        _source_class, functions = (
+            ZaPartyDeadRecoveryTests._source_class_and_functions())
+        namespace = {"Button": types.SimpleNamespace(ZR="ZR")}
+        module = ast.fix_missing_locations(ast.Module(
+            body=[functions["ZA_get_pokemon"], functions["_za_capture_lock_target"]], type_ignores=[]))
+        exec(compile(module, "<supplemental_get>", "exec"), namespace)
+
+        class Command:
+            ZA_get_pokemon = namespace["ZA_get_pokemon"]
+            _za_capture_lock_target = namespace["_za_capture_lock_target"]
+            main_current_state = "MAIN_1_Z_LANK"
+            _1_story_current_state = "1_STORY_OUT_HOTEL_Z_20"
+            _command_supplemental_session = types.SimpleNamespace(
+                options=types.SimpleNamespace(supplemental=True))
+
+            def __init__(self, bars_now, bars_after_lock):
+                self.ZL_state = 1
+                self.events = []
+                self.bars_now, self.bars_after_lock = bars_now, bars_after_lock
+                test = self
+
+                class Keys:
+                    def input(self, button):
+                        test.events.append(("press", button))
+
+                    def inputEnd(self, button):
+                        test.events.append(("release", button))
+                self.keys = Keys()
+
+            def ZA_capture_target_view(self):
+                return {"bars": [1] if self.bars_now else [], "getchance": False}
+
+            def _za_capture_wait_view(self):
+                return {"bars": [1] if self.bars_after_lock else [], "getchance": False}
+
+            def ZA_ZL_ACTION(self, action="RELOAD"):
+                self.events.append(("zl", action))
+                self.ZL_state = 0 if action == "END" else 1
+
+            def wait(self, seconds):
+                self.events.append(("wait", seconds))
+
+        command = Command(bars_now=True, bars_after_lock=True)
+        self.assertTrue(command.ZA_get_pokemon())
+        # 今のロックのまま投げる（ZL を押し直さない）
+        self.assertEqual([e for e in command.events if e[0] == "zl"], [("zl", "END")])
+        self.assertLess(command.events.index(("press", "ZR")), command.events.index(("zl", "END")))
+        command = Command(bars_now=False, bars_after_lock=True)
+        self.assertTrue(command.ZA_get_pokemon())
+        end = command.events.index(("zl", "END"))
+        self.assertGreaterEqual(command.events[end + 1][1], 0.15)  # 間を空けて掛け直す
+        self.assertEqual(command.events[end + 2], ("zl", ""))
+        command = Command(bars_now=False, bars_after_lock=False)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertFalse(command.ZA_get_pokemon())
+        self.assertNotIn(("press", "ZR"), command.events)
+
+    def test_capture_images_use_pokecon_folders_not_the_file_depth(self):
+        # 配布先は Commands/PythonCommands/ZA_story/ と1階層浅く、__file__ から ".." を数えると
+        # 別の場所を探して止まった（2026-11-01 別PC: getmerker4.png の FileNotFoundError）
+        _source_class, functions = (
+            ZaPartyDeadRecoveryTests._source_class_and_functions())
+        for name in ("ZA_capture_target_view", "_za_beedle_other_species"):
+            function = functions[name]
+            constants = [node.value for node in ast.walk(function) if isinstance(node, ast.Constant)]
+            calls = [node.func.attr for node in ast.walk(function)
+                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)]
+            self.assertNotIn("..", constants, name)
+            self.assertIn("get_filespec", calls, name)
+        # ZA_story と Pokemon_Template/ZA は、このファイルの位置から ".." をたどって場所を決めない
+        # （ZA/ZA_story と PythonCommands 直下の ZA_story のどちらに置いても動くように）
+        import re
+        story_path = os.path.join(SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA", "ZA_story", "ZA_story.py")
+        template_dir = os.path.join(SERIAL_CONTROLLER, "Commands", "PythonCommands", "Pokemon_Template", "ZA")
+        sources = [story_path] + [os.path.join(template_dir, n) for n in os.listdir(template_dir)
+                                  if n.endswith(".py")]
+        for path in sources:
+            with open(path, encoding="utf-8-sig") as stream:
+                text = stream.read()
+            self.assertIsNone(re.search(r"(?<!\.)__file__\)\)?,\s*\"\.\.\"", text), path)
+        # Reload でコマンド名の後ろのフォルダ名が重なっても、置き場所によらず1つに戻す
+        with open(story_path, encoding="utf-8-sig") as stream:
+            tree = ast.parse(stream.read())
+        meta = next(node for node in tree.body
+                    if isinstance(node, ast.ClassDef) and node.name == "_StableZACommandNameMeta")
+        namespace = {"re": re}
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[meta], type_ignores=[])),
+                     "<meta>", "exec"), namespace)
+        command = namespace["_StableZACommandNameMeta"]("Command", (), {})
+        for suffix in (" (ZA/ZA_story/ZA_story)", " (ZA_story/ZA_story)"):
+            command.NAME = "ZA_story_v1.0.0" + suffix * 3
+            self.assertEqual(command.NAME, "ZA_story_v1.0.0" + suffix)
+
+    def _beedle_command(self, bars_seq, caught_after=None, other=None):
+        """ビードルの Step の模擬。bars_seq: ロックした時に HP バーが見えるかを順に返す。"""
+        source_class, functions = (
+            ZaPartyDeadRecoveryTests._source_class_and_functions())
+        clock = types.SimpleNamespace(now=0.0)
+        namespace = {"time": types.SimpleNamespace(monotonic=lambda: clock.now),
+                     "Direction": lambda stick, angle: ("LEFT", angle),
+                     "Stick": types.SimpleNamespace(LEFT="LEFT")}
+        module = ast.fix_missing_locations(ast.Module(
+            body=[functions["_1_story_out_hotel_z_20_beedle"], functions["_za_beedle_route"]],
+            type_ignores=[]))
+        exec(compile(module, "<beedle>", "exec"), namespace)
+        constants = {}
+        for node in source_class.body:
+            if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                    and isinstance(node.targets[0], ast.Name)
+                    and node.targets[0].id.startswith("ZA_BEEDLE_")):
+                constants[node.targets[0].id] = ast.literal_eval(node.value)
+
+        class Command:
+            step = namespace["_1_story_out_hotel_z_20_beedle"]
+            route = namespace["_za_beedle_route"]
+
+            def __init__(self):
+                for name, value in constants.items():
+                    setattr(self, name, value)
+                self.events = []
+                self.bars = list(bars_seq)
+                self.ZL_state = 0
+                self.throws = 0
+
+            def _1_story_out_hotel_z_17_22_black_comment_recovery(self, state):
+                return None
+
+            def _1_story_out_hotel_z_20_dead_recovery(self):
+                return None
+
+            def _za_beedle_caught(self):
+                return caught_after is not None and self.throws >= caught_after
+
+            def _1_story_out_hotel_z_20_beedle_reset(self, reason):
+                self.events.append(("reset", reason))
+                return "1_STORY_OUT_HOTEL_Z_19"
+
+            def image_check(self, target):
+                return True
+
+            def ZA_ZL_ACTION(self, action="RELOAD"):
+                self.ZL_state = 0 if action == "END" else 1
+
+            def _za_capture_wait_view(self):
+                bar = self.bars.pop(0) if len(self.bars) > 1 else self.bars[0]
+                clock.now += 0.8
+                return {"bars": [{"bar": (600, 300, 72, 12)}] if bar else [], "getchance": False}
+
+            def _za_beedle_other_species(self):
+                return other
+
+            def ZA_get_pokemon(self):
+                self.throws += 1
+                self.events.append(("throw",))
+                return True
+
+            def press(self, direction, duration=0.0, wait=0.0):
+                self.events.append(("turn", direction, duration))
+
+            def checkIfAlive(self):
+                return True
+
+            def wait(self, seconds):
+                clock.now += seconds
+
+        return Command()
+
+    def test_beedle_retries_throws_and_turns_before_resetting(self):
+        state = "1_STORY_OUT_HOTEL_Z_20_BEEDLE"
+        # ロックできる相手が続けていない → 3回目で少し右へ向きを変える（最大3回）
+        command = self._beedle_command([False])
+        with contextlib.redirect_stdout(io.StringIO()):
+            for _ in range(9):
+                self.assertEqual(command.step(), state)
+        turns = [event for event in command.events if event[0] == "turn"]
+        self.assertEqual(turns, [("turn", ("LEFT", 70), 0.1)] * 3)
+        # 投げて捕まらず、ロックし直すとビードルが見える → リセットせずに投げ直す（3球まで）
+        command = self._beedle_command([True])
+        with contextlib.redirect_stdout(io.StringIO()):
+            results = [command.step() for _ in range(3)]
+        self.assertEqual(results, [state, state, "1_STORY_OUT_HOTEL_Z_19"])
+        self.assertEqual([e[0] for e in command.events], ["throw", "throw", "throw", "reset"])
+        # 2球目で捕まえた
+        command = self._beedle_command([True], caught_after=2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            results = [command.step() for _ in range(2)]
+        self.assertEqual(results, [state, "1_STORY_OUT_HOTEL_Z_20_BEEDLE_RETURN"])
+        # 日本語以外（おくりものループの他言語・補完モード）はビードルを使わずメリープ
+        route = self._beedle_command([True])
+        route.GIFT_LOOP_MODE = True
+        route.BEEDLE_ROUTE = True
+        route._za_gift_loop_settings = {"capture_route": "beedle", "language": "JPN"}
+        self.assertTrue(route.route())
+        route._za_gift_loop_settings = {"capture_route": "beedle", "language": "ENG"}
+        self.assertFalse(route.route())
+        route._za_gift_loop_settings = {"capture_route": "beedle", "language": "JPN"}
+        route._command_supplemental_session = types.SimpleNamespace(
+            options=types.SimpleNamespace(supplemental=True))
+        self.assertFalse(route.route())
+
+    def test_wild_zone_exit_prompt_is_used_before_the_wall_move(self):
+        # ビードル後の戻りと Z_21 の壁沿いの移動の前に「A でる」が出たら、そこでワイルドゾーンを出る
+        _source_class, functions = (
+            ZaPartyDeadRecoveryTests._source_class_and_functions())
+        namespace = {"Direction": lambda stick, angle: ("LEFT", angle),
+                     "Stick": types.SimpleNamespace(LEFT="LEFT"),
+                     "Button": types.SimpleNamespace(A="A", L="L")}
+        module = ast.fix_missing_locations(ast.Module(
+            body=[functions["_1_story_out_hotel_z_20_beedle_return"],
+                  functions["_1_story_out_hotel_z_wild_zone_exit_prompt"],
+                  functions["_1_story_out_hotel_z_21"]],
+            type_ignores=[]))
+        exec(compile(module, "<wild_zone_exit>", "exec"), namespace)
+
+        class Command:
+            ZA_BEEDLE_RETURN_MOVES = ((90, 5.0),)
+            ZA_WILD_ZONE_EXIT_CHECK_STEP = 0.5
+            ret = namespace["_1_story_out_hotel_z_20_beedle_return"]
+            z21 = namespace["_1_story_out_hotel_z_21"]
+            _1_story_out_hotel_z_wild_zone_exit_prompt = namespace[
+                "_1_story_out_hotel_z_wild_zone_exit_prompt"]
+
+            def __init__(self, exit_after):
+                self.exit_after = exit_after   # 何回目の「A でる」の確認で出ているか（None は出ない）
+                self.exit_checks = 0
+                self.events = []
+
+            def _1_story_out_hotel_z_17_22_black_comment_recovery(self, state):
+                return None
+
+            def image_check(self, target):
+                if target == "POKEMON_ZA_OUT_MARKER":
+                    self.exit_checks += 1
+                    return self.exit_after is not None and self.exit_checks >= self.exit_after
+                return target == "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"
+
+            def ZA_ZL_ACTION(self, action):
+                pass
+
+            def ZA_markerdir(self, marker):
+                return True
+
+            def press(self, direction, duration=0.0, wait=0.0):
+                self.events.append(("move", direction, duration))
+
+            def pressRep(self, button, **kwargs):
+                self.events.append(("press", button))
+
+            def wait(self, seconds):
+                pass
+
+        command = Command(exit_after=4)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(command.ret(), "1_STORY_OUT_HOTEL_Z_22")
+        # 向き直した直後に1回、その後0.5秒ずつ進んで3回目で「A でる」が出たので A で出た（残りの移動はしない）
+        self.assertEqual(command.events, [("move", ("LEFT", 90), 0.5)] * 3 + [("press", "A")])
+        command = Command(exit_after=1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(command.ret(), "1_STORY_OUT_HOTEL_Z_22")
+        self.assertEqual(command.events, [("press", "A")])
+        command = Command(exit_after=None)
+        self.assertEqual(command.ret(), "1_STORY_OUT_HOTEL_Z_20_1")
+        self.assertEqual(sum(e[2] for e in command.events if e[0] == "move"), 5.0)
+        # Z_21: 壁沿いの移動（右寄り 5秒）の前に出ていれば、移動せずに出る
+        command = Command(exit_after=1)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(command.z21(), "1_STORY_OUT_HOTEL_Z_22")
+        self.assertEqual(command.events, [("press", "A")])
+
+    def test_capture_steps_use_gate_instead_of_plain_attack(self):
+        _source_class, functions = (
+            ZaPartyDeadRecoveryTests._source_class_and_functions())
+        for name in ("_1_story_out_hotel_z_18", "_1_story_out_hotel_z_18_2",
+                     "_1_story_out_hotel_z_20"):
+            calls = [node.func.attr for node in ast.walk(functions[name])
+                     if isinstance(node, ast.Call)
+                     and isinstance(node.func, ast.Attribute)]
+            self.assertIn("_1_story_capture_lockon_attack", calls, name)
+            self.assertIn("_za_capture_getchance", calls, name)
+            self.assertNotIn("ZA_battle_coCp_noloop", calls, name)
+
+
+class ZaSupplementalAPromptTests(unittest.TestCase):
+    """補完モード（日本語以外）: 「A＋日本語」の参照ではなく A の字だけで判定する。"""
+
+    RESET_TEMPLATES = os.path.join(SERIAL_CONTROLLER, "Template", "ZA_Reset_Sample")
+
+    @staticmethod
+    def _command(supplemental, matched=()):
+        class Command:
+            IMAGE_DETECTION_TARGETS = {
+                "POKEMON_ZA_CHAT_MARKER": [{}], "POKEMON_ZA_OUT_MARKER": [{}],
+                "POKEMON_ZA_OTHER_A_MARKER": [{}], "ZA_STORY_COMMON_ZA_RESEARCH_A": [{}]}
+
+            def __init__(self):
+                self.checked = []
+                # 補完モードのセッション（LocalFunction/ZA/SupplementalSession.py）が付いている間だけ有効
+                self._command_supplemental_session = (types.SimpleNamespace(
+                    options=types.SimpleNamespace(supplemental=True)) if supplemental else None)
+
+            def _image_check_target(self, target):
+                self.checked.append(target)
+                return target in matched
+        return Command()
+
+    def test_supplemental_mode_uses_registered_a_checks(self):
+        import ActionPromptCheck as action_prompt
+        command = self._command(True, matched=("POKEMON_ZA_CHAT_MARKER",))
+        with mock.patch.object(action_prompt, "read_command_frame",
+                               side_effect=AssertionError("日本語の参照を読んだ")):
+            # BAG_CHASE_END の「A 話しかける」（日本語は talk_light_ja）
+            self.assertTrue(action_prompt.check_action_prompt(
+                command, ("POKEMON_ZA_CHAT_MARKER",), count_attempt=True))
+            self.assertEqual(command.checked, ["POKEMON_ZA_CHAT_MARKER"])
+            self.assertEqual(command.last_action_prompt_detection["status"], "supplemental_A")
+            command = self._command(True)
+            self.assertFalse(action_prompt.check_action_prompt(
+                command, ("POKEMON_ZA_OUT_MARKER", "ZA_RESEARCH_A", "ZA_ACTION_PROMPT_REST_JA")))
+            # 調査の A は登録名へ、単語だけの参照は汎用の A へ
+            self.assertEqual(command.checked, [
+                "POKEMON_ZA_OUT_MARKER", "ZA_STORY_COMMON_ZA_RESEARCH_A",
+                "POKEMON_ZA_OTHER_A_MARKER"])
+
+    def test_japanese_mode_keeps_word_references(self):
+        import ActionPromptCheck as action_prompt
+        command = self._command(False)
+        with mock.patch.object(action_prompt, "read_command_frame", return_value=None):
+            self.assertFalse(action_prompt.check_action_prompt(
+                command, ("POKEMON_ZA_CHAT_MARKER",)))
+        self.assertEqual(command.checked, [])
+        self.assertEqual(command.last_action_prompt_detection["status"], "no_frame")
+
+    @staticmethod
+    def _supplemental_registry():
+        _source_class, _functions = ZaPartyDeadRecoveryTests._source_class_and_functions()
+        node = next(item for item in _source_class.body if isinstance(item, ast.Assign)
+                    and any(getattr(t, "id", "") == "IMAGE_DETECTION_SUPPLEMENTAL_TARGETS" for t in item.targets))
+        return ast.literal_eval(node.value)
+
+    @staticmethod
+    def _session_module():
+        from Commands.PythonCommands.LocalFunction.ZA import SupplementalSession
+        return SupplementalSession
+
+    def _detect(self, command, frame, name, template_path, crop, threshold=0.85, use_gray=True):
+        from Commands.PythonCommands.LocalFunction import ImageDetection
+        with mock.patch.object(ImageDetection, "_command_frame", return_value=frame):
+            return ImageDetection.detect_image(
+                command, name=name, template_path=template_path, crop=crop,
+                threshold=threshold, use_gray=use_gray, show_position=False)
+
+    def test_battle_level_hud_matches_on_a_bright_floor(self):
+        # 英語の初戦（明るい石畳）: 22px の ♂ は背景込みで 0.37 になり、一度も攻撃しなかった。
+        # ZA_story の文字なし画像の登録（Lv. / ♂ / ♀ の丸の内側）で判定する。
+        hud = cv2.imread(os.path.join(os.path.dirname(__file__), "fixtures", "za_supplemental_eng",
+                                      "first_battle_bright_floor.png"))
+        frame = numpy.full((720, 1280, 3), 150, numpy.uint8)
+        frame[490:600, 100:340] = hud
+        command = types.SimpleNamespace(IMAGE_DETECTION_SUPPLEMENTAL_TARGETS=self._supplemental_registry())
+        session = self._session_module().SupplementalSession(SERIAL_CONTROLLER, "ENG")
+        japanese = {"name": "POKEMON_ZA_BATTLE_ACTIVE_LEVEL", "matched": False, "score": 0.4,
+                    "threshold": 0.75, "position": (0, 0), "template_size": (20, 13)}
+
+        def check(image):
+            return session.replace(command, image, dict(japanese),
+                                   "Template/ZA_Story_PIC/Common/battle_active_level.png", [120, 500, 300, 580])
+
+        result = check(frame)
+        self.assertTrue(result["matched"], result)
+        self.assertEqual(result["match_source"], "supplemental_registry")
+        self.assertFalse(result["japanese"]["matched"])
+        # 「Lv.」を消しても ♂ だけで一致（Lv. 以外の表記の言語を想定）
+        no_level = frame.copy()
+        no_level[525:552, 150:200] = 150
+        result = check(no_level)
+        self.assertTrue(result["matched"], result)
+        self.assertIn("male_symbol_disc", result["supplemental"]["template_path"])
+        # HUD が無い床だけでは一致しない
+        empty = numpy.full((720, 1280, 3), 150, numpy.uint8)
+        empty[490:600, 100:340] = hud[:, :40].mean(axis=(0, 1)).astype(numpy.uint8)
+        self.assertFalse(check(empty)["matched"])
+
+    def test_detect_image_uses_the_command_side_session(self):
+        # 補完モードは PokeCon 本体なしで動く: detect_image が Commands 側のセッションで A の字だけを見る
+        glyph = cv2.imread(os.path.join(SERIAL_CONTROLLER, "Template", "ZA_Story_PIC", "Common", "other_a_marker.png"))
+        frame = numpy.full((720, 1280, 3), 90, numpy.uint8)
+        frame[420:420 + glyph.shape[0], 690:690 + glyph.shape[1]] = glyph
+        target = ("POKEMON_ZA_CHAT_MARKER", "Template/ZA_Story_PIC/Common/chatmarker.png", [400, 200, 1000, 700])
+        command = types.SimpleNamespace()
+        japanese = self._detect(command, frame, *target)
+        self.assertFalse(japanese["matched"])
+        self.assertNotIn("supplemental", japanese)
+        command._command_supplemental_session = self._session_module().SupplementalSession(SERIAL_CONTROLLER, "ENG")
+        result = self._detect(command, frame, *target)
+        self.assertTrue(result["matched"], result)
+        self.assertEqual(result["match_source"], "supplemental_A")
+        self.assertFalse(result["japanese"]["matched"])
+        # 改造版の本体の置き換え（_native_image_collection）があっても、Commands 側の判定が優先
+        native = types.SimpleNamespace(process=lambda c, f, d, *a: dict(d, matched=False, score=0.0, japanese=dict(d)))
+        command._native_image_collection = native
+        self.assertTrue(self._detect(command, frame, *target)["matched"])
+
+    def test_x_menu_is_not_open_under_the_help_popup(self):
+        # 英語の HOTEL_Z_SKILL_CHANGE1: 初回の X メニューに「Saving Your Progress」のヘルプが重なる。
+        # 日本語の X メニュー画像は隠れて一致せずヘルプの A へ進むが、補完の ≡ アイコンは見えていた。
+        fixtures = os.path.join(os.path.dirname(__file__), "fixtures", "za_supplemental_eng")
+        session = self._session_module().SupplementalSession(SERIAL_CONTROLLER, "ENG")
+        japanese = {"name": "POKEMON_ZA_X_MENU_OPEN", "matched": False, "score": 0.1, "threshold": 0.8,
+                    "position": (0, 0), "template_size": (10, 10)}
+
+        def menu_open(name):
+            frame = cv2.imread(os.path.join(fixtures, name))
+            return session.replace(types.SimpleNamespace(), frame, dict(japanese),
+                                   "Template/ZA_Story_PIC/Common/x_menu_window.png", [0, 0, 0, 0])
+
+        under_help = menu_open("x_menu_help_popup.jpg")
+        self.assertFalse(under_help["matched"])
+        self.assertEqual(under_help["supplemental"]["hidden_by"], "help_popup")
+        self.assertTrue(menu_open("x_menu_pokemon.jpg")["matched"])
+
+    def test_skill_page_uses_zl_and_zr_icons(self):
+        # 技の変更ページは ZL / ZR のアイコンで判定（英語では ⇄ をカーソルと数えて位置判定が外れた）
+        fixtures = os.path.join(os.path.dirname(__file__), "fixtures")
+        command = types.SimpleNamespace(IMAGE_DETECTION_SUPPLEMENTAL_TARGETS=self._supplemental_registry())
+        session = self._session_module().SupplementalSession(SERIAL_CONTROLLER, "ENG")
+        japanese = {"name": "POKEMON_ZA_SKILL_PAGE_WINDOW", "matched": False, "score": 0.2, "threshold": 0.85,
+                    "position": (0, 0), "template_size": (10, 10)}
+
+        def skill_page(*path):
+            frame = cv2.imread(os.path.join(fixtures, *path))
+            return session.replace(command, frame, dict(japanese),
+                                   "Template/ZA_Story_PIC/Common/X_menu/skillpage.png", [550, 170, 750, 250])["matched"]
+
+        self.assertTrue(skill_page("za_supplemental_eng", "skill_page_list_cursor.jpg"))
+        self.assertTrue(skill_page("command_supplemental_checks", "skillpage.jpg"))  # 日本語（ZL/ZR が暗い）
+        self.assertFalse(skill_page("za_supplemental_eng", "x_menu_pokemon.jpg"))
+        self.assertFalse(skill_page("command_supplemental_checks", "pokemon_menu.jpg"))
+
+    def test_dialog_arrow_ignores_long_english_lines(self):
+        # OUT_HOTEL_Z_5_2: 英語の長い文が▼の近くまで来て、元の白い会話枠の画像が 0.56 で外れた
+        fixtures = os.path.join(os.path.dirname(__file__), "fixtures", "za_supplemental_eng")
+        command = types.SimpleNamespace(IMAGE_DETECTION_SUPPLEMENTAL_TARGETS=self._supplemental_registry())
+        session = self._session_module().SupplementalSession(SERIAL_CONTROLLER, "ENG")
+
+        def visible(name, frame_name, template):
+            frame = cv2.imread(os.path.join(fixtures, frame_name))
+            detail = {"name": name, "matched": False, "score": 0.5, "threshold": 0.85,
+                      "position": (0, 0), "template_size": (10, 10)}
+            return session.replace(command, frame, detail, template, [300, 555, 1000, 700])["matched"]
+
+        white = "Template/ZA_Story_PIC/Common/white_comment.png"
+        self.assertTrue(visible("POKEMON_ZA_TEXT_WHITE_COMMENT", "white_comment_long_line.jpg", white))
+        # 白い会話枠を黒・緑と取り違えない。会話の無い画面では一致しない
+        self.assertFalse(visible("POKEMON_ZA_TEXT_BLACK_COMMENT", "white_comment_long_line.jpg",
+                                 "Template/ZA_Story_PIC/Common/black_comment.png"))
+        self.assertFalse(visible("POKEMON_ZA_TEXT_GREEN_COMMENT", "white_comment_long_line.jpg",
+                                 "Template/ZA_Story_PIC/Common/green_comment.png"))
+        self.assertFalse(visible("POKEMON_ZA_TEXT_WHITE_COMMENT", "x_menu_pokemon.jpg", white))
+
+    def test_supplemental_mode_is_decided_on_the_command_side(self):
+        with tokenize.open(ZaPartyDeadRecoveryTests._source_path()) as stream:
+            tree = ast.parse(stream.read())
+        story = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ZA_story")
+        setup = next(node for node in story.body
+                     if isinstance(node, ast.FunctionDef) and node.name == "_za_supplemental_setup")
+        do = next(node for node in story.body if isinstance(node, ast.FunctionDef) and node.name == "do")
+        self.assertEqual(ast.unparse(do.body[0]), "self._za_supplemental_setup()")
+        module = ast.fix_missing_locations(ast.Module(body=[setup], type_ignores=[]))
+        namespace = {}
+        exec(compile(module, "<supplemental_setup>", "exec"), namespace)
+
+        def run(**attributes):
+            command = types.SimpleNamespace(**attributes)
+            with contextlib.redirect_stdout(io.StringIO()):
+                namespace["_za_supplemental_setup"](command)
+            return command._command_supplemental_session
+
+        self.assertIsNone(run())
+        self.assertIsNotNone(run(ZA_SUPPLEMENTAL=True))  # Start 画面の「補完モード」
+        loop = dict(GIFT_LOOP_MODE=True)
+        self.assertEqual(run(_za_gift_loop_settings={"language": "ENG"}, **loop).language, "ENG")
+        self.assertIsNone(run(_za_gift_loop_settings={"language": "JPN"}, **loop))
+        # 改造版 PokeCon のチェック欄は読むだけ
+        native = types.SimpleNamespace(options=types.SimpleNamespace(supplemental=True, language="FRA"))
+        self.assertEqual(run(_native_image_collection=native).language, "FRA")
+
+    def test_local_function_copies_match_the_tested_core_checks(self):
+        # LocalFunction/ZA の写しは本体の判定と同じ中身（説明文と import 名だけ違う）。
+        # 本体側の既存テスト（tests/test_command_supplemental_*.py）がそのまま中身の確認になる。
+        local = os.path.join(SERIAL_CONTROLLER, "Commands", "PythonCommands", "LocalFunction", "ZA")
+
+        def body(path):
+            with open(path, encoding="utf-8") as stream:
+                tree = ast.parse(stream.read())
+            tree.body = tree.body[1:]  # module docstring
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module:
+                    node.module = node.module.replace("CommandSupplemental", "Supplemental")
+            return ast.dump(tree)
+
+        for name in ("Checks", "Icons", "Scenes"):
+            with self.subTest(name=name):
+                self.assertEqual(body(os.path.join(local, "Supplemental%s.py" % name)),
+                                 body(os.path.join(SERIAL_CONTROLLER, "CommandSupplemental%s.py" % name)))
+
+    def test_story_and_local_function_do_not_need_pokecon_core(self):
+        story = os.path.join(SERIAL_CONTROLLER, "Commands", "PythonCommands", "ZA", "ZA_story", "ZA_story.py")
+        with open(story, encoding="utf-8-sig") as stream:
+            source = stream.read()
+        self.assertNotIn("_native_image_collection", source)
+        # LocalFunction/ZA は PokeCon 本体のモジュール（Command*.py）を import しない
+        folder = os.path.join(SERIAL_CONTROLLER, "Commands", "PythonCommands", "LocalFunction", "ZA")
+        for name in os.listdir(folder):
+            if name.endswith(".py"):
+                with open(os.path.join(folder, name), encoding="utf-8") as stream:
+                    tree = ast.parse(stream.read())
+                imported = [alias.name for node in ast.walk(tree) if isinstance(node, ast.Import)
+                            for alias in node.names]
+                imported += [node.module or "" for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)]
+                self.assertEqual([module for module in imported if "Command" in module], [], name)
+
+    def test_title_a_glyph_templates_come_from_press_a_button(self):
+        # 英語のタイトルは「PRESS Ⓐ」だけで、日本語の「PRESS Ⓐ BUTTON」と一致しない（2026-11-01 実機 0.40）
+        for source, glyph in (("za_title_press_a.png", "za_title_a_glyph.png"),
+                              ("za_title_press_a_end.png", "za_title_a_glyph_end.png")):
+            source_image = cv2.imread(os.path.join(self.RESET_TEMPLATES, source), cv2.IMREAD_GRAYSCALE)
+            glyph_image = cv2.imread(os.path.join(self.RESET_TEMPLATES, glyph), cv2.IMREAD_GRAYSCALE)
+            self.assertIsNotNone(glyph_image, glyph)
+            score = cv2.matchTemplate(source_image, glyph_image, cv2.TM_CCOEFF_NORMED).max()
+            self.assertGreater(score, .99, glyph)
+            # 文字だけの「PRESS」部分とは一致しない
+            press = source_image[:, :140]
+            self.assertLess(cv2.matchTemplate(press, glyph_image, cv2.TM_CCOEFF_NORMED).max(), .9, glyph)
+
+    def test_title_uses_a_glyph_only_in_supplemental_mode(self):
+        _source_class, functions = (
+            ZaPartyDeadRecoveryTests._source_class_and_functions())
+        module = ast.fix_missing_locations(ast.Module(
+            body=[functions["_ZA_gamereset_title_visible"]], type_ignores=[]))
+        namespace = {}
+        exec(compile(module, "<title_visible>", "exec"), namespace)
+
+        class Command:
+            title_visible = namespace["_ZA_gamereset_title_visible"]
+
+            def __init__(self, supplemental, matches, field=False):
+                self._command_supplemental_session = types.SimpleNamespace(
+                    options=types.SimpleNamespace(supplemental=supplemental))
+                self.matches = matches
+                self.field = field
+
+            def _reset_template_matches_any(self, name):
+                return name in self.matches
+
+            def _ZA_gamereset_field_ready(self):
+                return self.field
+
+        self.assertTrue(Command(False, {"ZA_TITLE_PRESS_A"}).title_visible())
+        self.assertFalse(Command(False, {"ZA_TITLE_A_GLYPH"}).title_visible())
+        self.assertTrue(Command(True, {"ZA_TITLE_A_GLYPH"}).title_visible())
+        # フィールドのA表示はタイトルにしない
+        self.assertFalse(Command(True, {"ZA_TITLE_A_GLYPH"}, field=True).title_visible())
+        calls = {node.func.attr for name in ("_ZA_gamereset_game_screen", "ZA_gamereset")
+                 for node in ast.walk(functions[name])
+                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)}
+        self.assertIn("_ZA_gamereset_title_visible", calls)
+
+
+class ZaGiftLoopNoUserNameTests(unittest.TestCase):
+    """おくりものループ: ユーザー名を持たず、番号／登録アイコンで動く。"""
+
+    @staticmethod
+    def _modules():
+        from Commands.PythonCommands.Pokemon_Template.ZA import (
+            GiftLoopSettings, SaveDataDelete, UserIcon)
+        return GiftLoopSettings, SaveDataDelete, UserIcon
+
+    @staticmethod
+    def _user_select_frame(seed=1, count=8):
+        """ユーザー選択画面の模擬。人数が少ない時は中央寄せで並べる（位置は画面から求める）。"""
+        rng = numpy.random.default_rng(seed)
+        frame = numpy.full((720, 1280, 3), 68, numpy.uint8)
+        icons = []
+        left = 640 - 75 * count
+        for slot in range(count):
+            icon = cv2.resize(rng.integers(0, 255, (8, 8, 3), dtype=numpy.uint8),
+                              (134, 134), interpolation=cv2.INTER_NEAREST)
+            x = left + 150 * slot
+            frame[565:612, x:x + 140] = 126          # 名前の帯
+            frame[428:562, x + 3:x + 137] = icon
+            icons.append(icon)
+        return frame, icons
+
+    def test_user_select_slots_follow_user_count(self):
+        _settings, _delete, icon_mod = self._modules()
+        for count in (8, 5, 3):
+            frame, icons = self._user_select_frame(seed=count, count=count)
+            centers = icon_mod.user_select_slot_centers(frame)
+            self.assertEqual(len(centers), count)
+            for slot in range(count):
+                self.assertEqual(icon_mod.user_select_icon_slot(frame, icons[slot]), slot)
+            self.assertIsNone(icon_mod.crop_user_select_icon(frame, count))
+
+    def test_user_select_slot_is_found_by_registered_icon(self):
+        _settings, _delete, icon_mod = self._modules()
+        frame, icons = self._user_select_frame()
+        for slot in (0, 3, 7):
+            captured = icon_mod.crop_user_select_icon(frame, slot)
+            self.assertEqual(icon_mod.user_select_icon_slot(frame, captured), slot)
+        self.assertIsNone(icon_mod.user_select_icon_slot(
+            frame, numpy.full((134, 134, 3), 128, numpy.uint8)))
+
+    def test_duplicate_icons_cannot_be_used_and_icon_can_be_cleared(self):
+        _settings, _delete, icon_mod = self._modules()
+        frame, icons = self._user_select_frame(seed=4)
+        left = 640 - 75 * 8
+        frame[428:562, left + 150 * 6 + 3:left + 150 * 6 + 137] = icons[3]   # 7番目も4番目と同じ
+        captured = icon_mod.crop_user_select_icon(frame, 3)
+        self.assertEqual(icon_mod.user_select_matching_slots(frame, captured), [3, 6])
+        self.assertIsNone(icon_mod.user_select_icon_slot(frame, captured))
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "user_icon", "delete_user.png")
+            icon_mod.save_icon(path, captured)
+            self.assertIsNotNone(icon_mod.load_icon(path))
+            self.assertTrue(icon_mod.clear_icon(path))
+            self.assertIsNone(icon_mod.load_icon(path))
+            self.assertFalse(icon_mod.clear_icon(path))
+
+    def test_erase_row_icon_matches_only_its_own_circle(self):
+        _settings, _delete, icon_mod = self._modules()
+        _frame, icons = self._user_select_frame(seed=2)
+        row = numpy.zeros((720, 1280, 3), numpy.uint8)
+        small = cv2.resize(icons[2], (50, 50), interpolation=cv2.INTER_AREA)
+        row[345:395, 750:800] = small
+        self.assertGreaterEqual(icon_mod.erase_row_icon_score(row, icons[2], (330, 410)),
+                                icon_mod.ICON_MIN_SCORE)
+        self.assertLess(icon_mod.erase_row_icon_score(row, icons[5], (330, 410)),
+                        icon_mod.ICON_MIN_SCORE)
+
+    def test_round_icon_from_erase_list_selects_user_and_detects_duplicates(self):
+        """消去画面（ユーザー一覧）の丸アイコンを登録し、ユーザー選択画面でも選べる。"""
+        _settings, _delete, icon_mod = self._modules()
+        frame, icons = self._user_select_frame(seed=5)
+        erase = numpy.full((720, 1280, 3), 30, numpy.uint8)
+        for index, top in enumerate((156, 227, 298, 369)):
+            erase[top - 25:top + 26, 749:800] = cv2.resize(icons[index], (51, 51), interpolation=cv2.INTER_AREA)
+            cv2.circle(erase, (774, top), 25, (235, 235, 235), 2)
+        round_icon = icon_mod.crop_erase_row_icon(erase, (330, 409))
+        self.assertIsNotNone(round_icon)
+        self.assertTrue(icon_mod.is_round_icon(round_icon))
+        self.assertFalse(icon_mod.is_round_icon(icons[3]))
+        self.assertEqual(icon_mod.user_select_icon_slot(frame, round_icon), 3)
+        self.assertEqual(len(icon_mod.erase_list_matching_rows(erase, round_icon)), 1)
+        # 同じアイコンのユーザーが一覧に2人いると登録できない
+        erase[227 - 25:227 + 26, 749:800] = erase[369 - 25:369 + 26, 749:800]
+        self.assertEqual(len(icon_mod.erase_list_matching_rows(erase, round_icon)), 2)
+
+    @staticmethod
+    def _white_user_select_frame(count, selected, seed=7):
+        """ホワイトテーマのユーザー選択画面の模擬: 名前の帯が無く、選択枠の線は太く隣の縁にかかる。"""
+        rng = numpy.random.default_rng(seed)
+        frame = numpy.full((720, 1280, 3), 254, numpy.uint8)
+        centers = [int(round(640 + 150 * (i - (count - 1) / 2.0))) for i in range(count)]
+        for c in centers:
+            icon = cv2.resize(rng.integers(0, 255, (8, 8, 3), dtype=numpy.uint8),
+                              (140, 140), interpolation=cv2.INTER_NEAREST)
+            frame[425:565, c - 70:c + 70] = icon
+        c = centers[selected]
+        cyan = (240, 255, 80)
+        frame[418:424, c - 77:c + 79] = cyan
+        frame[616:622, c - 77:c + 79] = cyan
+        frame[418:622, c - 77:c - 71] = cyan     # 左の線
+        frame[418:622, c + 74:c + 79] = cyan     # 右の線（大半が右隣の縁の範囲）
+        return frame, centers
+
+    def test_white_theme_user_select_slots_and_cursor(self):
+        """ホワイトテーマ（2026-10-31 実機）: 帯で区切れなくても並びから人数・中央・選択を求める。"""
+        _settings, _delete, icon_mod = self._modules()
+        from Commands.PythonCommands.Pokemon_Template.ZA import NewGameStart
+        for count, selected in ((8, 3), (8, 4), (5, 0), (3, 2)):
+            with self.subTest(count=count, selected=selected):
+                frame, centers = self._white_user_select_frame(count, selected)
+                self.assertEqual(icon_mod.user_select_slot_centers(frame), centers)
+                self.assertEqual(NewGameStart.detect_user_select_cursor(frame), selected)
+        # 背景だけ（選択画面でない）なら何も返さない
+        blank = numpy.full((720, 1280, 3), 254, numpy.uint8)
+        self.assertEqual(icon_mod.user_select_slot_centers(blank), [])
+        self.assertIsNone(NewGameStart.detect_user_select_cursor(blank))
+
+    def test_white_theme_name_keyboard_cursor_and_mode(self):
+        """ホワイトテーマの名前入力キーボード（2026-10-31 実機）: 枠≒(216,243,0)、モードは青い文字。"""
+        _settings, _delete, _icon_mod = self._modules()
+        from Commands.PythonCommands.Pokemon_Template.ZA import NewGameStart as ng
+        frame = numpy.full((720, 1280, 3), 255, numpy.uint8)
+        frame[330:660, 165:1100:86] = (40, 40, 40)          # キーの文字（黒）のつもりの縦線
+        frame[600:660, 1110:1226] = (255, 80, 40)            # OK ボタン（青の塗り）
+        x, y = ng.keyboard_key_center(("grid", 2, 4))
+        cv2.rectangle(frame, (x - 45, y - 34), (x + 45, y + 34), (216, 243, 0), 4)
+        kx, ky = ng.KEYBOARD_SPECIAL_KEYS[("mode", "kata")]
+        frame[ky + 18:ky + 22, kx - 12:kx + 12] = (255, 70, 40)   # 青い下線
+        frame[ky - 12:ky + 8, kx - 6:kx + 6] = (255, 70, 40)      # 青い文字
+        self.assertEqual(ng.detect_keyboard_cursor(frame), ("grid", 2, 4))
+        self.assertEqual(ng.detect_keyboard_mode(frame), "kata")
+        hint = ng._load_template("name_keyboard/keyboard_hint.png")
+        gray_hint = 255 - hint                                      # 白黒が逆の操作説明
+        x0, y0 = 990, 668
+        frame[y0:y0 + hint.shape[0], x0:x0 + hint.shape[1]] = cv2.cvtColor(gray_hint, cv2.COLOR_GRAY2BGR)
+        self.assertEqual(ng.detect_screen(frame), "keyboard")
+
+    def test_user_select_waits_through_unreadable_frames(self):
+        """表示直後・明滅で選択枠が読めないフレームがあっても止めず、別のスロットなら止める。"""
+        _settings, _delete, _icon_mod = self._modules()
+        from Commands.PythonCommands.Pokemon_Template.ZA import NewGameStart
+        blank = numpy.full((720, 1280, 3), 254, numpy.uint8)
+        sel3, _ = self._white_user_select_frame(8, 3)
+        sel4, _ = self._white_user_select_frame(8, 4)
+        sel5, _ = self._white_user_select_frame(8, 5)
+
+        class Command:
+            ZA_NG_MOVE_LIMIT = 40
+            ZA_NG_KEY_WAIT = 0.15
+            ZA_NG_USER_SELECT_SETTLE_SECONDS = 3.0
+            _za_ng_move_cursor = NewGameStart.ZANewGameStartMixin._za_ng_move_cursor
+            za_select_switch_user = NewGameStart.ZANewGameStartMixin.za_select_switch_user
+
+            def __init__(self, frames):
+                self.frames = list(frames)
+                self.presses = []
+
+            def _za_ng_frame(self):
+                return self.frames.pop(0) if len(self.frames) > 1 else self.frames[0]
+
+            def checkIfAlive(self):
+                return True
+
+            def wait(self, _seconds):
+                return None
+
+            def press(self, button, **_kwargs):
+                self.presses.append(button)
+                if button is NewGameStart.Hat.LEFT:
+                    self.frames = [sel3]
+
+            def _za_ng_log(self, _message):
+                return None
+
+        command = Command([blank, blank, sel3, sel3, blank, sel3, sel3, sel3])
+        self.assertEqual(command.za_select_switch_user(4), 4)
+        self.assertEqual(command.presses, [NewGameStart.Button.A])
+        moved = Command([blank, sel4, sel4])
+        self.assertEqual(moved.za_select_switch_user(4), 4)
+        self.assertEqual(moved.presses, [NewGameStart.Hat.LEFT, NewGameStart.Button.A])
+        jumped = Command([sel3, sel3, sel3, sel5])
+        with self.assertRaises(RuntimeError):
+            jumped.za_select_switch_user(4)
+        self.assertNotIn(NewGameStart.Button.A, jumped.presses)
+
+    def test_white_theme_faint_round_icon_is_cropped_by_its_outer_circle(self):
+        """外周が背景とほぼ同じ明るさの丸アイコン（白テーマ）でも内側の円ではなく外周で切り出す。"""
+        _settings, _delete, icon_mod = self._modules()
+        erase = numpy.full((720, 1280, 3), 254, numpy.uint8)
+        cv2.circle(erase, (775, 369), 24, (238, 238, 238), -1)       # 薄い灰色のアイコン背景
+        cv2.circle(erase, (775, 369), 17, (40, 40, 200), -1)         # 中の絵（くっきりした円）
+        cv2.rectangle(erase, (765, 360), (785, 378), (200, 60, 30), -1)
+        icon = icon_mod.crop_erase_row_icon(erase, (330, 409))
+        self.assertIsNotNone(icon)
+        self.assertGreaterEqual(icon.shape[0], 45)
+        self.assertGreaterEqual(icon_mod.erase_row_icon_score(erase, icon, (330, 409)),
+                                icon_mod.ICON_MIN_SCORE)
+
+    def test_received_pokemon_in_slot6_moves_to_an_empty_box_slot(self):
+        """コフキムシ1匹: 受け取った1匹目は手持ち6番目。移し先は BOX 移動の空き枠判定に任せる。"""
+        from Commands.PythonCommands.Pokemon_Template.ZA import ZAGiftLoop
+
+        clock = [0.0]
+
+        class Command:
+            def __init__(self, slot6=True, second=False, stays=False, stale_reads=0, result=None):
+                self.result = result   # ボックス画面での確認結果（BOX 移動が残す）
+                self.slot6 = slot6
+                self.second = second
+                self.stays = stays
+                self.stale_reads = stale_reads   # 戻った直後に前の表示（6匹）のまま読める回数
+                self.calls = []
+                self.common_box_change_current_state = "COMMON_BOX_CHANGE_START"
+                self._steps = 0
+
+            def _za_gift_loop_second_kohuki(self):
+                return self.second
+
+            def _za_party_slot_filled(self, slot, timeout=5.0):
+                if self.calls and self.stale_reads > 0:
+                    self.stale_reads -= 1
+                    return True
+                return self.slot6
+
+            def checkIfAlive(self):
+                return None
+
+            def wait(self, seconds):
+                clock[0] += seconds
+
+            def ZA_common_box_change_function(self, **kwargs):
+                self._steps += 1
+                if self._steps == 1:
+                    return "COMMON_BOX_CHANGE_START_CHECK"
+                self.calls.append(kwargs)
+                self.slot6 = self.stays
+                self._common_box_change_result = self.result
+                return "COMMON_BOX_CHANGE_START"
+
+        fake_time = types.SimpleNamespace(monotonic=lambda: clock[0])
+        with mock.patch.object(ZAGiftLoop, "time", fake_time):
+            one = Command()
+            self.assertTrue(ZAGiftLoop._move_party_slot6_to_box(one))
+            self.assertEqual(one.calls, [dict(target1=5, target2=0, target1_high=-1, target2_high=0,
+                                              target2_empty=True)])
+            # 2026-11-01 実機: 戻った直後の1回目は前の表示のまま。読み直して空なら移せている
+            self.assertTrue(ZAGiftLoop._move_party_slot6_to_box(Command(stale_reads=2)))
+            with self.assertRaisesRegex(RuntimeError, "手持ち6番目"):
+                ZAGiftLoop._move_party_slot6_to_box(Command(stays=True))
+            # ボックス画面での確認を優先する（フィールドの手持ち欄が埋まって見えても）
+            self.assertTrue(ZAGiftLoop._move_party_slot6_to_box(Command(stays=True, result="moved")))
+            self.assertFalse(ZAGiftLoop._move_party_slot6_to_box(Command(stays=True, result="source_empty")))
+            with self.assertRaisesRegex(RuntimeError, "ボックス画面で確認できません"):
+                ZAGiftLoop._move_party_slot6_to_box(Command(result="not_verified"))
+        item = Command(slot6=False)   # ポケモン以外: 何もしない
+        self.assertFalse(ZAGiftLoop._move_party_slot6_to_box(item))
+        self.assertEqual(item.calls, [])
+        old = Command(second=True)     # 従来の2匹: 移動しない
+        self.assertFalse(ZAGiftLoop._move_party_slot6_to_box(old))
+        self.assertEqual(old.calls, [])
+
+    def test_settings_pairs_names_with_gender_and_converts_old_format(self):
+        settings_mod, _delete, _icon = self._modules()
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "gift_loop_settings.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({"delete_user_number": 2, "names": ["アオイ", "ミナト"],
+                           "gender": "female"}, stream, ensure_ascii=False)
+            settings = settings_mod.load_settings(path)
+        self.assertEqual(settings["profiles"], [
+            {"name": "アオイ", "gender": "female"}, {"name": "ミナト", "gender": "female"}])
+        settings["profiles"] = [{"name": "アオイ", "gender": "male"},
+                                {"name": "ミナト", "gender": "female"}]
+        self.assertEqual(settings_mod.loop_profile(settings, 0)[:2], ("アオイ", "male"))
+        self.assertEqual(settings_mod.loop_profile(settings, 1)[:2], ("ミナト", "female"))
+        self.assertEqual(settings_mod.loop_profile(settings, 2)[:2], ("アオイ", "male"))
+
+    def test_number_mode_requires_number_and_icon_mode_requires_icons(self):
+        settings_mod, _delete, _icon = self._modules()
+        settings = dict(settings_mod.DEFAULT_SETTINGS, delete_user_number=0)
+        self.assertEqual(settings_mod.user_mode(settings), settings_mod.MODE_NUMBER)   # 既定は番号方式
+        with self.assertRaises(ValueError):
+            settings_mod.validate_settings(settings)
+        settings["delete_user_number"] = 4
+        self.assertTrue(settings_mod.validate_settings(settings))
+        self.assertIn("上から4番目", settings_mod.describe_target(settings))
+        icon_settings = dict(settings, user_mode=settings_mod.MODE_ICON, delete_user_number=0)
+        with mock.patch.object(settings_mod, "load_user_icons", return_value=[]):
+            with self.assertRaises(ValueError):
+                settings_mod.validate_settings(icon_settings)
+        rng = numpy.random.default_rng(11)
+        a = cv2.resize(rng.integers(0, 255, (6, 6, 3), dtype=numpy.uint8), (49, 49),
+                       interpolation=cv2.INTER_NEAREST)
+        b = cv2.resize(rng.integers(0, 255, (6, 6, 3), dtype=numpy.uint8), (49, 49),
+                       interpolation=cv2.INTER_NEAREST)
+        with mock.patch.object(settings_mod, "load_user_icons", return_value=[a, b]):
+            self.assertTrue(settings_mod.validate_settings(icon_settings))
+            self.assertIn("2人", settings_mod.describe_target(icon_settings))
+        with mock.patch.object(settings_mod, "load_user_icons", return_value=[a, a.copy()]):
+            with self.assertRaises(ValueError):   # 同じ絵を2回登録
+                settings_mod.validate_settings(icon_settings)
+
+    def test_old_use_icon_setting_becomes_a_mode(self):
+        settings_mod, _delete, _icon = self._modules()
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "gift_loop_settings.json")
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({"delete_user_number": 4, "use_icon": False}, stream)
+            self.assertEqual(settings_mod.load_settings(path)["user_mode"], settings_mod.MODE_NUMBER)
+            with open(path, "w", encoding="utf-8") as stream:
+                json.dump({"delete_user_number": 4, "use_icon": True}, stream)
+            with mock.patch.object(settings_mod, "load_user_icons", return_value=[numpy.zeros((49, 49, 3))]):
+                self.assertEqual(settings_mod.load_settings(path)["user_mode"], settings_mod.MODE_ICON)
+            self.assertNotIn("use_icon", settings_mod.load_settings(path))
+
+    @staticmethod
+    def _rows(*keys):
+        """消去画面の行の模擬（行の画像は key ごとに違う乱数の帯）。"""
+        rows = []
+        for key in keys:
+            rng = numpy.random.default_rng(1000 + key)
+            rows.append({"rows": (100, 170), "all_row": False,
+                         "print": rng.integers(0, 255, (63, 724), dtype=numpy.uint8),
+                         "icon_score": None})
+        return rows
+
+    def test_number_mode_deletes_nth_row_only_when_it_is_the_new_save(self):
+        """番号＝消去画面の上から何番目。歯抜けがあっても、今回増えた行がその番号の時だけ消す。"""
+        _settings, delete_mod, _icon = self._modules()
+        # ユーザー 1・2・3・5 にセーブ（4 は歯抜け）→ ユーザー4 で作ると上から4番目に入る
+        base = self._rows(1, 2, 3, 5)
+        after = self._rows(1, 2, 3, 4, 5)
+        self.assertTrue(delete_mod._same_selected_row(delete_mod.numbered_row(after, 4, base), after[3]))
+        with self.assertRaises(RuntimeError):     # 4番目ではなく既存の5番目を指定 → 消さない
+            delete_mod.numbered_row(after, 5, base)
+        with self.assertRaises(RuntimeError):     # 行が足りない
+            delete_mod.numbered_row(base, 6)
+        with self.assertRaises(RuntimeError):     # 増えていない（前回ユーザーが別の人で既存セーブ）
+            delete_mod.numbered_row(base, 4, base)
+        self.assertTrue(delete_mod._same_selected_row(delete_mod.numbered_row(base, 4), base[3]))
+
+    def test_icon_mode_deletes_only_a_unique_matching_row(self):
+        _settings, delete_mod, icon_mod = self._modules()
+        rows = self._rows(1, 2, 3)
+        for row, score in zip(rows, (0.90, 0.994, 0.908)):
+            row["icon_score"] = score
+        self.assertIs(delete_mod.unique_icon_row(rows), rows[1])
+        rows[2]["icon_score"] = 0.97                     # 同じアイコンの人がもう1人
+        with self.assertRaises(RuntimeError):
+            delete_mod.unique_icon_row(rows)
+        rows[2]["icon_score"] = 0.959                     # 一致は1行だが、次点との差が小さい
+        rows[1]["icon_score"] = 0.975
+        with self.assertRaises(RuntimeError):
+            delete_mod.unique_icon_row(rows)
+        rows[1]["icon_score"] = 0.5
+        rows[2]["icon_score"] = 0.5
+        with self.assertRaises(RuntimeError):            # 一致なし
+            delete_mod.unique_icon_row(rows)
+
+    def test_icon_mode_checks_all_registered_icons_on_user_select(self):
+        """開始時: 同じアイコンのユーザー・一致しないアイコン・同じ人を指す登録は問題として止める。"""
+        _settings, _delete, icon_mod = self._modules()
+        frame, icons = self._user_select_frame(seed=8)
+        crop = icon_mod.crop_user_select_icon
+        slots, problems = icon_mod.user_select_icon_problems(frame, [crop(frame, 3), crop(frame, 6)])
+        self.assertEqual((slots, problems), ([3, 6], []))
+        _slots, problems = icon_mod.user_select_icon_problems(frame, [crop(frame, 3), crop(frame, 3)])
+        self.assertTrue(any("同じユーザー" in p for p in problems))
+        stranger = numpy.full((134, 134, 3), 90, numpy.uint8)
+        stranger[20:110, 20:110] = (10, 200, 30)
+        _slots, problems = icon_mod.user_select_icon_problems(frame, [stranger])
+        self.assertEqual(len(problems), 1)
+        left = 640 - 75 * 8
+        frame[428:562, left + 150 * 6 + 3:left + 150 * 6 + 137] = icons[3]   # 7番目も4番目と同じ
+        _slots, problems = icon_mod.user_select_icon_problems(frame, [crop(frame, 3)])
+        self.assertTrue(any("同じアイコンのユーザーが2人" in p for p in problems))
+        _slots, problems = icon_mod.user_select_icon_problems(
+            numpy.full((720, 1280, 3), 254, numpy.uint8), [crop(frame, 3)])
+        self.assertEqual(problems, ["ユーザー選択画面の並びを読めません"])
+
+    def test_icons_are_added_in_order_and_duplicates_are_detected(self):
+        _settings, _delete, icon_mod = self._modules()
+        rng = numpy.random.default_rng(21)
+        a = cv2.resize(rng.integers(0, 255, (6, 6, 3), dtype=numpy.uint8), (49, 49),
+                       interpolation=cv2.INTER_NEAREST)
+        b = cv2.resize(rng.integers(0, 255, (6, 6, 3), dtype=numpy.uint8), (49, 49),
+                       interpolation=cv2.INTER_NEAREST)
+        with tempfile.TemporaryDirectory() as directory:
+            icon_mod.save_icon(os.path.join(directory, icon_mod.ICON_FILE), a)   # 以前の1件の登録
+            second = icon_mod.add_icon(directory, b)
+            self.assertEqual(os.path.basename(second), "user_01.png")
+            paths = icon_mod.list_icon_paths(directory)
+            self.assertEqual([os.path.basename(p) for p in paths], ["delete_user.png", "user_01.png"])
+            self.assertEqual(len(icon_mod.load_icons(directory)), 2)
+            self.assertTrue(icon_mod.same_icon(a, icon_mod.load_icons(directory)[0]))
+            self.assertFalse(icon_mod.same_icon(a, b))
+            icon_mod.clear_icon(paths[0])
+            self.assertEqual(os.path.basename(icon_mod.add_icon(directory, a)), "user_02.png")
+
+    def test_rows_are_compared_by_image_not_by_user_name(self):
+        _settings, delete_mod, _icon = self._modules()
+        rng = numpy.random.default_rng(3)
+        a = rng.integers(0, 255, (63, 724), dtype=numpy.uint8)
+        b = rng.integers(0, 255, (63, 724), dtype=numpy.uint8)
+        self.assertTrue(delete_mod.same_row(a, a.copy()))
+        self.assertFalse(delete_mod.same_row(a, b))
+        for name in ("SAVE_DELETE_USERS", "DELETABLE_USERS", "SWITCH_USER_ORDER"):
+            self.assertFalse(hasattr(delete_mod, name), name)
+
+    def test_start_panel_can_live_in_commands_tab_or_open_on_start(self):
+        """開始位置・その他の操作: Commandsタブに常時表示（AI操作向け）か、Start時の画面か。"""
+        import tkinter as tk
+        import CommandQuickRun as quick_run
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest(str(error))
+        self.addCleanup(root.destroy)
+        root.withdraw()
+        saved = []
+
+        class App:
+            command_start_overrides, command_run_favorites = {}, {}
+            _active_input_set_name, cur_command = "", None
+            settings = types.SimpleNamespace(command_start_panel="dialog", save=lambda: saved.append(1))
+            starts = []
+
+            def _selected_command_name(self):
+                return ""
+
+            def _command_run_options(self, name):
+                return {}
+
+            def _command_classes(self, name):
+                return []
+
+            def startPlay(self):
+                self.starts.append(self.command_quick_run.capture_before_start())
+
+        app = App()
+        host = quick_run.CommandStartPanelHost(root, app)
+        self.assertEqual(host.place.get(), "tab")              # 設定の読込前は従来どおりタブ内
+        self.assertIs(app.command_quick_run.master, host)
+        host.apply_saved_mode()                                   # settings.ini: dialog
+        self.assertTrue(host.dialog_mode())
+        self.assertIs(app.command_quick_run.master, host.window)
+        app.startPlay()                                           # Start → 画面を出して止まる
+        self.assertEqual(app.starts, [False])
+        host.accept_dialog()                                      # 「この内容で開始」→ 開始へ進む
+        self.assertEqual(app.starts, [False, True])
+        host.place.set("tab")
+        host.switch()
+        self.assertIsNone(host.window)
+        self.assertIs(app.command_quick_run.master, host)
+        self.assertEqual(app.settings.command_start_panel, "tab")
+        self.assertEqual(saved, [1])
+        app.startPlay()
+        self.assertEqual(app.starts[-1], True)
+
+    def test_quick_run_shows_mode_tab_and_passes_settings(self):
+        import tkinter as tk
+        import CommandQuickRun as quick_run
+        settings_mod, _delete, _icon = self._modules()
+        directory = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, ignore_errors=True))
+
+        class Owner:
+            NAME = "gift_owner"
+
+            @staticmethod
+            def _builder(parent, host):
+                return settings_mod.build_panel(parent, host, directory)
+            COMMAND_RUN_MODES = ({"key": "gift_loop", "label": "gift", "builder": _builder},)
+
+        class App:
+            command_start_overrides, command_run_favorites = {}, {}
+            camera, _active_input_set_name, started = None, "p", 0
+
+            def _selected_command_name(self):
+                return Owner.NAME
+
+            def _command_run_options(self, _name):
+                return {"locations": [{"id": "a", "label": "A", "value": "A", "variable": "V"}]}
+
+            def _command_classes(self, _name):
+                return [Owner]
+
+            def startPlay(self):
+                App.started += 1
+
+        class Command:
+            NAME = Owner.NAME
+
+            def apply_command_run_mode(self, key, settings):
+                self.mode = (key, settings)
+
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest("Tk unavailable: {}".format(error))
+        self.addCleanup(root.destroy)
+        root.withdraw()
+        panel_host = quick_run.CommandQuickRun(root, App())
+        panel_host.refresh(force=True)
+        self.assertIn("gift_loop", panel_host.mode_panels)
+        panel_host.mode.set("gift_loop")
+        panel_host.show_mode()
+        panel = panel_host.mode_panels["gift_loop"]
+        panel.number.set("4")
+        with mock.patch.object(settings_mod, "load_user_icon", return_value=None):
+            self.assertFalse(panel_host.capture_before_start())   # 削除の確認を表示
+            panel_host.confirm_button.invoke()
+            self.assertEqual(App.started, 1)
+            self.assertTrue(panel_host.capture_before_start())
+        command = Command()
+        self.assertTrue(panel_host.prepare(command))
+        with mock.patch.object(quick_run, "apply_command_run_options", return_value={}), \
+                mock.patch.dict(sys.modules, {"CommandImageCollection": types.SimpleNamespace(
+                    arm_native_image_collection=lambda *a, **k: None,
+                    CollectionOptions=lambda **k: None)}):
+            self.assertTrue(panel_host.apply(command))
+        self.assertEqual(command.mode[0], "gift_loop")
+        self.assertEqual(command.mode[1]["delete_user_number"], 4)
+        # ストーリータブへ戻すと通常開始（mode=None）
+        panel_host.mode.set("")
+        panel_host.show_mode()
+        self.assertTrue(panel_host.story_frame.winfo_manager())
+        # おくりものループタブを開いたまま Reload（refresh(force=True)）しても落ちない
+        panel_host.mode.set("gift_loop")
+        panel_host.show_mode()
+        panel_host.refresh(force=True)
+        self.assertTrue(panel_host.mode_bar.winfo_manager())
+        self.assertTrue(panel_host.story_frame.winfo_manager())
+        packed = panel_host.pack_slaves()
+        self.assertLess(packed.index(panel_host.mode_bar), packed.index(panel_host.story_frame))
+        self.assertLess(packed.index(panel_host.story_frame), packed.index(panel_host.status_label))
+
+
+class ZaBoxAndHomeTransferTests(unittest.TestCase):
+    """BOX 移動の空き枠判定・説明画面、Pokémon HOME への輸送（2026-11-01 実機キャプチャ）。"""
+
+    @staticmethod
+    def _capture(name):
+        path = os.path.join(SERIAL_CONTROLLER, "Captures", name + ".png")
+        frame = cv2.imread(path, cv2.IMREAD_COLOR)
+        if frame is None:
+            raise unittest.SkipTest("キャプチャがありません: " + path)
+        return frame
+
+    @staticmethod
+    def _modules():
+        from Commands.PythonCommands.Pokemon_Template.ZA import BoxScreen, HomeTransfer, ReportSave
+        return BoxScreen, HomeTransfer, ReportSave
+
+    def test_za_box_cursor_and_empty_cells_do_not_depend_on_the_pokemon(self):
+        box, _home, _report = self._modules()
+        cases = {
+            "2026-11-01_01-10-34": ((0, 0), [True] * 5 + [False]),    # 開いた直後: ボックス左上
+            "2026-11-01_01-10-49": ((0, -1), [True] * 5 + [False]),   # 手持ち1番目（名前の札）
+            "2026-11-01_01-11-05": ((5, -1), [True] * 5 + [False]),   # 空の手持ち6番目（▼）
+            "2026-11-01_01-11-31": ((4, 1), [True] * 4 + [False] * 2),  # 持ち上げて移動中
+            "2026-11-01_01-11-55": ((1, 2), [True] * 4 + [False] * 2),
+        }
+        for name, (cursor, party) in cases.items():
+            with self.subTest(name=name):
+                frame = self._capture(name)
+                self.assertTrue(box.za_box_ready(frame))
+                self.assertFalse(box.za_box_tutorial_visible(frame))
+                self.assertEqual(box.za_box_cursor(frame), cursor)
+                self.assertEqual(box.za_party_filled(frame), party)
+        # ビードルを置いた枠だけが埋まり、明るい照明が透けた空き枠は空きのまま
+        filled = box.za_box_filled(self._capture("2026-11-01_01-11-55"))
+        self.assertEqual([(x, y) for y, row in enumerate(filled) for x, v in enumerate(row) if v], [(4, 1)])
+        self.assertEqual(box.first_empty_cell(filled), (0, 0))
+        self.assertEqual(box.first_empty_cell([[True] * 6, [True, False] + [True] * 4]), (1, 1))
+        self.assertIsNone(box.first_empty_cell([[True] * 6] * 5))
+        # ボックス以外（X メニュー・REPORT）ではボックスと判定しない
+        for name in ("2026-11-01_01-10-27", "2026-11-01_01-12-18"):
+            self.assertFalse(box.za_box_ready(self._capture(name)), name)
+
+    def test_box_tutorial_panel_is_detected(self):
+        box, _home, _report = self._modules()
+        frame = self._capture("2026-11-01_01-10-34").copy()
+        frame[300:600, 380:900] = 250     # 初回の「ボックス」説明（中央の白い板）
+        self.assertTrue(box.za_box_tutorial_visible(frame))
+        self.assertFalse(box.za_box_ready(frame))
+
+    def _box_change_harness(self, tutorial=True, readable=True, filled_cells=((0, 0), (1, 0))):
+        _source, functions = ZaPartyDeadRecoveryTests._source_class_and_functions()
+        box_module, _home, _report = self._modules()
+        names = ("ZA_common_box_change_function", "ZA_common_box_change_box_target1",
+                 "ZA_common_box_change_box_target1_select", "ZA_common_box_change_box_target2",
+                 "_za_box_cursor_now", "_za_box_move_cursor", "_za_box_wait_moved")
+        namespace = {"Button": types.SimpleNamespace(A="A", B="B"), "time": time,
+                     "read_command_frame": lambda command: command.frame()}
+        exec(compile(ast.fix_missing_locations(ast.Module(
+            body=[functions[n] for n in names], type_ignores=[])), "ZA_story.py", "exec"), namespace)
+
+        class Box:
+            """ボックス画面の模擬。説明画面の間は十字キーが効かない。"""
+            def __init__(self):
+                self.tutorial = tutorial
+                self.cursor = (0, 0)
+                self.cells = {(x, -1) for x in range(6)} | set(filled_cells)
+                self.menu = False
+                self.held = None
+                self.inputs = []
+                self.common_box_change_current_state = "COMMON_BOX_CHANGE_BOX_TARGET1"
+                self.STATE_COMMON_BOX_CHANGE_FUNCTION = {}
+
+            def frame(self):
+                return self
+
+            def _za_box_screen(self):
+                screen = types.SimpleNamespace(
+                    za_box_tutorial_visible=lambda f: f.tutorial,
+                    za_box_ready=lambda f, text=True: not f.tutorial,
+                    za_box_cursor=lambda f: f.cursor if readable and not f.tutorial else None,
+                    za_box_filled=lambda f: [[(x, y) in f.cells for x in range(6)] for y in range(5)],
+                    za_party_filled=lambda f: [(x, -1) in f.cells for x in range(6)],
+                    first_empty_cell=box_module.first_empty_cell)
+                return screen
+
+            def image_check(self, name):
+                return {"POKEMON_ZA_BOX_WINDOW": True, "POKEMON_ZA_BOX_MENU": self.menu}[name]
+
+            def etc_sendCommand(self, name):
+                self.inputs.append(name)
+                if self.tutorial:
+                    return
+                dx, dy = {"Lbutton_right": (1, 0), "Lbutton_left": (-1, 0),
+                          "Lbutton_down": (0, 1), "Lbutton_up": (0, -1)}[name]
+                self.cursor = (self.cursor[0] + dx, self.cursor[1] + dy)
+
+            def pressRep(self, button, repeat=1, duration=0.15, wait=0.5, interval=0.1):
+                if self.tutorial:
+                    self.tutorial = False
+                elif self.menu:
+                    self.menu, self.held = False, self.cursor
+                elif self.held is not None:
+                    self.cells.discard(self.held)
+                    self.cells.add(self.cursor)
+                    self.held = None
+                elif self.cursor in self.cells:
+                    self.menu = True
+
+            def wait(self, seconds):
+                return None
+
+            def checkIfAlive(self):
+                return None
+
+        command = Box()
+        for name in names:
+            setattr(command, name, types.MethodType(namespace[name], command))
+        command.STATE_COMMON_BOX_CHANGE_FUNCTION = {
+            "COMMON_BOX_CHANGE_BOX_TARGET1_SELECT": command.ZA_common_box_change_box_target1_select}
+        return command
+
+    def _run_box_change(self, command, **kwargs):
+        for _ in range(20):
+            state = command.ZA_common_box_change_function(**kwargs)
+            if state == "COMMON_BOX_CHANGE_SKILL_WINDOW_CLOSE":
+                return
+        self.fail("BOX 移動が終わりませんでした: " + state)
+
+    def test_box_change_closes_tutorial_then_moves_slot6_to_the_first_empty_cell(self):
+        """2026-11-01: 説明画面の間に移動入力が捨てられ、左上の空き枠で A を押し続けた。"""
+        command = self._box_change_harness(tutorial=True)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self._run_box_change(command, target1=5, target2=0, target1_high=-1, target2_high=0,
+                                 target2_empty=True)
+        self.assertNotIn((5, -1), command.cells)          # 手持ち6番目は空
+        self.assertIn((2, 0), command.cells)              # ボックスの最初の空き枠へ
+        self.assertEqual(len(command.cells), 6 + 2)       # 入れ替わりは起きていない
+        self.assertEqual(command._common_box_change_result, "moved")   # ボックス画面で確認
+
+    def test_box_change_with_empty_source_closes_without_pressing_a(self):
+        """フィールドの手持ち欄は赤いじゅうたんで埋まって見えることがある。ボックス画面で空なら閉じる。"""
+        command = self._box_change_harness(tutorial=False)
+        command.cells.discard((5, -1))
+        with contextlib.redirect_stdout(io.StringIO()):
+            self._run_box_change(command, target1=5, target2=0, target1_high=-1, target2_high=0,
+                                 target2_empty=True)
+        self.assertEqual(command._common_box_change_result, "source_empty")
+        self.assertEqual(command.inputs, [])
+        self.assertFalse(command.menu)
+
+    def test_box_change_without_readable_cursor_keeps_relative_moves(self):
+        command = self._box_change_harness(tutorial=False, readable=False, filled_cells=())
+        with contextlib.redirect_stdout(io.StringIO()):
+            self._run_box_change(command, target1=4, target2=1, target1_high=-1, target2_high=0)
+        self.assertEqual(command.inputs, ["Lbutton_right"] * 4 + ["Lbutton_up"]
+                         + ["Lbutton_left"] * 3 + ["Lbutton_down"])
+        self.assertIn((1, 0), command.cells)
+
+    def test_full_box_stops_instead_of_swapping(self):
+        command = self._box_change_harness(
+            tutorial=False, filled_cells=[(x, y) for x in range(6) for y in range(5)])
+        with contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(RuntimeError, "空き枠"):
+            self._run_box_change(command, target1=5, target2=0, target1_high=-1, target2_high=0,
+                                 target2_empty=True)
+
+    def test_home_screens_and_selected_buttons(self):
+        _box, home, _report = self._modules()
+        expected = {
+            "2026-11-01_00-57-06": "title", "2026-11-01_01-00-08": "main_menu",
+            "2026-11-01_01-00-28": "game_select", "2026-11-01_01-00-42": "link_confirm",
+            "2026-11-01_01-01-11": "box", "2026-11-01_01-03-23": "save_confirm",
+            "2026-11-01_01-03-58": "saved", "2026-11-01_00-55-50": None, "2026-11-01_01-12-18": None,
+        }
+        for name, screen in expected.items():
+            with self.subTest(name=name):
+                self.assertEqual(home.home_screen(self._capture(name)), screen)
+        self.assertTrue(home.main_menu_pokemon_selected(self._capture("2026-11-01_01-00-08")))
+        self.assertTrue(home.game_select_za_selected(self._capture("2026-11-01_01-00-28")))
+        self.assertTrue(home.link_confirm_yes_selected(self._capture("2026-11-01_01-00-42")))
+        self.assertTrue(home.save_and_quit_selected(self._capture("2026-11-01_01-03-23")))
+        # Switch HOME のソフト名: Pokémon HOME だけ（ZA の「Pokémon LEGENDS Z-A」は 0.68）
+        self.assertTrue(home.switch_home_home_selected(self._capture("2026-11-01_00-55-50")))
+        self.assertFalse(home.switch_home_home_selected(self._capture("2026-11-01_01-08-50")))
+
+    def test_home_box_cells_hover_and_mode(self):
+        box, _home, _report = self._modules()
+        frame = self._capture("2026-11-01_01-01-11")      # HOME: コフーライ・ピカチュウ / ZA: コフーライ
+        home_cells = box.home_box_filled(frame, "home")
+        game_cells = box.home_box_filled(frame, "game")
+        self.assertEqual([(x, y) for y, r in enumerate(home_cells) for x, v in enumerate(r) if v], [(0, 0), (1, 0)])
+        self.assertEqual([(x, y) for y, r in enumerate(game_cells) for x, v in enumerate(r) if v], [(0, 0)])
+        self.assertEqual(box.home_box_mode(frame), box.HOME_MODE_SWAP)
+        self.assertTrue(box.home_hover_filled(frame))
+        self.assertFalse(box.home_hover_filled(self._capture("2026-11-01_01-02-55")))   # 空き枠の上
+        after = self._capture("2026-11-01_01-03-06")
+        self.assertEqual(box.first_empty_cell(box.home_box_filled(after, "home")), (3, 0))
+        self.assertIsNone(box.first_empty_cell([[True] * 6] * 5))
+        self.assertFalse(any(any(r) for r in box.home_box_filled(after, "game")))
+
+    def test_home_transfer_plan_never_overwrites_home_pokemon(self):
+        _box, home, _report = self._modules()
+        home_cells = [[True, True, False, False, False, False]] + [[False] * 6] * 4
+        game_cells = [[True, False, True, False, False, False]] + [[False] * 6] * 4
+        self.assertEqual(home.plan_transfer(home_cells, game_cells), [((0, 0), (2, 0)), ((2, 0), (3, 0))])
+        full = [[True] * 6] * 4 + [[True] * 5 + [False]]
+        with self.assertRaisesRegex(ValueError, "空きが足りません"):
+            home.plan_transfer(full, game_cells)
+        self.assertEqual(home.plan_transfer(full, [[False] * 6] * 5), [])
+
+    def test_home_move_presses_b_instead_of_placing_on_a_pokemon(self):
+        box, home, _report = self._modules()
+
+        class Helper(home.ZAHomeTransferMixin):
+            def __init__(self):
+                self.pressed = []
+                self.hover = [True, True]   # 持ち上げ前: ポケモン / 置く前: 埋まっている（想定外）
+
+            def _za_sd_frame(self):
+                return "frame"
+
+            def _za_sd_poll(self, predicate, timeout=2.0):
+                return predicate("frame")
+
+            def press(self, button, duration=0.1, wait=0.5):
+                self.pressed.append(button)
+
+            def wait(self, seconds):
+                return None
+
+            def checkIfAlive(self):
+                return None
+
+        helper = Helper()
+        filled = {"home": [[True] + [False] * 5] + [[False] * 6] * 4,
+                  "game": [[True] + [False] * 5] + [[False] * 6] * 4}
+        hovers = iter([True, True])
+        with mock.patch.object(home._box_screen, "home_box_filled", lambda f, side: filled[side]), \
+                mock.patch.object(home._box_screen, "home_hover_filled", lambda f: next(hovers)), \
+                contextlib.redirect_stdout(io.StringIO()), \
+                self.assertRaisesRegex(RuntimeError, "空いていない"):
+            helper.za_home_move_box_pokemon()
+        self.assertEqual(helper.pressed[-1], home.Button.B)        # 持ち上げをやめる
+        self.assertEqual(helper.pressed.count(home.Button.A), 1)   # 持ち上げだけ。置く A は押さない
+
+    def test_language_samples_are_valid_and_all_languages_start(self):
+        from Commands.PythonCommands.Pokemon_Template.ZA import GiftLoopSettings as settings_mod
+        for code, _label, _col, _row in settings_mod.LANGUAGES:
+            samples = settings_mod.sample_profiles(code)
+            self.assertEqual([p["gender"] for p in samples], ["male", "female"], code)
+            for profile in samples:
+                settings_mod.validate_name(profile["name"], code, profile.get("reading"))
+        with self.assertRaisesRegex(ValueError, "12文字"):
+            settings_mod.validate_name("A" * 13, "ENG")
+        with self.assertRaisesRegex(ValueError, "入力できない文字"):
+            settings_mod.validate_name("アオイ", "ENG")
+        with self.assertRaisesRegex(ValueError, "漢字"):
+            settings_mod.validate_name("小明", "CHS")
+        with self.assertRaisesRegex(ValueError, "6文字"):
+            settings_mod.validate_name("가나다라마바사", "KOR")
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "gift_loop_settings.json")
+            with open(path, "w", encoding="utf-8") as stream:   # 言語の無い以前の設定
+                json.dump({"user_mode": "number", "delete_user_number": 4,
+                           "profiles": [{"name": "アオイ", "gender": "male"}]}, stream)
+            loaded = settings_mod.load_settings(path)
+        self.assertEqual(loaded["language"], "JPN")
+        self.assertTrue(loaded["home_transfer"])
+        self.assertEqual(loaded["profiles_by_language"], {"JPN": [{"name": "アオイ", "gender": "male"}]})
+        settings_mod.validate_settings(loaded)
+        for code in ("ENG", "KOR", "CHT"):
+            settings_mod.validate_settings(dict(loaded, language=code,
+                                                profiles=settings_mod.sample_profiles(code)))
+
+    def test_report_screens(self):
+        _box, _home, report = self._modules()
+        self.assertTrue(report.report_button_selected(self._capture("2026-11-01_01-12-18")))
+        saving = self._capture("2026-11-01_01-12-30")
+        self.assertTrue(report.report_screen_visible(saving))
+        self.assertFalse(report.report_button_selected(saving))
+        self.assertTrue(report.report_done_visible(self._capture("2026-11-01_01-12-36")))
+        for name in ("2026-11-01_01-10-27", "2026-11-01_01-12-48", "2026-11-01_01-10-34"):
+            self.assertFalse(report.report_screen_visible(self._capture(name)), name)
+        # 補完モード（text=False）: 日本語の文字を見ず、REPORT 見出し・▶・▼だけで同じ結果になる
+        self.assertTrue(report.report_button_selected(self._capture("2026-11-01_01-12-18"), False))
+        self.assertTrue(report.report_screen_visible(saving, False))
+        self.assertFalse(report.report_button_selected(saving, False))
+        self.assertFalse(report.report_done_visible(saving, False))
+        self.assertTrue(report.report_done_visible(self._capture("2026-11-01_01-12-36"), False))
+        for name in ("2026-11-01_01-10-27", "2026-11-01_01-12-48", "2026-11-01_01-10-34"):
+            self.assertFalse(report.report_screen_visible(self._capture(name), False), name)
+
+    def test_menu_headers_by_icon_in_supplemental_mode(self):
+        # 補完モードは見出しの文字を見ず左のアイコンだけ（英語は「ONLINE PLAY」が「LINK PLAY」で 0.53）
+        from Commands.PythonCommands.Pokemon_Template.ZA import MysteryGift as gift
+        link_play = cv2.imread(os.path.join(os.path.dirname(__file__), "fixtures", "za_supplemental_eng",
+                                            "link_play.jpg"))
+        self.assertIsNone(gift.detect_header(link_play, icons_only=False))
+        self.assertEqual(gift.detect_header(link_play, icons_only=True), "online")
+        # 日本語の画面では文字ありと同じ結果（X メニュー・REPORT・ボックス・フィールド）
+        for name in ("2026-11-01_01-12-18", "2026-11-01_01-12-36", "2026-11-01_01-10-27",
+                     "2026-11-01_01-12-48", "2026-11-01_01-10-34"):
+            frame = self._capture(name)
+            self.assertEqual(gift.detect_header(frame, icons_only=True),
+                             gift.detect_header(frame, icons_only=False), name)
+        # 既定（日本語）は文字ありのまま。切り替えは補完モードのセッションに合わせる
+        self.assertFalse(gift._icons_only)
+
+    def test_english_gift_and_report_screens_by_marks(self):
+        # ユーザーが撮った英語の画面（2026-11-01）: おくりものの3項目・一覧、レポート（見出しが「SAVE」）
+        _box, _home, report = self._modules()
+        from Commands.PythonCommands.Pokemon_Template.ZA import MysteryGift as gift
+        fixtures = os.path.join(os.path.dirname(__file__), "fixtures", "za_supplemental_eng")
+
+        def frame(name):
+            return cv2.imread(os.path.join(fixtures, name))
+
+        save = frame("save_progress.jpg")
+        self.assertFalse(report.report_screen_visible(save))           # 日本語の「REPORT」では一致しない
+        self.assertTrue(report.report_button_selected(save, False))    # 鉛筆・▶で一致
+        self.assertFalse(report.report_done_visible(save, False))
+        gift.set_header_icons_only(True)
+        try:
+            self.assertEqual(gift.gift_menu_active(frame("mystery_gift_menu.jpg")), 0)
+            listing = frame("mystery_gift_list.jpg")
+            self.assertEqual(gift.gift_list_state(listing), (4, 0, False))  # メッセージ中は操作待ちではない
+            self.assertTrue(gift.next_marker_visible(listing))
+            self.assertEqual(gift.gift_list_new_rows(listing, 4), [True] * 4)
+            self.assertEqual(gift.detect_header(save), "menu")             # レポートの後ろの X メニュー
+        finally:
+            gift.set_header_icons_only(False)
+
+    def test_box_screen_by_icon_in_supplemental_mode(self):
+        # 補完モードは「BOX」の文字ではなく左上のボックスのアイコンで見る（文字ありと同じ結果）
+        box, _home, _report = self._modules()
+        for name in ("2026-11-01_01-10-34", "2026-11-01_01-12-18", "2026-11-01_01-10-27"):
+            frame = self._capture(name)
+            self.assertEqual(box.za_box_ready(frame, text=False), box.za_box_ready(frame), name)
+        self.assertTrue(box.za_box_ready(self._capture("2026-11-01_01-10-34"), text=False))
+
+
+class ZaMultiLanguageNewGameTests(unittest.TestCase):
+    """はじめからの他言語対応（言語選択・画面判定・Switch 本体のキーボード。2026-11-01 実機キャプチャ）。"""
+
+    _capture = staticmethod(ZaBoxAndHomeTransferTests._capture)
+
+    @staticmethod
+    def _modules():
+        from Commands.PythonCommands.Pokemon_Template.ZA import NameKeyboard, NewGameStart
+        return NewGameStart, NameKeyboard
+
+    def test_language_buttons_are_found_by_label_in_any_order(self):
+        ng, _kb = self._modules()
+        rest = ["ENG", "SPA_ES", "SPA_LA", "FRA", "GER", "ITA", "JPN", "KOR", "CHS", "CHT"]
+        # 直前に選んだ言語が左上、残りは決まった順に左の列の上から詰まる
+        for name, first in (("2026-11-01_09-59-46", "JPN"), ("2026-11-01_10-03-32", "ENG"),
+                            ("2026-11-01_10-04-46", "SPA_ES"), ("2026-11-01_10-05-58", "SPA_LA"),
+                            ("2026-11-01_10-08-08", "FRA"), ("2026-11-01_10-11-46", "GER"),
+                            ("2026-11-01_10-24-34", "ITA"), ("2026-11-01_10-16-46", "KOR"),
+                            ("2026-11-01_10-20-08", "CHS"), ("2026-11-01_10-23-28", "CHT")):
+            with self.subTest(name=name):
+                frame = self._capture(name)
+                order = [first] + [code for code in rest if code != first]
+                expected = {(index // 5, index % 5): code for index, code in enumerate(order)}
+                self.assertEqual(ng.detect_language_buttons(frame), expected)
+                self.assertEqual(ng.detect_screen(frame), "language")
+                self.assertEqual(ng.detect_language_cursor(frame), (0, 0))
+        # カーソルが English（2段目）にある時も、選択中のボタン（白地）の文字が読める
+        frame = self._capture("2026-11-01_09-59-50")
+        self.assertEqual(ng.detect_language_cursor(frame), (0, 1))
+        self.assertEqual(ng.detect_language_buttons(frame)[(0, 1)], "ENG")
+
+    def test_screens_are_detected_without_the_language_headers(self):
+        ng, _kb = self._modules()
+        cases = {
+            "looks": ("2026-11-01_10-00-04", "2026-11-01_10-04-10", "2026-11-01_10-06-12",
+                      "2026-11-01_10-08-28", "2026-11-01_10-11-56", "2026-11-01_10-16-59",
+                      "2026-11-01_10-20-22", "2026-11-01_10-23-38"),
+            "keyboard": ("2026-11-01_10-00-37", "2026-11-01_10-04-16", "2026-11-01_10-12-12",
+                         "2026-11-01_10-17-07", "2026-11-01_10-20-31", "2026-11-01_10-23-47"),
+            "profile": ("2026-11-01_10-02-54", "2026-11-01_10-22-40", "2026-11-01_10-23-59"),
+        }
+        for screen, names in cases.items():
+            for name in names:
+                with self.subTest(name=name):
+                    self.assertEqual(ng.detect_screen(self._capture(name)), screen)
+        # キーボードの選択（地球儀キー）の一覧はどの画面でもない
+        self.assertIsNone(ng.detect_screen(self._capture("2026-11-01_10-09-10")))
+
+    def test_system_keyboard_cursor_mode_and_shift(self):
+        _ng, kb = self._modules()
+        cases = {
+            "2026-11-01_10-00-37": ("ENG", (0, 0), "abc", False),
+            "2026-11-01_10-01-11": ("ENG", (4, 1), "abc", True),
+            "2026-11-01_10-01-15": ("ENG", (4, 3), "symbol", False),
+            "2026-11-01_10-02-15": ("ENG", (2, 0), "abc", False),
+            "2026-11-01_10-10-22": ("GER", (4, 4), "accent1", True),
+            "2026-11-01_10-10-29": ("GER", (4, 5), "accent2", True),   # 大文字固定（⇧に青い点）
+            "2026-11-01_10-12-43": ("KOR", (0, 0), "hangul", True),
+            "2026-11-01_10-14-03": ("KOR", (4, 3), "english", False),
+            "2026-11-01_10-15-46": ("KOR", (2, 1), "hangul", False),
+            "2026-11-01_10-18-37": ("CHS", (-1, 0), "pinyin", False),  # 変換候補の列
+            "2026-11-01_10-25-16": ("CHS", (4, 3), "english", True),
+            "2026-11-01_10-21-21": ("CHT", (4, 6), "symbol", False),
+            "2026-11-01_10-22-20": ("CHT", (3, 2), "english", False),
+        }
+        for name, (language, cursor, mode, shift) in cases.items():
+            with self.subTest(name=name):
+                frame = self._capture(name)
+                keyboard = kb.KEYBOARDS[language]
+                self.assertEqual(kb.detect_cursor(frame, keyboard), cursor)
+                self.assertEqual(kb.detect_mode(frame, keyboard, language), mode)
+                self.assertEqual(kb.shift_active(frame), shift)
+
+    def test_name_plans_cover_the_keyboard_characters(self):
+        _ng, kb = self._modules()
+        self.assertEqual(kb.plan_name("ENG", "Alex"), [
+            ("key", "abc", 2, 0, True), ("key", "abc", 2, 8, False),
+            ("key", "abc", 1, 2, False), ("key", "abc", 3, 1, False)])
+        self.assertEqual(kb.plan_name("GER", "Jürgen Ä")[1], ("key", "accent2", 2, 3, False))
+        self.assertEqual(kb.plan_name("GER", "Jürgen Ä")[-2:], [("space",), ("key", "accent1", 0, 4, True)])
+        self.assertEqual(kb.plan_name("FRA", "#1+")[0], ("key", "abc", 0, 0, True))
+        self.assertEqual(kb.plan_name("ITA", "a~")[1], ("key", "symbol", 2, 0, False))
+        # ハングルは字母に分けて入れる（二重母音・二重パッチムは2キー、濃音は ⇧）
+        self.assertEqual(kb.hangul_jamo("민"), ["ㅁ", "ㅣ", "ㄴ"])
+        self.assertEqual(kb.hangul_jamo("왜"), ["ㅇ", "ㅗ", "ㅐ"])
+        self.assertEqual(kb.hangul_jamo("값"), ["ㄱ", "ㅏ", "ㅂ", "ㅅ"])
+        self.assertEqual(kb.plan_name("KOR", "까")[0], ("key", "hangul", 1, 3, True))
+        self.assertEqual([step[1] for step in kb.plan_name("KOR", "A1")], ["english", "english"])
+        self.assertEqual([step[1] for step in kb.plan_name("CHS", "Mei")], ["english"] * 3)
+        for language, name, message in (("ENG", "@", "入力できない"), ("ENG", "A" * 13, "12文字"),
+                                        ("KOR", "ㅋㅋ", "字母"), ("CHT", "小", "読み"),
+                                        ("CHS", "A" * 7, "6文字"), ("ENG", "", "空"),
+                                        ("KOR", "小", "入力できない")):
+            with self.subTest(language=language, name=name):
+                with self.assertRaisesRegex(ValueError, message):
+                    kb.plan_name(language, name)
+
+    def test_chinese_names_use_readings_and_candidate_images(self):
+        _ng, kb = self._modules()
+        plan = kb.plan_name("CHS", "小明A", reading="xiao ming")
+        self.assertEqual([step[0] for step in plan], ["convert", "convert", "key"])
+        self.assertEqual(plan[0][:2], ("convert", "pinyin"))
+        self.assertEqual(plan[0][3], "小")
+        self.assertEqual(len(plan[0][2]), 4)                      # x i a o
+        plan = kb.plan_name("CHT", "小美心", reading="ㄒㄧㄠˇ ㄇㄟˇ ㄒㄧㄣ")
+        self.assertEqual(plan[2][2], [(3, 3), (1, 6), (1, 9)])    # 1声は記号なし
+        self.assertEqual(kb.reading_parts("LÜ  Xiao"), ["lv", "xiao"])
+        for name, reading, message in (("小明", "xiao", "読みが 1個"), ("小", "xiao3", "打てない"),
+                                       ("张晓明亮", "zhang xiao ming liang", "文字数に数え"),
+                                       ("Ming", "ming", "漢字の名前の時だけ")):
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(ValueError, message):
+                    kb.plan_name("CHS", name, reading=reading)
+        # 実機の変換候補（2026-11-01）: xiao の 小・肖、ㄇㄟˇ の 美・每 は選べる。
+        # 晓 は 哓 と区別しきれないため選ばない（止める）。候補に無い字は見つからない
+        if not os.path.isfile(os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts", "msyh.ttc")):
+            self.skipTest("中国語のフォントがありません")
+        xiao = self._capture("2026-11-01_10-18-10")
+        mei = self._capture("2026-11-01_12-07-39")
+        # カーソル枠が「红」に乗っている（枠の中は細い線が欠けて位置がずれる）
+        hong = self._capture("2026-11-01_13-34-33")
+        for frame, char, language, index in ((xiao, "小", "CHS", 0), (xiao, "肖", "CHS", 7),
+                                             (xiao, "哓", "CHS", 14), (hong, "红", "CHS", 0),
+                                             (hong, "洪", "CHS", 1), (mei, "美", "CHT", 1),
+                                             (mei, "每", "CHT", 0)):
+            with self.subTest(char=char):
+                detail = kb.find_candidate(frame, char, language)
+                self.assertTrue(detail["found"], detail)
+                self.assertEqual(detail["index"], index)
+        self.assertEqual(kb.find_candidate(xiao, "晓", "CHS")["reason"], "ambiguous")
+        self.assertEqual(kb.find_candidate(mei, "明", "CHT")["reason"], "not_found")
+        # カーソル枠が候補の上にあっても候補を切り分けられる
+        self.assertEqual(len(kb.candidate_segments(self._capture("2026-11-01_10-18-37"))), 15)
+
+    def _keyboard_command(self, language):
+        """Switch 本体のキーボードの動きを模擬して、名前入力の操作を確かめる。"""
+        ng, kb = self._modules()
+        keyboard = kb.KEYBOARDS[language]
+        test = self
+
+        class State:
+            screen = "keyboard"
+            cursor = (0, 0)
+            mode = keyboard.initial_mode
+            shift = 0          # 0 小文字 / 1 次の1文字 / 2 固定
+            text = ""
+            composing = False
+            pressed = []
+
+        state = State()
+
+        class Command(ng.ZANewGameStartMixin):
+            def __init__(self):
+                pass
+
+            def checkIfAlive(self):
+                return True
+
+            def wait(self, seconds):
+                pass
+
+            def _za_ng_frame(self):
+                return state
+
+            def _za_ng_screen(self):
+                return state.screen
+
+            def _za_ng_log(self, message):
+                pass
+
+            def _za_ng_advance_to(self, target, **kwargs):
+                test.assertEqual(state.screen, target)
+
+            def press(self, button, duration=0.1, wait=0.1):
+                state.pressed.append(button)
+                row, col = state.cursor
+                if button is ng.Hat.RIGHT:
+                    col = min(col + 1, keyboard.space_col if row == 4 else 10)
+                elif button is ng.Hat.LEFT:
+                    col = max(col - 1, 0)
+                elif button is ng.Hat.TOP:
+                    row, col = max(row - 1, 0), min(col, 10)
+                elif button is ng.Hat.BTM:
+                    row = min(row + 1, 4)
+                    col = min(col, keyboard.space_col) if row == 4 else col
+                elif button is ng.Button.LCLICK:
+                    state.shift = (state.shift + 1) % 3
+                elif button is ng.Button.Y:
+                    state.text += " "
+                elif button is ng.Button.PLUS:
+                    if state.composing:
+                        state.composing = False
+                    else:
+                        state.screen = "profile"
+                elif button is ng.Button.A:
+                    if row == 4:
+                        modes = {c: m for m, (c, _l, _u) in keyboard.modes.items()}
+                        test.assertIn(col, modes, "モードキー以外を押した")
+                        state.mode = modes[col]
+                    else:
+                        _c, lower, upper = keyboard.modes[state.mode]
+                        char = (upper if state.shift else lower)[row][col]
+                        test.assertNotEqual(char, kb._, "文字の無いキーを押した")
+                        state.text += char
+                        state.composing = language == "KOR" and state.mode == "hangul"
+                        if state.shift == 1:
+                            state.shift = 0
+                state.cursor = (row, col)
+
+        patches = (mock.patch.object(kb, "detect_cursor", lambda frame, _k: frame.cursor),
+                   mock.patch.object(kb, "detect_mode", lambda frame, _k, _l=None: frame.mode),
+                   mock.patch.object(kb, "shift_active", lambda frame: frame.shift > 0))
+        return Command(), state, patches
+
+    def test_system_keyboard_input_switches_modes_and_case(self):
+        _ng, kb = self._modules()
+        for language, name, jamo in (("ENG", "Jürgen Ä", None), ("SPA_LA", "Sofía", None),
+                                     ("KOR", "민준 A1", "ㅁㅣㄴㅈㅜㄴ A1"), ("CHT", "Mei~", None),
+                                     ("CHS", "Ming", None)):
+            with self.subTest(language=language):
+                command, state, patches = self._keyboard_command(language)
+                with patches[0], patches[1], patches[2]:
+                    command._za_ng_input_system_keyboard(name, language)
+                self.assertEqual(state.text, jamo or name)
+                self.assertEqual(state.screen, "profile")
+                self.assertEqual(state.shift, 0)
+        # 韓国語は組み立て中の文字を + で確定してから、もう1回 + で名前を決める
+        command, state, patches = self._keyboard_command("KOR")
+        with patches[0], patches[1], patches[2]:
+            command._za_ng_input_system_keyboard("서연", "KOR")
+        self.assertEqual(state.pressed.count(_ng_button_plus()), 2)
+
+
+def _ng_button_plus():
+    from Commands.PythonCommands.Pokemon_Template.ZA import NewGameStart
+    return NewGameStart.Button.PLUS
+
+
+class ZaThirdBattleSkillOrderTests(unittest.TestCase):
+    """3rdバトル: 技の入れ替えをバトル前へ移し、A/Bで攻撃。Lv.判定の救済は3rd専用。"""
+
+    @staticmethod
+    def _functions():
+        return ZaPartyDeadRecoveryTests._source_class_and_functions()[1]
+
+    @staticmethod
+    def _returns(function):
+        return {node.value.value for node in ast.walk(function)
+                if isinstance(node, ast.Return) and isinstance(node.value, ast.Constant)}
+
+    @staticmethod
+    def _template_calls(function):
+        return [node for node in ast.walk(function)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr == "ZA_story_Template_battle_function_renda_route"]
+
+    def test_skill_change_runs_before_third_battle_once(self):
+        functions = self._functions()
+        self.assertIn("1_STORY_HOTEL_Z_SKILL_CHANGE1", self._returns(functions["_1_story_hote_z_move12"]))
+        self.assertNotIn("1_STORY_HOTEL_Z_MOVE13", self._returns(functions["_1_story_hote_z_move12"]))
+        self.assertIn("1_STORY_HOTEL_Z_SKILL_CHANGE2", self._returns(functions["_1_story_hotel_z_skill_change1"]))
+        self.assertIn("1_STORY_HOTEL_Z_MOVE13", self._returns(functions["_1_story_hotel_z_skill_change2"]))
+        # 以前の入れ替え位置（Z_9の後）は通過するだけ（2回入れ替えると元に戻るため）
+        self.assertIn("1_STORY_OUT_HOTEL_Z_10", self._returns(functions["_1_story_out_hotel_z_9"]))
+        for name in ("_1_story_waninoko_skill_change1", "_1_story_waninoko_skill_change2"):
+            self.assertEqual(self._returns(functions[name]), {"1_STORY_OUT_HOTEL_Z_10"}, name)
+            self.assertFalse([node for node in ast.walk(functions[name])
+                              if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                              and node.func.attr == "ZA_common_skill_change_function"], name)
+
+    def test_third_battle_attacks_with_a_and_b_only(self):
+        call = self._template_calls(self._functions()["_1_story_third_battle"])[0]
+        kwargs = {kw.arg: ast.literal_eval(kw.value) for kw in call.keywords
+                  if kw.arg in ("Xaction", "Aaction", "Yaction", "Baction", "attack_without_active_level")}
+        self.assertEqual(kwargs, {"Xaction": 0, "Aaction": 1, "Yaction": 0, "Baction": 1,
+                                  "attack_without_active_level": True})
+
+    def test_third_battle_end_keeps_attacking_second_opponent(self):
+        functions = self._functions()
+        namespace = {"Button": types.SimpleNamespace(A="A", B="B"),
+                     "Direction": lambda stick, angle: (stick, angle),
+                     "Stick": types.SimpleNamespace(LEFT="LEFT")}
+        module = ast.fix_missing_locations(ast.Module(
+            body=[functions["_1_story_third_battle_end"],
+                  functions["_1_story_third_battle_in_progress"]], type_ignores=[]))
+        exec(compile(module, "<third_end>", "exec"), namespace)
+
+        class Command:
+            step = namespace["_1_story_third_battle_end"]
+            _1_story_third_battle_in_progress = namespace["_1_story_third_battle_in_progress"]
+
+            def __init__(self, visible, renda_result=True):
+                self.visible, self.renda_result = set(visible), renda_result
+                self.attacks, self.renda_calls = [], []
+
+            def image_check(self, target):
+                return target in self.visible
+
+            def wait(self, _seconds):
+                pass
+
+            def ZA_battle_coCp_noloop(self, **kwargs):
+                self.attacks.append(kwargs)
+
+            def ZA_renda_button(self, **kwargs):
+                self.renda_calls.append(kwargs)
+                return self.renda_result
+
+            def press(self, *_args, **_kwargs):
+                pass
+
+        # 2匹目と戦闘中（Lv.は外れても FIELD 無し＋戦闘中の手持ち表示）→ A/B 攻撃
+        fighting = Command({"POKEMON_ZA_BATTLE"})
+        self.assertEqual(fighting.step(), "1_STORY_THIRD_BATTLE_END")
+        self.assertEqual(fighting.attacks, [{"Xaction": 0, "Aaction": 1, "Yaction": 0, "Baction": 1}])
+        # フィールド表示中は攻撃しない
+        field = Command({"POKEMON_ZA_BATTLE", "POKEMON_ZA_NO_BATTLE_FIELD_HARD_CHECK"})
+        field.step()
+        self.assertEqual(field.attacks, [])
+        # 途中の会話: 戦闘に戻ったら（resume_combat）次へ進まない
+        talk = Command({"POKEMON_ZA_TEXT_WHITE_COMMENT"}, renda_result="resume_combat")
+        self.assertEqual(talk.step(), "1_STORY_THIRD_BATTLE_END")
+        self.assertTrue(callable(talk.renda_calls[0]["interrupt_callback"]))
+        done = Command({"POKEMON_ZA_TEXT_WHITE_COMMENT"}, renda_result=True)
+        self.assertEqual(done.step(), "1_STORY_OUT_HOTEL_Z_1")
+
+    def test_active_level_fallback_is_third_battle_only(self):
+        users = [name for name, function in self._functions().items()
+                 if any(kw.arg == "attack_without_active_level"
+                        for call in self._template_calls(function) for kw in call.keywords)]
+        self.assertEqual(users, ["_1_story_third_battle"])
 
 
 if __name__ == "__main__":

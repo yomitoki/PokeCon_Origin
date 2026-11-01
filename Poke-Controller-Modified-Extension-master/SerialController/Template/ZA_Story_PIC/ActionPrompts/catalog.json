@@ -14,12 +14,12 @@
       "mask_path": "Template/ZA_Story_PIC/ActionPrompts/enter_ja_mask.png",
       "template_crop": null,
       "crop": [
-        550,
+        600,
         250,
         900,
-        550
+        650
       ],
-      "threshold": 0.9,
+      "threshold": 0.85,
       "use_gray": true,
       "match_mode": "zncc",
       "source": {
@@ -68,12 +68,12 @@
       "mask_path": "Template/ZA_Story_PIC/ActionPrompts/talk_ja_mask.png",
       "template_crop": null,
       "crop": [
-        550,
+        600,
         250,
         900,
-        550
+        650
       ],
-      "threshold": 0.9,
+      "threshold": 0.85,
       "use_gray": true,
       "match_mode": "zncc",
       "source": {
@@ -123,12 +123,12 @@
       "mask_path": "Template/ZA_Story_PIC/ActionPrompts/investigate_ja_mask.png",
       "template_crop": null,
       "crop": [
-        550,
+        600,
         250,
         900,
-        550
+        650
       ],
-      "threshold": 0.9,
+      "threshold": 0.85,
       "use_gray": true,
       "match_mode": "zncc",
       "source": {
@@ -177,12 +177,12 @@
       "mask_path": "Template/ZA_Story_PIC/ActionPrompts/pickup_ja_mask.png",
       "template_crop": null,
       "crop": [
-        550,
+        600,
         250,
         900,
-        550
+        650
       ],
-      "threshold": 0.9,
+      "threshold": 0.85,
       "use_gray": true,
       "match_mode": "zncc",
       "source": {
@@ -231,12 +231,12 @@
       "mask_path": "Template/ZA_Story_PIC/ActionPrompts/pet_ja_mask.png",
       "template_crop": null,
       "crop": [
-        550,
+        600,
         250,
         900,
-        550
+        650
       ],
-      "threshold": 0.9,
+      "threshold": 0.85,
       "use_gray": true,
       "match_mode": "zncc",
       "source": {
@@ -285,12 +285,12 @@
       "mask_path": "Template/ZA_Story_PIC/ActionPrompts/sit_ja_mask.png",
       "template_crop": null,
       "crop": [
-        550,
+        600,
         250,
         900,
-        550
+        650
       ],
-      "threshold": 0.9,
+      "threshold": 0.85,
       "use_gray": true,
       "match_mode": "zncc",
       "source": {
@@ -339,12 +339,12 @@
       "mask_path": "Template/ZA_Story_PIC/ActionPrompts/exit_ja_mask.png",
       "template_crop": null,
       "crop": [
-        550,
+        600,
         250,
         900,
-        550
+        650
       ],
-      "threshold": 0.9,
+      "threshold": 0.85,
       "use_gray": true,
       "match_mode": "zncc",
       "source": {
@@ -382,6 +382,62 @@
       "mask_pixels": 798
     },
     {
+      "id": "exit_light_ja",
+      "language": "ja",
+      "text": "A でる",
+      "picture": "POKEMON_ZA_OUT_MARKER",
+      "pictures": [
+        "POKEMON_ZA_OUT_MARKER"
+      ],
+      "template_path": "Template/ZA_Story_PIC/ActionPrompts/exit_light_ja.png",
+      "mask_path": "Template/ZA_Story_PIC/ActionPrompts/exit_light_ja_mask.png",
+      "template_crop": null,
+      "crop": [
+        600,
+        250,
+        900,
+        650
+      ],
+      "threshold": 0.9,
+      "use_gray": true,
+      "match_mode": "zncc",
+      "source": {
+        "kind": "debug_a_check_frame",
+        "path": "SerialController/Debug_A_Check/events/20261031_180020_701648_7e3800da80a7431ab2b3b51aba39695b/frame.png",
+        "sha256": "118fdaf78d7a11694b451834c8335baf7a2c43893eccf123f36595c1d8624ef2",
+        "frame_shape": [
+          720,
+          1280,
+          3
+        ],
+        "crop": [
+          689,
+          414,
+          754,
+          439
+        ],
+        "active_state": "1_STORY_OUT_HOTEL_Z_21",
+        "note": "ワイルドゾーン出口の緑に光る柱の前の「A でる」。元の exit_ja は 0.79 で、Z_21 で表示中に2回見逃した（2026-10-31 19:55 の録画で確認）。Debug_A_Check が保存した PokeCon の取り込みフレーム",
+        "bgr_pixels_sha256": "ef4c8059fcf252002e730ed889f769adb77fa2eb0c86391ff2ce0b4ae4232d4e",
+        "crop_bgr_pixels_sha256": "904f39d78b8a5ea7bc1cc9a5fea30bdbcadf5cd091b34f30620f6eb951ee4e0a"
+      },
+      "mask_method": "exit_ja_mask.png (same glyph layout, text and A disc only)",
+      "template_sha256": "7fa7ae48fd356d921d2927bc560eba562a8230385a81630bf9958b1a7dda8468",
+      "mask_sha256": "b54555d3521237bbf0c0908c332270cf9c2825f66b7bdf6320465f54fc37c6d6",
+      "status": "verified_live_frames_and_offline_crosscheck",
+      "mask_pixels": 798,
+      "validation": {
+        "same_scene_frames": 2,
+        "same_scene_min_score": 0.965,
+        "gray_background_exit_score": 0.9223,
+        "pickup_prompt_same_place_score": 0.6954,
+        "other_word_frames_max_score": 0.7163,
+        "step_frames": 780,
+        "step_frames_max_score": 0.8208,
+        "note": "同じ場面は 2026-10-30 21:54 の Debug_A_Check フレーム（0.965）。灰色の背景の「A でる」（2026-10-30 03:52）にも 0.922。同じ位置の「A 拾う」は 0.695。録画の step フレームの最高は明るい背景の「A 話しかける」（0.821）のため、閾値は exit_ja より高い 0.90"
+      }
+    },
+    {
       "id": "climb_ja",
       "language": "ja",
       "text": "A のぼる",
@@ -393,12 +449,12 @@
       "mask_path": "Template/ZA_Story_PIC/ActionPrompts/climb_ja_mask.png",
       "template_crop": null,
       "crop": [
-        550,
+        600,
         250,
         900,
-        550
+        650
       ],
-      "threshold": 0.9,
+      "threshold": 0.85,
       "use_gray": true,
       "match_mode": "zncc",
       "source": {
@@ -447,12 +503,12 @@
       "mask_path": "Template/ZA_Story_PIC/ActionPrompts/elevator_ja_mask.png",
       "template_crop": null,
       "crop": [
-        550,
+        600,
         250,
         900,
-        550
+        650
       ],
-      "threshold": 0.9,
+      "threshold": 0.85,
       "use_gray": true,
       "match_mode": "zncc",
       "source": {
@@ -488,6 +544,158 @@
       "mask_sha256": "6b65c96c2a27951de5d5b6ed5d7f4d5efc009224f6f9230fe47d82317597a720",
       "status": "verified_zip_pixels_and_offline_crosscheck",
       "mask_pixels": 1119
+    },
+    {
+      "id": "rest_ja",
+      "language": "ja",
+      "text": "A 休む",
+      "picture": "POKEMON_ZA_REST_MARKER",
+      "pictures": [
+        "POKEMON_ZA_REST_MARKER"
+      ],
+      "template_path": "Template/ZA_Story_PIC/ActionPrompts/rest_ja.png",
+      "mask_path": "Template/ZA_Story_PIC/ActionPrompts/rest_ja_mask.png",
+      "template_crop": null,
+      "crop": [
+        600,
+        250,
+        900,
+        650
+      ],
+      "threshold": 0.85,
+      "use_gray": true,
+      "match_mode": "zncc",
+      "source": {
+        "kind": "live_step_frame",
+        "path": "D:/Recording/Switch_No3_sub/20261030_001526_414623_Commands_merged/step_frames/040_step_000001.jpg",
+        "sha256": "eb9065f93a549c431df366503b35db8e6d2a90e8159ea4cb9bb43e822f4475a5",
+        "frame_shape": [
+          720,
+          1280,
+          3
+        ],
+        "crop": [
+          689,
+          422,
+          754,
+          447
+        ],
+        "active_state": "1_STORY_HOTEL_Z_MOVE7",
+        "note": "ホテルZの部屋のベッド前（MOVE7到着位置）。2026-10-30 実機の録画"
+      },
+      "mask_method": "source gray >= 180, 1px dilation for text; full A disc radius 12 at (11,11)",
+      "template_sha256": "13d6f991dacec782e74a22067f65b442cb581675fbeea8707a40c65bc8f84260",
+      "mask_sha256": "d697bc7056dcfbf724a00f7d374ea206272722b8a1656174b2b5e92a68384663",
+      "status": "verified_live_frames_and_offline_crosscheck",
+      "mask_pixels": 912,
+      "validation": {
+        "same_scene_frames": 5,
+        "same_scene_min_score": 0.9991,
+        "other_word_frames_max_score": 0.632,
+        "existing_references_on_rest_frame_max_score": 0.634,
+        "limits": "同じ録画の同じ場面だけで確認（別の録画にこの表示が無かった）"
+      }
+    },
+    {
+      "id": "climb_dark_ja",
+      "language": "ja",
+      "text": "A のぼる",
+      "picture": "POKEMON_ZA_HASHIGO_ICON",
+      "pictures": [
+        "POKEMON_ZA_HASHIGO_ICON"
+      ],
+      "template_path": "Template/ZA_Story_PIC/ActionPrompts/climb_dark_ja.png",
+      "mask_path": "Template/ZA_Story_PIC/ActionPrompts/climb_dark_ja_mask.png",
+      "template_crop": null,
+      "crop": [
+        600,
+        250,
+        900,
+        650
+      ],
+      "threshold": 0.85,
+      "use_gray": true,
+      "match_mode": "zncc",
+      "source": {
+        "kind": "live_step_frame",
+        "path": "D:/Recording/Switch_No3_sub/20261030_023838_615835/step_frames/step_000001.jpg",
+        "sha256": "0cca8605d909b9a7a19abbd5a081f5f9f19be5504148ff49e40f7ecdb159a3ed",
+        "frame_shape": [
+          720,
+          1280,
+          3
+        ],
+        "crop": [
+          689,
+          537,
+          770,
+          562
+        ],
+        "active_state": "1_STORY_OUT_HOTEL_Z_4",
+        "note": "ホテルZ外のハシゴ（暗い壁の前）。既存 climb_ja はこの場面で0.87〜0.88。2026-10-30 実機の録画"
+      },
+      "mask_method": "source gray >= 180, 1px dilation for text; full A disc radius 12 at (11,11)",
+      "template_sha256": "cb0345373764b8232b6fa1adc1c3ec354290617a4f81abab2233d7e372aa0324",
+      "mask_sha256": "b00ef2dbc928e77cfbfc7c9f000ee56b4d02a9dfb520bf60fcec57e83cdcd337",
+      "status": "verified_live_frames_and_offline_crosscheck",
+      "mask_pixels": 1188,
+      "validation": {
+        "same_scene_frames": 2,
+        "same_scene_min_score": 0.9816,
+        "other_word_frames_max_score": 0.6375,
+        "existing_references_on_this_frame_max_score": 0.88,
+        "limits": "同じ場面の録画3フレームだけで確認"
+      }
+    },
+    {
+      "id": "talk_light_ja",
+      "language": "ja",
+      "text": "A 話しかける",
+      "picture": "POKEMON_ZA_CHAT_MARKER",
+      "pictures": [
+        "POKEMON_ZA_CHAT_MARKER"
+      ],
+      "template_path": "Template/ZA_Story_PIC/ActionPrompts/talk_light_ja.png",
+      "mask_path": "Template/ZA_Story_PIC/ActionPrompts/talk_light_ja_mask.png",
+      "template_crop": null,
+      "crop": [
+        600,
+        250,
+        900,
+        650
+      ],
+      "threshold": 0.85,
+      "use_gray": true,
+      "match_mode": "zncc",
+      "source": {
+        "kind": "live_step_frame",
+        "path": "D:/Recording/Switch_No3_sub/20261030_200421_935872/step_frames/step_000001.jpg",
+        "sha256": "5c4800860578ae5603021e3113933b3e23f126c4d73e43413df7558b9ef304df",
+        "frame_shape": [
+          720,
+          1280,
+          3
+        ],
+        "crop": [
+          689,
+          414,
+          802,
+          439
+        ],
+        "active_state": "1_STORY_BAG_CHASE_END",
+        "note": "最初のポケモン選び前、明るい石畳の前のタウニー（名前行つき）。既存 talk_ja は0.87で、BAG_CHASE_END が約1分半B連打で待っていた。2026-10-30 実機の録画"
+      },
+      "mask_method": "talk_ja_mask.png (same glyph layout, text and A disc only)",
+      "template_sha256": "6f2b9beb95a6f035c487b96c43c276d1cf0b6deb9fc1d3bed8043cf786584b95",
+      "mask_sha256": "2737f76fed20e4c553d01e32c13c8c4d212a95048b148bdc45fcf88859c93857",
+      "status": "verified_live_frames_and_offline_crosscheck",
+      "mask_pixels": 1481,
+      "validation": {
+        "same_scene_frames": 22,
+        "same_scene_min_score": 0.9838,
+        "other_frames_max_score": 0.8966,
+        "note": "0.9未満の最大は別場面の「A 話しかける」（0.8966）。他の文字での一致なし"
+      }
     }
   ],
   "notes": [
@@ -496,7 +704,9 @@
     "The existing HASHIGO label reads A のぼる, not A はしご.",
     "ZIP scan: 13,173 indexed saved game frames inspected in memory, 803 A-glyph >=0.90 candidates; six initial word classes plus all nine outliers reviewed.",
     "The glyph scan is a candidate retrieval pass, not a guarantee that every possible prompt was visible or retrieved.",
-    "ZIP enter reference does not pass the bright 2026-10-27 ABSOL21 frame; that known limitation is retained for explicit fallback collection."
+    "ZIP enter reference does not pass the bright 2026-10-27 ABSOL21 frame; that known limitation is retained for explicit fallback collection.",
+    "2026-10-30: crop を [550,250,900,550] から [600,250,900,650] に変更。A円は全参照画像で x=700 だが、y はキャラクター位置で 412〜548 に変わり、y=548（ハシゴ）では下端で文字が切れて一致しなかった。旧 POKEMON_ZA_HASHIGO_ICON の範囲は [300,150,900,650]。録画344フレームで誤一致なし（0.8以上はすべて正しい文字）。debug_a_glyph（ActionPromptCheck）はタイトルの PRESS A BUTTON を避けるため範囲を変更していない",
+    "2026-10-30: 全参照の threshold を 0.9 → 0.85 に変更。明るい背景・葉の手前などで正しい文字が 0.85〜0.9 にとどまり、A待ちが長引いていた（例: 最初のポケモン選び前の talk 0.873）。実機録画677フレームで別の文字が0.80以上になったものは無く、0.85〜0.9 の2件（拾う 0.855、話しかける 0.893）はどちらも正しい文字。validation の cross_label_source_max 0.702 / known_negative_max 0.405 とも余裕がある"
   ],
   "audit": {
     "archive": "D:/Recording/Switch_No3.zip",
@@ -522,7 +732,8 @@
       "拾う",
       "ふれあう",
       "座る",
-      "エレベータ"
+      "エレベータ",
+      "休む"
     ],
     "legacy_glyph_only": [
       {
